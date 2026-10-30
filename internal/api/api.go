@@ -1325,6 +1325,26 @@ func (s *Server) getPairing(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// checkPairingToken charges the per-IP pairing budget before the lookup, so
+// lookups are bounded and an exhausted budget answers 429 for hits and misses alike.
+func (s *Server) checkPairingToken(w http.ResponseWriter, r *http.Request, token string) (string, bool) {
+	if !s.lim.pairLim.Allow(rateLimitKey(clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets))) {
+		writeErr(w, http.StatusTooManyRequests, "rate limited")
+		return "", false
+	}
+	tokenHash := auth.Hash(token)
+	exists, err := s.st.PairingTokenExists(r.Context(), tokenHash)
+	if err != nil {
+		s.internal(w, err)
+		return "", false
+	}
+	if !exists {
+		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
+		return "", false
+	}
+	return tokenHash, true
+}
+
 // acceptPairing handles authenticated pairing acceptance (user already has API key).
 func (s *Server) acceptPairing(w http.ResponseWriter, r *http.Request) {
 	token := r.PathValue("token")
@@ -1333,27 +1353,8 @@ func (s *Server) acceptPairing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if pairing token exists before charging rate limit (#32)
-	tokenHash := auth.Hash(token)
-	exists, err := s.st.PairingTokenExists(r.Context(), tokenHash)
-	if err != nil {
-		s.internal(w, err)
-		return
-	}
-	if !exists {
-		// Charge failed-lookup budget (per-IP)
-		ipKey := rateLimitKey(clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets))
-		if !s.lim.failLim.Allow(ipKey) {
-			writeErr(w, http.StatusTooManyRequests, "rate limited")
-			return
-		}
-		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
-		return
-	}
-
-	// Rate limit valid pairing redemptions
-	if !s.lim.pairLim.Allow(rateLimitKey(clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets))) {
-		writeErr(w, http.StatusTooManyRequests, "rate limited")
+	tokenHash, ok := s.checkPairingToken(w, r, token)
+	if !ok {
 		return
 	}
 
@@ -1407,27 +1408,8 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Check if pairing token exists before charging rate limit (#32)
-	tokenHash := auth.Hash(token)
-	exists, err := s.st.PairingTokenExists(r.Context(), tokenHash)
-	if err != nil {
-		s.internal(w, err)
-		return
-	}
-	if !exists {
-		// Charge failed-lookup budget (per-IP)
-		ipKey := rateLimitKey(clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets))
-		if !s.lim.failLim.Allow(ipKey) {
-			writeErr(w, http.StatusTooManyRequests, "rate limited")
-			return
-		}
-		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
-		return
-	}
-
-	// Rate limit valid pairing redemptions
-	if !s.lim.pairLim.Allow(rateLimitKey(clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets))) {
-		writeErr(w, http.StatusTooManyRequests, "rate limited")
+	tokenHash, ok := s.checkPairingToken(w, r, token)
+	if !ok {
 		return
 	}
 
