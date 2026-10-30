@@ -158,7 +158,7 @@ func main() {
 		KeyIndexRebuildHours:  keyIndexRebuildHours,
 	})
 	if err != nil {
-		log.Error("api.New failed", "err", err)
+		log.Error("failed to create API server", "err", err)
 		os.Exit(1)
 	}
 

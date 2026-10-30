@@ -55,7 +55,7 @@ func (s *Server) home(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
-	nonce := base64.StdEncoding.EncodeToString(nonceBytes)
+	nonce := base64.RawURLEncoding.EncodeToString(nonceBytes)
 
 	// Render template to buffer first
 	var buf bytes.Buffer
