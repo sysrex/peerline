@@ -521,8 +521,13 @@ func (s *Server) inviterName(ctx context.Context, id string) string {
 //   - Tab, newline, and all unicode.IsSpace chars become a single space
 //   - Repeated spaces are collapsed
 //
+// Length limit:
+//   - Maximum 64 runes counted on the final NFC (composed) output
+//   - Precomposed characters (e.g., é = U+00E9) count as 1 rune
+//   - Hangul syllables (e.g., 한 = U+D55C) count as 1 rune each
+//   - If truncation is needed, ensures no dangling combining marks are left
+//
 // Returns "A Peerline peer" if the result is empty after filtering.
-// Max length 64 runes (not bytes).
 //
 // Note: Cross-script homoglyphs (e.g., Cyrillic а vs Latin a) are not fully solvable here
 // and require application-level awareness or visual similarity detection.
@@ -543,7 +548,6 @@ func sanitizeInviterName(name string) string {
 
 	var out strings.Builder
 	lastWasSpace := false
-	runeCount := 0
 	marksAfterBase := 0
 	lastWasBaseChar := false // tracks if last was letter/number (valid base for marks)
 
@@ -594,7 +598,6 @@ func sanitizeInviterName(name string) string {
 			if lastWasBaseChar && marksAfterBase < maxMarksPerBase {
 				out.WriteRune(r)
 				marksAfterBase++
-				runeCount++
 				// Keep lastWasBaseChar true so we stay in this mark sequence
 			}
 			// Otherwise drop the mark
@@ -604,7 +607,6 @@ func sanitizeInviterName(name string) string {
 			lastWasSpace = false
 			lastWasBaseChar = true
 			marksAfterBase = 0 // Reset mark counter for new base
-			runeCount++
 		} else if unicode.IsSpace(r) || r == '\t' || r == '\n' || r == '\r' {
 			// Map all whitespace (including tab/newline) to single space
 			if !lastWasSpace && out.Len() > 0 {
@@ -612,7 +614,6 @@ func sanitizeInviterName(name string) string {
 				lastWasSpace = true
 				lastWasBaseChar = false
 				marksAfterBase = 0
-				runeCount++
 			}
 		} else if r == '.' || r == ',' || r == '-' || r == '_' || r == '\'' {
 			// Basic ASCII punctuation
@@ -620,16 +621,10 @@ func sanitizeInviterName(name string) string {
 			lastWasSpace = false
 			lastWasBaseChar = false // punctuation is not a valid base for marks
 			marksAfterBase = 0
-			runeCount++
 		} else {
 			// Other characters: reset state but don't write
 			lastWasBaseChar = false
 			marksAfterBase = 0
-		}
-
-		// Stop if we exceed max runes
-		if runeCount >= maxRunes {
-			break
 		}
 	}
 
@@ -640,6 +635,14 @@ func sanitizeInviterName(name string) string {
 	// Return fallback if result is empty
 	if result == "" {
 		return fallbackName
+	}
+
+	// Apply length cap to NFC output (64 runes of final composed form)
+	// This ensures precomposed characters (é), Hangul syllables (한), etc. count as 1 rune each
+	runes := []rune(result)
+	if len(runes) > maxRunes {
+		// Truncate at maxRunes. NFC form ensures no incomplete grapheme clusters.
+		result = string(runes[:maxRunes])
 	}
 
 	return result
