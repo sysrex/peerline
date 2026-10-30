@@ -27,6 +27,9 @@ func NewKey() string { return KeyPrefix + randB64(32) }
 // NewSecret returns a random URL-safe secret (used for invite codes).
 func NewSecret(prefix string) string { return prefix + randB64(24) }
 
+// NewPairingToken returns a random pairing token.
+func NewPairingToken() string { return "pair_" + randB64(24) }
+
 // Hash returns the hex SHA-256 of a secret.
 func Hash(secret string) string {
 	h := sha256.Sum256([]byte(secret))
