@@ -89,7 +89,8 @@ func Open(path string) (*Store, error) {
 func buildDSN(path string) string {
 	pragmas := "_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
 	if path == ":memory:" {
-		// Use file-based shared-cache for :memory: so pragmas apply
+		// Use file-based shared-cache for :memory: so pragmas apply.
+		// Caller should provide a unique name to prevent test bleed.
 		return "file::memory:?mode=memory&cache=shared&" + pragmas
 	}
 	sep := "?"
@@ -101,12 +102,6 @@ func buildDSN(path string) string {
 
 // migrate applies ordered, idempotent schema upgrades tracked by PRAGMA user_version.
 func migrate(db *sql.DB) error {
-	// Read user_version outside tx to avoid holding connection
-	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
-		return err
-	}
-
 	migrations := []func(*sql.Tx) error{
 		migrateV1NotifyEmail,
 		migrateV2PairingTokenHash,
@@ -114,31 +109,36 @@ func migrate(db *sql.DB) error {
 
 	for i, mig := range migrations {
 		target := i + 1
-		if version >= target {
-			continue
-		}
 
 		tx, err := db.Begin()
 		if err != nil {
 			return fmt.Errorf("begin migration v%d: %w", target, err)
 		}
+		defer tx.Rollback()
+
+		// Read user_version inside tx to ensure consistent view
+		var version int
+		if err := tx.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+			return fmt.Errorf("read user_version in migration v%d: %w", target, err)
+		}
+
+		if version >= target {
+			tx.Commit()
+			continue
+		}
 
 		// Run migration step on tx (not db) to avoid deadlock with MaxOpenConns=1
 		if err := mig(tx); err != nil {
-			tx.Rollback()
 			return fmt.Errorf("migration v%d: %w", target, err)
 		}
 
 		if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, target)); err != nil {
-			tx.Rollback()
 			return fmt.Errorf("update user_version to %d: %w", target, err)
 		}
 
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit migration v%d: %w", target, err)
 		}
-
-		version = target
 	}
 	return nil
 }
@@ -160,6 +160,7 @@ func migrateV1NotifyEmail(tx *sql.Tx) error {
 
 // migrateV2PairingTokenHash adds the pairing_token_hash column and unique index to invites.
 // PR #11 already added both (without user_version tracking), so this checks before acting.
+// Also normalizes the index to the partial form if it differs.
 func migrateV2PairingTokenHash(tx *sql.Tx) error {
 	var n int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('invites') WHERE name = 'pairing_token_hash'`).Scan(&n); err != nil {
@@ -170,18 +171,43 @@ func migrateV2PairingTokenHash(tx *sql.Tx) error {
 			return err
 		}
 	}
-	// Check if the index already exists. PR #11 created a full unique index (no WHERE clause).
-	// We create a partial index (WHERE NOT NULL). IF NOT EXISTS won't error either way.
-	var hasIndex int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='invites_pairing_token_hash'`).Scan(&hasIndex); err != nil {
+
+	// Check if the index exists and verify its definition
+	var indexSQL sql.NullString
+	err := tx.QueryRow(`SELECT sql FROM sqlite_master WHERE type='index' AND name='invites_pairing_token_hash'`).Scan(&indexSQL)
+	if err != nil && err != sql.ErrNoRows {
 		return err
 	}
-	if hasIndex > 0 {
-		// Index already exists (from PR #11 or a previous run). Keep it as-is.
-		return nil
+
+	expectedSQL := "CREATE UNIQUE INDEX invites_pairing_token_hash ON invites(pairing_token_hash) WHERE pairing_token_hash IS NOT NULL"
+	needsRecreate := false
+
+	if indexSQL.Valid {
+		// Normalize both SQLs for comparison (remove extra whitespace)
+		normalize := func(s string) string {
+			return strings.Join(strings.Fields(s), " ")
+		}
+		if normalize(indexSQL.String) != normalize(expectedSQL) {
+			needsRecreate = true
+		}
+	} else {
+		needsRecreate = true
 	}
-	_, err := tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS invites_pairing_token_hash ON invites(pairing_token_hash) WHERE pairing_token_hash IS NOT NULL`)
-	return err
+
+	if needsRecreate {
+		// Drop existing index if present
+		if indexSQL.Valid {
+			if _, err := tx.Exec(`DROP INDEX IF EXISTS invites_pairing_token_hash`); err != nil {
+				return err
+			}
+		}
+		// Create the partial index
+		if _, err := tx.Exec(expectedSQL); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -336,20 +362,27 @@ func (s *Store) GetInviteByPairingToken(ctx context.Context, pairingTokenHash st
 
 // AcceptInviteByPairingToken atomically consumes an invite via pairing token and creates grants.
 func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash, accepter string, backScopes, backBags []string) (*Grant, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
+	// Read-only pre-check to avoid taking write lock for invalid tokens
 	var codeHash string
-	err = tx.QueryRowContext(ctx, `SELECT code_hash FROM invites WHERE pairing_token_hash=?`, pairingTokenHash).Scan(&codeHash)
+	var exp int64
+	var used sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT code_hash,expires_at,used_by FROM invites WHERE pairing_token_hash=?`, pairingTokenHash).
+		Scan(&codeHash, &exp, &used)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	if used.Valid || exp < now() {
+		return nil, ErrNotFound
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
 
 	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags)
 	if err != nil {
@@ -365,6 +398,21 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 // AcceptInvite atomically consumes an invite and creates the inviter->accepter grant
 // plus, optionally, a reciprocal accepter->inviter grant. Returns the inviter's grant.
 func (s *Store) AcceptInvite(ctx context.Context, codeHash, accepter string, backScopes, backBags []string) (*Grant, error) {
+	// Read-only pre-check to avoid taking write lock for invalid codes
+	var exp int64
+	var used sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT expires_at,used_by FROM invites WHERE code_hash=?`, codeHash).
+		Scan(&exp, &used)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if used.Valid || exp < now() {
+		return nil, ErrNotFound
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -400,9 +448,6 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 	ts := now()
 	if used.Valid || exp < ts {
 		return nil, ErrNotFound
-	}
-	if fromPeer == peerID {
-		return nil, ErrConflict
 	}
 
 	// Now begin transaction for writes
