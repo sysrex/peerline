@@ -1965,7 +1965,7 @@ func TestBagStats(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err := s.CreatePeer(ctx, "alice", "Alice", "halice", "alice@example.com"); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "halice", "alice@example.com", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1990,7 +1990,7 @@ func TestBagStats(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s2.Close()
-	if err := s2.CreatePeer(ctx, "bob", "Bob", "hbob", ""); err != nil {
+	if err := s2.CreatePeer(ctx, "bob", "Bob", "hbob", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	_, err = s2.PutBag(ctx, "bob", "a", []byte("12345"), "bob", -1, 100, 10)
@@ -2027,7 +2027,7 @@ func TestBagLimitsConcurrency(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err := s.CreatePeer(ctx, "carol", "Carol", "hcarol", ""); err != nil {
+	if err := s.CreatePeer(ctx, "carol", "Carol", "hcarol", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2083,7 +2083,7 @@ func TestBagLimitsFileDB(t *testing.T) {
 	}
 	defer s2.Close()
 
-	if err := s1.CreatePeer(ctx, "dave", "Dave", "hdave", ""); err != nil {
+	if err := s1.CreatePeer(ctx, "dave", "Dave", "hdave", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2143,7 +2143,7 @@ func TestBagLimitsShrinkWhileOverQuota(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err := s.CreatePeer(ctx, "eve", "Eve", "heve", ""); err != nil {
+	if err := s.CreatePeer(ctx, "eve", "Eve", "heve", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2173,7 +2173,7 @@ func TestBagLimitsUpdateAtCountCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err := s.CreatePeer(ctx, "frank", "Frank", "hfrank", ""); err != nil {
+	if err := s.CreatePeer(ctx, "frank", "Frank", "hfrank", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
