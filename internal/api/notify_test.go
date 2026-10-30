@@ -146,6 +146,26 @@ func TestNotifyOnSuccessfulMessage(t *testing.T) {
 		APIKey *string `json:"api_key"`
 	}{&b.id, &b.key})
 
+	// Verify bob's email - extract token from verification email
+	msgs := cap.all()
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 verification email, got %d", len(msgs))
+	}
+	verifyEmail := msgs[0]
+	tokenStart := strings.Index(verifyEmail.Body, "token=eml_") + 6
+	tokenEnd := strings.Index(verifyEmail.Body[tokenStart:], "\n")
+	if tokenEnd == -1 {
+		tokenEnd = strings.Index(verifyEmail.Body[tokenStart:], " ")
+	}
+	verifyToken := verifyEmail.Body[tokenStart : tokenStart+tokenEnd]
+	resp, body = b.do("POST", "/v1/me/verify-email?token="+verifyToken, nil, nil)
+	want(t, resp, body, 200)
+
+	// Clear emails after verification
+	cap.mu.Lock()
+	cap.msgs = nil
+	cap.mu.Unlock()
+
 	// No grant yet: same 403 as a stranger, and no wake-up.
 	resp, body = a.do("POST", "/v1/peers/"+b.id+"/messages", map[string]any{"type": "note", "body": "secret"}, nil)
 	want(t, resp, body, 403)
@@ -172,7 +192,7 @@ func TestNotifyOnSuccessfulMessage(t *testing.T) {
 		CreatedAt string `json:"created_at"`
 	}
 	json.Unmarshal(body, &sent)
-	msgs := cap.all()
+	msgs = cap.all()
 	if len(msgs) != 1 {
 		t.Fatalf("mails: %+v", msgs)
 	}
@@ -194,6 +214,10 @@ func TestNotifyOnSuccessfulMessage(t *testing.T) {
 		if !strings.Contains(m.Body, needle) {
 			t.Errorf("body missing %q\n%s", needle, m.Body)
 		}
+	}
+	// Check for peer info footer
+	if !strings.Contains(m.Body, "You received this notification because peer") {
+		t.Errorf("missing peer info footer in body:\n%s", m.Body)
 	}
 	if strings.Contains(m.Body, a.key) || strings.Contains(m.Subject, a.key) || strings.Contains(m.Body, token) || strings.Contains(m.Body, b.key) {
 		t.Fatalf("mail leaked a secret:\n%s", m.Body)
@@ -260,29 +284,63 @@ func TestNotifyMailFailureStillStoresMessage(t *testing.T) {
 
 func TestNotifyDevModeLogsAndStillSucceeds(t *testing.T) {
 	var logs syncBuf
-	srv := newServer(t, Config{Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	cap := &captureMailer{}
+	srv := newServer(t, Config{Mailer: cap, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
 	a := register(t, srv, "alice")
-	b := registerNotify(t, srv, "bob", "bob@mail.grokbot.com")
+	b := &client{t: t, srv: srv}
+	resp, body := b.do("POST", "/v1/register", map[string]string{"name": "bob", "notify_email": "bob@mail.grokbot.com"}, nil)
+	want(t, resp, body, 201)
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&b.id, &b.key})
+
+	// Extract and verify
+	msgs := cap.all()
+	verifyEmail := msgs[0]
+	tokenStart := strings.Index(verifyEmail.Body, "token=eml_") + 6
+	tokenEnd := strings.Index(verifyEmail.Body[tokenStart:], "\n")
+	if tokenEnd == -1 {
+		tokenEnd = strings.Index(verifyEmail.Body[tokenStart:], " ")
+	}
+	verifyToken := verifyEmail.Body[tokenStart : tokenStart+tokenEnd]
+	resp, body = b.do("POST", "/v1/me/verify-email?token="+verifyToken, nil, nil)
+	want(t, resp, body, 200)
+
+	// Clear emails after verification
+	cap.mu.Lock()
+	cap.msgs = nil
+	cap.mu.Unlock()
+
 	pairUp(t, b, a, []string{"messages"}, nil, nil)
 	long := strings.Repeat("你", 250)
-	resp, body := a.do("POST", "/v1/peers/"+b.id+"/messages", map[string]any{"type": "note", "body": long}, nil)
+	resp, body = a.do("POST", "/v1/peers/"+b.id+"/messages", map[string]any{"type": "note", "body": long}, nil)
 	want(t, resp, body, 201)
-	l := logs.String()
-	if !strings.Contains(l, "dev mode") || !strings.Contains(l, "bob@mail.grokbot.com") {
-		t.Fatalf("not logged: %s", l)
+
+	// Check captured notification email
+	msgs = cap.all()
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 notification email, got %d", len(msgs))
 	}
-	if !strings.Contains(l, "Peerline: new message from "+a.id) || !strings.Contains(l, "Type: note") {
-		t.Fatalf("log missing fields: %s", l)
+	m := msgs[0]
+	if m.To != "bob@mail.grokbot.com" {
+		t.Fatalf("notification to %q", m.To)
 	}
-	if strings.Contains(l, a.key) || strings.Contains(l, b.key) {
-		t.Fatal("dev log contains an api key")
+	if !strings.Contains(m.Subject, "Peerline: new message from "+a.id) {
+		t.Fatalf("subject %q", m.Subject)
+	}
+	if !strings.Contains(m.Body, "Type: note") {
+		t.Fatalf("body missing Type: %s", m.Body)
+	}
+	if strings.Contains(m.Body, a.key) || strings.Contains(m.Body, b.key) {
+		t.Fatal("email contains an api key")
 	}
 	preview := bodyPreview(long, "", notifyPreviewMax)
 	if utf8.RuneCountInString(preview) != notifyPreviewMax || !strings.HasSuffix(preview, "…") {
 		t.Fatalf("preview %d %q", utf8.RuneCountInString(preview), preview)
 	}
-	if !strings.Contains(l, preview) {
-		t.Fatal("logged body is not the truncated preview")
+	if !strings.Contains(m.Body, preview) {
+		t.Fatal("email body is missing the truncated preview")
 	}
 }
 
