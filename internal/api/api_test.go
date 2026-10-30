@@ -19,6 +19,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/sysrex/peerline/internal/auth"
 	"github.com/sysrex/peerline/internal/store"
 	"golang.org/x/text/unicode/norm"
 )
@@ -2803,5 +2804,25 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 	}
 	if resp.Header.Get("Link") != "" {
 		t.Errorf("body code: unexpected Link header: %s", resp.Header.Get("Link"))
+	}
+}
+
+func TestPairingLookupsBoundedPerIP(t *testing.T) {
+	srv := newServer(t, Config{})
+	anon := &client{t: t, srv: srv}
+	notFound, limited := 0, 0
+	for i := 0; i < 100; i++ {
+		resp, _ := anon.do("POST", "/v1/pairing/"+auth.NewPairingToken(), map[string]any{"name": "x"}, nil)
+		switch resp.StatusCode {
+		case http.StatusNotFound:
+			notFound++
+		case http.StatusTooManyRequests:
+			limited++
+		default:
+			t.Fatalf("unexpected status %d", resp.StatusCode)
+		}
+	}
+	if notFound > 5 || limited < 95 {
+		t.Fatalf("lookups not bounded: 404=%d 429=%d", notFound, limited)
 	}
 }
