@@ -3018,3 +3018,29 @@ func TestVersionEndpointMethodNotAllowed(t *testing.T) {
 		})
 	}
 }
+
+func TestVersionOffIndistinguishableFromUnknownRoute(t *testing.T) {
+	srv := newServer(t, Config{VersionDetail: "off"})
+	probe := func(method, path string) (int, string, string, string) {
+		req, _ := http.NewRequest(method, srv.URL+path, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, resp.Header.Get("Content-Type"), resp.Header.Get("Allow"), string(b)
+	}
+	for _, m := range []string{"GET", "HEAD", "POST"} {
+		c1, t1, a1, b1 := probe(m, "/version")
+		c2, t2, a2, b2 := probe(m, "/does-not-exist")
+		if c1 != c2 || t1 != t2 || a1 != a2 || b1 != b2 {
+			t.Errorf("%s /version differs from unknown route: %d %q %q %q vs %d %q %q %q", m, c1, t1, a1, b1, c2, t2, a2, b2)
+		}
+	}
+	for i := 0; i < 40; i++ {
+		if c, _, _, _ := probe("GET", "/version"); c == http.StatusTooManyRequests {
+			t.Fatal("off mode must never rate limit")
+		}
+	}
+}

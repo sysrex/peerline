@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"runtime/debug"
 	"sync"
+	"time"
 )
 
 var (
@@ -29,6 +30,8 @@ var (
 
 // releaseVersionRE matches strict semver releases: vX.Y.Z or X.Y.Z with no build metadata or git describe suffix
 var releaseVersionRE = regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+$`)
+
+var commitRE = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
 
 // Info returns version information as a structured map.
 // Computed once on first call.
@@ -62,15 +65,14 @@ func Info() map[string]string {
 			}
 		}
 
-		if commit == "" || commit == "unknown" {
+		if !commitRE.MatchString(commit) {
 			commit = "unknown"
+		}
+		if _, err := time.Parse(time.RFC3339, buildTime); err != nil {
+			buildTime = "unknown"
 		}
 		if dirty && commit != "unknown" {
 			commit += "-dirty"
-		}
-
-		if buildTime == "" || buildTime == "unknown" {
-			buildTime = "unknown"
 		}
 
 		infoOnce = map[string]string{

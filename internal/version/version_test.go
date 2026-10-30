@@ -224,3 +224,33 @@ func TestNeedsAttention(t *testing.T) {
 		t.Error("NeedsAttention should be false when commit is set")
 	}
 }
+
+func TestInfoValidatesInjectedValues(t *testing.T) {
+	origV, origC, origB := Version, Commit, BuildTime
+	defer func() {
+		Version, Commit, BuildTime = origV, origC, origB
+		once = sync.Once{}
+		infoOnce = nil
+	}()
+	tests := []struct {
+		name, version, commit, buildTime string
+		wantVersion, wantCommit, wantBT  string
+	}{
+		{"git describe", "v1.2.3-4-gabc1234", "abc1234", "2026-01-02T03:04:05Z", "dev", "abc1234", "2026-01-02T03:04:05Z"},
+		{"sha metadata", "1.2.3+0123456789abcdef0123456789abcdef01234567", "abc1234", "2026-01-02T03:04:05Z", "dev", "abc1234", "2026-01-02T03:04:05Z"},
+		{"branch prerelease", "v1.2.3-feature-x", "abc1234", "2026-01-02T03:04:05Z", "dev", "abc1234", "2026-01-02T03:04:05Z"},
+		{"release", "v1.2.3", "abc1234", "2026-01-02T03:04:05Z", "v1.2.3", "abc1234", "2026-01-02T03:04:05Z"},
+		{"malformed commit and time", "v1.2.3", "zz<script>", "yesterday", "v1.2.3", "unknown", "unknown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			once = sync.Once{}
+			infoOnce = nil
+			Version, Commit, BuildTime = tt.version, tt.commit, tt.buildTime
+			got := Info()
+			if got["version"] != tt.wantVersion || got["commit"] != tt.wantCommit || got["build_time"] != tt.wantBT {
+				t.Errorf("got %v", got)
+			}
+		})
+	}
+}
