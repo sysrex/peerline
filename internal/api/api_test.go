@@ -2,12 +2,17 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sysrex/peerline/internal/store"
 )
@@ -676,4 +681,587 @@ func TestPairingAcceptStatusCodes(t *testing.T) {
 	if !strings.Contains(string(body), "invalid, used, or expired") {
 		t.Errorf("unexpected 404 for used token: %s", body)
 	}
+}
+
+// Security hardening tests for #17, #18, #21-#24, #31-#39
+
+func TestXFFParsing(t *testing.T) {
+	trustedNets, _ := ParseTrustedProxies([]string{"10.0.0.0/8", "192.168.1.1"})
+
+	tests := []struct {
+		name        string
+		remoteAddr  string
+		xff         string
+		trustedNets []*net.IPNet
+		want        string
+	}{
+		{
+			name:        "client-forged leftmost entry",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         "1.2.3.4, 203.0.113.5",
+			trustedNets: trustedNets,
+			want:        "203.0.113.5", // rightmost untrusted
+		},
+		{
+			name:        "untrusted RemoteAddr ignores XFF",
+			remoteAddr:  "203.0.113.1:5678",
+			xff:         "1.2.3.4, 10.0.0.5",
+			trustedNets: trustedNets,
+			want:        "203.0.113.1",
+		},
+		{
+			name:        "chain of trusted proxies",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         "203.0.113.99, 10.0.0.2, 10.0.0.3",
+			trustedNets: trustedNets,
+			want:        "203.0.113.99",
+		},
+		{
+			name:        "IPv4-mapped IPv6 normalization",
+			remoteAddr:  "[::ffff:203.0.113.5]:1234",
+			xff:         "",
+			trustedNets: nil,
+			want:        "203.0.113.5",
+		},
+		{
+			name:        "IPv6 canonical form",
+			remoteAddr:  "[2001:0db8:0000:0000:0000:0000:0000:0001]:1234",
+			xff:         "",
+			trustedNets: nil,
+			want:        "2001:db8::1",
+		},
+		{
+			name:        "bare IP trusted proxy",
+			remoteAddr:  "192.168.1.1:1234",
+			xff:         "203.0.113.10",
+			trustedNets: trustedNets,
+			want:        "203.0.113.10",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := clientIP(tt.remoteAddr, tt.xff, tt.trustedNets)
+			if got != tt.want {
+				t.Errorf("clientIP() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseTrustedProxies(t *testing.T) {
+	tests := []struct {
+		name    string
+		cidrs   []string
+		wantErr bool
+		wantLen int
+	}{
+		{
+			name:    "valid CIDRs",
+			cidrs:   []string{"10.0.0.0/8", "192.168.0.0/16"},
+			wantErr: false,
+			wantLen: 2,
+		},
+		{
+			name:    "bare IPs",
+			cidrs:   []string{"10.0.0.1", "192.168.1.1"},
+			wantErr: false,
+			wantLen: 2,
+		},
+		{
+			name:    "mixed",
+			cidrs:   []string{"10.0.0.0/8", "192.168.1.1"},
+			wantErr: false,
+			wantLen: 2,
+		},
+		{
+			name:    "invalid CIDR",
+			cidrs:   []string{"10.0.0.0/999"},
+			wantErr: true,
+		},
+		{
+			name:    "invalid IP",
+			cidrs:   []string{"not-an-ip"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nets, err := ParseTrustedProxies(tt.cidrs)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ParseTrustedProxies() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && len(nets) != tt.wantLen {
+				t.Errorf("ParseTrustedProxies() len = %d, want %d", len(nets), tt.wantLen)
+			}
+		})
+	}
+}
+
+func TestAuthenticatedGETRateLimiting(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+	b := register(t, srv, "bob")
+
+	// Authenticated GETs are per-peer-id (120/min, burst 40)
+	// Alice hammers /v1/me, Bob should be unaffected
+	for i := 0; i < 45; i++ {
+		resp, body := a.do("GET", "/v1/me", nil, nil)
+		if i < 40 {
+			want(t, resp, body, 200)
+		} else {
+			// After burst exhausted, should be rate limited
+			if resp.StatusCode != 429 {
+				t.Fatalf("iteration %d: expected 429, got %d", i, resp.StatusCode)
+			}
+			break
+		}
+	}
+
+	// Bob should still be fine
+	resp, body := b.do("GET", "/v1/me", nil, nil)
+	want(t, resp, body, 200)
+}
+
+func TestInboxPollingNoRateLimit(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+
+	// Realistic polling: authLim is 120/min = 2/s sustained, burst 40
+	// Test that we can use the full burst without hitting 429
+	for i := 0; i < 40; i++ {
+		resp, body := a.do("GET", "/v1/inbox", nil, nil)
+		if resp.StatusCode == 429 {
+			t.Fatalf("iteration %d: unexpected 429 during burst polling", i)
+		}
+		want(t, resp, body, 200)
+	}
+
+	// After burst, wait for refill (1 second gives us 2 more tokens)
+	time.Sleep(1 * time.Second)
+
+	// Should be able to make 2 more requests
+	for i := 0; i < 2; i++ {
+		resp, body := a.do("GET", "/v1/inbox", nil, nil)
+		if resp.StatusCode == 429 {
+			t.Fatalf("after refill: unexpected 429 during polling")
+		}
+		want(t, resp, body, 200)
+	}
+}
+
+func TestRegisterRateLimitAfterTokenCheck(t *testing.T) {
+	srv := newServer(t, Config{RegisterToken: "secret123"})
+
+	// Without register token, should fail with 403 before charging rate limit
+	// We can hammer this without getting 429
+	for i := 0; i < 20; i++ {
+		resp, body := doAnon(t, srv, "POST", "/v1/register", map[string]any{"name": "test"}, nil)
+		want(t, resp, body, 403)
+		if strings.Contains(string(body), "rate limited") {
+			t.Fatal("got 429 before token check")
+		}
+	}
+}
+
+func TestPairingRateLimitAfterTokenValidation(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+
+	// Create a pairing invite
+	resp, body := a.do("POST", "/v1/invites", map[string]any{
+		"scopes":           []string{"messages"},
+		"generate_pairing": true,
+	}, nil)
+	want(t, resp, body, 201)
+	var inv struct{ PairingURL string `json:"pairing_url"` }
+	json.Unmarshal(body, &inv)
+	validToken := strings.Split(inv.PairingURL, "/v1/pairing/")[1]
+
+	// Invalid token format should fail validation before charging pairLim (returns 400)
+	// Use token that doesn't match the regex (too short or wrong prefix)
+	for i := 0; i < 15; i++ {
+		resp, body := doAnon(t, srv, "POST", "/v1/pairing/bad", map[string]any{"name": "test"}, nil)
+		want(t, resp, body, 400)
+		if strings.Contains(string(body), "rate limited") {
+			t.Fatal("got rate limit before format check")
+		}
+	}
+
+	// Valid token should work (charges pairLim after format validation)
+	resp, body = doAnon(t, srv, "POST", "/v1/pairing/"+validToken, map[string]any{"name": "bob"}, nil)
+	want(t, resp, body, 201)
+}
+
+func TestInviteListPagination(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+	b := register(t, srv, "bob")
+
+	// Alice creates 5 invites
+	for i := 0; i < 5; i++ {
+		resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+		want(t, resp, body, 201)
+	}
+
+	// List with limit=2
+	resp, body := a.do("GET", "/v1/invites?limit=2", nil, nil)
+	want(t, resp, body, 200)
+	var list1 struct{ Invites []store.InviteMetadata `json:"invites"` }
+	json.Unmarshal(body, &list1)
+	if len(list1.Invites) != 2 {
+		t.Fatalf("expected 2 invites, got %d", len(list1.Invites))
+	}
+
+	// List with limit=2&offset=2
+	resp, body = a.do("GET", "/v1/invites?limit=2&offset=2", nil, nil)
+	want(t, resp, body, 200)
+	var list2 struct{ Invites []store.InviteMetadata `json:"invites"` }
+	json.Unmarshal(body, &list2)
+	if len(list2.Invites) != 2 {
+		t.Fatalf("expected 2 invites, got %d", len(list2.Invites))
+	}
+
+	// Bob can't see Alice's invites
+	resp, body = b.do("GET", "/v1/invites", nil, nil)
+	want(t, resp, body, 200)
+	var listB struct{ Invites []store.InviteMetadata `json:"invites"` }
+	json.Unmarshal(body, &listB)
+	if len(listB.Invites) != 0 {
+		t.Fatalf("Bob should see 0 invites, got %d", len(listB.Invites))
+	}
+}
+
+func TestDeleteInviteByID(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+	b := register(t, srv, "bob")
+
+	// Alice creates an invite
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv struct{ InviteID int64 `json:"invite_id"` }
+	json.Unmarshal(body, &inv)
+
+	// Bob can't delete Alice's invite
+	resp, body = b.do("DELETE", fmt.Sprintf("/v1/invites/%d", inv.InviteID), nil, nil)
+	want(t, resp, body, 404)
+
+	// Alice can delete her own invite
+	resp, body = a.do("DELETE", fmt.Sprintf("/v1/invites/%d", inv.InviteID), nil, nil)
+	want(t, resp, body, 204)
+
+	// Repeat delete returns 404
+	resp, body = a.do("DELETE", fmt.Sprintf("/v1/invites/%d", inv.InviteID), nil, nil)
+	want(t, resp, body, 404)
+}
+
+func TestInviteCodeNeverLogged(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	srv := newServer(t, Config{Logger: logger})
+	a := register(t, srv, "alice")
+
+	// Create an invite
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv struct {
+		Code     string `json:"code"`
+		InviteID int64  `json:"invite_id"`
+	}
+	json.Unmarshal(body, &inv)
+
+	// Delete the invite (triggers log)
+	a.do("DELETE", fmt.Sprintf("/v1/invites/%d", inv.InviteID), nil, nil)
+
+	// Check logs don't contain the code or any prefix
+	logs := logBuf.String()
+	if strings.Contains(logs, inv.Code) {
+		t.Error("invite code found in logs")
+	}
+	codePrefix := inv.Code[:10]
+	if strings.Contains(logs, codePrefix) {
+		t.Error("invite code prefix found in logs")
+	}
+	// Should contain invite_id
+	if !strings.Contains(logs, fmt.Sprintf("%d", inv.InviteID)) {
+		t.Error("invite_id not found in logs")
+	}
+}
+
+func TestInviteCapEnforcedAtomically(t *testing.T) {
+	srv := newServer(t, Config{MaxOutstandingInvites: 3})
+	a := register(t, srv, "alice")
+
+	// Create 3 invites (at cap)
+	for i := 0; i < 3; i++ {
+		resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+		want(t, resp, body, 201)
+	}
+
+	// 4th should fail
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 429)
+	if !strings.Contains(string(body), "too many outstanding invites") {
+		t.Errorf("unexpected error: %s", body)
+	}
+}
+
+func TestInviteTTLDefaults(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+
+	// No TTL specified, should default to 1h
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv struct{ ExpiresAt string `json:"expires_at"` }
+	json.Unmarshal(body, &inv)
+	expTime, _ := time.Parse(time.RFC3339, inv.ExpiresAt)
+	if time.Until(expTime) > 65*time.Minute || time.Until(expTime) < 55*time.Minute {
+		t.Errorf("expiry not ~1h from now: %v", expTime)
+	}
+
+	// TTL > 7 days should fail
+	resp, body = a.do("POST", "/v1/invites", map[string]any{
+		"scopes":      []string{"messages"},
+		"ttl_seconds": 604801,
+	}, nil)
+	want(t, resp, body, 400)
+	if !strings.Contains(string(body), "must not exceed") {
+		t.Errorf("unexpected error: %s", body)
+	}
+}
+
+func TestGeneratePairingReturnsOnlyURL(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+
+	resp, body := a.do("POST", "/v1/invites", map[string]any{
+		"scopes":           []string{"messages"},
+		"generate_pairing": true,
+	}, nil)
+	want(t, resp, body, 201)
+
+	var result map[string]any
+	json.Unmarshal(body, &result)
+
+	// Should have pairing_url and invite_id
+	if _, ok := result["pairing_url"]; !ok {
+		t.Error("missing pairing_url")
+	}
+	if _, ok := result["invite_id"]; !ok {
+		t.Error("missing invite_id")
+	}
+
+	// Should NOT have code or accept_url
+	if _, ok := result["code"]; ok {
+		t.Error("code should not be present")
+	}
+	if _, ok := result["accept_url"]; ok {
+		t.Error("accept_url should not be present")
+	}
+}
+
+func TestGeneratePairingWithEmailRejected(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+
+	resp, body := a.do("POST", "/v1/invites", map[string]any{
+		"scopes":           []string{"messages"},
+		"generate_pairing": true,
+		"to_email":         "bob@example.com",
+	}, nil)
+	want(t, resp, body, 400)
+	if !strings.Contains(string(body), "cannot combine") {
+		t.Errorf("unexpected error: %s", body)
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	srv := newServer(t, Config{})
+
+	resp, _ := doAnon(t, srv, "GET", "/", nil, nil)
+
+	headers := []struct {
+		name string
+		want string
+	}{
+		{"X-Frame-Options", "DENY"},
+		{"Referrer-Policy", "no-referrer"},
+		{"X-Content-Type-Options", "nosniff"},
+	}
+
+	for _, h := range headers {
+		if got := resp.Header.Get(h.name); got != h.want {
+			t.Errorf("%s = %q, want %q", h.name, got, h.want)
+		}
+	}
+
+	csp := resp.Header.Get("Content-Security-Policy")
+	if !strings.Contains(csp, "frame-ancestors 'none'") {
+		t.Errorf("CSP missing frame-ancestors 'none': %s", csp)
+	}
+}
+
+func TestNameSanitization(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "tag characters",
+			input: "alice\U000E0020test",
+			want:  "alicetest",
+		},
+		{
+			name:  "bidi override",
+			input: "alice\u202Etest",
+			want:  "alicetest",
+		},
+		{
+			name:  "bidi isolate",
+			input: "alice\u2066test",
+			want:  "alicetest",
+		},
+		{
+			name:  "zero-width space",
+			input: "alice\u200Btest",
+			want:  "alicetest",
+		},
+		{
+			name:  "length cap",
+			input: strings.Repeat("a", 100),
+			want:  strings.Repeat("a", 64),
+		},
+		{
+			name:  "allowed chars preserved",
+			input: "Alice-123 O'Brien",
+			want:  "Alice-123 O'Brien",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeInviterName(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeInviterName(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPairingGETNoPrefilledScopes(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+
+	// Create pairing link with specific scopes
+	resp, body := a.do("POST", "/v1/invites", map[string]any{
+		"scopes":           []string{"messages"},
+		"generate_pairing": true,
+	}, nil)
+	want(t, resp, body, 201)
+	var inv struct{ PairingURL string `json:"pairing_url"` }
+	json.Unmarshal(body, &inv)
+	token := strings.Split(inv.PairingURL, "/v1/pairing/")[1]
+
+	// GET the pairing page
+	resp, body = doAnon(t, srv, "GET", "/v1/pairing/"+token, nil, nil)
+	want(t, resp, body, 200)
+
+	var pairingResp map[string]any
+	json.Unmarshal(body, &pairingResp)
+
+	// Should contain consent language in instructions
+	instructions, ok := pairingResp["instructions"].(map[string]any)
+	if !ok {
+		t.Fatal("missing instructions")
+	}
+	summary, ok := instructions["summary"].(string)
+	if !ok || !strings.Contains(strings.ToLower(summary), "approval") {
+		t.Error("instructions missing consent/approval language")
+	}
+
+	// Check that example POST bodies show empty scopes
+	auth, ok := instructions["authenticated"].(map[string]any)
+	if !ok {
+		t.Fatal("missing authenticated instructions")
+	}
+	authBody, ok := auth["body"].(string)
+	if !ok || !strings.Contains(authBody, `"scopes":[]`) {
+		t.Error("authenticated example should show empty scopes")
+	}
+
+	unauth, ok := instructions["unauthenticated"].(map[string]any)
+	if !ok {
+		t.Fatal("missing unauthenticated instructions")
+	}
+	unauthBody, ok := unauth["body"].(string)
+	if !ok || !strings.Contains(unauthBody, `"scopes":[]`) {
+		t.Error("unauthenticated example should show empty scopes")
+	}
+
+	// Top-level scopes field should show what the inviter is offering (can be non-empty)
+	// That's intentional and not a security issue
+	topScopes, ok := pairingResp["scopes"].([]any)
+	if !ok {
+		t.Error("missing top-level scopes field")
+	}
+	if len(topScopes) == 0 {
+		t.Error("top-level scopes should show what inviter is offering")
+	}
+}
+
+func doAnon(t *testing.T, srv *httptest.Server, method, path string, body any, hdr map[string]string) (*http.Response, []byte) {
+	t.Helper()
+	anon := &client{t: t, srv: srv}
+	return anon.do(method, path, body, hdr)
+}
+
+// Lifecycle tests for LimiterManager and MaintenanceManager
+
+func TestLimiterManagerStops(t *testing.T) {
+	cfg := Config{
+		MsgPerMinute:  60,
+		MsgBurst:      10,
+		EmailPerHour:  10,
+		EmailBurst:    5,
+		EmailRcptPerHour: 10,
+		NotifyPerHour: 10,
+		NotifyBurst:   5,
+	}
+	mgr := NewLimiterManager(cfg)
+
+	// Let it run a bit
+	time.Sleep(100 * time.Millisecond)
+
+	// Call Stop
+	mgr.Stop()
+
+	// Calling Stop again should not panic
+	mgr.Stop()
+}
+
+func TestMaintenanceManagerStops(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	mgr := NewMaintenanceManager(ctx, st, logger)
+
+	// Let it run a bit
+	time.Sleep(100 * time.Millisecond)
+
+	// Call Stop
+	mgr.Stop()
+
+	// Calling Stop again should not panic
+	mgr.Stop()
 }
