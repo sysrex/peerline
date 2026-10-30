@@ -87,8 +87,7 @@ func TestEmailInviteDevMode(t *testing.T) {
 	if inv.Code == "" || inv.Email["status"] != "sent" || inv.Email["mode"] != "smtp" || inv.Email["to"] != "bob@example.com" {
 		t.Fatalf("invite: %s", body)
 	}
-	// accept_url keeps ?code= only for the deprecated landing page (see README#deprecations)
-	if !strings.HasPrefix(inv.AcceptURL, srv.URL+"/v1/invites/accept?code=") || !strings.Contains(inv.AcceptURL, inv.Code) {
+	if inv.AcceptURL != srv.URL+"/v1/invites/accept" || strings.Contains(inv.AcceptURL, inv.Code) {
 		t.Fatalf("accept_url: %s", inv.AcceptURL)
 	}
 
@@ -120,7 +119,7 @@ func TestEmailInviteDevMode(t *testing.T) {
 
 	// Unauthenticated click (human / mail scanner) shows instructions and does not consume.
 	anon := &client{t: t, srv: srv}
-	path := strings.TrimPrefix(inv.AcceptURL, srv.URL)
+	path := strings.TrimPrefix(inv.AcceptURL, srv.URL) + "?code=" + inv.Code
 	resp, body = anon.do("GET", path, nil, nil)
 	want(t, resp, body, 200)
 	if !strings.Contains(string(body), "Nothing has been accepted") {
@@ -155,10 +154,10 @@ func TestAcceptViaQueryPOST(t *testing.T) {
 	want(t, resp, body, 201)
 	var inv inviteResp
 	json.Unmarshal(body, &inv)
-	if !strings.HasPrefix(inv.AcceptURL, "https://peerline.example.com/v1/invites/accept?code=inv_") {
+	if inv.AcceptURL != "https://peerline.example.com/v1/invites/accept" {
 		t.Fatalf("accept_url: %s", inv.AcceptURL)
 	}
-	path := strings.TrimPrefix(inv.AcceptURL, "https://peerline.example.com")
+	path := "/v1/invites/accept?code=" + inv.Code
 	// mismatched body/query code
 	resp, body = b.do("POST", path, map[string]any{"code": "inv_other"}, nil)
 	want(t, resp, body, 400)
