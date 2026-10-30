@@ -162,7 +162,6 @@ func (s *Server) Handler() http.Handler {
 	authed.HandleFunc("GET /v1/invites", s.rateLimitAuth(s.listInvites))
 	authed.HandleFunc("DELETE /v1/invites/{id}", s.deleteInvite)
 	authed.HandleFunc("POST /v1/invites/accept", s.acceptInvite)
-	authed.HandleFunc("GET /v1/invites/accept", s.acceptInvite) // emailed magic link (Bearer required)
 	authed.HandleFunc("GET /v1/grants", s.rateLimitAuth(s.listGrants))
 	authed.HandleFunc("DELETE /v1/grants/{peer_id}", s.revokeGrant)
 	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.sendMessage)
@@ -178,12 +177,12 @@ func (s *Server) Handler() http.Handler {
 		return p.ID, nil
 	}, authed)
 	mux.Handle("/v1/", authMW)
-	// The emailed accept link: with a Bearer key it accepts (same flow as
-	// POST); without one (a human clicking, or a link scanner) it only shows
-	// instructions and never consumes the invite.
+	// The emailed accept link: only unauthenticated GET shows instructions.
+	// Authenticated GET returns 405; only POST accepts the invite.
 	mux.HandleFunc("GET /v1/invites/accept", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "" {
-			authMW.ServeHTTP(w, r)
+			w.Header().Set("Allow", "POST")
+			writeErr(w, http.StatusMethodNotAllowed, "use POST to accept the invite")
 			return
 		}
 		s.acceptLanding(w, r)
@@ -586,7 +585,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.Mailer.Mode() == "log" {
 			status = "logged"
 		}
-		m := inviteEmail(s.inviterName(r.Context(), me), me, to, code, acceptURL, sc, bg, exp)
+		m := inviteEmail(s.inviterName(r.Context(), me), me, to, code, s.publicBase(r), sc, bg, exp)
 		// Detach from client cancellation; the SMTP sender has its own timeout.
 		if err := s.cfg.Mailer.Send(context.WithoutCancel(r.Context()), m); err != nil {
 			s.log.Error("invite email failed", "inviter", me, "err", err)
@@ -769,7 +768,7 @@ func sanitizeInviterName(name string) string {
 	return result
 }
 
-func inviteEmail(inviter, inviterID, to, code, acceptURL string, scopes, bags []string, exp time.Time) mailer.Message {
+func inviteEmail(inviter, inviterID, to, code, publicBase string, scopes, bags []string, exp time.Time) mailer.Message {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s (Peerline peer %s) invited one of your bots to pair on Peerline,\n", inviter, inviterID)
 	b.WriteString("a deny-all relay that lets bots on different accounts exchange short messages.\n\n")
@@ -778,10 +777,12 @@ func inviteEmail(inviter, inviterID, to, code, acceptURL string, scopes, bags []
 		fmt.Fprintf(&b, "Bags: %s\n", strings.Join(bags, ", "))
 	}
 	fmt.Fprintf(&b, "Expires: %s (single use)\n\n", exp.Format(time.RFC3339))
-	b.WriteString("Accept with your bot's own Peerline API key (opening the link in a browser\nonly shows instructions; it does not accept):\n\n")
-	fmt.Fprintf(&b, "  %s\n\n", acceptURL)
-	fmt.Fprintf(&b, "  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" \\\n    '%s'\n\n", acceptURL)
-	fmt.Fprintf(&b, "Or give your bot this one-time code:\n\n  %s\n\n", code)
+	b.WriteString("Accept with your bot's own Peerline API key (POST with code in body):\n\n")
+	fmt.Fprintf(&b, "  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" \\\n")
+	fmt.Fprintf(&b, "    -H \"Content-Type: application/json\" \\\n")
+	fmt.Fprintf(&b, "    -d '{\"code\":\"%s\"}' \\\n", code)
+	fmt.Fprintf(&b, "    '%s/v1/invites/accept'\n\n", publicBase)
+	fmt.Fprintf(&b, "Or give your bot this one-time code to paste:\n\n  %s\n\n", code)
 	b.WriteString("Accepting only lets your bot act within the scopes above on the inviter's side;\nnothing of yours is shared unless you grant scopes back.\n")
 	b.WriteString("If you don't recognise the inviter, ignore this email. The code expires on its own.\n")
 	return mailer.Message{To: to, Subject: "Peerline: " + inviter + " invited your bot to pair", Body: b.String()}
@@ -799,11 +800,14 @@ func (s *Server) acceptLanding(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "Peerline: missing or malformed invite code.\n")
 		return
 	}
-	u := s.publicBase(r) + "/v1/invites/accept?code=" + url.QueryEscape(code)
-	fmt.Fprintf(w, "Peerline invite\n\nThis link must be opened by your bot with its Peerline API key:\n\n"+
-		"  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" '%s'\n\n"+
-		"Optionally grant scopes back in the same call with a JSON body, e.g. {\"scopes\":[\"messages\"]}.\n"+
-		"Or paste the one-time code into your bot: %s\n\nNothing has been accepted yet.\n", u, code)
+	u := s.publicBase(r) + "/v1/invites/accept"
+	fmt.Fprintf(w, "Peerline invite\n\nAccept with your bot's Peerline API key (use POST with code in body):\n\n"+
+		"  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" \\\n"+
+		"    -H \"Content-Type: application/json\" \\\n"+
+		"    -d '{\"code\":\"%s\"}' \\\n"+
+		"    '%s'\n\n"+
+		"Optionally grant scopes back in the same call: {\"code\":\"%s\",\"scopes\":[\"messages\"]}.\n"+
+		"Or paste the one-time code into your bot: %s\n\nNothing has been accepted yet.\n", code, u, code, code)
 }
 
 func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
@@ -812,22 +816,23 @@ func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 		Scopes []string `json:"scopes"` // optional reciprocal grant to the inviter
 		Bags   []string `json:"bags"`
 	}
-	// Body is optional when the code comes from the emailed link (?code=).
-	if r.Method == http.MethodPost && r.ContentLength != 0 {
+	// Body is optional when the code comes from the query string (?code=).
+	if r.ContentLength != 0 {
 		if !decode(w, r, &in) {
 			return
 		}
 	}
 	q := r.URL.Query()
+	queryOnlyCode := false
 	if qc := q.Get("code"); qc != "" {
 		if in.Code != "" && in.Code != qc {
 			writeErr(w, http.StatusBadRequest, "code in body and query differ")
 			return
 		}
+		if in.Code == "" {
+			queryOnlyCode = true
+		}
 		in.Code = qc
-	}
-	if r.Method == http.MethodGet {
-		in.Scopes, in.Bags = splitCSV(q.Get("scopes")), splitCSV(q.Get("bags"))
 	}
 	if in.Code == "" {
 		writeErr(w, http.StatusBadRequest, "code required (JSON body or ?code=)")
@@ -850,6 +855,12 @@ func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		s.internal(w, err)
 		return
+	}
+	// RFC 9745 deprecation headers for query-string-only code path (legacy).
+	// TODO: confirm-mode invites (#3) will return 404 on this path.
+	if queryOnlyCode {
+		w.Header().Set("Deprecation", "@1767225600") // 2026-01-01 00:00:00 UTC
+		w.Header().Set("Link", `<https://github.com/sysrex/peerline#email-invites>; rel="deprecation"; type="text/html"`)
 	}
 	resp := map[string]any{"peer_id": g.Owner, "granted_to_you": g}
 	if len(sc) > 0 {
