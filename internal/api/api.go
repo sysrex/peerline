@@ -494,6 +494,12 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	var pairingToken string
 	var publicID string
 
+	// testInviteCreatedHook is called before the atomic cap check for deterministic testing.
+	// Production: nil. Test: N-party barrier synchronizes concurrent requests.
+	if s.testInviteCreatedHook != nil {
+		s.testInviteCreatedHook(me)
+	}
+
 	// Create invite first with atomic cap check (#53)
 	if in.GeneratePairing {
 		pairingToken = auth.NewPairingToken()
@@ -518,11 +524,6 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Test hook for deterministic concurrency testing
-	if s.testInviteCreatedHook != nil {
-		s.testInviteCreatedHook(me)
-	}
-
 	// Check email rate limit AFTER creating invite (#53)
 	// If limit fails, delete the invite and return error
 	if to != "" {
@@ -531,7 +532,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		if !s.lim.mailLim.Ready(me) || !s.lim.rcptLim.Ready(rk) {
 			// Delete the invite we just created
 			if delErr := s.st.DeleteInvite(r.Context(), publicID, me); delErr != nil {
-				s.cfg.Logger.Error("failed to delete invite after rate limit check", "public_id", publicID, "error", delErr)
+				s.log.Error("failed to delete invite after rate limit check", "public_id", publicID, "error", delErr)
 				s.internal(w, fmt.Errorf("rate limit check failed and invite cleanup failed: %w", delErr))
 				return
 			}
@@ -539,11 +540,12 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusTooManyRequests, "invite email rate limited; try later or create an invite without to_email and share the code yourself")
 			return
 		}
-		// Both ready, now consume from both (Ready→Allow has a race, but delete handles it)
+		// Both ready, consume from both. Narrow race: two requests can both pass Ready,
+		// second Allow fails, spending one sender token. Compensating delete doesn't refund.
 		if !s.lim.mailLim.Allow(me) || !s.lim.rcptLim.Allow(rk) {
-			// This should not happen if Ready checks passed, but handle it
+			// Rare: Ready passed but Allow failed (concurrent race)
 			if delErr := s.st.DeleteInvite(r.Context(), publicID, me); delErr != nil {
-				s.cfg.Logger.Error("failed to delete invite after rate limit consume", "public_id", publicID, "error", delErr)
+				s.log.Error("failed to delete invite after rate limit consume", "public_id", publicID, "error", delErr)
 				s.internal(w, fmt.Errorf("rate limit consume failed and invite cleanup failed: %w", delErr))
 				return
 			}
