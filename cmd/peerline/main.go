@@ -72,6 +72,9 @@ func main() {
 		log.Error("PEERLINE_PUBLIC_URL is required when SMTP is configured (used in emailed accept links)")
 		os.Exit(1)
 	}
+	if publicURL == "" {
+		log.Warn("PEERLINE_PUBLIC_URL unset: pairing links and base_url fall back to the request Host header; set it so clients never send keys to a forged origin")
+	}
 	emailPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_EMAIL_PER_HOUR"))
 	notifyPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_NOTIFY_PER_HOUR"))
 	retentionDays, _ := strconv.Atoi(os.Getenv("PEERLINE_RETENTION_DAYS"))
