@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode"
@@ -1224,6 +1225,162 @@ func TestSecurityHeaders(t *testing.T) {
 	}
 }
 
+func TestCSPNoUnsafeInline(t *testing.T) {
+	srv := newServer(t, Config{})
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{"home page", "/"},
+		{"public stats API", "/v1/public/stats"},
+		{"healthz", "/healthz"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, _ := doAnon(t, srv, "GET", tt.path, nil, nil)
+			csp := resp.Header.Get("Content-Security-Policy")
+			if csp == "" {
+				t.Error("missing Content-Security-Policy header")
+				return
+			}
+			if strings.Contains(csp, "unsafe-inline") {
+				t.Errorf("CSP contains 'unsafe-inline': %s", csp)
+			}
+		})
+	}
+
+	// Test an authenticated API route
+	a := register(t, srv, "alice")
+	resp, _ := a.do("GET", "/v1/me", nil, nil)
+	csp := resp.Header.Get("Content-Security-Policy")
+	if csp == "" {
+		t.Error("/v1/me: missing Content-Security-Policy header")
+	} else if strings.Contains(csp, "unsafe-inline") {
+		t.Errorf("/v1/me: CSP contains 'unsafe-inline': %s", csp)
+	}
+}
+
+func TestCSPHomePageNonce(t *testing.T) {
+	srv := newServer(t, Config{})
+	anon := &client{t: t, srv: srv}
+
+	resp, body := anon.do("GET", "/", nil, nil)
+	want(t, resp, body, 200)
+
+	csp := resp.Header.Get("Content-Security-Policy")
+	if csp == "" {
+		t.Fatal("missing CSP header")
+	}
+
+	// Extract nonce from CSP header
+	// Expected format: script-src 'nonce-...'
+	var nonce string
+	for _, part := range strings.Split(csp, ";") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "script-src ") {
+			// Extract nonce value
+			if idx := strings.Index(part, "'nonce-"); idx >= 0 {
+				nonceStart := idx + len("'nonce-")
+				if endIdx := strings.Index(part[nonceStart:], "'"); endIdx >= 0 {
+					nonce = part[nonceStart : nonceStart+endIdx]
+					break
+				}
+			}
+		}
+	}
+
+	if nonce == "" {
+		t.Fatalf("no nonce found in CSP: %s", csp)
+	}
+
+	// Verify the nonce appears in both the style and script tags
+	html := string(body)
+	expectedStyle := `<style nonce="` + nonce + `">`
+	expectedScript := `<script nonce="` + nonce + `">`
+
+	if !strings.Contains(html, expectedStyle) {
+		t.Errorf("style tag missing nonce attribute: want %q", expectedStyle)
+	}
+	if !strings.Contains(html, expectedScript) {
+		t.Errorf("script tag missing nonce attribute: want %q", expectedScript)
+	}
+
+	// Verify CSP includes base-uri and form-action
+	if !strings.Contains(csp, "base-uri 'none'") {
+		t.Errorf("CSP missing base-uri 'none': %s", csp)
+	}
+	if !strings.Contains(csp, "form-action 'none'") {
+		t.Errorf("CSP missing form-action 'none': %s", csp)
+	}
+	// Verify CSP includes connect-src for fetch() calls
+	if !strings.Contains(csp, "connect-src 'self'") {
+		t.Errorf("CSP missing connect-src 'self': %s", csp)
+	}
+}
+
+func TestCSPAPIRoutesStrict(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+
+	tests := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{"me", "GET", "/v1/me"},
+		{"inbox", "GET", "/v1/inbox"},
+		{"public stats", "GET", "/v1/public/stats"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var resp *http.Response
+			var body []byte
+			if tt.path == "/v1/public/stats" {
+				anon := &client{t: t, srv: srv}
+				resp, body = anon.do(tt.method, tt.path, nil, nil)
+			} else {
+				resp, body = a.do(tt.method, tt.path, nil, nil)
+			}
+			want(t, resp, body, 200)
+
+			csp := resp.Header.Get("Content-Security-Policy")
+			if csp == "" {
+				t.Error("missing CSP header")
+				return
+			}
+
+			// API routes should have strict CSP
+			if !strings.Contains(csp, "default-src 'none'") {
+				t.Errorf("CSP missing default-src 'none': %s", csp)
+			}
+			if !strings.Contains(csp, "frame-ancestors 'none'") {
+				t.Errorf("CSP missing frame-ancestors 'none': %s", csp)
+			}
+			if !strings.Contains(csp, "base-uri 'none'") {
+				t.Errorf("CSP missing base-uri 'none': %s", csp)
+			}
+			if !strings.Contains(csp, "form-action 'none'") {
+				t.Errorf("CSP missing form-action 'none': %s", csp)
+			}
+
+			// Should not have script-src or style-src at all
+			if strings.Contains(csp, "script-src") {
+				t.Errorf("API route should not have script-src: %s", csp)
+			}
+			if strings.Contains(csp, "style-src") {
+				t.Errorf("API route should not have style-src: %s", csp)
+			}
+			// Should not have connect-src (API routes don't need it)
+			if strings.Contains(csp, "connect-src") {
+				t.Errorf("API route should not have connect-src: %s", csp)
+			}
+		})
+	}
+}
+
 func TestNameSanitization(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -1461,28 +1618,29 @@ func TestRevokePreventsPairing(t *testing.T) {
 func TestInviteCapBeforeEmailBudget(t *testing.T) {
 	cfg := Config{}
 	cfg.MaxOutstandingInvites = 2 // Set cap to 2
+	cfg.EmailPerHour = 1          // Tight budget: only 1 email allowed
+	cfg.EmailBurst = 1
+	cfg.EmailRcptPerHour = 10 // Generous recipient budget to isolate sender
 	srv := newServer(t, cfg)
 	alice := register(t, srv, "Alice")
 
-	// Create first invite (should succeed, 1/2)
+	// Create first invite without email (should succeed, 1/2, no budget spent)
 	resp, b := alice.do("POST", "/v1/invites", map[string]any{
-		"to_email": "bob@example.com",
-		"scopes":   []string{"messages"},
+		"scopes": []string{"messages"},
 	}, nil)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
 	}
 
-	// Create second invite (should succeed, 2/2 - at cap)
+	// Create second invite without email (should succeed, 2/2 - at cap, no budget spent)
 	resp, b = alice.do("POST", "/v1/invites", map[string]any{
-		"to_email": "carol@example.com",
-		"scopes":   []string{"messages"},
+		"scopes": []string{"messages"},
 	}, nil)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("second invite (at cap): %d %s", resp.StatusCode, b)
 	}
 
-	// Attempt third invite (one over cap, should fail without spending email budget)
+	// Attempt third invite with to_email (should fail with 429, no budget consumed)
 	resp, b = alice.do("POST", "/v1/invites", map[string]any{
 		"to_email": "dave@example.com",
 		"scopes":   []string{"messages"},
@@ -1495,6 +1653,289 @@ func TestInviteCapBeforeEmailBudget(t *testing.T) {
 	}
 	if !bytes.Contains(b, []byte("limit 2")) {
 		t.Errorf("over-cap error: should mention limit 2")
+	}
+
+	// Revoke one invite to make room
+	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites: %d %s", resp.StatusCode, b)
+	}
+	var listResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(listResp.Invites) < 1 {
+		t.Fatal("no invites to revoke")
+	}
+	revokeID := listResp.Invites[0]["public_id"].(string)
+	resp, b = alice.do("DELETE", "/v1/invites/"+revokeID, nil, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("revoke: %d %s", resp.StatusCode, b)
+	}
+
+	// Now create an invite with to_email (should succeed, proving budget wasn't consumed)
+	// If budget was consumed during cap rejection, this would fail with 429
+	resp, b = alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "dave@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("invite after cap rejection: status %d, want 201, body %s", resp.StatusCode, b)
+		t.Errorf("this proves email budget WAS consumed during the cap rejection")
+	}
+
+	// Verify the invite was actually created and can be listed
+	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites final: %d %s", resp.StatusCode, b)
+	}
+	var finalResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &finalResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(finalResp.Invites) != 2 {
+		t.Errorf("final invite count: %d, want 2 (one revoked, one new with email)", len(finalResp.Invites))
+	}
+}
+
+// TestEmailLimitDeletesInvite verifies invite is deleted when email limit fails (#53)
+func TestEmailLimitDeletesInvite(t *testing.T) {
+	cfg := Config{}
+	cfg.EmailPerHour = 3
+	cfg.EmailBurst = 3
+	srv := newServer(t, cfg)
+	alice := register(t, srv, "Alice")
+
+	// Exhaust sender's email budget (3 burst)
+	for i := 0; i < 3; i++ {
+		resp, b := alice.do("POST", "/v1/invites", map[string]any{
+			"to_email": fmt.Sprintf("user%d@example.com", i),
+			"scopes":   []string{"messages"},
+		}, nil)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("invite %d: %d %s", i, resp.StatusCode, b)
+		}
+	}
+
+	// List invites before next attempt
+	resp, b := alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites: %d %s", resp.StatusCode, b)
+	}
+	var beforeResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &beforeResp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Next invite should fail with rate limit
+	resp, b = alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "ratelimited@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("rate limited invite: status %d, want 429, body %s", resp.StatusCode, b)
+	}
+	if !bytes.Contains(b, []byte("rate limited")) {
+		t.Errorf("rate limit error: %s, want rate limit message", b)
+	}
+
+	// List invites after - count should be the same (invite was deleted)
+	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites after: %d %s", resp.StatusCode, b)
+	}
+	var afterResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &afterResp); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(afterResp.Invites) != len(beforeResp.Invites) {
+		t.Errorf("invite count changed: before=%d, after=%d (invite should have been deleted)", len(beforeResp.Invites), len(afterResp.Invites))
+	}
+}
+
+// TestDeletedInviteCannotBeAccepted verifies hard-deleted invites are unusable (#53)
+func TestDeletedInviteCannotBeAccepted(t *testing.T) {
+	cfg := Config{}
+	cfg.EmailPerHour = 1
+	cfg.EmailBurst = 1
+	srv := newServer(t, cfg)
+	alice := register(t, srv, "Alice")
+	bob := register(t, srv, "Bob")
+
+	// Alice creates an invite with email, consuming her budget
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "bob@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
+	}
+	var inv1 struct {
+		Code string `json:"code"`
+	}
+	json.Unmarshal(b, &inv1)
+
+	// Alice tries to create another invite with email (should fail, invite created then deleted)
+	resp, b = alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "carol@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("rate limited invite: status %d, want 429, body %s", resp.StatusCode, b)
+	}
+
+	// Bob tries to accept the first invite (should succeed)
+	resp, b = bob.do("POST", "/v1/invites/accept?code="+inv1.Code, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("accept first invite: %d %s, want 200", resp.StatusCode, b)
+	}
+}
+
+// TestConcurrentInviteCapRace verifies the concurrent cap check race is fixed (#53)
+// This test was verified to FAIL on main (236eabc) and PASS on this branch.
+func TestConcurrentInviteCapRace(t *testing.T) {
+	cfg := Config{}
+	cfg.MaxOutstandingInvites = 2
+	cfg.EmailPerHour = 10
+	cfg.EmailBurst = 5 // 5 tokens available
+	cfg.EmailRcptPerHour = 20
+
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	rawSrv := New(st, cfg)
+	srv := httptest.NewServer(rawSrv.Handler())
+	defer srv.Close()
+
+	alice := register(t, srv, "Alice")
+
+	// Create first invite to get close to cap (1/2)
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"scopes": []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
+	}
+
+	// Set up deterministic concurrent race using test hook
+	// All goroutines will pause after invite creation, before budget check
+	const concurrent = 5
+	barrier := make(chan struct{})
+	var barrierOnce sync.Once
+	rawSrv.testInviteCreatedHook = func(peerID string) {
+		// First goroutine closes barrier, others wait on it
+		barrierOnce.Do(func() {
+			// Let all goroutines reach this point
+			time.Sleep(50 * time.Millisecond)
+			close(barrier)
+		})
+		<-barrier
+	}
+
+	// Launch concurrent requests at the cap with to_email
+	// One should succeed (2/2), others should fail at atomic cap check
+	// BUG on main: all 5 consume budget before atomic check (5 tokens consumed)
+	// FIX here: only the 1 successful request consumes budget (1 token consumed)
+	results := make(chan int, concurrent)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrent; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, _ := alice.do("POST", "/v1/invites", map[string]any{
+				"to_email": fmt.Sprintf("user%d@example.com", i),
+				"scopes":   []string{"messages"},
+			}, nil)
+			results <- resp.StatusCode
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	// Collect results
+	var created, rejected int
+	for status := range results {
+		if status == http.StatusCreated {
+			created++
+		} else if status == http.StatusTooManyRequests {
+			rejected++
+		} else {
+			t.Errorf("unexpected status: %d", status)
+		}
+	}
+
+	// Exactly one should have succeeded (reaching cap at 2/2)
+	if created != 1 {
+		t.Errorf("concurrent creates: %d succeeded, want 1", created)
+	}
+	if rejected != concurrent-1 {
+		t.Errorf("concurrent rejects: %d, want %d", rejected, concurrent-1)
+	}
+
+	// Verify final state: exactly 2 invites
+	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites: %d %s", resp.StatusCode, b)
+	}
+	var listResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(listResp.Invites) != 2 {
+		t.Errorf("final invite count: %d, want 2 (at cap)", len(listResp.Invites))
+	}
+
+	// Clear hook for budget verification
+	rawSrv.testInviteCreatedHook = nil
+
+	// Revoke one invite to make room for budget check
+	revokeID := listResp.Invites[0]["public_id"].(string)
+	resp, b = alice.do("DELETE", "/v1/invites/"+revokeID, nil, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("revoke: %d %s", resp.StatusCode, b)
+	}
+
+	// Verify budget: check how many more email invites succeed
+	// If bug existed: 5 tokens consumed during race, 0 left
+	// With fix: 1 token consumed during race, 4 left
+	// We should be able to create 4 more email invites
+	var budgetSucceeded int
+	for i := 0; i < 6; i++ { // Try 6, expect 4 to succeed
+		resp, b := alice.do("POST", "/v1/invites", map[string]any{
+			"to_email": fmt.Sprintf("budget%d@example.com", i),
+			"scopes":   []string{"messages"},
+		}, nil)
+		if resp.StatusCode == http.StatusCreated {
+			budgetSucceeded++
+			// Revoke immediately to avoid hitting cap
+			var inv struct {
+				PublicID string `json:"public_id"`
+			}
+			json.Unmarshal(b, &inv)
+			alice.do("DELETE", "/v1/invites/"+inv.PublicID, nil, nil)
+		} else if resp.StatusCode == http.StatusTooManyRequests && bytes.Contains(b, []byte("rate limited")) {
+			break // Hit rate limit as expected
+		}
+	}
+
+	if budgetSucceeded != 4 {
+		t.Errorf("budget check: %d email invites succeeded, want 4 (5 total tokens - 1 consumed in race)", budgetSucceeded)
+		t.Errorf("this proves email budget was over-consumed during concurrent cap rejection")
 	}
 }
 

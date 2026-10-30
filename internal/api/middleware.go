@@ -7,13 +7,15 @@ import (
 )
 
 // securityHeaders adds security-hardening HTTP headers to all responses.
+// The home page sets its own CSP with a nonce; API routes get a strict policy.
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'")
+		// API routes get a strict CSP. The home page (/) overrides this with a nonce-based policy.
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 		next.ServeHTTP(w, r)
 	})
 }
