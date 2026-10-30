@@ -267,6 +267,7 @@ type LimiterManager struct {
 	regLim        *msg.Limiter
 	pairLim       *msg.Limiter
 	getLim        *msg.Limiter
+	versionLim    *msg.Limiter // Dedicated limiter for /version
 	authLim       *msg.Limiter
 	bagWriteLim   *msg.Limiter // Bag PUTs, keyed by authenticated caller (never the bag owner)
 	mailLim       *msg.Limiter
@@ -296,6 +297,7 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 		regLim:        msg.NewLimiter(10, 5, clk),
 		pairLim:       msg.NewLimiter(10, 5, clk),
 		getLim:        msg.NewLimiter(getPerMinute, getBurst, clk),
+		versionLim:    msg.NewLimiter(120, 30, clk), // Separate limiter for /version to avoid monitor conflicts
 		authLim:       msg.NewLimiter(authGetPerMinute, authGetBurst, clk),
 		bagWriteLim:   msg.NewLimiter(30, 10, clk),
 		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst, clk),
@@ -318,7 +320,6 @@ func (lm *LimiterManager) all() []*msg.Limiter {
 		lm.msgLim,
 		lm.regLim,
 		lm.pairLim,
-		lm.bagWriteLim,
 		lm.getLim,
 		lm.authLim,
 		lm.bagWriteLim,

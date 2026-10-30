@@ -3578,3 +3578,268 @@ func TestCSPNonceUniqueAndErrorResponsesStrict(t *testing.T) {
 		}
 	}
 }
+
+func TestVersionEndpoint(t *testing.T) {
+	tests := []struct {
+		name        string
+		detail      string
+		wantStatus  int
+		wantKeys    []string
+		wantMissing []string
+	}{
+		{
+			name:        "minimal (default)",
+			detail:      "",
+			wantStatus:  http.StatusOK,
+			wantKeys:    []string{"version"},
+			wantMissing: []string{"commit", "build_time"},
+		},
+		{
+			name:        "minimal explicit",
+			detail:      "minimal",
+			wantStatus:  http.StatusOK,
+			wantKeys:    []string{"version"},
+			wantMissing: []string{"commit", "build_time"},
+		},
+		{
+			name:       "full",
+			detail:     "full",
+			wantStatus: http.StatusOK,
+			wantKeys:   []string{"version", "commit", "build_time"},
+		},
+		{
+			name:       "off",
+			detail:     "off",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:        "unknown value falls back to minimal",
+			detail:      "invalid",
+			wantStatus:  http.StatusOK,
+			wantKeys:    []string{"version"},
+			wantMissing: []string{"commit", "build_time"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newServer(t, Config{VersionDetail: tt.detail})
+			req, _ := http.NewRequest("GET", srv.URL+"/version", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("expected status %d, got %d", tt.wantStatus, resp.StatusCode)
+			}
+
+			// Check Cache-Control header
+			if cc := resp.Header.Get("Cache-Control"); !strings.Contains(cc, "no-store") {
+				t.Errorf("expected Cache-Control to contain no-store, got %q", cc)
+			}
+
+			if tt.wantStatus == http.StatusOK {
+				var info map[string]string
+				if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+					t.Fatalf("failed to decode response: %v", err)
+				}
+
+				// Assert exact key set
+				expectedKeys := make(map[string]bool)
+				for _, key := range tt.wantKeys {
+					expectedKeys[key] = true
+				}
+				for key := range info {
+					if !expectedKeys[key] {
+						t.Errorf("unexpected key %q in response (expected only %v)", key, tt.wantKeys)
+					}
+				}
+
+				// Check expected keys are present and non-empty
+				for _, key := range tt.wantKeys {
+					val, ok := info[key]
+					if !ok {
+						t.Errorf("missing expected key %q", key)
+					} else if val == "" {
+						t.Errorf("key %q has empty value", key)
+					}
+				}
+
+				// Check unwanted keys are absent
+				for _, key := range tt.wantMissing {
+					if _, ok := info[key]; ok {
+						t.Errorf("unexpected key %q present", key)
+					}
+				}
+
+				// For full mode, commit should be short (<=12 chars or "unknown")
+				if tt.detail == "full" {
+					commit := info["commit"]
+					if commit != "unknown" && len(commit) > 12 {
+						t.Errorf("full mode commit should be <=12 chars, got %d (%q)", len(commit), commit)
+					}
+				}
+
+				// Version should never expose branch names
+				version := info["version"]
+				if strings.Contains(version, "/") || strings.Contains(version, "merge") {
+					t.Errorf("version should not contain branch-like strings, got %q", version)
+				}
+
+				// Assert security headers from securityHeaders wrapper
+				headers := map[string]string{
+					"Content-Security-Policy": "default-src 'none'",
+					"X-Frame-Options":         "DENY",
+					"X-Content-Type-Options":  "nosniff",
+					"Referrer-Policy":         "no-referrer",
+				}
+				for header, expectedSubstring := range headers {
+					value := resp.Header.Get(header)
+					if !strings.Contains(value, expectedSubstring) {
+						t.Errorf("header %s should contain %q, got: %s", header, expectedSubstring, value)
+					}
+				}
+			}
+
+			// Check Content-Type (except for off mode, which returns plain text 404)
+			if tt.detail != "off" {
+				if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+					t.Errorf("expected Content-Type application/json, got %s", ct)
+				}
+			}
+		})
+	}
+}
+
+func TestVersionEndpointNoAuth(t *testing.T) {
+	// Version endpoint should be public (no auth required) even with RegisterToken
+	srv := newServer(t, Config{RegisterToken: "secret"})
+	req, _ := http.NewRequest("GET", srv.URL+"/version", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("version endpoint should not require auth, got status %d", resp.StatusCode)
+	}
+}
+
+func TestVersionEndpointRateLimit(t *testing.T) {
+	srv := newServer(t, Config{})
+	client := http.Client{Timeout: 2 * time.Second}
+	foundRateLimit := false
+
+	// The version endpoint has a separate limiter with burst of 30
+	for i := 0; i < 50; i++ {
+		req, _ := http.NewRequest("GET", srv.URL+"/version", nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			foundRateLimit = true
+
+			// Check for Retry-After header
+			if ra := resp.Header.Get("Retry-After"); ra == "" {
+				t.Error("429 response should include Retry-After header")
+			}
+
+			// Check uniform 429 body
+			var errResp map[string]string
+			if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+				t.Errorf("failed to decode 429 body: %v", err)
+			} else if errMsg, ok := errResp["error"]; !ok || !strings.Contains(errMsg, "rate") {
+				t.Errorf("429 response should contain rate limit error, got: %v", errResp)
+			}
+
+			// Verify security headers are present on 429
+			if csp := resp.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'none'") {
+				t.Errorf("429 missing strict CSP, got: %s", csp)
+			}
+
+			resp.Body.Close()
+			break
+		}
+		resp.Body.Close()
+	}
+
+	if !foundRateLimit {
+		t.Fatal("versionLim not wired: no 429 returned after 50 requests (burst is 30)")
+	}
+}
+
+func TestVersionEndpointHEAD(t *testing.T) {
+	srv := newServer(t, Config{})
+	req, _ := http.NewRequest("HEAD", srv.URL+"/version", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("HEAD /version should return 200, got %d", resp.StatusCode)
+	}
+
+	// Content-Type should still be set
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected Content-Type application/json, got %s", ct)
+	}
+
+	// Body should be empty for HEAD
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) > 0 {
+		t.Errorf("HEAD response should have empty body, got %d bytes", len(body))
+	}
+}
+
+func TestVersionEndpointMethodNotAllowed(t *testing.T) {
+	srv := newServer(t, Config{})
+	methods := []string{"POST", "PUT", "DELETE", "PATCH"}
+
+	for _, method := range methods {
+		t.Run(method, func(t *testing.T) {
+			req, _ := http.NewRequest(method, srv.URL+"/version", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusMethodNotAllowed {
+				t.Errorf("%s /version should return 405, got %d", method, resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestVersionOffIndistinguishableFromUnknownRoute(t *testing.T) {
+	srv := newServer(t, Config{VersionDetail: "off"})
+	probe := func(method, path string) (int, string, string, string) {
+		req, _ := http.NewRequest(method, srv.URL+path, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, resp.Header.Get("Content-Type"), resp.Header.Get("Allow"), string(b)
+	}
+	for _, m := range []string{"GET", "HEAD", "POST"} {
+		c1, t1, a1, b1 := probe(m, "/version")
+		c2, t2, a2, b2 := probe(m, "/does-not-exist")
+		if c1 != c2 || t1 != t2 || a1 != a2 || b1 != b2 {
+			t.Errorf("%s /version differs from unknown route: %d %q %q %q vs %d %q %q %q", m, c1, t1, a1, b1, c2, t2, a2, b2)
+		}
+	}
+	for i := 0; i < 40; i++ {
+		if c, _, _, _ := probe("GET", "/version"); c == http.StatusTooManyRequests {
+			t.Fatal("off mode must never rate limit")
+		}
+	}
+}

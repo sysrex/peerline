@@ -18,6 +18,7 @@ import (
 	"github.com/sysrex/peerline/internal/api"
 	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/store"
+	"github.com/sysrex/peerline/internal/version"
 )
 
 func env(k, def string) string {
@@ -27,12 +28,43 @@ func env(k, def string) string {
 	return def
 }
 
+// parseVersionDetail validates and normalizes PEERLINE_VERSION_DETAIL.
+// Accepts "minimal", "full", or "off" (case-insensitive, whitespace-trimmed).
+// Returns an error for any other value to fail-closed on typos.
+func parseVersionDetail(raw string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(raw))
+	switch normalized {
+	case "minimal", "full", "off":
+		return normalized, nil
+	default:
+		return "", fmt.Errorf("must be 'minimal', 'full', or 'off', got: %q", raw)
+	}
+}
+
 func main() {
+	showVersion := flag.Bool("version", false, "print version and exit")
 	addr := flag.String("addr", env("PEERLINE_ADDR", "127.0.0.1:8787"), "listen address")
 	dbPath := flag.String("db", env("PEERLINE_DB", "peerline.db"), "SQLite database path")
 	flag.Parse()
 
+	if *showVersion {
+		fmt.Println(version.String())
+		os.Exit(0)
+	}
+
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	log.Info("peerline starting", "version", version.String())
+	if version.NeedsAttention() {
+		log.Warn("version information incomplete", "commit", version.Info()["commit"])
+	}
+
+	// Validate PEERLINE_VERSION_DETAIL at startup (fail closed on typos)
+	versionDetail, err := parseVersionDetail(env("PEERLINE_VERSION_DETAIL", "minimal"))
+	if err != nil {
+		log.Error("invalid PEERLINE_VERSION_DETAIL value; must be 'minimal', 'full', or 'off'", "value", env("PEERLINE_VERSION_DETAIL", ""))
+		os.Exit(1)
+	}
+
 	st, err := store.Open(*dbPath)
 	if err != nil {
 		log.Error("open store", "err", err)
@@ -114,6 +146,7 @@ func main() {
 		TrustedProxies:        trustedProxies,
 		MaxOutstandingInvites: maxOutstandingInvites,
 		RetentionSeconds:      retentionSeconds,
+		VersionDetail:         versionDetail,
 		MaxBagsPerPeer:        maxBagsPerPeer,
 		MaxBagBytesPerPeer:    maxBagBytesPerPeer,
 	})

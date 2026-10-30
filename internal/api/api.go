@@ -25,6 +25,7 @@ import (
 	"github.com/sysrex/peerline/internal/msg"
 	"github.com/sysrex/peerline/internal/pair"
 	"github.com/sysrex/peerline/internal/store"
+	"github.com/sysrex/peerline/internal/version"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -70,6 +71,8 @@ type Config struct {
 	// RetentionSeconds is how long (in seconds) to keep used invites before purging.
 	// Default is 30 days (2592000 seconds). Set to 0 for the default.
 	RetentionSeconds int64
+	// VersionDetail controls /version response: "minimal" (version only, default), "full" (+ commit + build_time), "off" (404).
+	VersionDetail string
 	// CodePepper keys the claim short code. Empty = random per process, so codes
 	// change on restart; set PEERLINE_CODE_PEPPER in production.
 	CodePepper []byte
@@ -222,6 +225,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/register", s.register)
 	// Registered on the outer mux so it is not behind Bearer auth. The more
 	// specific pattern wins over the /v1/ subtree below.
+	// Only register /version if not disabled
+	if s.cfg.VersionDetail != "off" {
+		mux.HandleFunc("GET /version", s.rateLimitVersion(s.versionHandler))
+	}
 	mux.HandleFunc("GET /v1/public/stats", s.rateLimitGet(s.publicStats))
 	mux.HandleFunc("GET /v1/guide", s.rateLimitGet(s.guide))
 
@@ -1618,4 +1625,30 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 		resp["granted_by_you"] = store.Grant{Owner: id, Grantee: g.Owner, Scopes: sc, Bags: bg}
 	}
 	writeJSON(w, http.StatusCreated, resp)
+}
+
+// versionHandler serves build version information.
+// This is a public endpoint (no auth) that respects the configured VersionDetail level:
+// "minimal" (default) returns only the version, "full" includes commit and build_time.
+// "off" is handled by not registering the route at all.
+func (s *Server) versionHandler(w http.ResponseWriter, r *http.Request) {
+	detail := s.cfg.VersionDetail
+	if detail == "" || detail == "minimal" {
+		detail = "minimal"
+	} else if detail != "full" {
+		// Unknown values fall back to minimal (fail-closed)
+		detail = "minimal"
+	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	info := version.Info()
+	resp := map[string]string{"version": info["version"]}
+	if detail == "full" {
+		resp["commit"] = version.ShortCommit()
+		resp["build_time"] = info["build_time"]
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
