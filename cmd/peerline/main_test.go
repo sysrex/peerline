@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -61,5 +62,47 @@ func TestParseNonNegativeInt64(t *testing.T) {
 				t.Errorf("parseNonNegativeInt64(%q) = %d; want %d", tt.input, got, tt.want)
 			}
 		}
+	}
+}
+
+func TestParseBagLimits(t *testing.T) {
+	tests := []struct {
+		name        string
+		bagsStr     string
+		bytesStr    string
+		wantBags    int
+		wantBytes   int64
+		wantErr     bool
+		errContains string
+	}{
+		{"both valid", "100", "1048576", 100, 1048576, false, ""},
+		{"both empty", "", "", 0, 0, false, ""},
+		{"bags invalid", "abc", "100", 0, 0, true, "MAX_BAGS_PER_PEER"},
+		{"bytes invalid", "100", "xyz", 0, 0, true, "MAX_BAG_BYTES_PER_PEER"},
+		{"bags negative", "-5", "100", 0, 0, true, "MAX_BAGS_PER_PEER"},
+		{"bytes negative", "100", "-1", 0, 0, true, "MAX_BAG_BYTES_PER_PEER"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotBags, gotBytes, err := parseBagLimits(tt.bagsStr, tt.bytesStr)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("parseBagLimits(%q, %q) = (%d, %d, nil); want error containing %q",
+						tt.bagsStr, tt.bytesStr, gotBags, gotBytes, tt.errContains)
+				} else if !strings.Contains(err.Error(), tt.errContains) {
+					t.Errorf("parseBagLimits(%q, %q) error = %v; want error containing %q",
+						tt.bagsStr, tt.bytesStr, err, tt.errContains)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("parseBagLimits(%q, %q) = (%d, %d, %v); want (%d, %d, nil)",
+						tt.bagsStr, tt.bytesStr, gotBags, gotBytes, err, tt.wantBags, tt.wantBytes)
+				} else if gotBags != tt.wantBags || gotBytes != tt.wantBytes {
+					t.Errorf("parseBagLimits(%q, %q) = (%d, %d); want (%d, %d)",
+						tt.bagsStr, tt.bytesStr, gotBags, gotBytes, tt.wantBags, tt.wantBytes)
+				}
+			}
+		})
 	}
 }

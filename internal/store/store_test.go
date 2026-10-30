@@ -2147,22 +2147,34 @@ func TestBagLimitsShrinkWhileOverQuota(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create a bag at the limit
-	_, err = s.PutBag(ctx, "eve", "bag1", bytes.Repeat([]byte("x"), 100), "eve", -1, 100, 100)
+	// Create a bag with a large cap
+	largeContent := bytes.Repeat([]byte("x"), 100)
+	_, err = s.PutBag(ctx, "eve", "bag1", largeContent, "eve", -1, 100, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Shrinking should work even though we're at quota
-	_, err = s.PutBag(ctx, "eve", "bag1", []byte("small"), "eve", -1, 100, 100)
+	// Now enforce a smaller cap (50 bytes) - peer is over quota
+	smallCap := int64(50)
+
+	// Shrinking should work even though we're over quota
+	smallContent := []byte("small")
+	_, err = s.PutBag(ctx, "eve", "bag1", smallContent, "eve", -1, 100, smallCap)
 	if err != nil {
-		t.Errorf("shrink failed: %v", err)
+		t.Errorf("shrink while over quota failed: %v", err)
 	}
 
-	// Growing should still fail when over quota
-	_, err = s.PutBag(ctx, "eve", "bag1", bytes.Repeat([]byte("x"), 101), "eve", -1, 100, 100)
+	// Growing should fail when over quota (even after shrink, if it would exceed)
+	mediumContent := bytes.Repeat([]byte("x"), 60)
+	_, err = s.PutBag(ctx, "eve", "bag1", mediumContent, "eve", -1, 100, smallCap)
 	if !errors.Is(err, ErrStorageQuotaExceeded) {
 		t.Errorf("grow while over quota: got %v, want ErrStorageQuotaExceeded", err)
+	}
+
+	// Same size should work
+	_, err = s.PutBag(ctx, "eve", "bag1", []byte("same5"), "eve", -1, 100, smallCap)
+	if err != nil {
+		t.Errorf("same size update failed: %v", err)
 	}
 }
 
@@ -2208,5 +2220,108 @@ func TestDSNContainsTxLockImmediate(t *testing.T) {
 	dsn = buildDSN(":memory:")
 	if !strings.Contains(dsn, "_txlock=immediate") {
 		t.Errorf("memory DSN missing _txlock=immediate: %s", dsn)
+	}
+}
+
+func TestPutBagNonPositiveLimits(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.CreatePeer(ctx, "grace", "Grace", "hgrace", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Zero limits should error
+	_, err = s.PutBag(ctx, "grace", "bag1", []byte("test"), "grace", -1, 0, 100)
+	if err == nil || !strings.Contains(err.Error(), "must be positive") {
+		t.Errorf("zero maxBagsPerPeer: got %v, want 'must be positive' error", err)
+	}
+
+	_, err = s.PutBag(ctx, "grace", "bag1", []byte("test"), "grace", -1, 100, 0)
+	if err == nil || !strings.Contains(err.Error(), "must be positive") {
+		t.Errorf("zero maxBagBytesPerPeer: got %v, want 'must be positive' error", err)
+	}
+
+	// Negative limits should error
+	_, err = s.PutBag(ctx, "grace", "bag1", []byte("test"), "grace", -1, -1, 100)
+	if err == nil || !strings.Contains(err.Error(), "must be positive") {
+		t.Errorf("negative maxBagsPerPeer: got %v, want 'must be positive' error", err)
+	}
+
+	_, err = s.PutBag(ctx, "grace", "bag1", []byte("test"), "grace", -1, 100, -1)
+	if err == nil || !strings.Contains(err.Error(), "must be positive") {
+		t.Errorf("negative maxBagBytesPerPeer: got %v, want 'must be positive' error", err)
+	}
+}
+
+func TestBagLimitsByteCapFileDBRace(t *testing.T) {
+	ctx := context.Background()
+	tmpFile := t.TempDir() + "/race.db"
+
+	// Open two separate Store handles
+	s1, err := Open(tmpFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s1.Close()
+
+	s2, err := Open(tmpFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	if err := s1.CreatePeer(ctx, "henry", "Henry", "hhenry", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Limit: 100 bytes total. Each bag is 30 bytes.
+	// Try to create 5 bags (150 bytes total) concurrently.
+	// At most 3 should succeed (90 bytes).
+	const byteCap = int64(100)
+	const bagSize = 30
+	const attempts = 5
+	const expectedMax = 3
+
+	results := make(chan error, attempts)
+	for i := 0; i < attempts; i++ {
+		i := i
+		go func() {
+			s := s1
+			if i%2 == 1 {
+				s = s2
+			}
+			name := fmt.Sprintf("bag%d", i)
+			content := bytes.Repeat([]byte("x"), bagSize)
+			_, err := s.PutBag(ctx, "henry", name, content, "henry", -1, 100, byteCap)
+			results <- err
+		}()
+	}
+
+	var successes int
+	for i := 0; i < attempts; i++ {
+		err := <-results
+		if err == nil {
+			successes++
+		} else if !errors.Is(err, ErrStorageQuotaExceeded) {
+			t.Errorf("unexpected error: %v", err)
+		}
+	}
+
+	if successes > expectedMax {
+		t.Errorf("byte cap race: %d bags succeeded, want at most %d (cap violated)", successes, expectedMax)
+	}
+
+	// Verify actual total bytes
+	var totalBytes int64
+	err = s1.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(LENGTH(content)), 0) FROM bags WHERE owner='henry'`).Scan(&totalBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totalBytes > byteCap {
+		t.Errorf("total bytes %d exceeds cap %d (atomicity failure)", totalBytes, byteCap)
 	}
 }

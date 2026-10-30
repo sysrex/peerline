@@ -143,9 +143,9 @@ func New(st *store.Store, cfg Config) *Server {
 	return s
 }
 
-// Config returns a copy of the server's configuration.
-func (s *Server) Config() Config {
-	return s.cfg
+// BagLimits returns the effective bag storage caps for this server.
+func (s *Server) BagLimits() (maxBags int, maxBytes int64) {
+	return s.cfg.MaxBagsPerPeer, s.cfg.MaxBagBytesPerPeer
 }
 
 // Stop gracefully stops background tasks.

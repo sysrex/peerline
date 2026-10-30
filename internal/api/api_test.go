@@ -302,6 +302,98 @@ func TestBagStorageLimits(t *testing.T) {
 	want(t, resp, body, 413)
 }
 
+func TestBagStorageShrinkOverQuota(t *testing.T) {
+	// Share a store across two API servers with different byte caps
+	tmpFile := t.TempDir() + "/shrink.db"
+	st, err := store.Open(tmpFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Server with large cap
+	srv1 := httptest.NewServer(New(st, Config{MaxBagBytesPerPeer: 1000}).Handler())
+	defer srv1.Close()
+	a1 := &client{t: t, srv: srv1}
+
+	// Register alice
+	resp, body := a1.do("POST", "/v1/register", []byte(`{"name":"Alice"}`), nil)
+	want(t, resp, body, 201)
+	var reg struct {
+		PeerID string `json:"peer_id"`
+		APIKey string `json:"api_key"`
+	}
+	if err := json.Unmarshal(body, &reg); err != nil {
+		t.Fatal(err)
+	}
+	a1.id = reg.PeerID
+	a1.key = reg.APIKey
+
+	// Create a 200-byte bag
+	largeContent := bytes.Repeat([]byte("x"), 200)
+	resp, body = a1.do("PUT", "/v1/bags/data", largeContent, nil)
+	want(t, resp, body, 201)
+
+	// Now create a server with smaller cap pointing at same store
+	srv2 := httptest.NewServer(New(st, Config{MaxBagBytesPerPeer: 100}).Handler())
+	defer srv2.Close()
+	a2 := &client{t: t, srv: srv2, key: a1.key, id: a1.id}
+
+	// Shrinking should work
+	smallContent := []byte("small")
+	resp, body = a2.do("PUT", "/v1/bags/data", smallContent, nil)
+	want(t, resp, body, 200)
+
+	// Growing should fail
+	mediumContent := bytes.Repeat([]byte("y"), 150)
+	resp, body = a2.do("PUT", "/v1/bags/data", mediumContent, nil)
+	want(t, resp, body, 413)
+	if !strings.Contains(string(body), "storage quota exceeded") {
+		t.Errorf("expected storage quota exceeded, got: %s", body)
+	}
+}
+
+func TestBagLimitsGranteeChargedToOwner(t *testing.T) {
+	// Owner has 3-bag limit
+	srv := newServer(t, Config{MaxBagsPerPeer: 3, MaxBagBytesPerPeer: 100})
+	owner := register(t, srv, "owner")
+	grantee := register(t, srv, "grantee")
+
+	// Grant bags:write to grantee for data and data2
+	pairUp(t, owner, grantee, []string{"bags:write"}, []string{"data", "data2"}, nil)
+
+	// Owner creates 2 bags
+	owner.do("PUT", "/v1/bags/bag1", []byte("owner1"), nil)
+	owner.do("PUT", "/v1/bags/bag2", []byte("owner2"), nil)
+
+	// Grantee creates a bag in owner's namespace - should succeed
+	resp, body := grantee.do("PUT", "/v1/bags/data?owner="+owner.id, bytes.Repeat([]byte("x"), 20), nil)
+	want(t, resp, body, 201)
+
+	// Owner now at 3-bag limit. Grantee's 4th bag should fail with owner's count limit
+	resp, body = grantee.do("PUT", "/v1/bags/data2?owner="+owner.id, []byte("test"), nil)
+	want(t, resp, body, 413)
+	if !strings.Contains(string(body), "bag count limit reached") {
+		t.Errorf("expected bag count limit, got: %s", body)
+	}
+
+	// Grantee can still create in their own namespace (their quota is separate)
+	resp, body = grantee.do("PUT", "/v1/bags/mine", []byte("grantee data"), nil)
+	want(t, resp, body, 201)
+
+	// Test byte quota: grantee write charged to owner
+	owner.do("PUT", "/v1/bags/bag1", bytes.Repeat([]byte("x"), 40), nil)
+	owner.do("PUT", "/v1/bags/bag2", bytes.Repeat([]byte("y"), 40), nil)
+	// owner now at 100 bytes (40+40+20)
+
+	// Grantee tries to write 30 more bytes (would total 120, over 100 limit)
+	resp, body = grantee.do("PUT", "/v1/bags/data?owner="+owner.id, bytes.Repeat([]byte("z"), 30), nil)
+	want(t, resp, body, 413)
+	if !strings.Contains(string(body), "storage quota exceeded") {
+		t.Errorf("expected storage quota exceeded, got: %s", body)
+	}
+}
+
 func TestBagStorageDefaults(t *testing.T) {
 	// Test that New applies defaults
 	st, err := store.Open(t.TempDir() + "/t.db")

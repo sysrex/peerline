@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -75,14 +76,12 @@ func main() {
 	emailPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_EMAIL_PER_HOUR"))
 	notifyPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_NOTIFY_PER_HOUR"))
 
-	maxBagsPerPeer, err := parseNonNegativeInt(os.Getenv("PEERLINE_MAX_BAGS_PER_PEER"))
+	maxBagsPerPeer, maxBagBytesPerPeer, err := parseBagLimits(
+		os.Getenv("PEERLINE_MAX_BAGS_PER_PEER"),
+		os.Getenv("PEERLINE_MAX_BAG_BYTES_PER_PEER"),
+	)
 	if err != nil {
-		log.Error("invalid PEERLINE_MAX_BAGS_PER_PEER", "err", err)
-		os.Exit(1)
-	}
-	maxBagBytesPerPeer, err := parseNonNegativeInt64(os.Getenv("PEERLINE_MAX_BAG_BYTES_PER_PEER"))
-	if err != nil {
-		log.Error("invalid PEERLINE_MAX_BAG_BYTES_PER_PEER", "err", err)
+		log.Error("invalid bag limit configuration", "err", err)
 		os.Exit(1)
 	}
 
@@ -106,8 +105,8 @@ func main() {
 		MaxBagBytesPerPeer:    maxBagBytesPerPeer,
 	})
 
-	log.Info("bag storage caps", "max_bags_per_peer", apiServer.Config().MaxBagsPerPeer,
-		"max_bag_bytes_per_peer", apiServer.Config().MaxBagBytesPerPeer)
+	maxBags, maxBytes := apiServer.BagLimits()
+	log.Info("bag storage caps", "max_bags_per_peer", maxBags, "max_bag_bytes_per_peer", maxBytes)
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -137,6 +136,18 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(shutCtx)
 	log.Info("peerline stopped")
+}
+
+func parseBagLimits(bagsStr, bytesStr string) (int, int64, error) {
+	maxBags, err := parseNonNegativeInt(bagsStr)
+	if err != nil {
+		return 0, 0, fmt.Errorf("PEERLINE_MAX_BAGS_PER_PEER: %w", err)
+	}
+	maxBytes, err := parseNonNegativeInt64(bytesStr)
+	if err != nil {
+		return 0, 0, fmt.Errorf("PEERLINE_MAX_BAG_BYTES_PER_PEER: %w", err)
+	}
+	return maxBags, maxBytes, nil
 }
 
 func parseNonNegativeInt(s string) (int, error) {
