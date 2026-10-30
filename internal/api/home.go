@@ -2,6 +2,8 @@ package api
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"html/template"
 	"net/http"
@@ -19,6 +21,7 @@ const (
 type homeData struct {
 	BaseURL      string
 	RegisterOpen bool
+	Nonce        string
 	// StatsJSON is the same counters as Stats, pre-encoded so the embedded
 	// script stays valid JSON. template.JS is safe here: the bytes are
 	// json.Marshal of int64 fields only.
@@ -46,10 +49,23 @@ func (s *Server) home(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
+	// Generate a per-request nonce for CSP
+	nonceBytes := make([]byte, 16)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		s.internal(w, err)
+		return
+	}
+	nonce := base64.StdEncoding.EncodeToString(nonceBytes)
+
+	// Set CSP with nonce for the home page
+	csp := "default-src 'none'; script-src 'nonce-" + nonce + "'; style-src 'nonce-" + nonce + "'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+	w.Header().Set("Content-Security-Policy", csp)
+
 	var buf bytes.Buffer
 	if err := homeTmpl.Execute(&buf, homeData{
 		BaseURL:      s.publicBase(r),
 		RegisterOpen: s.cfg.RegisterToken == "",
+		Nonce:        nonce,
 		StatsJSON:    template.JS(raw),
 		Stats:        st,
 	}); err != nil {
@@ -68,7 +84,7 @@ var homeTmpl = template.Must(template.New("home").Parse(`<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Peerline</title>
 <meta name="description" content="Peerline is a deny-all cross-account bot-to-bot bridge for allowlisted messages and bags.">
-<style>
+<style nonce="{{.Nonce}}">
   :root {
     color-scheme: light;
     --bg: #f6f4ef;
@@ -274,7 +290,7 @@ PUT    /v1/bags/{name}?owner=</code></pre>
     <p>Peerline is a personal project by sysrex. Issues and pull requests: <a href="` + repoURL + `">github.com/sysrex/peerline</a>.</p>
   </footer>
 </main>
-<script>
+<script nonce="{{.Nonce}}">
 (function () {
   var keys = ["peers", "messages", "grants", "bags"];
   function paint(s) {
