@@ -59,6 +59,8 @@ type Config struct {
 	// TrustedProxies is a list of CIDR ranges (e.g. "10.0.0.0/8") from which
 	// X-Forwarded-For headers are honored. If empty, X-Forwarded-For is ignored.
 	TrustedProxies []string
+	// Now is the clock for invite expiry and rate limiters; defaults to time.Now.
+	Now func() time.Time
 	// MaxOutstandingInvites is the per-peer limit on active (non-expired, unused) invites.
 	MaxOutstandingInvites int
 	// RetentionSeconds is how long (in seconds) to keep used invites before purging.
@@ -112,6 +114,10 @@ func New(st *store.Store, cfg Config) *Server {
 	}
 	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
 
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+
 	trustedNets, err := ParseTrustedProxies(cfg.TrustedProxies)
 	if err != nil {
 		// This should have been caught at startup, log and continue with empty list
@@ -125,7 +131,7 @@ func New(st *store.Store, cfg Config) *Server {
 		log:         cfg.Logger,
 		lim:         NewLimiterManager(cfg),
 		trustedNets: trustedNets,
-		now:         time.Now,
+		now:         cfg.Now,
 	}
 
 	// Start maintenance tasks
