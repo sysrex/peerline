@@ -1,11 +1,16 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/sysrex/peerline/internal/store"
 )
 
 // TestMalformedHeadersNotCharged verifies #99: malformed or missing Bearer tokens
@@ -399,5 +404,64 @@ func TestAllAuthenticatedWriteRoutesLimited(t *testing.T) {
 				t.Errorf("want body %q, got %q", expectedBody, actualBody)
 			}
 		})
+	}
+}
+
+func authFailStatus(h http.Handler, remote, xff string) int {
+	req := httptest.NewRequest("GET", "/v1/me", nil)
+	req.RemoteAddr = remote
+	req.Header.Set("Authorization", "Bearer pl_unknown")
+	if xff != "" {
+		req.Header.Set("X-Forwarded-For", xff)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	return rr.Code
+}
+
+func newAuthFailHandler(t *testing.T, trusted []string) http.Handler {
+	t.Helper()
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(st, Config{
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AuthFailPerMinute: 1,
+		AuthFailBurst:     1,
+		TrustedProxies:    trusted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Stop)
+	return s.Handler()
+}
+
+// TestAuthFailBucketsFollowProxyConfig verifies #98: behind a trusted proxy each
+// forwarded client has its own failed-auth bucket; without trusted proxies a
+// spoofed X-Forwarded-For neither splits nor evades the bucket.
+func TestAuthFailBucketsFollowProxyConfig(t *testing.T) {
+	h := newAuthFailHandler(t, []string{"10.0.0.0/8"})
+	if got := authFailStatus(h, "10.0.0.1:1", "1.1.1.1"); got != 401 {
+		t.Fatalf("client A first: want 401, got %d", got)
+	}
+	if got := authFailStatus(h, "10.0.0.1:1", "1.1.1.1"); got != 429 {
+		t.Fatalf("client A over budget: want 429, got %d", got)
+	}
+	if got := authFailStatus(h, "10.0.0.1:1", "2.2.2.2"); got != 401 {
+		t.Fatalf("client B must have its own bucket: want 401, got %d", got)
+	}
+
+	h = newAuthFailHandler(t, nil)
+	if got := authFailStatus(h, "9.9.9.9:1", "1.1.1.1"); got != 401 {
+		t.Fatalf("first: want 401, got %d", got)
+	}
+	if got := authFailStatus(h, "9.9.9.9:1", "2.2.2.2"); got != 429 {
+		t.Fatalf("spoofed XFF must not evade the bucket: want 429, got %d", got)
 	}
 }

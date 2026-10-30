@@ -77,7 +77,13 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `PEERLINE_KEY_INDEX_WARN` | `1000000` | Log a warning if the key index size exceeds this threshold at startup |
 | `PEERLINE_KEY_INDEX_REBUILD_HOURS` | `6` | Hours between full key index rebuilds (maintenance also rebuilds on count mismatch) |
 
-When write rate limits are exceeded, Peerline returns `429 Too Many Requests` with a `Retry-After: 2` header. The value of 2 seconds represents the minimum time until one token refills at the default rate (10/minute = 6 seconds/token, rounded conservatively to 2 seconds to account for timing variations and give clients a practical retry window).
+**Failed auth.** A missing, non-Bearer or non-`pl_` token always returns `401` and is never charged. A well-formed `pl_` key that is not in the in-memory key index returns `401` and is charged to the client IP; once that IP's budget is spent, further unknown keys get `429` with `Retry-After: 60`. Valid keys are never refused by this limiter.
+
+**Writes.** `PUT /v1/me`, `POST /v1/me/verify-email`, `POST /v1/invites`, `DELETE /v1/invites/{id}`, `POST /v1/invites/accept`, `DELETE /v1/grants/{peer_id}`, `POST /v1/peers/{peer_id}/messages`, `PUT /v1/bags/{name}` and the authenticated `POST /v1/pairing/{token}` share one per-peer bucket (`PEERLINE_WRITE_*`). Over budget returns `429` with a fixed `Retry-After: 2`, a retry hint that is shorter than the real refill time (6 s per token at the default 10/minute).
+
+**Messages.** Every message send is also subject to the per-peer message limiter (30/minute, burst 10, not configurable by env), so the effective message rate is the lower of that and the write limit. With the default write limit (10/minute, burst 3) the write limit is the binding one.
+
+**Behind a proxy.** Set `PEERLINE_TRUSTED_PROXIES` to your proxy's CIDR. If it is unset, every client shares the proxy's IP and therefore one failed-auth bucket (see [Trusted proxies](#trusted-proxies)).
 
 ### Pair two bots (different accounts)
 
