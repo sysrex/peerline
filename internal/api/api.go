@@ -74,6 +74,9 @@ type Server struct {
 	log         *slog.Logger
 	trustedNets []*net.IPNet
 	now         func() time.Time // clock for invite expiry; defaults to time.Now
+
+	// Test-only hook: called after invite creation, before email limit check
+	testInviteCreatedHook func(peerID string)
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -492,6 +495,11 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	var pairingToken string
 	var publicID string
 
+	// Test hook for deterministic concurrency testing (before atomic create)
+	if s.testInviteCreatedHook != nil {
+		s.testInviteCreatedHook(me)
+	}
+
 	// Create invite first with atomic cap check (#53)
 	if in.GeneratePairing {
 		pairingToken = auth.NewPairingToken()
@@ -517,13 +525,29 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check email rate limit AFTER creating invite (#53)
-	// If limit fails, delete the invite and return 429
+	// If limit fails, delete the invite and return error
 	if to != "" {
 		rk := strings.ToLower(to)
-		if !s.lim.mailLim.Ready(me) || !s.lim.rcptLim.Ready(rk) || !s.lim.mailLim.Allow(me) || !s.lim.rcptLim.Allow(rk) {
+		// Check both limiters are ready before consuming from either (avoid partial spend)
+		if !s.lim.mailLim.Ready(me) || !s.lim.rcptLim.Ready(rk) {
 			// Delete the invite we just created
 			if delErr := s.st.DeleteInvite(r.Context(), publicID, me); delErr != nil {
-				s.cfg.Logger.Warn("failed to delete invite after rate limit", "public_id", publicID, "error", delErr)
+				s.log.Error("failed to delete invite after rate limit check", "public_id", publicID, "error", delErr)
+				s.internal(w, fmt.Errorf("rate limit check failed and invite cleanup failed: %w", delErr))
+				return
+			}
+			w.Header().Set("Retry-After", "600")
+			writeErr(w, http.StatusTooManyRequests, "invite email rate limited; try later or create an invite without to_email and share the code yourself")
+			return
+		}
+		// Both ready, consume from both. Narrow race: two requests can both pass Ready,
+		// second Allow fails, spending one sender token. Compensating delete doesn't refund.
+		if !s.lim.mailLim.Allow(me) || !s.lim.rcptLim.Allow(rk) {
+			// Rare: Ready passed but Allow failed (concurrent race)
+			if delErr := s.st.DeleteInvite(r.Context(), publicID, me); delErr != nil {
+				s.log.Error("failed to delete invite after rate limit consume", "public_id", publicID, "error", delErr)
+				s.internal(w, fmt.Errorf("rate limit consume failed and invite cleanup failed: %w", delErr))
+				return
 			}
 			w.Header().Set("Retry-After", "600")
 			writeErr(w, http.StatusTooManyRequests, "invite email rate limited; try later or create an invite without to_email and share the code yourself")
