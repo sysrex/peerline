@@ -1816,11 +1816,17 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Empty string", "", "A Peerline peer"},
 		{"Only spaces", "   ", "A Peerline peer"},
 
-		// Issue #68: Length tests (64 runes max)
+		// Issue #68: Length tests (64 runes max, counted on final NFC output)
 		{"70 ASCII letters", strings.Repeat("a", 70), strings.Repeat("a", 64)},
 		{"30 CJK chars under byte limit", strings.Repeat("日", 30), strings.Repeat("日", 30)},
 		// 64 runes (not bytes): "日" is 3 bytes, 64 copies = 192 bytes, should keep exactly 64 runes
 		{"Long multibyte truncated at 64 runes", strings.Repeat("日", 70), strings.Repeat("日", 64)},
+		// Precomposed characters: é (U+00E9) is 1 rune in NFC
+		{"70 precomposed é gives 64", strings.Repeat("é", 70), strings.Repeat("é", 64)},
+		// Hangul syllables: 한 (U+D55C) is 1 rune in NFC, decomposes to 3 jamo in NFD
+		{"70 Hangul syllables gives 64", strings.Repeat("한", 70), strings.Repeat("한", 64)},
+		// Truncation at mark boundary: 64 'a' + 64 combining marks, truncate without leaving dangling marks
+		{"Truncation drops trailing marks", strings.Repeat("a\u0301", 70), strings.Repeat("á", 64)},
 	}
 
 	for _, tt := range tests {
