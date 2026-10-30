@@ -7,17 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
-// Test hook: called after peer INSERT in RegisterAndAcceptByPairing, before COMMIT.
-// Nil in production. Tests can set this to inject cancellation or other failures.
-var afterPeerInsertHook func()
-
 var ErrNotFound = errors.New("not found")
 var ErrConflict = errors.New("conflict")
+
+var memDBCounter uint64
 
 type Store struct{ db *sql.DB }
 
@@ -94,8 +93,9 @@ func buildDSN(path string) string {
 	pragmas := "_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
 	if path == ":memory:" {
 		// Use file-based shared-cache for :memory: so pragmas apply.
-		// Caller should provide a unique name to prevent test bleed.
-		return "file::memory:?mode=memory&cache=shared&" + pragmas
+		// Generate unique name per Open to prevent test bleed.
+		id := atomic.AddUint64(&memDBCounter, 1)
+		return fmt.Sprintf("file:memdb-%d?mode=memory&cache=shared&%s", id, pragmas)
 	}
 	sep := "?"
 	if strings.Contains(path, "?") {
@@ -113,36 +113,45 @@ func migrate(db *sql.DB) error {
 
 	for i, mig := range migrations {
 		target := i + 1
-
-		tx, err := db.Begin()
-		if err != nil {
-			return fmt.Errorf("begin migration v%d: %w", target, err)
+		if err := runMigrationStep(db, target, mig); err != nil {
+			return err
 		}
-		defer tx.Rollback()
+	}
+	return nil
+}
 
-		// Read user_version inside tx to ensure consistent view
-		var version int
-		if err := tx.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
-			return fmt.Errorf("read user_version in migration v%d: %w", target, err)
-		}
+// runMigrationStep runs a single migration step in its own transaction.
+func runMigrationStep(db *sql.DB, target int, mig func(*sql.Tx) error) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin migration v%d: %w", target, err)
+	}
+	defer tx.Rollback()
 
-		if version >= target {
-			tx.Commit()
-			continue
-		}
+	// Read user_version inside tx to ensure consistent view
+	var version int
+	if err := tx.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return fmt.Errorf("read user_version in migration v%d: %w", target, err)
+	}
 
-		// Run migration step on tx (not db) to avoid deadlock with MaxOpenConns=1
-		if err := mig(tx); err != nil {
-			return fmt.Errorf("migration v%d: %w", target, err)
-		}
-
-		if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, target)); err != nil {
-			return fmt.Errorf("update user_version to %d: %w", target, err)
-		}
-
+	if version >= target {
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit migration v%d: %w", target, err)
+			return fmt.Errorf("commit migration v%d skip: %w", target, err)
 		}
+		return nil
+	}
+
+	// Run migration step on tx (not db) to avoid deadlock with MaxOpenConns=1
+	if err := mig(tx); err != nil {
+		return fmt.Errorf("migration v%d: %w", target, err)
+	}
+
+	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, target)); err != nil {
+		return fmt.Errorf("update user_version to %d: %w", target, err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration v%d: %w", target, err)
 	}
 	return nil
 }
@@ -465,11 +474,6 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 		peerID, name, keyHash, ts, notifyEmail)
 	if err != nil {
 		return nil, err
-	}
-
-	// Test hook: allows injecting failures after peer INSERT
-	if afterPeerInsertHook != nil {
-		afterPeerInsertHook()
 	}
 
 	grant, err = acceptInviteInTx(ctx, tx, codeHash, peerID, backScopes, backBags)

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"strings"
@@ -11,18 +12,25 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 )
 
-var memDBCounter uint64
+// Global cancel function for the test_cancel scalar function
+var testCancelFunc atomic.Value // stores context.CancelFunc
 
-func uniqueMemoryDB(t *testing.T) string {
-	id := atomic.AddUint64(&memDBCounter, 1)
-	return fmt.Sprintf("file:memdb-%s-%d?mode=memory&cache=shared&_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)", t.Name(), id)
+func init() {
+	// Register the test_cancel scalar function globally
+	sqlite.MustRegisterDeterministicScalarFunction("test_cancel", 0, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+		if fn := testCancelFunc.Load(); fn != nil {
+			fn.(context.CancelFunc)()
+		}
+		return int64(0), nil
+	})
 }
 
 func TestStoreBasics(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(uniqueMemoryDB(t))
+	s, err := Open(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +71,7 @@ func TestStoreBasics(t *testing.T) {
 
 func TestStats(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(uniqueMemoryDB(t))
+	s, err := Open(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -641,7 +649,7 @@ func TestConcurrentPairingRedemption(t *testing.T) {
 // no orphan peer row is left behind.
 func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(uniqueMemoryDB(t))
+	s, err := Open(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -713,7 +721,7 @@ func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 // TestExpiredInviteRejection verifies that expired invites cannot be accepted.
 func TestExpiredInviteRejection(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(uniqueMemoryDB(t))
+	s, err := Open(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -769,50 +777,47 @@ func TestRollbackAfterPeerInsert(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Test 1: Duplicate peer ID causes rollback after peer insert
-	pairingHash1 := "pair1"
-	if err := s.CreateInviteWithPairing(ctx, "code1", pairingHash1, "alice", []string{"messages"}, nil, time.Now().Add(time.Hour)); err != nil {
+	pairingHash := "pair1"
+	if err := s.CreateInviteWithPairing(ctx, "code1", pairingHash, "alice", []string{"messages"}, nil, time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 
-	// First redemption should succeed
-	if _, err := s.RegisterAndAcceptByPairing(ctx, pairingHash1, "bob", "Bob", "hb", "", nil, nil); err != nil {
+	// Create a trigger that will fail the grant INSERT (after peer INSERT succeeds)
+	if _, err := s.db.Exec(`CREATE TRIGGER rollback_test_trigger BEFORE INSERT ON grants BEGIN SELECT RAISE(ABORT, 'injected failure'); END`); err != nil {
 		t.Fatal(err)
 	}
+	defer s.db.Exec(`DROP TRIGGER IF EXISTS rollback_test_trigger`)
 
-	// Create another invite
-	pairingHash2 := "pair2"
-	if err := s.CreateInviteWithPairing(ctx, "code2", pairingHash2, "alice", []string{"messages"}, nil, time.Now().Add(time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-
-	// Try to register again with the same peer ID - should fail after peer insert
-	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash2, "bob", "Bob2", "hb2", "", nil, nil)
+	// Try to register - peer INSERT will succeed but grant INSERT will fail due to trigger
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash, "bob", "Bob", "hb", "", nil, nil)
 	if err == nil {
-		t.Fatal("expected error for duplicate peer ID")
+		t.Fatal("expected error due to injected failure")
 	}
 
 	// Verify no orphan peer was created
-	var peerCount int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE id='bob'`).Scan(&peerCount); err != nil {
+	var bobCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE id='bob'`).Scan(&bobCount); err != nil {
 		t.Fatal(err)
 	}
-	if peerCount != 1 {
-		t.Errorf("got %d bob peers, want 1", peerCount)
+	if bobCount != 0 {
+		t.Error("orphan peer 'bob' created after failed grant insert")
 	}
 
-	// Verify the invite is still unconsumed
+	// Verify the invite is still unconsumed (used_by IS NULL)
 	var used sql.NullString
-	if err := s.db.QueryRow(`SELECT used_by FROM invites WHERE pairing_token_hash=?`, pairingHash2).Scan(&used); err != nil {
+	if err := s.db.QueryRow(`SELECT used_by FROM invites WHERE pairing_token_hash=?`, pairingHash).Scan(&used); err != nil {
 		t.Fatal(err)
 	}
 	if used.Valid {
-		t.Errorf("invite was marked as used after failed redemption")
+		t.Error("invite was marked as used after failed transaction")
 	}
 
-	// Verify the invite can still be redeemed by a different peer
-	if _, err := s.RegisterAndAcceptByPairing(ctx, pairingHash2, "carol", "Carol", "hc", "", nil, nil); err != nil {
-		t.Fatalf("invite should still be redeemable: %v", err)
+	// Drop the trigger and verify the invite can still be redeemed
+	if _, err := s.db.Exec(`DROP TRIGGER rollback_test_trigger`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RegisterAndAcceptByPairing(ctx, pairingHash, "carol", "Carol", "hc", "", nil, nil); err != nil {
+		t.Fatalf("invite should still be redeemable after trigger removed: %v", err)
 	}
 }
 
@@ -895,10 +900,6 @@ func TestContextCancellationBeforeTransaction(t *testing.T) {
 // TestContextCancellationMidTransaction verifies that cancelling after BeginTx and after the peer INSERT
 // rolls back correctly, leaving no orphan peer and the invite unconsumed.
 func TestContextCancellationMidTransaction(t *testing.T) {
-	// Save original hook and restore after test
-	origHook := afterPeerInsertHook
-	defer func() { afterPeerInsertHook = origHook }()
-
 	path := t.TempDir() + "/cancel-mid-tx.db"
 	s, err := Open(path)
 	if err != nil {
@@ -917,25 +918,22 @@ func TestContextCancellationMidTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Set up hook to cancel context after peer INSERT
+	// Set up cancel function for the test_cancel scalar function
 	cancelCtx, cancel := context.WithCancel(context.Background())
-	afterPeerInsertHook = func() {
-		cancel()
-		// Give the cancellation a moment to propagate
-		time.Sleep(10 * time.Millisecond)
-	}
+	testCancelFunc.Store(cancel)
+	defer testCancelFunc.Store((context.CancelFunc)(nil))
 
-	// Try to register and accept - should fail due to cancellation after INSERT
+	// Create a trigger that calls test_cancel() after peer INSERT
+	if _, err := s.db.Exec(`CREATE TRIGGER cancel_test_trigger AFTER INSERT ON peers BEGIN SELECT test_cancel(); END`); err != nil {
+		t.Fatal(err)
+	}
+	defer s.db.Exec(`DROP TRIGGER IF EXISTS cancel_test_trigger`)
+
+	// Try to register and accept - should fail due to cancellation after peer INSERT
 	_, err = s.RegisterAndAcceptByPairing(cancelCtx, pairingHash, "bob", "Bob", "hb", "", nil, nil)
-	if err == nil {
-		t.Fatal("expected error after mid-transaction cancel")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
 	}
-	if !errors.Is(err, context.Canceled) && err != context.Canceled {
-		t.Logf("got error: %v (acceptable if transaction rolled back)", err)
-	}
-
-	// Clear the hook for subsequent operations
-	afterPeerInsertHook = nil
 
 	// Verify no orphan peer was created
 	var bobCount int
@@ -946,7 +944,7 @@ func TestContextCancellationMidTransaction(t *testing.T) {
 		t.Error("orphan peer 'bob' created after mid-transaction cancel")
 	}
 
-	// Verify the invite was not consumed
+	// Verify the invite was not consumed (used_by IS NULL)
 	var used sql.NullString
 	if err := s.db.QueryRow(`SELECT used_by FROM invites WHERE pairing_token_hash=?`, pairingHash).Scan(&used); err != nil {
 		t.Fatal(err)
@@ -954,6 +952,12 @@ func TestContextCancellationMidTransaction(t *testing.T) {
 	if used.Valid {
 		t.Error("invite was consumed after mid-transaction cancel")
 	}
+
+	// Drop trigger and clear cancel function
+	if _, err := s.db.Exec(`DROP TRIGGER cancel_test_trigger`); err != nil {
+		t.Fatal(err)
+	}
+	testCancelFunc.Store((context.CancelFunc)(nil))
 
 	// Verify DB isn't wedged: next accept should succeed
 	normalCtx := context.Background()
@@ -1282,7 +1286,7 @@ func TestPragmasInEffect(t *testing.T) {
 		name string
 		path string
 	}{
-		{"memory", uniqueMemoryDB(t)},
+		{"memory", ":memory:"},
 		{"file", t.TempDir() + "/pragmas.db"},
 	}
 
@@ -1315,7 +1319,7 @@ func TestPragmasInEffect(t *testing.T) {
 			// Verify _txlock=immediate: Begin() should take the write lock immediately,
 			// not defer it until the first write (which is DEFERRED behavior)
 			if tt.name == "file" {
-				// Only test with file DB (memory DB with single connection can't show this)
+				// For file DBs, open a second Store on the same path
 				s2, err := Open(tt.path)
 				if err != nil {
 					t.Fatal(err)
@@ -1349,6 +1353,55 @@ func TestPragmasInEffect(t *testing.T) {
 					t.Error("second BeginTx succeeded, but first tx should hold write lock (_txlock=immediate not active)")
 				} else if !errors.Is(err, context.DeadlineExceeded) {
 					// Also accept SQLITE_BUSY or similar errors
+					t.Logf("second BeginTx blocked/failed as expected: %v", err)
+				}
+			} else {
+				// For memory DBs, use a shared name to test txlock with two connections
+				sharedName := "file:test-pragma-mem?mode=memory&cache=shared&_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+				db1, err := sql.Open("sqlite", sharedName)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db1.Close()
+				db1.SetMaxOpenConns(1)
+
+				db2, err := sql.Open("sqlite", sharedName)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db2.Close()
+				db2.SetMaxOpenConns(1)
+
+				// Create the schema on db1
+				if _, err := db1.Exec(schema); err != nil {
+					t.Fatal(err)
+				}
+
+				// Start a transaction on db1 and do nothing
+				tx1, err := db1.Begin()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx1.Rollback()
+
+				// Try to begin a transaction on db2 - should block or fail
+				done := make(chan error, 1)
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+					defer cancel()
+					tx2, err := db2.BeginTx(ctx, nil)
+					if err != nil {
+						done <- err
+						return
+					}
+					tx2.Rollback()
+					done <- nil
+				}()
+
+				err = <-done
+				if err == nil {
+					t.Error("second BeginTx succeeded, but first tx should hold write lock (_txlock=immediate not active)")
+				} else if !errors.Is(err, context.DeadlineExceeded) {
 					t.Logf("second BeginTx blocked/failed as expected: %v", err)
 				}
 			}
