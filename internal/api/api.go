@@ -61,6 +61,9 @@ type Config struct {
 	TrustedProxies []string
 	// MaxOutstandingInvites is the per-peer limit on active (non-expired, unused) invites.
 	MaxOutstandingInvites int
+	// RetentionSeconds is how long (in seconds) to keep used invites before purging.
+	// Default is 30 days (2592000 seconds). Set to 0 for the default.
+	RetentionSeconds int64
 }
 
 type Server struct {
@@ -121,7 +124,7 @@ func New(st *store.Store, cfg Config) *Server {
 	}
 
 	// Start maintenance tasks
-	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger)
+	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, cfg.RetentionSeconds)
 
 	return s
 }
@@ -192,70 +195,6 @@ func (s *Server) Handler() http.Handler {
 }
 
 // ---- helpers ----
-
-// sanitizeInviterName applies NFKC normalization and filters characters that can be used
-// for prompt injection or homoglyph attacks. Allows only Unicode letters (L*), numbers (N*),
-// spaces, and basic ASCII punctuation (. , - _ '). Filters all Cf format characters (including
-// zero-width and bidi controls), variation selectors, Hangul fillers, and tag characters.
-// Collapses repeated spaces and trims the result. Max length 64 chars.
-//
-// Note: Cross-script homoglyphs (e.g., Cyrillic а vs Latin a) are not fully solvable here
-// and require application-level awareness or visual similarity detection.
-func sanitizeInviterName(name string) string {
-	const maxLen = 64
-
-	// Apply NFKC normalization (compatibility decomposition + canonical composition)
-	// This normalizes fullwidth/halfwidth chars, ligatures, compatibility forms
-	normalized := norm.NFKC.String(name)
-
-	var out strings.Builder
-	lastWasSpace := false
-
-	for _, r := range normalized {
-		// Filter Hangul fillers: U+115F, U+1160, U+3164, U+FFA0
-		if r == 0x115F || r == 0x1160 || r == 0x3164 || r == 0xFFA0 {
-			continue
-		}
-
-		// Filter variation selectors: U+FE00–U+FE0F (standard), U+E0100–U+E01EF (extended)
-		if (r >= 0xFE00 && r <= 0xFE0F) || (r >= 0xE0100 && r <= 0xE01EF) {
-			continue
-		}
-
-		// Filter all Cf (format) category: includes bidi controls, zero-width chars, etc.
-		if unicode.Is(unicode.Cf, r) {
-			continue
-		}
-
-		// Filter tag characters: U+E0000–U+E007F
-		if r >= 0xE0000 && r <= 0xE007F {
-			continue
-		}
-
-		// Allow: Unicode letters (L*), numbers (N*), space, and basic ASCII punctuation
-		if unicode.IsLetter(r) || unicode.IsNumber(r) {
-			out.WriteRune(r)
-			lastWasSpace = false
-		} else if r == ' ' {
-			// Collapse repeated spaces
-			if !lastWasSpace && out.Len() > 0 {
-				out.WriteRune(' ')
-				lastWasSpace = true
-			}
-		} else if r == '.' || r == ',' || r == '-' || r == '_' || r == '\'' {
-			// Basic ASCII punctuation
-			out.WriteRune(r)
-			lastWasSpace = false
-		}
-
-		// Stop if we exceed max length
-		if out.Len() >= maxLen {
-			break
-		}
-	}
-
-	return strings.TrimSpace(out.String())
-}
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -557,8 +496,75 @@ func (s *Server) inviterName(ctx context.Context, id string) string {
 	return sanitizeInviterName(n)
 }
 
-// sanitizeInviterName removes control characters, bidi controls, and zero-width
-// characters that could be used for prompt injection or display spoofing.
+// sanitizeInviterName applies NFKC normalization and filters characters that can be used
+// for prompt injection or homoglyph attacks. Allows Unicode letters (L*), numbers (N*),
+// combining marks (Mn, Mc), spaces, and basic ASCII punctuation (. , - _ ').
+// Filters all Cf format characters (including zero-width and bidi controls), variation selectors,
+// Hangul fillers, and tag characters. Collapses repeated spaces and trims the result.
+// Max length 64 runes (not bytes).
+//
+// Note: Cross-script homoglyphs (e.g., Cyrillic а vs Latin a) are not fully solvable here
+// and require application-level awareness or visual similarity detection.
+func sanitizeInviterName(name string) string {
+	const maxRunes = 64
+
+	// Apply NFKC normalization (compatibility decomposition + canonical composition)
+	// This normalizes fullwidth/halfwidth chars, ligatures, compatibility forms
+	normalized := norm.NFKC.String(name)
+
+	var out strings.Builder
+	lastWasSpace := false
+	runeCount := 0
+
+	for _, r := range normalized {
+		// Filter Hangul fillers: U+115F, U+1160, U+3164, U+FFA0
+		if r == 0x115F || r == 0x1160 || r == 0x3164 || r == 0xFFA0 {
+			continue
+		}
+
+		// Filter variation selectors: U+FE00–U+FE0F (standard), U+E0100–U+E01EF (extended)
+		if (r >= 0xFE00 && r <= 0xFE0F) || (r >= 0xE0100 && r <= 0xE01EF) {
+			continue
+		}
+
+		// Filter all Cf (format) category: includes bidi controls, zero-width chars, etc.
+		if unicode.Is(unicode.Cf, r) {
+			continue
+		}
+
+		// Filter tag characters: U+E0000–U+E007F
+		if r >= 0xE0000 && r <= 0xE007F {
+			continue
+		}
+
+		// Allow: Unicode letters (L*), numbers (N*), combining marks (Mn, Mc), space, and basic ASCII punctuation
+		if unicode.IsLetter(r) || unicode.IsNumber(r) || unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) {
+			out.WriteRune(r)
+			lastWasSpace = false
+			runeCount++
+		} else if r == ' ' {
+			// Collapse repeated spaces
+			if !lastWasSpace && out.Len() > 0 {
+				out.WriteRune(' ')
+				lastWasSpace = true
+				runeCount++
+			}
+		} else if r == '.' || r == ',' || r == '-' || r == '_' || r == '\'' {
+			// Basic ASCII punctuation
+			out.WriteRune(r)
+			lastWasSpace = false
+			runeCount++
+		}
+
+		// Stop if we exceed max runes
+		if runeCount >= maxRunes {
+			break
+		}
+	}
+
+	return strings.TrimSpace(out.String())
+}
+
 func inviteEmail(inviter, inviterID, to, code, acceptURL string, scopes, bags []string, exp time.Time) mailer.Message {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s (Peerline peer %s) invited one of your bots to pair on Peerline,\n", inviter, inviterID)

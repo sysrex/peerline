@@ -75,6 +75,11 @@ func main() {
 	}
 	emailPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_EMAIL_PER_HOUR"))
 	notifyPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_NOTIFY_PER_HOUR"))
+	retentionDays, _ := strconv.Atoi(os.Getenv("PEERLINE_RETENTION_DAYS"))
+	if retentionDays <= 0 {
+		retentionDays = 30 // default
+	}
+	retentionSeconds := int64(retentionDays * 24 * 60 * 60)
 
 	apiServer := api.New(st, api.Config{
 		RegisterToken:         regTok,
@@ -85,6 +90,7 @@ func main() {
 		NotifyPerHour:         notifyPerHour,
 		TrustedProxies:        trustedProxies,
 		MaxOutstandingInvites: maxOutstandingInvites,
+		RetentionSeconds:      retentionSeconds,
 	})
 
 	srv := &http.Server{

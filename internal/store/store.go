@@ -287,7 +287,7 @@ func migrateV3InvitePublicID(tx *sql.Tx) error {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-func now() int64 { return time.Now().Unix() }
+var now = func() int64 { return time.Now().Unix() }
 
 // generatePublicID returns a random 16-byte hex string for invite public_id.
 func generatePublicID() (string, error) {
@@ -422,8 +422,6 @@ func (s *Store) CreateInviteWithPairing(ctx context.Context, codeHash, pairingTo
 }
 
 // CreateInviteAtomic checks the per-peer invite cap and creates an invite atomically within one transaction.
-// Returns ErrTooManyInvites if the cap would be exceeded. Returns the invite's ROWID on success.
-// CreateInviteAtomic checks the per-peer invite cap and creates an invite atomically within one transaction.
 // Returns ErrTooManyInvites if the cap would be exceeded. Returns the invite's public_id on success.
 func (s *Store) CreateInviteAtomic(ctx context.Context, codeHash, from string, scopes, bags []string, expires time.Time, cap int) (string, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
@@ -459,8 +457,6 @@ func (s *Store) CreateInviteAtomic(ctx context.Context, codeHash, from string, s
 	return publicID, nil
 }
 
-// CreateInviteWithPairingAtomic checks the per-peer invite cap and creates a pairing invite atomically within one transaction.
-// Returns ErrTooManyInvites if the cap would be exceeded. Returns the invite's ROWID on success.
 // CreateInviteWithPairingAtomic checks the per-peer invite cap and creates a pairing invite atomically within one transaction.
 // Returns ErrTooManyInvites if the cap would be exceeded. Returns the invite's public_id on success.
 func (s *Store) CreateInviteWithPairingAtomic(ctx context.Context, codeHash, pairingTokenHash, from string, scopes, bags []string, expires time.Time, cap int) (string, error) {
@@ -558,7 +554,6 @@ func (s *Store) ListInvitesByPeer(ctx context.Context, peerID string, limit, off
 	return invites, rows.Err()
 }
 
-// DeleteInvite removes an invite by ID if it belongs to the specified peer and is unused.
 // DeleteInvite revokes an unused invite by public_id (owner-only).
 // Returns ErrNotFound if the invite doesn't exist, already used, or doesn't belong to owner.
 func (s *Store) DeleteInvite(ctx context.Context, publicID, ownerID string) error {
@@ -574,12 +569,23 @@ func (s *Store) DeleteInvite(ctx context.Context, publicID, ownerID string) erro
 	return nil
 }
 
-// PurgeExpiredInvites removes expired and unused invite rows.
-// It does NOT delete used invites, since those may be useful for audit.
-func (s *Store) PurgeExpiredInvites(ctx context.Context) (int, error) {
+// PurgeExpiredInvites removes expired unused invites and old used invites.
+// Unused invites: deleted when expires_at < now.
+// Used invites: deleted when expires_at < now - retentionSeconds (default 30 days).
+func (s *Store) PurgeExpiredInvites(ctx context.Context, retentionSeconds int64) (int, error) {
+	if retentionSeconds <= 0 {
+		retentionSeconds = 30 * 24 * 60 * 60 // 30 days default
+	}
+
+	ts := now()
+	retentionCutoff := ts - retentionSeconds
+
+	// Delete unused expired invites and used invites older than retention window
 	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM invites WHERE expires_at<? AND used_by IS NULL`,
-		now())
+		`DELETE FROM invites WHERE 
+			(used_by IS NULL AND expires_at < ?) OR 
+			(used_by IS NOT NULL AND expires_at < ?)`,
+		ts, retentionCutoff)
 	if err != nil {
 		return 0, err
 	}

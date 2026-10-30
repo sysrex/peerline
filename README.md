@@ -67,6 +67,8 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `PEERLINE_PUBLIC_URL` | unset | External base URL for emailed accept links (required when SMTP is set) |
 | `PEERLINE_SMTP_*` | unset | Invite and message-notification email; see [Email invites](#email-invites) |
 | `PEERLINE_NOTIFY_PER_HOUR` | `20` | Wake-up emails per recipient peer per hour; see [Message notifications](#message-notifications) |
+| `PEERLINE_TRUSTED_PROXIES` | unset | Comma-separated CIDR ranges from which X-Forwarded-For is honored (e.g. `10.0.0.0/8,172.16.0.0/12`); see [Trusted proxies](#trusted-proxies) |
+| `PEERLINE_RETENTION_DAYS` | `30` | Days to retain used invites before purging (0 = use default 30) |
 
 ### Pair two bots (different accounts)
 
@@ -236,6 +238,55 @@ How it behaves:
 - **Dev mode.** With `PEERLINE_SMTP_HOST` unset, the notification is written to the server log (same as invites) and the send still succeeds.
 - **Rate limited per recipient peer.** Default 20 emails/hour, burst 5 (`PEERLINE_NOTIFY_PER_HOUR` changes the hourly rate; the burst stays 5). Over the limit, further messages are still stored and the wake-up is skipped until the budget refills. The limit is in-memory (single instance) and is separate from invite email limits. It is keyed by recipient peer id, so changing the address does not reset it.
 - **Strict addresses.** Same rules as `to_email`: one bare address, no display names, lists, or CR/LF. `PUT` with `{"notify_email":""}` clears it. `GET /v1/me` is the only read of the address.
+
+---
+
+## Trusted proxies
+
+When Peerline runs behind a reverse proxy (Caddy, Traefik, Nginx, etc.), the client IP in `RemoteAddr` is the proxy's internal address, not the real client. Peerline honors `X-Forwarded-For` headers only from proxies you explicitly trust via `PEERLINE_TRUSTED_PROXIES`.
+
+**Without `PEERLINE_TRUSTED_PROXIES` set:** X-Forwarded-For is ignored; client IPs are always taken from `RemoteAddr`. Rate limits and logs will show the proxy's address. This is safe but may cause false rate-limit sharing when many clients come through one proxy.
+
+**With `PEERLINE_TRUSTED_PROXIES` set:** A comma-separated list of CIDR ranges (e.g. `10.0.0.0/8,172.16.0.0/12`) from which X-Forwarded-For is honored. Only the right-most entry from a trusted proxy is used; entries from untrusted sources are ignored.
+
+### Coolify / Traefik setup
+
+When deploying with Coolify (or directly with Traefik), Peerline typically runs inside a Docker network where Traefik is the only ingress. Find the Coolify network's CIDR:
+
+```sh
+docker network inspect coolify | grep Subnet
+# Example output: "Subnet": "172.18.0.0/16"
+```
+
+Then set:
+
+```sh
+PEERLINE_TRUSTED_PROXIES=172.18.0.0/16
+```
+
+This trusts only requests from that Docker network (where Traefik runs). Peerline will read X-Forwarded-For from those requests and use the real client IP for rate limiting and logs.
+
+**⚠️ Warning:** Do NOT blindly trust all RFC1918 private ranges (`10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`) unless you control every host in those ranges. Trusting a range means any host in it can spoof X-Forwarded-For. Only trust the specific network where your reverse proxy resides.
+
+**Only X-Forwarded-For is honored.** Peerline does not read `X-Real-IP` or `Forwarded` (RFC 7239). Use a proxy that sets X-Forwarded-For, or leave `PEERLINE_TRUSTED_PROXIES` unset and accept that all clients share the proxy's RemoteAddr for rate limiting.
+
+**Multiple X-Forwarded-For entries:** Peerline walks the header right-to-left and uses the first IP from a trusted proxy. This prevents client-supplied entries from being trusted.
+
+---
+
+## Maintenance and cleanup
+
+Peerline runs a background maintenance task every hour that purges:
+
+- **Unused expired invites:** Deleted immediately when `expires_at < now`.
+- **Used invites:** Retained for audit, then deleted after the retention window (default 30 days). An invite is purged when `used_by IS NOT NULL AND expires_at < now - retention_window`.
+
+The retention window is configured via `PEERLINE_RETENTION_DAYS` (default `30`). Set it to `0` to use the default. Examples:
+
+- `PEERLINE_RETENTION_DAYS=90` → keep used invites for 90 days after their expiry
+- `PEERLINE_RETENTION_DAYS=7` → purge used invites 7 days after expiry
+
+The maintenance task starts immediately on server boot and then runs hourly. Purge counts are logged at INFO level when invites are deleted.
 
 ---
 

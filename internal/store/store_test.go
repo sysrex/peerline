@@ -1603,3 +1603,143 @@ func TestV3MigrationIdempotent(t *testing.T) {
 		t.Errorf("user_version = %d, want 3", version)
 	}
 }
+
+// TestPurgeExpiredInvitesRetention verifies that used invites are retained
+// for the configured retention period and then purged.
+func TestPurgeExpiredInvitesRetention(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Create peers
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mock time
+	origNow := now
+	defer func() { now = origNow }()
+	
+	// Start at a base time
+	currentTime := int64(2000000)
+	now = func() int64 { return currentTime }
+
+	// Create and immediately accept invites at different points in time
+	
+	// 1. Unused expired invite (expires 100s ago) - should be purged
+	exp1 := time.Unix(currentTime-100, 0)
+	if err := s.CreateInvite(ctx, "code1", "alice", []string{"messages"}, nil, exp1); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Used invite that expired 10 days ago - should be KEPT (within 30-day retention)
+	// Create it 10 days ago, accept it then, and it expires 10 days ago
+	tenDaysAgo := currentTime - 10*24*60*60
+	exp2 := time.Unix(tenDaysAgo-100, 0) // expired 10 days + 100s ago
+	// Temporarily go back in time to create and accept it
+	now = func() int64 { return tenDaysAgo - 200 } // before exp2
+	if err := s.CreateInvite(ctx, "code2", "alice", []string{"messages"}, nil, exp2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptInvite(ctx, "code2", "bob", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Return to current time
+	now = func() int64 { return currentTime }
+
+	// 3. Used invite that expired 40 days ago - should be PURGED (beyond 30-day retention)
+	fortyDaysAgo := currentTime - 40*24*60*60
+	exp3 := time.Unix(fortyDaysAgo-100, 0) // expired 40 days + 100s ago
+	// Temporarily go back in time to create and accept it
+	now = func() int64 { return fortyDaysAgo - 200 } // before exp3
+	if err := s.CreateInvite(ctx, "code3", "alice", []string{"messages"}, nil, exp3); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "charlie", "Charlie", "hc", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptInvite(ctx, "code3", "charlie", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Return to current time
+	now = func() int64 { return currentTime }
+
+	// 4. Used invite not yet expired - should be KEPT
+	exp4 := time.Unix(currentTime+24*60*60, 0) // expires in 1 day
+	if err := s.CreateInvite(ctx, "code4", "alice", []string{"messages"}, nil, exp4); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "dave", "Dave", "hd", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptInvite(ctx, "code4", "dave", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Before purge: 4 invites
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM invites`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 4 {
+		t.Errorf("before purge: got %d invites, want 4", count)
+	}
+
+	// Purge with 30-day retention (2592000 seconds)
+	purged, err := s.PurgeExpiredInvites(ctx, 30*24*60*60)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should purge: code1 (unused expired) + code3 (used, expired 40 days ago) = 2
+	if purged != 2 {
+		t.Errorf("purged %d invites, want 2", purged)
+	}
+
+	// After purge: code2 (used, expired 10 days ago) and code4 (used, not expired) remain
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM invites`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Errorf("after purge: got %d invites, want 2", count)
+	}
+
+	// Verify the right ones remain
+	var codes []string
+	rows, err := s.db.Query(`SELECT code_hash FROM invites ORDER BY code_hash`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ch string
+		if err := rows.Scan(&ch); err != nil {
+			t.Fatal(err)
+		}
+		codes = append(codes, ch)
+	}
+	if len(codes) != 2 {
+		t.Errorf("got %d remaining codes, want 2", len(codes))
+	}
+	// code2 and code4 should remain (their hashes)
+	wantHash2 := "code2"
+	wantHash4 := "code4"
+	found2, found4 := false, false
+	for _, ch := range codes {
+		if ch == wantHash2 {
+			found2 = true
+		}
+		if ch == wantHash4 {
+			found4 = true
+		}
+	}
+	if !found2 || !found4 {
+		t.Errorf("expected code2 and code4 to remain, got hashes: %v", codes)
+	}
+}

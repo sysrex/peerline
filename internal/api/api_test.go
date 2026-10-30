@@ -1362,7 +1362,7 @@ func TestMaintenanceManagerStops(t *testing.T) {
 
 	ctx := context.Background()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	mgr := NewMaintenanceManager(ctx, st, logger)
+	mgr := NewMaintenanceManager(ctx, st, logger, 30*24*60*60)
 
 	// Let it run a bit
 	time.Sleep(100 * time.Millisecond)
@@ -1560,6 +1560,8 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Japanese", "田中太郎", "田中太郎"},
 		{"Arabic", "محمد علي", "محمد علي"},
 		{"Mixed valid", "Alice-O'Neil, Jr.", "Alice-O'Neil, Jr."},
+		{"Hindi with combining marks", "राजेश कुमार", "राजेश कुमार"},
+		{"Thai with combining marks", "สมชาย ใจดี", "สมชาย ใจดี"},
 
 		// Bidi controls (Cf category) - all filtered
 		{"Bidi LRE", "Alice\u202AEvil", "AliceEvil"},
@@ -1616,6 +1618,8 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Empty string", "", ""},
 		{"Only spaces", "   ", ""},
 		{"Only filtered chars", "\u200B\u200C\uFEFF", ""},
+		// 64 runes (not bytes): "日" is 3 bytes, 64 copies = 192 bytes, should keep exactly 64 runes
+		{"Long multibyte truncated at 64 runes", strings.Repeat("日", 70), strings.Repeat("日", 64)},
 	}
 
 	for _, tt := range tests {

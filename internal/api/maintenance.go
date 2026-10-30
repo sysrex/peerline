@@ -9,26 +9,28 @@ import (
 
 // StorePurger defines the interface for cleaning expired invites.
 type StorePurger interface {
-	PurgeExpiredInvites(ctx context.Context) (int, error)
+	PurgeExpiredInvites(ctx context.Context, retentionSeconds int64) (int, error)
 }
 
 // MaintenanceManager runs periodic cleanup tasks.
 type MaintenanceManager struct {
-	store  StorePurger
-	log    *slog.Logger
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	store            StorePurger
+	log              *slog.Logger
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
+	retentionSeconds int64
 }
 
 // NewMaintenanceManager creates and starts a maintenance manager.
-func NewMaintenanceManager(ctx context.Context, store StorePurger, log *slog.Logger) *MaintenanceManager {
+func NewMaintenanceManager(ctx context.Context, store StorePurger, log *slog.Logger, retentionSeconds int64) *MaintenanceManager {
 	ctx, cancel := context.WithCancel(ctx)
 	m := &MaintenanceManager{
-		store:  store,
-		log:    log,
-		ctx:    ctx,
-		cancel: cancel,
+		store:            store,
+		log:              log,
+		ctx:              ctx,
+		cancel:           cancel,
+		retentionSeconds: retentionSeconds,
 	}
 
 	m.wg.Add(1)
@@ -59,11 +61,11 @@ func (m *MaintenanceManager) maintenanceLoop() {
 }
 
 func (m *MaintenanceManager) purgeExpired() {
-	count, err := m.store.PurgeExpiredInvites(m.ctx)
+	count, err := m.store.PurgeExpiredInvites(m.ctx, m.retentionSeconds)
 	if err != nil {
 		m.log.Error("maintenance: purge failed", "err", err)
 	} else if count > 0 {
-		m.log.Info("maintenance: purged expired invites", "count", count)
+		m.log.Info("maintenance: purged invites", "count", count)
 	}
 }
 
