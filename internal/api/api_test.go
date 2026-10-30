@@ -876,7 +876,9 @@ func TestPairingRateLimitAfterTokenValidation(t *testing.T) {
 		"generate_pairing": true,
 	}, nil)
 	want(t, resp, body, 201)
-	var inv struct{ PairingURL string `json:"pairing_url"` }
+	var inv struct {
+		PairingURL string `json:"pairing_url"`
+	}
 	json.Unmarshal(body, &inv)
 	validToken := strings.Split(inv.PairingURL, "/v1/pairing/")[1]
 
@@ -909,7 +911,9 @@ func TestInviteListPagination(t *testing.T) {
 	// List with limit=2
 	resp, body := a.do("GET", "/v1/invites?limit=2", nil, nil)
 	want(t, resp, body, 200)
-	var list1 struct{ Invites []store.InviteMetadata `json:"invites"` }
+	var list1 struct {
+		Invites []store.InviteMetadata `json:"invites"`
+	}
 	json.Unmarshal(body, &list1)
 	if len(list1.Invites) != 2 {
 		t.Fatalf("expected 2 invites, got %d", len(list1.Invites))
@@ -918,7 +922,9 @@ func TestInviteListPagination(t *testing.T) {
 	// List with limit=2&offset=2
 	resp, body = a.do("GET", "/v1/invites?limit=2&offset=2", nil, nil)
 	want(t, resp, body, 200)
-	var list2 struct{ Invites []store.InviteMetadata `json:"invites"` }
+	var list2 struct {
+		Invites []store.InviteMetadata `json:"invites"`
+	}
 	json.Unmarshal(body, &list2)
 	if len(list2.Invites) != 2 {
 		t.Fatalf("expected 2 invites, got %d", len(list2.Invites))
@@ -927,7 +933,9 @@ func TestInviteListPagination(t *testing.T) {
 	// Bob can't see Alice's invites
 	resp, body = b.do("GET", "/v1/invites", nil, nil)
 	want(t, resp, body, 200)
-	var listB struct{ Invites []store.InviteMetadata `json:"invites"` }
+	var listB struct {
+		Invites []store.InviteMetadata `json:"invites"`
+	}
 	json.Unmarshal(body, &listB)
 	if len(listB.Invites) != 0 {
 		t.Fatalf("Bob should see 0 invites, got %d", len(listB.Invites))
@@ -942,7 +950,9 @@ func TestDeleteInviteByID(t *testing.T) {
 	// Alice creates an invite
 	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
-	var inv struct{ InviteID int64 `json:"invite_id"` }
+	var inv struct {
+		InviteID int64 `json:"invite_id"`
+	}
 	json.Unmarshal(body, &inv)
 
 	// Bob can't delete Alice's invite
@@ -1017,7 +1027,9 @@ func TestInviteTTLDefaults(t *testing.T) {
 	// No TTL specified, should default to 1h
 	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
-	var inv struct{ ExpiresAt string `json:"expires_at"` }
+	var inv struct {
+		ExpiresAt string `json:"expires_at"`
+	}
 	json.Unmarshal(body, &inv)
 	expTime, _ := time.Parse(time.RFC3339, inv.ExpiresAt)
 	if time.Until(expTime) > 65*time.Minute || time.Until(expTime) < 55*time.Minute {
@@ -1164,7 +1176,9 @@ func TestPairingGETNoPrefilledScopes(t *testing.T) {
 		"generate_pairing": true,
 	}, nil)
 	want(t, resp, body, 201)
-	var inv struct{ PairingURL string `json:"pairing_url"` }
+	var inv struct {
+		PairingURL string `json:"pairing_url"`
+	}
 	json.Unmarshal(body, &inv)
 	token := strings.Split(inv.PairingURL, "/v1/pairing/")[1]
 
@@ -1225,13 +1239,13 @@ func doAnon(t *testing.T, srv *httptest.Server, method, path string, body any, h
 
 func TestLimiterManagerStops(t *testing.T) {
 	cfg := Config{
-		MsgPerMinute:  60,
-		MsgBurst:      10,
-		EmailPerHour:  10,
-		EmailBurst:    5,
+		MsgPerMinute:     60,
+		MsgBurst:         10,
+		EmailPerHour:     10,
+		EmailBurst:       5,
 		EmailRcptPerHour: 10,
-		NotifyPerHour: 10,
-		NotifyBurst:   5,
+		NotifyPerHour:    10,
+		NotifyBurst:      5,
 	}
 	mgr := NewLimiterManager(cfg)
 
