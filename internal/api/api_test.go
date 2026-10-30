@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +23,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/sysrex/peerline/internal/auth"
 	"github.com/sysrex/peerline/internal/store"
 	"golang.org/x/text/unicode/norm"
 )
@@ -107,6 +110,9 @@ func (c *client) do(method, path string, body any, hdr map[string]string) (*http
 		r = bytes.NewReader(j)
 	}
 	req, _ := http.NewRequest(method, c.srv.URL+path, r)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	if c.key != "" {
 		req.Header.Set("Authorization", "Bearer "+c.key)
 	}
@@ -383,8 +389,7 @@ func TestBagStorageShrinkOverQuota(t *testing.T) {
 	defer st.Close()
 
 	// Server with large cap
-	server1, _ := New(st, Config{MaxBagBytesPerPeer: 1000})
-	srv1 := httptest.NewServer(server1.Handler())
+	srv1 := httptest.NewServer(mustNew(t, st, Config{MaxBagBytesPerPeer: 1000}).Handler())
 	defer srv1.Close()
 	a1 := &client{t: t, srv: srv1}
 
@@ -408,8 +413,7 @@ func TestBagStorageShrinkOverQuota(t *testing.T) {
 	want(t, resp, body, 201)
 
 	// Now create a server with 50-byte cap (alice is over quota)
-	server2, _ := New(st, Config{MaxBagBytesPerPeer: 50})
-	srv2 := httptest.NewServer(server2.Handler())
+	srv2 := httptest.NewServer(mustNew(t, st, Config{MaxBagBytesPerPeer: 50}).Handler())
 	defer srv2.Close()
 	a2 := &client{t: t, srv: srv2, key: a1.key, id: a1.id}
 
@@ -508,8 +512,7 @@ func TestBagLimitsNonGrantee403(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st1.Close()
-	server1, _ := New(st1, Config{MaxBagsPerPeer: 2, MaxBagBytesPerPeer: 100})
-	srv1 := httptest.NewServer(server1.Handler())
+	srv1 := httptest.NewServer(mustNew(t, st1, Config{MaxBagsPerPeer: 2, MaxBagBytesPerPeer: 100}).Handler())
 	defer srv1.Close()
 
 	owner1 := register(t, srv1, "owner")
@@ -541,8 +544,7 @@ func TestBagLimitsNonGrantee403(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st2.Close()
-	server2, _ := New(st2, Config{MaxBagsPerPeer: 10, MaxBagBytesPerPeer: 50})
-	srv2 := httptest.NewServer(server2.Handler())
+	srv2 := httptest.NewServer(mustNew(t, st2, Config{MaxBagsPerPeer: 10, MaxBagBytesPerPeer: 50}).Handler())
 	defer srv2.Close()
 
 	owner2 := register(t, srv2, "owner2")
@@ -575,7 +577,7 @@ func TestBagStorageDefaults(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	srv, _ := New(st, Config{})
+	srv := mustNew(t, st, Config{})
 	if srv.cfg.MaxBagsPerPeer != 100 {
 		t.Errorf("got MaxBagsPerPeer %d, want 100", srv.cfg.MaxBagsPerPeer)
 	}
@@ -1391,8 +1393,8 @@ func TestDeleteInviteByID(t *testing.T) {
 }
 
 func TestInviteCodeNeverLogged(t *testing.T) {
-	var logBuf bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+	var logs syncBuf
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 
 	srv := newServer(t, Config{Logger: logger})
 	a := register(t, srv, "alice")
@@ -1409,18 +1411,19 @@ func TestInviteCodeNeverLogged(t *testing.T) {
 	// Delete the invite (triggers log)
 	a.do("DELETE", fmt.Sprintf("/v1/invites/%s", inv.PublicID), nil, nil)
 
+	// Positive control: logs should contain expected events
+	logStr := logs.String()
+	if !strings.Contains(logStr, inv.PublicID) {
+		t.Error("public_id should be logged (positive control)")
+	}
+
 	// Check logs don't contain the code or any prefix
-	logs := logBuf.String()
-	if strings.Contains(logs, inv.Code) {
+	if strings.Contains(logStr, inv.Code) {
 		t.Error("invite code found in logs")
 	}
 	codePrefix := inv.Code[:10]
-	if strings.Contains(logs, codePrefix) {
+	if strings.Contains(logStr, codePrefix) {
 		t.Error("invite code prefix found in logs")
-	}
-	// Should contain public_id
-	if !strings.Contains(logs, inv.PublicID) {
-		t.Error("public_id not found in logs")
 	}
 }
 
@@ -2575,6 +2578,22 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"70 Hangul syllables gives 64", strings.Repeat("한", 70), strings.Repeat("한", 64)},
 		// a+acute recomposes to á in NFC, 70 gives 64
 		{"70 a+acute recomposes to 64 á", strings.Repeat("a\u0301", 70), strings.Repeat("á", 64)},
+
+		// Issue #181: Edge cases for combining-mark cluster boundaries
+		{"cluster ending at rune 64 kept whole", strings.Repeat("a", 63) + "e\u0300", strings.Repeat("a", 63) + "è"},
+		{"cluster + trailing space at cut", strings.Repeat("a", 63) + "e\u0300 zzz", strings.Repeat("a", 63) + "è"},
+		{"4 marks on one base capped at 3", "a\u0300\u0301\u0302\u0303", "\u00e0\u0301\u0302"}, // 4 marks -> 3 marks
+
+		// Emoji with ZWJ, flags, skin tone modifiers (all filtered: ZWJ is Cf, regional indicators and modifiers are So/Sk)
+		{"ZWJ emoji filtered", "Alice👨‍👩‍👧Smith", "AliceSmith"},
+		{"Flag emoji filtered", "Alice🇺🇸Smith", "AliceSmith"},
+		{"Skin tone modifier filtered", "Alice👍🏻Smith", "AliceSmith"},
+
+		// NFKC expansion: U+FDFA (ﷺ) expands to 18 characters in NFKC
+		{"ﷺ×5 NFKC expands", strings.Repeat("\uFDFA", 5), "صلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى الله ع"}, // 5*18=90 -> 64
+
+		// Issue #182: Virama cut (CCC 9) - should not leave dangling virama
+		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62)}, // क + virama + ष cut before the conjunct
 	}
 
 	for _, tt := range tests {
@@ -2605,6 +2624,92 @@ func TestSanitizerUnicode(t *testing.T) {
 				if maxMarks > 3 {
 					t.Errorf("sanitizeInviterName(%q) NFD has %d consecutive marks (max 3 allowed), NFD=%q", tt.input, maxMarks, nfd)
 				}
+			}
+		})
+	}
+}
+
+// TestTruncateUTF8 verifies the UTF-8 truncation helper
+func TestTruncateUTF8(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		max     int
+		wantLen int
+	}{
+		{"empty", "", 10, 0},
+		{"shorter than max", "abc", 10, 3},
+		{"exact max", "abcde", 5, 5},
+		{"max 0", "abc", 0, 0},
+
+		// Cut inside multibyte runes (lead byte should be excluded)
+		{"2-byte rune at cut", "aaa" + "é", 4, 3},       // é is c3 a9, cut at c3
+		{"3-byte rune at cut byte 1", "aa" + "日", 3, 2}, // 日 is e6 97 a5, cut at e6
+		{"3-byte rune at cut byte 2", "aa" + "日", 4, 2}, // cut at 97
+		{"4-byte rune at cut byte 1", "aa" + "😀", 3, 2}, // 😀 is f0 9f 98 80, cut at f0
+		{"4-byte rune at cut byte 2", "aa" + "😀", 4, 2}, // cut at 9f
+		{"4-byte rune at cut byte 3", "aa" + "😀", 5, 2}, // cut at 98
+
+		// Multiple multibyte runes
+		{"multiple 3-byte", strings.Repeat("日", 10), 10, 9}, // 9 bytes = 3 runes
+
+		// Continuation byte runs (exercises backoff loop)
+		{"continuation bytes at cut", "aaa" + string([]byte{0x80, 0x80, 0x80}), 4, 2}, // backs off past 0x80 at position 3
+		{"many continuation bytes", string([]byte{0x80, 0x80, 0x80, 0x80, 0x80}), 3, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncateUTF8(tt.input, tt.max)
+
+			// Check length
+			if len(got) != tt.wantLen {
+				t.Errorf("truncateUTF8(%q, %d) len = %d, want %d", tt.input, tt.max, len(got), tt.wantLen)
+			}
+
+			// Check valid UTF-8
+			if !utf8.ValidString(got) {
+				t.Errorf("truncateUTF8(%q, %d) returned invalid UTF-8: %q", tt.input, tt.max, got)
+			}
+
+			// Check it's a prefix
+			if !strings.HasPrefix(tt.input, got) {
+				t.Errorf("truncateUTF8(%q, %d) = %q, not a prefix", tt.input, tt.max, got)
+			}
+		})
+	}
+}
+
+// TestSanitizerPropertyBeforeFix is a property test that SHOULD FAIL on main (dcc099a)
+// before the guard fix, demonstrating the bugs in issue #181.
+// After the fix (truncateUTF8 + ToValidUTF8), all these properties hold.
+func TestSanitizerPropertyBeforeFix(t *testing.T) {
+	// Test cases that fail on main before the guard fix:
+	// 1. Input over 1024 bytes with multibyte rune at boundary -> invalid UTF-8 in guarded string
+	// 2. Invalid byte mid-string -> non-idempotent (e.g., "\xf0\u00b2" -> "\u00b2" -> "2")
+	testCases := []struct {
+		name  string
+		input string
+	}{
+		{"1022a + 日 at 1024", strings.Repeat("a", 1022) + "日"},
+		{"1021a + 😀 at 1024", strings.Repeat("a", 1021) + "😀"},
+		{"invalid byte disables NFKC", "\xf0\u00b2"}, // should become "2", not "\u00b2"
+		{"0x80 runs near cut", strings.Repeat("a", 1020) + string([]byte{0x80, 0x80, 0x80, 0x80})},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeInviterName(tc.input)
+
+			// Property 1: Output is valid UTF-8
+			if !utf8.ValidString(got) {
+				t.Errorf("sanitizeInviterName(%q) returned invalid UTF-8", tc.name)
+			}
+
+			// Property 2: Idempotent
+			got2 := sanitizeInviterName(got)
+			if got != got2 {
+				t.Errorf("sanitizeInviterName not idempotent for %q: first=%q, second=%q", tc.name, got, got2)
 			}
 		})
 	}
@@ -2651,7 +2756,7 @@ func TestSanitizerHugeInput(t *testing.T) {
 	// Should return 64 'a' characters (truncated at input guard, then at 64 runes)
 	want := strings.Repeat("a", 64)
 	if got != want {
-		t.Errorf("sanitizeInviterName(100KB input) = %q (len %d), want %q (len %d)", got[:20]+"...", len([]rune(got)), want, len([]rune(want)))
+		t.Errorf("sanitizeInviterName(100KB input) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
 	}
 }
 
@@ -2665,6 +2770,37 @@ func TestSanitizerInputGuardInvalidUTF8(t *testing.T) {
 
 	if got != want {
 		t.Errorf("sanitizeInviterName(2000 bytes with invalid at byte 10) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
+}
+
+// TestSanitizerInputGuardContinuationBytes verifies the guard handles continuation byte runs
+func TestSanitizerInputGuardContinuationBytes(t *testing.T) {
+	// Place runs of 0x80 (continuation bytes) near the 1024-byte cut
+	// These are invalid UTF-8 and should be replaced by U+FFFD, then filtered
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			"continuation bytes at 1020-1024",
+			strings.Repeat("a", 1020) + string([]byte{0x80, 0x80, 0x80, 0x80}) + strings.Repeat("b", 100),
+			strings.Repeat("a", 64),
+		},
+		{
+			"continuation bytes before cut",
+			strings.Repeat("a", 1010) + string([]byte{0x80, 0x80}) + strings.Repeat("a", 12) + strings.Repeat("b", 100),
+			strings.Repeat("a", 64), // 0x80 replaced by U+FFFD (category So), filtered out, so we get 1022 'a' -> 64 'a'
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeInviterName(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeInviterName(%s) = %q (len %d), want %q (len %d)", tt.name, got, len([]rune(got)), tt.want, len([]rune(tt.want)))
+			}
+		})
 	}
 }
 
@@ -2697,6 +2833,63 @@ func TestSanitizerTrailingSpaceTrim(t *testing.T) {
 	if got != want {
 		t.Errorf("sanitizeInviterName(63a + space + text) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
 	}
+}
+
+// FuzzSanitizeInviterName verifies invariants over random inputs
+func FuzzSanitizeInviterName(f *testing.F) {
+	// Seed corpus with edge cases
+	f.Add("Alice")
+	f.Add(strings.Repeat("a", 70))
+	f.Add("e\u0300\u0316")                 // non-composing marks
+	f.Add("\uFDFA")                        // NFKC expands
+	f.Add("\xf0\u00b2")                    // invalid byte + NFKC char
+	f.Add(strings.Repeat("a", 1022) + "日") // 3-byte rune at 1024
+	f.Add("क्ष")                           // Indic conjunct (virama)
+
+	f.Fuzz(func(t *testing.T, input string) {
+		got := sanitizeInviterName(input)
+
+		// Invariant 1: Output is valid UTF-8
+		if !utf8.ValidString(got) {
+			t.Errorf("sanitizeInviterName(%q) returned invalid UTF-8: %q", input, got)
+		}
+
+		// Invariant 2: Output is NFC normalized
+		if !norm.NFC.IsNormalString(got) {
+			t.Errorf("sanitizeInviterName(%q) returned non-NFC string: %q", input, got)
+		}
+
+		// Invariant 3: At most 64 runes
+		runeCount := utf8.RuneCountInString(got)
+		if runeCount > 64 {
+			t.Errorf("sanitizeInviterName(%q) returned %d runes (> 64): %q", input, runeCount, got)
+		}
+
+		// Invariant 4: Non-empty (fallback applied if needed)
+		if got == "" {
+			t.Errorf("sanitizeInviterName(%q) returned empty string", input)
+		}
+
+		// Invariant 5: No leading/trailing space
+		if strings.TrimSpace(got) != got {
+			t.Errorf("sanitizeInviterName(%q) has leading/trailing space: %q", input, got)
+		}
+
+		// Invariant 6: No leading combining mark
+		runes := []rune(got)
+		if len(runes) > 0 {
+			firstRune := runes[0]
+			if unicode.Is(unicode.Mn, firstRune) || unicode.Is(unicode.Mc, firstRune) {
+				t.Errorf("sanitizeInviterName(%q) starts with combining mark: %q", input, got)
+			}
+		}
+
+		// Invariant 7: Idempotent
+		got2 := sanitizeInviterName(got)
+		if got != got2 {
+			t.Errorf("sanitizeInviterName not idempotent for input %q: first=%q, second=%q", input, got, got2)
+		}
+	})
 }
 
 // TestAPIClock verifies that api.Server.now is used in createInvite.
@@ -2928,13 +3121,17 @@ func TestInviteAcceptGETWithScopesReturns405(t *testing.T) {
 
 // TestInviteAcceptPathsNeverLogCode verifies that invite codes never appear in
 // logs across all accept paths: POST body, POST query, GET 405, HEAD, landing, failed (issue #28, #146).
+// TestInviteAcceptPathsNeverLogCode verifies that invite codes never appear in
+// logs across all accept paths, including success, error, and failure cases (issue #28, #146, #174).
+// This test captures only the slog logger; there is no http.Server.ErrorLog or access-log middleware today.
 func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
-	var logBuf bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+	var logs syncBuf
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 	srv := newServer(t, Config{Logger: logger})
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+	c := register(t, srv, "carol")
 
-	// Create multiple invites for different paths
+	// Create invites for different test cases
 	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv1 struct{ Code string }
@@ -2950,22 +3147,27 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	var inv3 struct{ Code string }
 	json.Unmarshal(body, &inv3)
 
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv4 struct{ Code string }
+	json.Unmarshal(body, &inv4)
+
 	// Test all accept paths:
 	// 1. POST with body code (successful)
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv1.Code}, nil)
 	want(t, resp, body, 200)
 
-	// 2. POST with query code (successful)
+	// 2. POST with query code (successful, deprecated)
 	resp, body = b.do("POST", "/v1/invites/accept?code="+inv2.Code, nil, nil)
 	want(t, resp, body, 200)
 
 	// 3. Authenticated GET (405)
-	resp, body = b.do("GET", "/v1/invites/accept?code="+inv3.Code, nil, nil)
+	resp, body = c.do("GET", "/v1/invites/accept?code="+inv3.Code, nil, nil)
 	want(t, resp, body, 405)
 
 	// 4. HEAD with auth (405)
 	req, _ := http.NewRequest("HEAD", srv.URL+"/v1/invites/accept?code="+inv3.Code, nil)
-	req.Header.Set("Authorization", "Bearer "+b.key)
+	req.Header.Set("Authorization", "Bearer "+c.key)
 	resp2, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -2980,28 +3182,49 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	resp, body = anon.do("GET", "/v1/invites/accept?code="+inv3.Code, nil, nil)
 	want(t, resp, body, 200)
 
-	// 6. Failed accept (invalid code)
-	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": "inv_doesnotexist"}, nil)
+	// 6. Failed accept (well-formed but unknown code)
+	unknownCode := auth.NewSecret("inv_")
+	resp, body = c.do("POST", "/v1/invites/accept", map[string]any{"code": unknownCode}, nil)
 	want(t, resp, body, 404)
 
+	// 7. Failed: bad scopes (code stays valid)
+	resp, body = c.do("POST", "/v1/invites/accept", map[string]any{"code": inv3.Code, "scopes": []string{"BadScope"}}, nil)
+	want(t, resp, body, 400)
+
+	// 8. Failed: accepting own invite (code stays valid)
+	resp, body = a.do("POST", "/v1/invites/accept", map[string]any{"code": inv4.Code}, nil)
+	want(t, resp, body, 400)
+
+	// 9. Failed: body/query mismatch (both codes stay valid)
+	resp, body = c.do("POST", "/v1/invites/accept?code="+inv3.Code, map[string]any{"code": inv4.Code}, nil)
+	want(t, resp, body, 400)
+
+	// Positive control: assert logs captured expected events
+	logStr := logs.String()
+	if !strings.Contains(logStr, "pairing accepted") {
+		t.Error("logs should contain 'pairing accepted' (positive control)")
+	}
+	if !strings.Contains(logStr, "peer registered") {
+		t.Error("logs should contain 'peer registered' (positive control)")
+	}
+
 	// Check logs don't contain any of the codes or their prefixes
-	logs := logBuf.String()
-	for _, code := range []string{inv1.Code, inv2.Code, inv3.Code, "inv_doesnotexist"} {
-		if strings.Contains(logs, code) {
+	for _, code := range []string{inv1.Code, inv2.Code, inv3.Code, inv4.Code, unknownCode} {
+		if strings.Contains(logStr, code) {
 			t.Errorf("invite code %s found in logs", code)
 		}
-		if len(code) >= 10 && strings.Contains(logs, code[:10]) {
+		if len(code) >= 10 && strings.Contains(logStr, code[:10]) {
 			t.Errorf("invite code prefix %s found in logs", code[:10])
 		}
 	}
 }
 
-// TestInviteAccept405Comprehensive covers all the edge cases from issue #146.
+// TestInviteAccept405Comprehensive covers all the edge cases from issue #146 and #174.
 func TestInviteAccept405Comprehensive(t *testing.T) {
 	srv := newServer(t, Config{})
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
 
-	// Create three invites: valid, to-be-used, to-be-expired
+	// Create invites with different states: valid, used, expired, missing
 	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv1 struct{ Code string }
@@ -3012,11 +3235,19 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	var inv2 struct{ Code string }
 	json.Unmarshal(body, &inv2)
 
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
+	want(t, resp, body, 201)
+	var inv3 struct{ Code string }
+	json.Unmarshal(body, &inv3)
+	time.Sleep(2 * time.Second) // Let it expire
+
 	// Use inv2
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
 	want(t, resp, body, 200)
 
-	// Test 1: HEAD with auth returns 405 and does not consume invite
+	missingCode := auth.NewSecret("inv_")
+
+	// Test 1: HEAD with auth returns 405 with deprecation headers
 	req, _ := http.NewRequest("HEAD", srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
 	req.Header.Set("Authorization", "Bearer "+b.key)
 	resp2, err := http.DefaultClient.Do(req)
@@ -3030,6 +3261,12 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	if resp2.Header.Get("Allow") != "POST" {
 		t.Errorf("HEAD Allow header: want POST, got %s", resp2.Header.Get("Allow"))
 	}
+	if resp2.Header.Get("Deprecation") == "" {
+		t.Error("HEAD with auth: missing Deprecation header")
+	}
+	if resp2.Header.Get("Link") == "" {
+		t.Error("HEAD with auth: missing Link header")
+	}
 
 	// Test 2: HEAD without auth shows landing page (ServeMux routes HEAD to GET)
 	req, _ = http.NewRequest("HEAD", srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
@@ -3041,16 +3278,18 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	if resp2.StatusCode != 200 {
 		t.Errorf("HEAD without auth: want 200, got %d", resp2.StatusCode)
 	}
+	if resp2.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("HEAD without auth: want Cache-Control no-store, got %s", resp2.Header.Get("Cache-Control"))
+	}
 
 	// Test 3: GET with invalid/bogus Bearer token returns 405 (not 401)
-	// The handler checks Authorization != "" before key validation
 	resp, body = b.do("GET", "/v1/invites/accept?code="+inv1.Code, nil, map[string]string{"Authorization": "Bearer pl_bogus"})
 	want(t, resp, body, 405)
 	if !strings.Contains(string(body), "use POST to accept") {
 		t.Errorf("bogus key GET body: %s", body)
 	}
 
-	// Test 4: 405 body and headers are identical for valid, used, missing codes
+	// Test 4: 405 responses are identical for valid, used, expired, missing codes (no oracle)
 	get405 := func(code string) ([]byte, http.Header) {
 		r, b := b.do("GET", "/v1/invites/accept?code="+code, nil, nil)
 		if r.StatusCode != 405 {
@@ -3060,12 +3299,27 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	}
 	validBody, validHdr := get405(inv1.Code)
 	usedBody, usedHdr := get405(inv2.Code)
-	missingBody, missingHdr := get405("inv_doesnotexist")
-	if !bytes.Equal(validBody, usedBody) || !bytes.Equal(validBody, missingBody) {
-		t.Errorf("405 bodies differ:\nvalid: %s\nused: %s\nmissing: %s", validBody, usedBody, missingBody)
-	}
-	if validHdr.Get("Allow") != usedHdr.Get("Allow") || validHdr.Get("Allow") != missingHdr.Get("Allow") {
-		t.Errorf("Allow headers differ: valid=%s used=%s missing=%s", validHdr.Get("Allow"), usedHdr.Get("Allow"), missingHdr.Get("Allow"))
+	expiredBody, expiredHdr := get405(inv3.Code)
+	missingBody, missingHdr := get405(missingCode)
+
+	for i, pair := range []struct {
+		name string
+		body []byte
+		hdr  http.Header
+	}{
+		{"used", usedBody, usedHdr},
+		{"expired", expiredBody, expiredHdr},
+		{"missing", missingBody, missingHdr},
+	} {
+		if !bytes.Equal(validBody, pair.body) {
+			t.Errorf("405 body differs for %s:\nvalid: %s\n%s: %s", pair.name, validBody, pair.name, pair.body)
+		}
+		for _, h := range []string{"Allow", "Content-Type", "Deprecation", "Link"} {
+			if validHdr.Get(h) != pair.hdr.Get(h) {
+				t.Errorf("405 header %s differs for %s (test %d): valid=%q %s=%q",
+					h, pair.name, i, validHdr.Get(h), pair.name, pair.hdr.Get(h))
+			}
+		}
 	}
 
 	// Test 5: Body and query code mismatch returns 400
@@ -3075,8 +3329,10 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 		t.Errorf("mismatch error: %s", body)
 	}
 
-	// Test 6: Other methods (PUT, PATCH, DELETE) return 405 or 404 and don't change state
-	for _, method := range []string{"PUT", "PATCH", "DELETE"} {
+	// Test 6: Other methods (strict, issue #174)
+	// PUT/PATCH should get 405 from the authed mux (handler exists but wrong method).
+	// DELETE gets 404 (no handler at all in authed mux).
+	for _, method := range []string{"PUT", "PATCH"} {
 		r, _ := http.NewRequest(method, srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
 		r.Header.Set("Authorization", "Bearer "+b.key)
 		rsp, err := http.DefaultClient.Do(r)
@@ -3084,18 +3340,54 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 			t.Fatal(err)
 		}
 		rsp.Body.Close()
-		if rsp.StatusCode != 405 && rsp.StatusCode != 404 {
-			t.Errorf("%s: want 405 or 404, got %d", method, rsp.StatusCode)
+		if rsp.StatusCode != 405 {
+			t.Errorf("%s: want 405, got %d", method, rsp.StatusCode)
+		}
+		if rsp.Header.Get("Allow") == "" {
+			t.Errorf("%s: missing Allow header", method)
 		}
 	}
-
-	// Test 7: Trailing slash doesn't accept
-	resp, body = b.do("POST", "/v1/invites/accept/?code="+inv1.Code, nil, nil)
-	if resp.StatusCode != 404 && resp.StatusCode != 301 {
-		t.Errorf("trailing slash: want 404 or 301, got %d", resp.StatusCode)
+	// DELETE: no handler in authed mux, should get 404
+	r, _ := http.NewRequest("DELETE", srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
+	r.Header.Set("Authorization", "Bearer "+b.key)
+	rsp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsp.Body.Close()
+	if rsp.StatusCode != 404 {
+		t.Errorf("DELETE: want 404, got %d", rsp.StatusCode)
 	}
 
-	// Test 8: Unauthenticated landing with bad code returns 400
+	// Test 7: Trailing slash returns 404 (strict, issue #174)
+	resp, body = b.do("POST", "/v1/invites/accept/?code="+inv1.Code, nil, nil)
+	if resp.StatusCode != 404 {
+		t.Errorf("trailing slash POST: want 404, got %d", resp.StatusCode)
+	}
+	req, _ = http.NewRequest("GET", srv.URL+"/v1/invites/accept/?code="+inv1.Code, nil)
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	resp2, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 404 {
+		t.Errorf("trailing slash GET: want 404, got %d", resp2.StatusCode)
+	}
+
+	// Test 8: HEAD trailing slash
+	req, _ = http.NewRequest("HEAD", srv.URL+"/v1/invites/accept/?code="+inv1.Code, nil)
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	resp2, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 404 {
+		t.Errorf("HEAD trailing slash: want 404, got %d", resp2.StatusCode)
+	}
+
+	// Test 9: Unauthenticated landing with bad code returns 400
 	anon := &client{t: t, srv: srv, key: ""}
 	resp, body = anon.do("GET", "/v1/invites/accept?code=inv_bad", nil, nil)
 	want(t, resp, body, 400)
@@ -3110,6 +3402,8 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 
 // TestInviteAcceptDeprecationHeaders verifies that query-only codes get
 // Deprecation and Link headers, but body codes do not (issue #28, #146).
+// TestInviteAcceptDeprecationHeaders verifies RFC 9745 deprecation headers
+// on all responses where the request has ?code= (issue #28, #146, #173, #174).
 func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 	srv := newServer(t, Config{})
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
@@ -3124,29 +3418,428 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 	var inv2 struct{ Code string }
 	json.Unmarshal(body, &inv2)
 
-	// Query-only code: should have Deprecation and Link headers
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv3 struct{ Code string }
+	json.Unmarshal(body, &inv3)
+
+	// 1. Query-only POST success: should have headers and Cache-Control
 	resp, body = b.do("POST", "/v1/invites/accept?code="+inv1.Code, nil, nil)
 	want(t, resp, body, 200)
 	if resp.Header.Get("Deprecation") == "" {
-		t.Error("query-only code: missing Deprecation header")
+		t.Error("query-only POST success: missing Deprecation header")
 	}
 	if !strings.HasPrefix(resp.Header.Get("Deprecation"), "@") {
-		t.Errorf("Deprecation header format: want @<unix>, got %s", resp.Header.Get("Deprecation"))
+		t.Errorf("Deprecation format: want @<unix>, got %s", resp.Header.Get("Deprecation"))
 	}
 	if resp.Header.Get("Link") == "" {
-		t.Error("query-only code: missing Link header")
+		t.Error("query-only POST success: missing Link header")
 	}
 	if !strings.Contains(resp.Header.Get("Link"), "rel=\"deprecation\"") {
-		t.Errorf("Link header: want rel=deprecation, got %s", resp.Header.Get("Link"))
+		t.Errorf("Link rel: want deprecation, got %s", resp.Header.Get("Link"))
+	}
+	if resp.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("query-only POST success: want Cache-Control no-store, got %s", resp.Header.Get("Cache-Control"))
 	}
 
-	// Body code: should NOT have Deprecation or Link headers
+	// 2. Body-only POST success: should NOT have deprecation headers
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
 	want(t, resp, body, 200)
 	if resp.Header.Get("Deprecation") != "" {
-		t.Errorf("body code: unexpected Deprecation header: %s", resp.Header.Get("Deprecation"))
+		t.Errorf("body-only POST: unexpected Deprecation header: %s", resp.Header.Get("Deprecation"))
 	}
 	if resp.Header.Get("Link") != "" {
-		t.Errorf("body code: unexpected Link header: %s", resp.Header.Get("Link"))
+		t.Errorf("body-only POST: unexpected Link header: %s", resp.Header.Get("Link"))
+	}
+	if resp.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("body-only POST: want Cache-Control no-store, got %s", resp.Header.Get("Cache-Control"))
+	}
+
+	// 3. Query-only POST error (404): should have headers (issue #173)
+	resp, body = b.do("POST", "/v1/invites/accept?code="+inv1.Code, nil, nil) // already used
+	want(t, resp, body, 404)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("query-only POST 404: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("query-only POST 404: missing Link header")
+	}
+
+	// 4. Query-only POST error (400: bad scopes): should have headers
+	resp, body = b.do("POST", "/v1/invites/accept?code="+inv3.Code, map[string]any{"scopes": []string{"BadScope"}}, nil)
+	want(t, resp, body, 400)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("query-only POST 400 bad scopes: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("query-only POST 400 bad scopes: missing Link header")
+	}
+
+	// 5. Query-only POST error (400: own invite): should have headers
+	resp, body = a.do("POST", "/v1/invites/accept?code="+inv3.Code, nil, nil)
+	want(t, resp, body, 400)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("query-only POST 400 own invite: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("query-only POST 400 own invite: missing Link header")
+	}
+
+	// 6. Body+query POST (body wins): should have headers (issue #173)
+	resp, body = b.do("POST", "/v1/invites/accept?code="+inv3.Code, map[string]any{"code": inv3.Code}, nil)
+	want(t, resp, body, 200)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("body+query POST: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("body+query POST: missing Link header")
+	}
+
+	// 7. Unauthenticated landing GET with ?code=: should have headers (issue #173)
+	anon := &client{t: t, srv: srv, key: ""}
+	resp, body = anon.do("GET", "/v1/invites/accept?code="+inv2.Code, nil, nil)
+	want(t, resp, body, 200)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("unauthenticated landing GET: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("unauthenticated landing GET: missing Link header")
+	}
+	if resp.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("unauthenticated landing GET: want Cache-Control no-store, got %s", resp.Header.Get("Cache-Control"))
+	}
+
+	// 8. Authenticated GET 405 with ?code=: should have headers (already tested in 405 comprehensive)
+	resp, body = b.do("GET", "/v1/invites/accept?code="+inv2.Code, nil, nil)
+	want(t, resp, body, 405)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("authenticated GET 405: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("authenticated GET 405: missing Link header")
+	}
+}
+
+func TestPairingLookupsBoundedPerIP(t *testing.T) {
+	srv := newServer(t, Config{})
+	anon := &client{t: t, srv: srv}
+	notFound, limited := 0, 0
+	for i := 0; i < 100; i++ {
+		resp, _ := anon.do("POST", "/v1/pairing/"+auth.NewPairingToken(), map[string]any{"name": "x"}, nil)
+		switch resp.StatusCode {
+		case http.StatusNotFound:
+			notFound++
+		case http.StatusTooManyRequests:
+			limited++
+		default:
+			t.Fatalf("unexpected status %d", resp.StatusCode)
+		}
+	}
+	if notFound > 5 || limited < 95 {
+		t.Fatalf("lookups not bounded: 404=%d 429=%d", notFound, limited)
+	}
+}
+
+func TestCSPNonceUniqueAndErrorResponsesStrict(t *testing.T) {
+	srv := newServer(t, Config{})
+	nonce := func() string {
+		resp, err := http.Get(srv.URL + "/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		v := resp.Header.Values("Content-Security-Policy")
+		if len(v) != 1 {
+			t.Fatalf("want one CSP header, got %v", v)
+		}
+		m := regexp.MustCompile(`script-src 'nonce-([^']+)'`).FindStringSubmatch(v[0])
+		if m == nil {
+			t.Fatalf("no nonce in %q", v[0])
+		}
+		raw, err := base64.StdEncoding.DecodeString(m[1])
+		if err != nil || len(raw) < 16 {
+			t.Fatalf("bad nonce %q: %v", m[1], err)
+		}
+		return m[1]
+	}
+	if nonce() == nonce() {
+		t.Fatal("nonce reused across requests")
+	}
+	const strict = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+	for _, c := range []struct{ method, path string }{{"GET", "/v1/me"}, {"GET", "/nope"}, {"POST", "/"}, {"POST", "/healthz"}} {
+		req, _ := http.NewRequest(c.method, srv.URL+c.path, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if got := resp.Header.Get("Content-Security-Policy"); got != strict {
+			t.Errorf("%s %s (%d): CSP %q", c.method, c.path, resp.StatusCode, got)
+		}
+	}
+}
+
+func TestVersionEndpoint(t *testing.T) {
+	tests := []struct {
+		name        string
+		detail      string
+		wantStatus  int
+		wantKeys    []string
+		wantMissing []string
+	}{
+		{
+			name:        "minimal (default)",
+			detail:      "",
+			wantStatus:  http.StatusOK,
+			wantKeys:    []string{"version"},
+			wantMissing: []string{"commit", "build_time"},
+		},
+		{
+			name:        "minimal explicit",
+			detail:      "minimal",
+			wantStatus:  http.StatusOK,
+			wantKeys:    []string{"version"},
+			wantMissing: []string{"commit", "build_time"},
+		},
+		{
+			name:       "full",
+			detail:     "full",
+			wantStatus: http.StatusOK,
+			wantKeys:   []string{"version", "commit", "build_time"},
+		},
+		{
+			name:       "off",
+			detail:     "off",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:        "unknown value falls back to minimal",
+			detail:      "invalid",
+			wantStatus:  http.StatusOK,
+			wantKeys:    []string{"version"},
+			wantMissing: []string{"commit", "build_time"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newServer(t, Config{VersionDetail: tt.detail})
+			req, _ := http.NewRequest("GET", srv.URL+"/version", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("expected status %d, got %d", tt.wantStatus, resp.StatusCode)
+			}
+
+			// Check Cache-Control header
+			if cc := resp.Header.Get("Cache-Control"); !strings.Contains(cc, "no-store") {
+				t.Errorf("expected Cache-Control to contain no-store, got %q", cc)
+			}
+
+			if tt.wantStatus == http.StatusOK {
+				var info map[string]string
+				if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+					t.Fatalf("failed to decode response: %v", err)
+				}
+
+				// Assert exact key set
+				expectedKeys := make(map[string]bool)
+				for _, key := range tt.wantKeys {
+					expectedKeys[key] = true
+				}
+				for key := range info {
+					if !expectedKeys[key] {
+						t.Errorf("unexpected key %q in response (expected only %v)", key, tt.wantKeys)
+					}
+				}
+
+				// Check expected keys are present and non-empty
+				for _, key := range tt.wantKeys {
+					val, ok := info[key]
+					if !ok {
+						t.Errorf("missing expected key %q", key)
+					} else if val == "" {
+						t.Errorf("key %q has empty value", key)
+					}
+				}
+
+				// Check unwanted keys are absent
+				for _, key := range tt.wantMissing {
+					if _, ok := info[key]; ok {
+						t.Errorf("unexpected key %q present", key)
+					}
+				}
+
+				// For full mode, commit should be short (<=12 chars or "unknown")
+				if tt.detail == "full" {
+					commit := info["commit"]
+					if commit != "unknown" && len(commit) > 12 {
+						t.Errorf("full mode commit should be <=12 chars, got %d (%q)", len(commit), commit)
+					}
+				}
+
+				// Version should never expose branch names
+				version := info["version"]
+				if strings.Contains(version, "/") || strings.Contains(version, "merge") {
+					t.Errorf("version should not contain branch-like strings, got %q", version)
+				}
+
+				// Assert security headers from securityHeaders wrapper
+				headers := map[string]string{
+					"Content-Security-Policy": "default-src 'none'",
+					"X-Frame-Options":         "DENY",
+					"X-Content-Type-Options":  "nosniff",
+					"Referrer-Policy":         "no-referrer",
+				}
+				for header, expectedSubstring := range headers {
+					value := resp.Header.Get(header)
+					if !strings.Contains(value, expectedSubstring) {
+						t.Errorf("header %s should contain %q, got: %s", header, expectedSubstring, value)
+					}
+				}
+			}
+
+			// Check Content-Type (except for off mode, which returns plain text 404)
+			if tt.detail != "off" {
+				if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+					t.Errorf("expected Content-Type application/json, got %s", ct)
+				}
+			}
+		})
+	}
+}
+
+func TestVersionEndpointNoAuth(t *testing.T) {
+	// Version endpoint should be public (no auth required) even with RegisterToken
+	srv := newServer(t, Config{RegisterToken: "secret"})
+	req, _ := http.NewRequest("GET", srv.URL+"/version", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("version endpoint should not require auth, got status %d", resp.StatusCode)
+	}
+}
+
+func TestVersionEndpointRateLimit(t *testing.T) {
+	srv := newServer(t, Config{})
+	client := http.Client{Timeout: 2 * time.Second}
+	foundRateLimit := false
+
+	// The version endpoint has a separate limiter with burst of 30
+	for i := 0; i < 50; i++ {
+		req, _ := http.NewRequest("GET", srv.URL+"/version", nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			foundRateLimit = true
+
+			// Check for Retry-After header
+			if ra := resp.Header.Get("Retry-After"); ra == "" {
+				t.Error("429 response should include Retry-After header")
+			}
+
+			// Check uniform 429 body
+			var errResp map[string]string
+			if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+				t.Errorf("failed to decode 429 body: %v", err)
+			} else if errMsg, ok := errResp["error"]; !ok || !strings.Contains(errMsg, "rate") {
+				t.Errorf("429 response should contain rate limit error, got: %v", errResp)
+			}
+
+			// Verify security headers are present on 429
+			if csp := resp.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'none'") {
+				t.Errorf("429 missing strict CSP, got: %s", csp)
+			}
+
+			resp.Body.Close()
+			break
+		}
+		resp.Body.Close()
+	}
+
+	if !foundRateLimit {
+		t.Fatal("versionLim not wired: no 429 returned after 50 requests (burst is 30)")
+	}
+}
+
+func TestVersionEndpointHEAD(t *testing.T) {
+	srv := newServer(t, Config{})
+	req, _ := http.NewRequest("HEAD", srv.URL+"/version", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("HEAD /version should return 200, got %d", resp.StatusCode)
+	}
+
+	// Content-Type should still be set
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected Content-Type application/json, got %s", ct)
+	}
+
+	// Body should be empty for HEAD
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) > 0 {
+		t.Errorf("HEAD response should have empty body, got %d bytes", len(body))
+	}
+}
+
+func TestVersionEndpointMethodNotAllowed(t *testing.T) {
+	srv := newServer(t, Config{})
+	methods := []string{"POST", "PUT", "DELETE", "PATCH"}
+
+	for _, method := range methods {
+		t.Run(method, func(t *testing.T) {
+			req, _ := http.NewRequest(method, srv.URL+"/version", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusMethodNotAllowed {
+				t.Errorf("%s /version should return 405, got %d", method, resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestVersionOffIndistinguishableFromUnknownRoute(t *testing.T) {
+	srv := newServer(t, Config{VersionDetail: "off"})
+	probe := func(method, path string) (int, string, string, string) {
+		req, _ := http.NewRequest(method, srv.URL+path, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, resp.Header.Get("Content-Type"), resp.Header.Get("Allow"), string(b)
+	}
+	for _, m := range []string{"GET", "HEAD", "POST"} {
+		c1, t1, a1, b1 := probe(m, "/version")
+		c2, t2, a2, b2 := probe(m, "/does-not-exist")
+		if c1 != c2 || t1 != t2 || a1 != a2 || b1 != b2 {
+			t.Errorf("%s /version differs from unknown route: %d %q %q %q vs %d %q %q %q", m, c1, t1, a1, b1, c2, t2, a2, b2)
+		}
+	}
+	for i := 0; i < 40; i++ {
+		if c, _, _, _ := probe("GET", "/version"); c == http.StatusTooManyRequests {
+			t.Fatal("off mode must never rate limit")
+		}
 	}
 }

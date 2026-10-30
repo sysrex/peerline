@@ -443,3 +443,13 @@ func TestNotifyDevModeNoBodyLeakage(t *testing.T) {
 		t.Fatalf("dev mode log leaked email structure: %s", l)
 	}
 }
+
+func TestBodyPreviewRedactsAllTokenKinds(t *testing.T) {
+	for _, tok := range []string{auth.NewSecret("inv_"), auth.NewPairingToken(), auth.NewKey(), "inv_" + strings.Repeat("a", 64)} {
+		for _, in := range []string{"code " + tok + " ok", "http://x/v1/pairing/" + tok, "?code=" + tok} {
+			if got := bodyPreview(in, "", 500); strings.Contains(got, tok[4:]) {
+				t.Errorf("%q leaked token: %q", in, got)
+			}
+		}
+	}
+}
