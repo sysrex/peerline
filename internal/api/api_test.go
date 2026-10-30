@@ -1214,6 +1214,162 @@ func TestSecurityHeaders(t *testing.T) {
 	}
 }
 
+func TestCSPNoUnsafeInline(t *testing.T) {
+	srv := newServer(t, Config{})
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{"home page", "/"},
+		{"public stats API", "/v1/public/stats"},
+		{"healthz", "/healthz"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, _ := doAnon(t, srv, "GET", tt.path, nil, nil)
+			csp := resp.Header.Get("Content-Security-Policy")
+			if csp == "" {
+				t.Error("missing Content-Security-Policy header")
+				return
+			}
+			if strings.Contains(csp, "unsafe-inline") {
+				t.Errorf("CSP contains 'unsafe-inline': %s", csp)
+			}
+		})
+	}
+
+	// Test an authenticated API route
+	a := register(t, srv, "alice")
+	resp, _ := a.do("GET", "/v1/me", nil, nil)
+	csp := resp.Header.Get("Content-Security-Policy")
+	if csp == "" {
+		t.Error("/v1/me: missing Content-Security-Policy header")
+	} else if strings.Contains(csp, "unsafe-inline") {
+		t.Errorf("/v1/me: CSP contains 'unsafe-inline': %s", csp)
+	}
+}
+
+func TestCSPHomePageNonce(t *testing.T) {
+	srv := newServer(t, Config{})
+	anon := &client{t: t, srv: srv}
+
+	resp, body := anon.do("GET", "/", nil, nil)
+	want(t, resp, body, 200)
+
+	csp := resp.Header.Get("Content-Security-Policy")
+	if csp == "" {
+		t.Fatal("missing CSP header")
+	}
+
+	// Extract nonce from CSP header
+	// Expected format: script-src 'nonce-...'
+	var nonce string
+	for _, part := range strings.Split(csp, ";") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "script-src ") {
+			// Extract nonce value
+			if idx := strings.Index(part, "'nonce-"); idx >= 0 {
+				nonceStart := idx + len("'nonce-")
+				if endIdx := strings.Index(part[nonceStart:], "'"); endIdx >= 0 {
+					nonce = part[nonceStart : nonceStart+endIdx]
+					break
+				}
+			}
+		}
+	}
+
+	if nonce == "" {
+		t.Fatalf("no nonce found in CSP: %s", csp)
+	}
+
+	// Verify the nonce appears in both the style and script tags
+	html := string(body)
+	expectedStyle := `<style nonce="` + nonce + `">`
+	expectedScript := `<script nonce="` + nonce + `">`
+
+	if !strings.Contains(html, expectedStyle) {
+		t.Errorf("style tag missing nonce attribute: want %q", expectedStyle)
+	}
+	if !strings.Contains(html, expectedScript) {
+		t.Errorf("script tag missing nonce attribute: want %q", expectedScript)
+	}
+
+	// Verify CSP includes base-uri and form-action
+	if !strings.Contains(csp, "base-uri 'none'") {
+		t.Errorf("CSP missing base-uri 'none': %s", csp)
+	}
+	if !strings.Contains(csp, "form-action 'none'") {
+		t.Errorf("CSP missing form-action 'none': %s", csp)
+	}
+	// Verify CSP includes connect-src for fetch() calls
+	if !strings.Contains(csp, "connect-src 'self'") {
+		t.Errorf("CSP missing connect-src 'self': %s", csp)
+	}
+}
+
+func TestCSPAPIRoutesStrict(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+
+	tests := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{"me", "GET", "/v1/me"},
+		{"inbox", "GET", "/v1/inbox"},
+		{"public stats", "GET", "/v1/public/stats"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var resp *http.Response
+			var body []byte
+			if tt.path == "/v1/public/stats" {
+				anon := &client{t: t, srv: srv}
+				resp, body = anon.do(tt.method, tt.path, nil, nil)
+			} else {
+				resp, body = a.do(tt.method, tt.path, nil, nil)
+			}
+			want(t, resp, body, 200)
+
+			csp := resp.Header.Get("Content-Security-Policy")
+			if csp == "" {
+				t.Error("missing CSP header")
+				return
+			}
+
+			// API routes should have strict CSP
+			if !strings.Contains(csp, "default-src 'none'") {
+				t.Errorf("CSP missing default-src 'none': %s", csp)
+			}
+			if !strings.Contains(csp, "frame-ancestors 'none'") {
+				t.Errorf("CSP missing frame-ancestors 'none': %s", csp)
+			}
+			if !strings.Contains(csp, "base-uri 'none'") {
+				t.Errorf("CSP missing base-uri 'none': %s", csp)
+			}
+			if !strings.Contains(csp, "form-action 'none'") {
+				t.Errorf("CSP missing form-action 'none': %s", csp)
+			}
+
+			// Should not have script-src or style-src at all
+			if strings.Contains(csp, "script-src") {
+				t.Errorf("API route should not have script-src: %s", csp)
+			}
+			if strings.Contains(csp, "style-src") {
+				t.Errorf("API route should not have style-src: %s", csp)
+			}
+			// Should not have connect-src (API routes don't need it)
+			if strings.Contains(csp, "connect-src") {
+				t.Errorf("API route should not have connect-src: %s", csp)
+			}
+		})
+	}
+}
+
 func TestNameSanitization(t *testing.T) {
 	tests := []struct {
 		name  string
