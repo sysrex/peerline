@@ -3890,8 +3890,8 @@ func TestVersionEndpoint(t *testing.T) {
 				// For full mode, commit should be short (<=12 chars or "unknown")
 				if tt.detail == "full" {
 					commit := info["commit"]
-					if commit != "unknown" && len(commit) > 12 {
-						t.Errorf("full mode commit should be <=12 chars, got %d (%q)", len(commit), commit)
+					if commit != "unknown" && len(strings.TrimSuffix(commit, "-dirty")) > 12 {
+						t.Errorf("full mode commit should be <=12 chars (plus -dirty), got %d (%q)", len(commit), commit)
 					}
 				}
 

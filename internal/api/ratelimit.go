@@ -326,6 +326,7 @@ func (lm *LimiterManager) all() []*msg.Limiter {
 		lm.pairLim,
 		lm.failLim,
 		lm.getLim,
+		lm.versionLim,
 		lm.authLim,
 		lm.writeLim,
 		lm.bagWriteLim,

@@ -262,6 +262,18 @@ func TestInfoValidatesInjectedValues(t *testing.T) {
 		{"branch prerelease", "v1.2.3-feature-x", "abc1234", "2026-01-02T03:04:05Z", "dev", "abc1234", "2026-01-02T03:04:05Z"},
 		{"release", "v1.2.3", "abc1234", "2026-01-02T03:04:05Z", "v1.2.3", "abc1234", "2026-01-02T03:04:05Z"},
 		{"malformed commit and time", "v1.2.3", "zz<script>", "yesterday", "v1.2.3", "unknown", "unknown"},
+		{"leading zero major", "v01.2.3", "abc1234", "2026-01-02T03:04:05Z", "dev", "abc1234", "2026-01-02T03:04:05Z"},
+		{"leading zero minor", "v1.02.3", "abc1234", "2026-01-02T03:04:05Z", "dev", "abc1234", "2026-01-02T03:04:05Z"},
+		{"11-digit component", "v1.2.12345678901", "abc1234", "2026-01-02T03:04:05Z", "dev", "abc1234", "2026-01-02T03:04:05Z"},
+		{"huge component", "v1.2." + strings.Repeat("9", 5000), "abc1234", "2026-01-02T03:04:05Z", "dev", "abc1234", "2026-01-02T03:04:05Z"},
+		{"trailing newline", "v1.2.3\n", "abc1234", "2026-01-02T03:04:05Z", "dev", "abc1234", "2026-01-02T03:04:05Z"},
+		{"bare zero", "0", "abc1234", "2026-01-02T03:04:05Z", "dev", "abc1234", "2026-01-02T03:04:05Z"},
+		{"zero release", "v0.0.0", "abc1234", "2026-01-02T03:04:05Z", "v0.0.0", "abc1234", "2026-01-02T03:04:05Z"},
+		{"10-digit component", "v1.2.1234567890", "abc1234", "2026-01-02T03:04:05Z", "v1.2.1234567890", "abc1234", "2026-01-02T03:04:05Z"},
+		{"41-hex commit", "v1.2.3", strings.Repeat("a", 41), "2026-01-02T03:04:05Z", "v1.2.3", "unknown", "2026-01-02T03:04:05Z"},
+		{"uppercase commit", "v1.2.3", "ABC1234", "2026-01-02T03:04:05Z", "v1.2.3", "unknown", "2026-01-02T03:04:05Z"},
+		{"huge fraction time", "v1.2.3", "abc1234", "2026-01-02T03:04:05." + strings.Repeat("1", 5000) + "Z", "v1.2.3", "abc1234", "unknown"},
+		{"time trailing newline", "v1.2.3", "abc1234", "2026-01-02T03:04:05Z" + "\n", "v1.2.3", "abc1234", "unknown"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -273,5 +285,15 @@ func TestInfoValidatesInjectedValues(t *testing.T) {
 				t.Errorf("got %v", got)
 			}
 		})
+	}
+}
+
+func TestShortCommitKeepsDirtyMarker(t *testing.T) {
+	defer func() { once = sync.Once{}; infoOnce = nil }()
+	once = sync.Once{}
+	infoOnce = map[string]string{"commit": strings.Repeat("a", 40), "dirty": "true"}
+	once.Do(func() {})
+	if got, want := ShortCommit(), strings.Repeat("a", 12)+"-dirty"; got != want {
+		t.Errorf("ShortCommit() = %q, want %q", got, want)
 	}
 }

@@ -34,6 +34,8 @@ var releaseVersionRE = regexp.MustCompile(`^v?(0|[1-9][0-9]{0,9})\.(0|[1-9][0-9]
 
 var commitRE = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
 
+const maxBuildTimeLen = 40
+
 // Info returns version information as a structured map.
 // Computed once on first call.
 func Info() map[string]string {
@@ -69,17 +71,19 @@ func Info() map[string]string {
 		if !commitRE.MatchString(commit) {
 			commit = "unknown"
 		}
-		if _, err := time.Parse(time.RFC3339, buildTime); err != nil {
+		if _, err := time.Parse(time.RFC3339, buildTime); err != nil || len(buildTime) > maxBuildTimeLen {
 			buildTime = "unknown"
 		}
+		dirtyStr := "false"
 		if dirty && commit != "unknown" {
-			commit += "-dirty"
+			dirtyStr = "true"
 		}
 
 		infoOnce = map[string]string{
 			"version":    version,
 			"commit":     commit,
 			"build_time": buildTime,
+			"dirty":      dirtyStr,
 		}
 	})
 	return infoOnce
@@ -98,13 +102,20 @@ func normalizeVersion(v string) string {
 	return "dev"
 }
 
-// ShortCommit returns the first 12 characters of the commit SHA.
+// ShortCommit returns the first 12 characters of the commit SHA, plus "-dirty" for a modified tree.
 func ShortCommit() string {
-	commit := Info()["commit"]
-	if commit == "unknown" || len(commit) <= 12 {
+	info := Info()
+	commit := info["commit"]
+	if commit == "unknown" {
 		return commit
 	}
-	return commit[:12]
+	if len(commit) > 12 {
+		commit = commit[:12]
+	}
+	if info["dirty"] == "true" {
+		commit += "-dirty"
+	}
+	return commit
 }
 
 // String returns a human-readable version string.
@@ -116,5 +127,5 @@ func String() string {
 // NeedsAttention returns true if the version information suggests a problem.
 func NeedsAttention() bool {
 	info := Info()
-	return info["commit"] == "unknown" || info["commit"] == "unknown-dirty"
+	return info["commit"] == "unknown"
 }
