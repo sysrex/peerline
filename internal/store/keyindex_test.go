@@ -36,7 +36,7 @@ func TestKeyIndexRebuildOnStart(t *testing.T) {
 		keyHash := auth.Hash(apiKey)
 
 		// Create peer in store
-		if err := st.CreatePeer(context.Background(), id, name, keyHash, ""); err != nil {
+		if err := st.CreatePeer(context.Background(), id, name, keyHash, "", ""); err != nil {
 			t.Fatal(err)
 		}
 		peers = append(peers, struct {
@@ -118,7 +118,7 @@ func TestKeyIndexRevokeRemoval(t *testing.T) {
 	peerID := auth.NewID()
 	oldKey := auth.NewKey()
 	oldHash := auth.Hash(oldKey)
-	if err := st.CreatePeer(context.Background(), peerID, "alice", oldHash, ""); err != nil {
+	if err := st.CreatePeer(context.Background(), peerID, "alice", oldHash, "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -165,7 +165,7 @@ func TestKeyIndexRevokeRemoval(t *testing.T) {
 	bobID := auth.NewID()
 	oldKey2 := auth.NewKey()
 	oldHash2 := auth.Hash(oldKey2)
-	if err := st.CreatePeer(context.Background(), bobID, "bob", oldHash2, ""); err != nil {
+	if err := st.CreatePeer(context.Background(), bobID, "bob", oldHash2, "", ""); err != nil {
 		t.Fatal(err)
 	}
 
