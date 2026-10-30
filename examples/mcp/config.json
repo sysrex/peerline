@@ -1,0 +1,30 @@
+{
+  "oauth": {
+    "resource_url": "https://mcp.example.com/mcp",
+    "issuer_url": "https://identity.example.com",
+    "introspection_url": "https://identity.example.com/oauth/introspect",
+    "client_id_env": "PEERLINE_OAUTH_CLIENT_ID",
+    "client_secret_env": "PEERLINE_OAUTH_CLIENT_SECRET",
+    "scopes": ["peerline:messages"],
+    "allow_private_networks": false
+  },
+  "allow_private_relay": false,
+  "accounts": [
+    {
+      "id": "account-a-connection-1",
+      "subject": "idp-subject-a",
+      "relay_url": "https://relay.example.com",
+      "peer_id": "p_account_a",
+      "api_key_env": "PEERLINE_ACCOUNT_A_KEY",
+      "peers": {"colleague": "p_colleague_a"}
+    },
+    {
+      "id": "account-b-connection-1",
+      "subject": "idp-subject-b",
+      "relay_url": "https://relay.example.com",
+      "peer_id": "p_account_b",
+      "api_key_env": "PEERLINE_ACCOUNT_B_KEY",
+      "peers": {"colleague": "p_colleague_b"}
+    }
+  ]
+}

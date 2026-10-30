@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "peerline",
+  "version": "0.1.0",
+  "description": "Exchange approved messages with paired bots through account-isolated Peerline connections."
+}

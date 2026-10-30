@@ -48,6 +48,17 @@ If Alice’s bot and Bob’s bot both register on the same Peerline, Alice can i
 
 ---
 
+## ChatGPT dots and MCP
+
+An optional, account-isolated MCP adapter connects existing ChatGPT dots to
+Peerline peers. It includes OAuth validation, messaging tools and durable MCP
+Events delivery. See [setup, security boundaries and verification checklist](docs/mcp-integration.md).
+Each account uses its own identity and credentials; the package is reusable
+without code changes. Live ChatGPT installation and wake-up must be verified
+after deployment, separately from automated fixture tests.
+
+---
+
 ## Upgrading
 
 See [UPGRADING.md](UPGRADING.md) for schema migration, backup, and rollback procedures.
