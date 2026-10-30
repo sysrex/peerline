@@ -13,8 +13,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/sysrex/peerline/internal/store"
+	"golang.org/x/text/unicode/norm"
 )
 
 type client struct {
@@ -1617,15 +1619,15 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"U+17B5 Khmer inherent vowel", "a\u17B5b", "ab"},
 
 		// Issue #84: Combining marks constraints
-		// Note: NFKC normalizes "a\u0301" to "á" (U+00E1), so test expectations must account for this
-		{"3 marks allowed", "a\u0301\u0302\u0303", "á\u0302\u0303"},                                     // NFKC: a+mark1 -> á, then 2 more marks
-		{"20 marks capped at 3", "a" + strings.Repeat("\u0301", 20), "á" + strings.Repeat("\u0301", 3)}, // NFKC: á + 19 marks -> á + 3 marks
-		{"64 marks alone becomes fallback", strings.Repeat("\u0301", 64), "A Peerline peer"},
-		{"100 marks capped at 3", "a" + strings.Repeat("\u0301", 100), "á" + strings.Repeat("\u0301", 3)},
+		// Mark limit is checked in NFD (decomposed) form to ensure visible result has max 3 marks per base
+		{"3 marks allowed", "a\u0301\u0302\u0303", "á\u0302\u0303"},                          // a + 3 marks -> á + 2 marks (NFC composition)
+		{"20 marks capped at 3", "a" + strings.Repeat("\u0301", 20), "á́́"},                  // a + 20 marks -> a + 3 marks (may compose)
+		{"64 marks alone becomes fallback", strings.Repeat("\u0301", 64), "A Peerline peer"}, // No base -> fallback (issue #68)
+		{"100 marks capped at 3", "a" + strings.Repeat("\u0301", 100), "á́́"},                // a + 100 marks -> a + 3 marks
 		{"Mark after space dropped", "a \u0301b", "a b"},
 		{"Mark at start dropped", "\u0301abc", "abc"},
 		{"Mark after punctuation dropped", "a.\u0301b", "a.b"},
-		{"Mark after letter then punctuation", "a\u0301.b", "á.b"}, // NFKC: a+mark -> á
+		{"Mark after letter then punctuation", "a\u0301.b", "á.b"}, // a+mark -> á (NFC)
 
 		// Issue #68: Tab and newline handling
 		{"Tab becomes space", "Alice\tSmith", "Alice Smith"},
@@ -1670,6 +1672,29 @@ func TestSanitizerUnicode(t *testing.T) {
 			got := sanitizeInviterName(tt.input)
 			if got != tt.want {
 				t.Errorf("sanitizeInviterName(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+
+			// For tests involving combining marks, verify that NFD form has at most 3 marks per base
+			if strings.Contains(tt.name, "marks") || strings.Contains(tt.name, "Devanagari") || strings.Contains(tt.name, "Thai") || strings.Contains(tt.name, "Hindi") {
+				nfd := norm.NFD.String(got)
+				consecutiveMarks := 0
+				maxMarks := 0
+				for _, r := range nfd {
+					isMark := unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r)
+					if isMark {
+						consecutiveMarks++
+						if consecutiveMarks > maxMarks {
+							maxMarks = consecutiveMarks
+						}
+					} else if unicode.IsLetter(r) || unicode.IsNumber(r) {
+						consecutiveMarks = 0
+					} else {
+						consecutiveMarks = 0
+					}
+				}
+				if maxMarks > 3 {
+					t.Errorf("sanitizeInviterName(%q) NFD has %d consecutive marks (max 3 allowed), NFD=%q", tt.input, maxMarks, nfd)
+				}
 			}
 		})
 	}

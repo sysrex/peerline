@@ -510,10 +510,11 @@ func (s *Server) inviterName(ctx context.Context, id string) string {
 //   - Tag characters (U+E0000–U+E007F)
 //   - Invisible Mn characters (U+034F, U+180B-180D, U+180F, U+17B4-17B5)
 //   - Other_Default_Ignorable_Code_Point property
+//   - Zl and Zp line/paragraph separators (U+2028, U+2029)
 //
-// Combining mark constraints:
-//   - Only allowed directly after a letter, number, or another mark
-//   - Maximum 3 consecutive marks
+// Combining mark constraints (counted in decomposed NFD form, issue #84):
+//   - Only allowed directly after a letter or number
+//   - Maximum 3 marks per base character (counted in NFD; visible result)
 //   - Marks after space, punctuation, or at start are dropped
 //
 // Whitespace handling:
@@ -527,22 +528,26 @@ func (s *Server) inviterName(ctx context.Context, id string) string {
 // and require application-level awareness or visual similarity detection.
 func sanitizeInviterName(name string) string {
 	const (
-		maxRunes            = 64
-		maxConsecutiveMarks = 3
-		fallbackName        = "A Peerline peer"
+		maxRunes        = 64
+		maxMarksPerBase = 3 // Issue #84 specifies 3 marks per base (issue #63 asked for 2 but #84 is the live tracker)
+		fallbackName    = "A Peerline peer"
 	)
 
-	// Apply NFKC normalization (compatibility decomposition + canonical composition)
+	// Apply NFKC normalization first (compatibility decomposition + canonical composition)
 	// This normalizes fullwidth/halfwidth chars, ligatures, compatibility forms
-	normalized := norm.NFKC.String(name)
+	nfkc := norm.NFKC.String(name)
+
+	// Then apply NFD (canonical decomposition) to separate all base+mark combinations
+	// This ensures we can accurately count and limit marks per base character
+	nfd := norm.NFD.String(nfkc)
 
 	var out strings.Builder
 	lastWasSpace := false
 	runeCount := 0
-	consecutiveMarks := 0
+	marksAfterBase := 0
 	lastWasBaseChar := false // tracks if last was letter/number (valid base for marks)
 
-	for _, r := range normalized {
+	for _, r := range nfd {
 		// Filter Hangul fillers: U+115F, U+1160, U+3164, U+FFA0
 		if r == 0x115F || r == 0x1160 || r == 0x3164 || r == 0xFFA0 {
 			continue
@@ -560,6 +565,7 @@ func sanitizeInviterName(name string) string {
 		}
 
 		// Filter Zl (line separator) and Zp (paragraph separator): U+2028, U+2029
+		// These are unicode.IsSpace but should be removed, not converted to space
 		if unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
 			continue
 		}
@@ -583,13 +589,13 @@ func sanitizeInviterName(name string) string {
 		isMark := unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r)
 
 		if isMark {
-			// Only allow marks after a base character (letter/number or previous mark)
-			// and limit consecutive marks to maxConsecutiveMarks
-			if lastWasBaseChar && consecutiveMarks < maxConsecutiveMarks {
+			// Only allow marks after a base character (letter/number)
+			// and limit to maxMarksPerBase per base character
+			if lastWasBaseChar && marksAfterBase < maxMarksPerBase {
 				out.WriteRune(r)
-				consecutiveMarks++
+				marksAfterBase++
 				runeCount++
-				// Keep lastWasBaseChar true so next mark can attach
+				// Keep lastWasBaseChar true so we stay in this mark sequence
 			}
 			// Otherwise drop the mark
 		} else if unicode.IsLetter(r) || unicode.IsNumber(r) {
@@ -597,7 +603,7 @@ func sanitizeInviterName(name string) string {
 			out.WriteRune(r)
 			lastWasSpace = false
 			lastWasBaseChar = true
-			consecutiveMarks = 0
+			marksAfterBase = 0 // Reset mark counter for new base
 			runeCount++
 		} else if unicode.IsSpace(r) || r == '\t' || r == '\n' || r == '\r' {
 			// Map all whitespace (including tab/newline) to single space
@@ -605,7 +611,7 @@ func sanitizeInviterName(name string) string {
 				out.WriteRune(' ')
 				lastWasSpace = true
 				lastWasBaseChar = false
-				consecutiveMarks = 0
+				marksAfterBase = 0
 				runeCount++
 			}
 		} else if r == '.' || r == ',' || r == '-' || r == '_' || r == '\'' {
@@ -613,12 +619,12 @@ func sanitizeInviterName(name string) string {
 			out.WriteRune(r)
 			lastWasSpace = false
 			lastWasBaseChar = false // punctuation is not a valid base for marks
-			consecutiveMarks = 0
+			marksAfterBase = 0
 			runeCount++
 		} else {
 			// Other characters: reset state but don't write
 			lastWasBaseChar = false
-			consecutiveMarks = 0
+			marksAfterBase = 0
 		}
 
 		// Stop if we exceed max runes
@@ -627,7 +633,9 @@ func sanitizeInviterName(name string) string {
 		}
 	}
 
-	result := strings.TrimSpace(out.String())
+	// Apply NFC (canonical composition) to the filtered result
+	// This recomposes base+mark sequences into precomposed forms where possible
+	result := norm.NFC.String(strings.TrimSpace(out.String()))
 
 	// Return fallback if result is empty
 	if result == "" {
