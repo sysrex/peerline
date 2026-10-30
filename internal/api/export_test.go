@@ -21,6 +21,7 @@ func newTestLimiterManager(cfg Config, clock func() time.Time) *LimiterManager {
 		getLim:        msg.NewLimiter(getPerMinute, getBurst, opts...),
 		authLim:       msg.NewLimiter(authGetPerMinute, authGetBurst, opts...),
 		writeLim:      msg.NewLimiter(cfg.WritePerMinute, cfg.WriteBurst, opts...),
+		bagWriteLim:   msg.NewLimiter(30, 10, opts...),
 		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst, opts...),
 		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour, opts...),
 		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst, opts...),

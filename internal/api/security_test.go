@@ -76,27 +76,20 @@ func TestAllWriteRoutesLimited(t *testing.T) {
 	srv := newServer(t, cfg)
 	alice := register(t, srv, "alice")
 
-	// Exhaust alice's write burst with bag writes (burst=3)
+	// Exhaust alice's write burst with invite creation (burst=3)
 	for i := 0; i < 3; i++ {
-		resp, _ := alice.do("PUT", "/v1/bags/test"+string(rune('a'+i)), map[string]any{"counter": i}, nil)
+		resp, _ := alice.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 		if resp.StatusCode >= 300 {
 			t.Fatalf("write %d: got %d", i, resp.StatusCode)
 		}
 	}
 
-	// Fourth write should be over budget -> 429
-	resp, _ := alice.do("PUT", "/v1/bags/test_over", map[string]any{"counter": 999}, nil)
+	resp, _ := alice.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	if resp.StatusCode != 429 {
-		t.Fatalf("over-budget write (bag): want 429, got %d", resp.StatusCode)
+		t.Fatalf("over-budget write: want 429, got %d", resp.StatusCode)
 	}
 	if resp.Header.Get("Retry-After") == "" {
 		t.Fatal("429 must have Retry-After")
-	}
-
-	// Verify subsequent writes are also blocked
-	resp, _ = alice.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
-	if resp.StatusCode != 429 {
-		t.Fatalf("POST /v1/invites over budget: want 429, got %d", resp.StatusCode)
 	}
 
 	resp, _ = alice.do("PUT", "/v1/me", map[string]any{"notify_email": "alice@example.com"}, nil)
@@ -244,6 +237,7 @@ func TestAllAuthenticatedWriteRoutesLimited(t *testing.T) {
 		method string
 		body   any
 		setup  func(*client, *client) string // returns path for test
+		retry  string                        // expected Retry-After; default "2"
 	}{
 		{
 			name:   "PUT /v1/me",
@@ -319,6 +313,7 @@ func TestAllAuthenticatedWriteRoutesLimited(t *testing.T) {
 			method: "PUT",
 			body:   []byte("test content"),
 			setup:  func(alice, _ *client) string { return "/v1/bags/testbag" },
+			retry:  "10", // bag PUTs use their own per-caller limiter
 		},
 		{
 			name:   "POST /v1/pairing/accept/{token} (authenticated)",
@@ -393,8 +388,12 @@ func TestAllAuthenticatedWriteRoutesLimited(t *testing.T) {
 
 			// Assert exact Retry-After value
 			retryAfter := resp.Header.Get("Retry-After")
-			if retryAfter != "2" {
-				t.Errorf("want Retry-After=2, got %q (status: %d, body: %s)", retryAfter, resp.StatusCode, respBody)
+			wantRetry := tt.retry
+			if wantRetry == "" {
+				wantRetry = "2"
+			}
+			if retryAfter != wantRetry {
+				t.Errorf("want Retry-After=%s, got %q (status: %d, body: %s)", wantRetry, retryAfter, resp.StatusCode, respBody)
 			}
 
 			// Assert exact error body

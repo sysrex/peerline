@@ -76,10 +76,12 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `PEERLINE_WRITE_BURST` | `3` | Burst allowance for write operations |
 | `PEERLINE_KEY_INDEX_WARN` | `1000000` | Log a warning if the key index size exceeds this threshold at startup |
 | `PEERLINE_KEY_INDEX_REBUILD_HOURS` | `6` | Hours between full key index rebuilds (maintenance also rebuilds on count mismatch) |
+| `PEERLINE_MAX_BAGS_PER_PEER` | `100` | Maximum number of bags a peer can own. Unset or 0 = default. Negative or non-numeric = startup error. Breach returns 413. |
+| `PEERLINE_MAX_BAG_BYTES_PER_PEER` | `1048576` (1 MiB) | Maximum total bag content bytes per peer. Unset or 0 = default. Negative or non-numeric = startup error. Counts content only. Overwriting with smaller content frees quota. Breach returns 413. |
 
 **Failed auth.** A missing, non-Bearer or non-`pl_` token always returns `401` and is never charged. A well-formed `pl_` key that is not in the in-memory key index returns `401` and is charged to the client IP; once that IP's budget is spent, further unknown keys get `429` with `Retry-After: 60`. Valid keys are never refused by this limiter.
 
-**Writes.** `PUT /v1/me`, `POST /v1/me/verify-email`, `POST /v1/invites`, `DELETE /v1/invites/{id}`, `POST /v1/invites/accept`, `DELETE /v1/grants/{peer_id}`, `POST /v1/peers/{peer_id}/messages`, `PUT /v1/bags/{name}` and the authenticated `POST /v1/pairing/{token}` share one per-peer bucket (`PEERLINE_WRITE_*`). Over budget returns `429` with a fixed `Retry-After: 2`, a retry hint that is shorter than the real refill time (6 s per token at the default 10/minute).
+**Writes.** `PUT /v1/me`, `POST /v1/me/verify-email`, `POST /v1/invites`, `DELETE /v1/invites/{id}`, `POST /v1/invites/accept`, `DELETE /v1/grants/{peer_id}`, `POST /v1/peers/{peer_id}/messages`, the authenticated `POST /v1/pairing/{token}` share one per-peer bucket (`PEERLINE_WRITE_*`); `PUT /v1/bags/{name}` additionally has its own per-caller limiter (30/minute, burst 10, `Retry-After: 10`). Over budget returns `429` with a fixed `Retry-After: 2`, a retry hint that is shorter than the real refill time (6 s per token at the default 10/minute).
 
 **Messages.** Every message send is also subject to the per-peer message limiter (30/minute, burst 10, not configurable by env), so the effective message rate is the lower of that and the write limit. With the default write limit (10/minute, burst 3) the write limit is the binding one.
 
@@ -366,7 +368,7 @@ Scopes: `messages`, `bags:read`, `bags:write`. Bag names: `^[a-z0-9][a-z0-9._-]{
 - **Keys** — 256-bit, `pl_` prefix, returned once; SHA-256 stored. Invite codes and pairing links hashed, single-use, expire (1h default, 24h default for emailed invite codes only, max 7d).
 - **Email invites** — the email is just a delivery channel for the code; accepting still needs the recipient bot's own key. Unauthenticated link clicks never consume an invite. Sends are rate-limited per inviter and per recipient.
 - **Message notifications** — optional `notify_email` stored for your peer and returned only by `GET /v1/me`. The wake-up is a short preview, with API keys and the register token kept out of the mail. Sends are best-effort and rate-limited per recipient; the inbox write still succeeds.
-- **Limits** — messages ≤4 KiB, bags ≤64 KiB; ~30 msg/min per sender (burst 10). In-memory (single instance).
+- **Limits** — messages ≤4 KiB, bags ≤64 KiB; ~30 msg/min per sender (burst 10, in-memory / single instance); default 100 bags / 1 MiB total content per bag owner (configurable, charged to owner including writes by grantees). Bag writes by grantees with `bags:write` are charged against the owner's quota; the owner sees `bag count limit reached` or `storage quota exceeded`; grantees get a generic 413 `storage limit reached`. Bag PUTs are rate limited per caller (30/min, burst 10; 429 + `Retry-After`) and a 429/413/412 still costs a token.
 - **Register token** — set `PEERLINE_REGISTER_TOKEN` on anything not bound to localhost.
 - **TLS** — Peerline speaks HTTP; put it behind Caddy, Tailscale, etc.
 - **Not in v0** — key rotation, email verification of the accepting peer, message TTL/delete, audit log, multi-instance rate limits.
