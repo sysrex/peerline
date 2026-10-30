@@ -85,6 +85,7 @@ func main() {
 
 	apiServer := api.New(st, api.Config{
 		RegisterToken:         regTok,
+		CodePepper:            []byte(os.Getenv("PEERLINE_CODE_PEPPER")),
 		Logger:                log,
 		Mailer:                ml,
 		PublicURL:             publicURL,
