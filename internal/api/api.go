@@ -262,19 +262,19 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "notify_email: invalid email address")
 		return
 	}
-	
+
 	// Generate verification token if email is set
 	token := ""
 	if notify != "" {
 		token = auth.NewSecret("eml_")
 	}
-	
+
 	id, key := auth.NewID(), auth.NewKey()
 	if err := s.st.CreatePeer(r.Context(), id, in.Name, auth.Hash(key), notify, token); err != nil {
 		s.internal(w, err)
 		return
 	}
-	
+
 	// Send verification email if address is set
 	if notify != "" && token != "" {
 		verifyURL := s.publicBase(r) + "/v1/me/verify-email?token=" + url.QueryEscape(token)
@@ -287,7 +287,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 			s.log.Info("verification email sent", "peer", id)
 		}
 	}
-	
+
 	s.log.Info("peer registered", "peer_id", id, "notify_email_set", notify != "")
 	resp := map[string]any{
 		"peer_id":      id,
@@ -338,13 +338,13 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	me := auth.PeerID(r.Context())
-	
+
 	// Generate verification token if setting email
 	token := ""
 	if email != "" {
 		token = auth.NewSecret("eml_")
 	}
-	
+
 	if err := s.st.SetNotifyEmail(r.Context(), me, email, token); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "peer not found")
@@ -353,7 +353,7 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
-	
+
 	// Send verification email if address is set
 	if email != "" && token != "" {
 		verifyURL := s.publicBase(r) + "/v1/me/verify-email?token=" + url.QueryEscape(token)
@@ -367,9 +367,9 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 			s.log.Info("verification email sent", "peer", me)
 		}
 	}
-	
+
 	s.log.Info("notify email updated", "peer_id", me, "set", email != "", "verified", false)
-	
+
 	// Return current status
 	currentEmail, verified, _, err := s.st.GetNotifyEmailWithStatus(r.Context(), me)
 	if err != nil {
@@ -911,7 +911,7 @@ const notifyPreviewMax = 200
 func (s *Server) notifyNewMessage(ctx context.Context, m *store.Message) {
 	// The message is already stored. Don't drop the wake-up if the client hangs up.
 	ctx = context.WithoutCancel(ctx)
-	
+
 	// Only send to verified emails
 	email, err := s.st.GetVerifiedNotifyEmail(ctx, m.To)
 	if err != nil {
@@ -921,7 +921,7 @@ func (s *Server) notifyNewMessage(ctx context.Context, m *store.Message) {
 	if email == "" {
 		return // No verified email set
 	}
-	
+
 	// Check both per-peer and per-address rate limits
 	normalizedAddr := strings.ToLower(email)
 	if !s.lim.notifyLim.Allow(m.To) {
@@ -932,7 +932,7 @@ func (s *Server) notifyNewMessage(ctx context.Context, m *store.Message) {
 		s.log.Warn("notify email rate limited (per-address)", "address", normalizedAddr, "recipient", m.To, "message_id", m.ID)
 		return
 	}
-	
+
 	status := "sent"
 	if s.cfg.Mailer.Mode() == "log" {
 		status = "logged"

@@ -294,7 +294,7 @@ func TestNotifyDevModeLogsAndStillSucceeds(t *testing.T) {
 		PeerID *string `json:"peer_id"`
 		APIKey *string `json:"api_key"`
 	}{&b.id, &b.key})
-	
+
 	// Extract and verify
 	msgs := cap.all()
 	verifyEmail := msgs[0]
@@ -306,17 +306,17 @@ func TestNotifyDevModeLogsAndStillSucceeds(t *testing.T) {
 	verifyToken := verifyEmail.Body[tokenStart : tokenStart+tokenEnd]
 	resp, body = b.do("POST", "/v1/me/verify-email?token="+verifyToken, nil, nil)
 	want(t, resp, body, 200)
-	
+
 	// Clear emails after verification
 	cap.mu.Lock()
 	cap.msgs = nil
 	cap.mu.Unlock()
-	
+
 	pairUp(t, b, a, []string{"messages"}, nil, nil)
 	long := strings.Repeat("你", 250)
 	resp, body = a.do("POST", "/v1/peers/"+b.id+"/messages", map[string]any{"type": "note", "body": long}, nil)
 	want(t, resp, body, 201)
-	
+
 	// Check captured notification email
 	msgs = cap.all()
 	if len(msgs) != 1 {

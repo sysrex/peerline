@@ -179,15 +179,15 @@ func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 
 // LimiterManager manages multiple rate limiters with proper lifecycle and pruning.
 type LimiterManager struct {
-	msgLim       *msg.Limiter
-	regLim       *msg.Limiter
-	pairLim      *msg.Limiter
-	failLim      *msg.Limiter // Failed pairing token lookups (per-IP)
-	getLim       *msg.Limiter
-	authLim      *msg.Limiter
-	mailLim      *msg.Limiter
-	rcptLim      *msg.Limiter
-	notifyLim    *msg.Limiter
+	msgLim        *msg.Limiter
+	regLim        *msg.Limiter
+	pairLim       *msg.Limiter
+	failLim       *msg.Limiter // Failed pairing token lookups (per-IP)
+	getLim        *msg.Limiter
+	authLim       *msg.Limiter
+	mailLim       *msg.Limiter
+	rcptLim       *msg.Limiter
+	notifyLim     *msg.Limiter
 	notifyAddrLim *msg.Limiter // Per-address notification rate limit
 
 	ctx    context.Context
