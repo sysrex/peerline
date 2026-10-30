@@ -54,6 +54,8 @@ type Store struct {
 	schemaVersionInUse int
 	lastBackupPath     string
 	backupReused       bool
+	keyIndex           *keyIndex
+	keyIndexLoaded     bool
 }
 
 // migrations is the ordered list of schema migration functions.
@@ -264,6 +266,7 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		schemaVersionInUse: schemaInUse,
 		lastBackupPath:     backupPath,
 		backupReused:       reused,
+		keyIndex:           newKeyIndex(),
 	}, nil
 }
 
@@ -889,6 +892,10 @@ func (s *Store) CreatePeer(ctx context.Context, id, name, keyHash, notifyEmail, 
 	verified := 0
 	_, err := s.db.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email,notify_email_verified,notify_email_token) VALUES(?,?,?,?,?,?,?)`,
 		id, name, keyHash, s.now(), notifyEmail, verified, notifyToken)
+	if err == nil {
+		// Add to key index after successful insert
+		s.keyIndex.add(keyHash, id)
+	}
 	return err
 }
 
@@ -1473,6 +1480,10 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+
+	// Add to key index after successful commit
+	s.keyIndex.add(keyHash, peerID)
+
 	return grant, nil
 }
 
@@ -1712,3 +1723,8 @@ func (s *Store) PutBag(ctx context.Context, owner, name string, content []byte, 
 	}
 	return next, tx.Commit()
 }
+
+// ---- Key Index (#112) ----
+
+// LoadKeyIndex loads all active API key hashes from the peers table into memory.
+// Must be called once at startup before serving requests.

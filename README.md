@@ -77,9 +77,23 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `PEERLINE_TRUSTED_PROXIES` | unset | Comma-separated CIDR ranges from which X-Forwarded-For is honored (e.g. `172.18.0.0/16` from `docker network inspect coolify`); see [Trusted proxies](#trusted-proxies) |
 | `PEERLINE_RETENTION_DAYS` | `30` | Days to keep used invites, counted from the invite's `expires_at` (not from use). 0 or unset = 30. |
 | `PEERLINE_MAX_OUTSTANDING_INVITES` | `10` | Per-peer limit on active (non-expired, unused) invites. 0 or negative = 10 (no unlimited). Breach returns 429. |
+| `PEERLINE_AUTH_FAIL_PER_MINUTE` | `30` | Per-IP rate limit for authentication failures (invalid Bearer tokens), per minute |
+| `PEERLINE_AUTH_FAIL_BURST` | `10` | Burst allowance for authentication failures |
+| `PEERLINE_WRITE_PER_MINUTE` | `10` | Per-peer rate limit for authenticated write operations, per minute |
+| `PEERLINE_WRITE_BURST` | `3` | Burst allowance for write operations |
+| `PEERLINE_KEY_INDEX_WARN` | `1000000` | Log a warning if the key index size exceeds this threshold at startup |
+| `PEERLINE_KEY_INDEX_REBUILD_HOURS` | `6` | Hours between full key index rebuilds (maintenance also rebuilds on count mismatch) |
 | `PEERLINE_VERSION_DETAIL` | unset | Controls `/version` endpoint disclosure. Unset or `minimal` (default): version only. `full`: includes short commit (12 chars) and build time. `off`: endpoint returns 404. Invalid values cause startup failure. Leave unset on public instances to avoid version fingerprinting. |
 | `PEERLINE_MAX_BAGS_PER_PEER` | `100` | Maximum number of bags a peer can own. Unset or 0 = default. Negative or non-numeric = startup error. Breach returns 413. |
 | `PEERLINE_MAX_BAG_BYTES_PER_PEER` | `1048576` (1 MiB) | Maximum total bag content bytes per peer. Unset or 0 = default. Negative or non-numeric = startup error. Counts content only. Overwriting with smaller content frees quota. Breach returns 413. |
+
+**Failed auth.** A missing, non-Bearer or non-`pl_` token always returns `401` and is never charged. A well-formed `pl_` key that is not in the in-memory key index returns `401` and is charged to the client IP; once that IP's budget is spent, further unknown keys get `429` with `Retry-After: 60`. Valid keys are never refused by this limiter.
+
+**Writes.** `PUT /v1/me`, `POST /v1/me/verify-email`, `POST /v1/invites`, `DELETE /v1/invites/{id}`, `POST /v1/invites/accept`, `DELETE /v1/grants/{peer_id}`, `POST /v1/peers/{peer_id}/messages` and the authenticated `POST /v1/pairing/{token}` share one per-peer bucket (`PEERLINE_WRITE_*`); `PUT /v1/bags/{name}` is not in that bucket; it has its own per-caller limiter (30/minute, burst 10, `Retry-After: 10`). Over budget returns `429` with a fixed `Retry-After: 2`, a retry hint that is shorter than the real refill time (6 s per token at the default 10/minute).
+
+**Messages.** Every message send is also subject to the per-peer message limiter (30/minute, burst 10, not configurable by env), so the effective message rate is the lower of that and the write limit. With the default write limit (10/minute, burst 3) the write limit is the binding one.
+
+**Behind a proxy.** Set `PEERLINE_TRUSTED_PROXIES` to your proxy's CIDR. If it is unset, every client shares the proxy's IP and therefore one failed-auth bucket (see [Trusted proxies](#trusted-proxies)).
 
 ### Pair two bots (different accounts)
 

@@ -29,6 +29,19 @@ func env(k, def string) string {
 	return def
 }
 
+// parseInt parses an env var as int, returning an error if set but non-numeric.
+// Returns (0, nil) if unset (caller provides default).
+func parseInt(val, name string) (int, error) {
+	if val == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(val)
+	if err != nil {
+		return 0, errors.New(name + " must be numeric, got: " + val)
+	}
+	return n, nil
+}
+
 // parseVersionDetail validates and normalizes PEERLINE_VERSION_DETAIL.
 // Accepts "minimal", "full", or "off" (case-insensitive, whitespace-trimmed).
 // Returns an error for any other value to fail-closed on typos.
@@ -132,6 +145,21 @@ func main() {
 		"max_supported", store.SchemaVersion(),
 		"backup", backupInfo)
 
+	// Load key index at startup (#112)
+	keyIndexWarn, _ := strconv.Atoi(os.Getenv("PEERLINE_KEY_INDEX_WARN"))
+	if keyIndexWarn <= 0 {
+		keyIndexWarn = 1_000_000
+	}
+	n, dur, err := st.LoadKeyIndex(context.Background())
+	if err != nil {
+		log.Error("load key index", "err", err)
+		os.Exit(1)
+	}
+	log.Info("key index loaded", "keys", n, "duration_ms", dur.Milliseconds())
+	if n >= keyIndexWarn {
+		log.Warn("key index size exceeds PEERLINE_KEY_INDEX_WARN", "keys", n, "warn_threshold", keyIndexWarn)
+	}
+
 	regTok := os.Getenv("PEERLINE_REGISTER_TOKEN")
 	if regTok == "" {
 		log.Warn("PEERLINE_REGISTER_TOKEN unset: registration is open to anyone who can reach this server")
@@ -219,6 +247,39 @@ func main() {
 	}
 	retentionSeconds := int64(retentionDays * 24 * 60 * 60)
 
+	keyIndexRebuildHours, _ := strconv.Atoi(os.Getenv("PEERLINE_KEY_INDEX_REBUILD_HOURS"))
+	if keyIndexRebuildHours <= 0 {
+		keyIndexRebuildHours = 6 // default
+	}
+
+	// Parse rate limiter config (#96: validate at startup)
+	authFailPerMinute, err := parseInt(os.Getenv("PEERLINE_AUTH_FAIL_PER_MINUTE"), "PEERLINE_AUTH_FAIL_PER_MINUTE")
+	if err != nil {
+		log.Error("invalid rate limiter config", "err", err)
+		os.Exit(1)
+	}
+	authFailBurst, err := parseInt(os.Getenv("PEERLINE_AUTH_FAIL_BURST"), "PEERLINE_AUTH_FAIL_BURST")
+	if err != nil {
+		log.Error("invalid rate limiter config", "err", err)
+		os.Exit(1)
+	}
+	writePerMinute, err := parseInt(os.Getenv("PEERLINE_WRITE_PER_MINUTE"), "PEERLINE_WRITE_PER_MINUTE")
+	if err != nil {
+		log.Error("invalid rate limiter config", "err", err)
+		os.Exit(1)
+	}
+	writeBurst, err := parseInt(os.Getenv("PEERLINE_WRITE_BURST"), "PEERLINE_WRITE_BURST")
+	if err != nil {
+		log.Error("invalid rate limiter config", "err", err)
+		os.Exit(1)
+	}
+
+	log.Info("rate limiter config",
+		"auth_fail_per_minute", authFailPerMinute,
+		"auth_fail_burst", authFailBurst,
+		"write_per_minute", writePerMinute,
+		"write_burst", writeBurst)
+
 	apiServer, err := api.New(st, api.Config{
 		RegisterToken:         regTok,
 		CodePepper:            []byte(os.Getenv("PEERLINE_CODE_PEPPER")),
@@ -230,6 +291,11 @@ func main() {
 		TrustedProxies:        trustedProxies,
 		MaxOutstandingInvites: maxOutstandingInvites,
 		RetentionSeconds:      retentionSeconds,
+		AuthFailPerMinute:     authFailPerMinute,
+		AuthFailBurst:         authFailBurst,
+		WritePerMinute:        writePerMinute,
+		WriteBurst:            writeBurst,
+		KeyIndexRebuildHours:  keyIndexRebuildHours,
 		VersionDetail:         versionDetail,
 		MaxBagsPerPeer:        maxBagsPerPeer,
 		MaxBagBytesPerPeer:    maxBagBytesPerPeer,
