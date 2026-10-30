@@ -744,6 +744,55 @@ func TestXFFParsing(t *testing.T) {
 			trustedNets: trustedNets,
 			want:        "203.0.113.20", // attacker in first header, proxy in second
 		},
+		{
+			name:        "missing XFF header",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         nil,
+			trustedNets: trustedNets,
+			want:        "10.0.0.1", // falls back to RemoteAddr
+		},
+		{
+			name:        "empty XFF header value",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         []string{""},
+			trustedNets: trustedNets,
+			want:        "10.0.0.1", // falls back to RemoteAddr
+		},
+		{
+			name:        "whitespace and empty entries in XFF",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         []string{"  , , 203.0.113.30, , 10.0.0.2  "},
+			trustedNets: trustedNets,
+			want:        "203.0.113.30", // skips empty/whitespace entries
+		},
+		{
+			name:        "all XFF entries trusted fallback",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         []string{"10.0.0.2, 10.0.0.3, 192.168.1.1"},
+			trustedNets: trustedNets,
+			want:        "10.0.0.1", // all XFF trusted, falls back to RemoteAddr
+		},
+		{
+			name:        "IPv6 in XFF chain",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         []string{"2001:db8::42, 10.0.0.2"},
+			trustedNets: trustedNets,
+			want:        "2001:db8::42", // IPv6 address returned in canonical form
+		},
+		{
+			name:        "spoofed leftmost never used",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         []string{"99.99.99.99", "203.0.113.50, 10.0.0.5"},
+			trustedNets: trustedNets,
+			want:        "203.0.113.50", // rightmost untrusted, not leftmost spoof
+		},
+		{
+			name:        "malformed IP in XFF skipped",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         []string{"not-an-ip, 203.0.113.60, 10.0.0.2"},
+			trustedNets: trustedNets,
+			want:        "203.0.113.60", // skips malformed, takes next valid untrusted
+		},
 	}
 
 	for _, tt := range tests {
@@ -1330,6 +1379,7 @@ func TestRevokePreventsPairing(t *testing.T) {
 	cfg := Config{}
 	srv := newServer(t, cfg)
 	alice := register(t, srv, "Alice")
+	bob := register(t, srv, "Bob")
 
 	// Create a pairing invite
 	resp, b := alice.do("POST", "/v1/invites", map[string]any{
@@ -1363,16 +1413,46 @@ func TestRevokePreventsPairing(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("pairing after revoke: status %d, want 404, body %s", resp.StatusCode, b)
 	}
+
+	// Second DELETE is idempotent (returns 404 per documented behavior)
+	resp, b = alice.do("DELETE", "/v1/invites/"+invResp.PublicID, nil, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("second DELETE: status %d, want 404 (idempotent/not found)", resp.StatusCode)
+	}
+
+	// Unknown public_id returns 404
+	resp, b = alice.do("DELETE", "/v1/invites/ffffffffffffffffffffffffffffffff", nil, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown public_id DELETE: status %d, want 404", resp.StatusCode)
+	}
+
+	// Bob creates an invite
+	resp, b = bob.do("POST", "/v1/invites", map[string]any{
+		"scopes": []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("bob create invite: %d %s", resp.StatusCode, b)
+	}
+	var bobInv struct {
+		PublicID string `json:"public_id"`
+	}
+	json.Unmarshal(b, &bobInv)
+
+	// Alice tries to delete Bob's invite (returns 404, not found or not owner)
+	resp, b = alice.do("DELETE", "/v1/invites/"+bobInv.PublicID, nil, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("other owner's public_id DELETE: status %d, want 404", resp.StatusCode)
+	}
 }
 
 // TestInviteCapBeforeEmailBudget verifies cap check doesn't consume email quota (#53)
 func TestInviteCapBeforeEmailBudget(t *testing.T) {
 	cfg := Config{}
-	cfg.MaxOutstandingInvites = 1
+	cfg.MaxOutstandingInvites = 2 // Set cap to 2
 	srv := newServer(t, cfg)
 	alice := register(t, srv, "Alice")
 
-	// Create first invite (should succeed)
+	// Create first invite (should succeed, 1/2)
 	resp, b := alice.do("POST", "/v1/invites", map[string]any{
 		"to_email": "bob@example.com",
 		"scopes":   []string{"messages"},
@@ -1381,16 +1461,28 @@ func TestInviteCapBeforeEmailBudget(t *testing.T) {
 		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
 	}
 
-	// Attempt second invite (should fail at cap check before email limiter)
+	// Create second invite (should succeed, 2/2 - at cap)
 	resp, b = alice.do("POST", "/v1/invites", map[string]any{
-		"to_email": "charlie@example.com",
+		"to_email": "carol@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("second invite (at cap): %d %s", resp.StatusCode, b)
+	}
+
+	// Attempt third invite (one over cap, should fail without spending email budget)
+	resp, b = alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "dave@example.com",
 		"scopes":   []string{"messages"},
 	}, nil)
 	if resp.StatusCode != http.StatusTooManyRequests {
-		t.Errorf("capped invite: status %d, want 429, body %s", resp.StatusCode, b)
+		t.Errorf("over-cap invite: status %d, want 429, body %s", resp.StatusCode, b)
 	}
 	if !bytes.Contains(b, []byte("too many outstanding invites")) {
-		t.Errorf("capped error: %s, want cap message", b)
+		t.Errorf("over-cap error: %s, want cap message", b)
+	}
+	if !bytes.Contains(b, []byte("limit 2")) {
+		t.Errorf("over-cap error: should mention limit 2")
 	}
 }
 
@@ -1461,11 +1553,15 @@ func TestSanitizerUnicode(t *testing.T) {
 		input string
 		want  string
 	}{
+		// Basic cases
 		{"ASCII", "Alice Smith", "Alice Smith"},
 		{"Unicode letters", "José García", "José García"},
 		{"Chinese", "李明", "李明"},
 		{"Japanese", "田中太郎", "田中太郎"},
 		{"Arabic", "محمد علي", "محمد علي"},
+		{"Mixed valid", "Alice-O'Neil, Jr.", "Alice-O'Neil, Jr."},
+
+		// Bidi controls (Cf category) - all filtered
 		{"Bidi LRE", "Alice\u202AEvil", "AliceEvil"},
 		{"Bidi RLE", "Alice\u202BEvil", "AliceEvil"},
 		{"Bidi PDF", "Alice\u202CEvil", "AliceEvil"},
@@ -1477,14 +1573,49 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Bidi PDI", "Alice\u2069Evil", "AliceEvil"},
 		{"Bidi LRM", "Alice\u200EEvil", "AliceEvil"},
 		{"Bidi RLM", "Alice\u200FEvil", "AliceEvil"},
-		{"Tag space", "Alice\U000E0020Evil", "AliceEvil"},
-		{"Tag char", "Alice\U000E0041Evil", "AliceEvil"},
+
+		// Zero-width and format characters (Cf category)
 		{"Zero-width space", "Alice\u200BEvil", "AliceEvil"},
 		{"Zero-width non-joiner", "Alice\u200CEvil", "AliceEvil"},
 		{"Zero-width joiner", "Alice\u200DEvil", "AliceEvil"},
 		{"BOM", "Alice\uFEFFEvil", "AliceEvil"},
-		{"Mixed valid", "Alice-O'Neil, Jr.", "Alice-O'Neil, Jr."},
-		{"Emoji removed", "Alice 😀 Smith", "Alice  Smith"},
+
+		// Tag characters
+		{"Tag space", "Alice\U000E0020Evil", "AliceEvil"},
+		{"Tag char", "Alice\U000E0041Evil", "AliceEvil"},
+
+		// Hangul fillers
+		{"Hangul filler U+115F", "Alice\u115FEvil", "AliceEvil"},
+		{"Hangul filler U+1160", "Alice\u1160Evil", "AliceEvil"},
+		{"Hangul filler U+3164", "Alice\u3164Evil", "AliceEvil"},
+		{"Hangul filler U+FFA0", "Alice\uFFA0Evil", "AliceEvil"},
+
+		// Variation selectors
+		{"Variation selector FE00", "Alice\uFE00Evil", "AliceEvil"},
+		{"Variation selector FE0F", "Alice\uFE0FEvil", "AliceEvil"},
+		{"Variation selector E0100", "Alice\U000E0100Evil", "AliceEvil"},
+
+		// NFKC normalization
+		{"Fullwidth ASCII", "Ａｌｉｃｅ", "Alice"},  // Fullwidth → ASCII
+		{"Superscript", "Alice²", "Alice2"},    // ² → 2
+		{"Ligature", "ﬁle", "file"},            // ﬁ → fi
+		{"Circled number", "Alice①", "Alice1"}, // ① → 1
+		{"Compatibility ideograph", "塚", "塚"},  // U+FA10 → U+585A
+
+		// Space collapsing
+		{"Multiple spaces", "Alice   Smith", "Alice Smith"},
+		{"Leading spaces", "   Alice", "Alice"},
+		{"Trailing spaces", "Alice   ", "Alice"},
+		{"Mixed whitespace", "Alice  \t  Smith", "Alice Smith"}, // Tab becomes space, then collapsed
+
+		// Emoji and symbols (filtered out)
+		{"Emoji removed", "Alice 😀 Smith", "Alice Smith"},
+		{"Symbol removed", "Alice ★ Smith", "Alice Smith"},
+
+		// Edge cases
+		{"Empty string", "", ""},
+		{"Only spaces", "   ", ""},
+		{"Only filtered chars", "\u200B\u200C\uFEFF", ""},
 	}
 
 	for _, tt := range tests {

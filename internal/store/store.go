@@ -522,10 +522,10 @@ func (s *Store) ListInvitesByPeer(ctx context.Context, peerID string, limit, off
 		limit = 50
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT public_id, scopes, bags, expires_at, used_by IS NOT NULL, 
+		`SELECT COALESCE(public_id, ''), scopes, bags, expires_at, used_by IS NOT NULL, 
 		        pairing_token_hash IS NOT NULL
 		 FROM invites 
-		 WHERE from_peer=? AND expires_at>=?
+		 WHERE from_peer=? AND expires_at>=? AND public_id IS NOT NULL
 		 ORDER BY ROWID
 		 LIMIT ? OFFSET ?`,
 		peerID, now(), limit, offset)
@@ -542,6 +542,10 @@ func (s *Store) ListInvitesByPeer(ctx context.Context, peerID string, limit, off
 		var used, hasPairingToken bool
 		if err := rows.Scan(&im.PublicID, &scopes, &bags, &exp, &used, &hasPairingToken); err != nil {
 			return nil, err
+		}
+		// Skip entries with empty public_id (defensive, should not happen after v3 migration)
+		if im.PublicID == "" {
+			continue
 		}
 		im.Scopes = split(scopes)
 		im.Bags = split(bags)

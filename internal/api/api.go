@@ -23,6 +23,7 @@ import (
 	"github.com/sysrex/peerline/internal/msg"
 	"github.com/sysrex/peerline/internal/pair"
 	"github.com/sysrex/peerline/internal/store"
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -192,36 +193,67 @@ func (s *Server) Handler() http.Handler {
 
 // ---- helpers ----
 
-// sanitizeInviterName strips characters that can be used for prompt injection.
-// Allows Unicode letters, digits, marks, spaces, and limited punctuation.
-// Explicitly filters bidi controls (U+202A-U+202E, U+2066-U+2069, U+200E/F) and tag characters (U+E0000-U+E007F).
+// sanitizeInviterName applies NFKC normalization and filters characters that can be used
+// for prompt injection or homoglyph attacks. Allows only Unicode letters (L*), numbers (N*),
+// spaces, and basic ASCII punctuation (. , - _ '). Filters all Cf format characters (including
+// zero-width and bidi controls), variation selectors, Hangul fillers, and tag characters.
+// Collapses repeated spaces and trims the result. Max length 64 chars.
+//
+// Note: Cross-script homoglyphs (e.g., Cyrillic а vs Latin a) are not fully solvable here
+// and require application-level awareness or visual similarity detection.
 func sanitizeInviterName(name string) string {
 	const maxLen = 64
+
+	// Apply NFKC normalization (compatibility decomposition + canonical composition)
+	// This normalizes fullwidth/halfwidth chars, ligatures, compatibility forms
+	normalized := norm.NFKC.String(name)
+
 	var out strings.Builder
-	for _, r := range name {
-		// Filter bidi controls: U+202A-U+202E (embedding/override), U+2066-U+2069 (isolates), U+200E/F (marks)
-		if (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) || r == 0x200E || r == 0x200F {
-			continue
-		}
-		// Filter tag characters: U+E0000-U+E007F
-		if r >= 0xE0000 && r <= 0xE007F {
-			continue
-		}
-		// Filter zero-width and format characters that were in the old allowlist implicitly excluded
-		if r == 0x200B || r == 0x200C || r == 0x200D || r == 0xFEFF {
+	lastWasSpace := false
+
+	for _, r := range normalized {
+		// Filter Hangul fillers: U+115F, U+1160, U+3164, U+FFA0
+		if r == 0x115F || r == 0x1160 || r == 0x3164 || r == 0xFFA0 {
 			continue
 		}
 
-		// Allow: Unicode letters, digits, marks, spaces, and limited punctuation
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsMark(r) || r == ' ' ||
-			r == '.' || r == '-' || r == '_' || r == ',' || r == '\'' {
-			out.WriteRune(r)
+		// Filter variation selectors: U+FE00–U+FE0F (standard), U+E0100–U+E01EF (extended)
+		if (r >= 0xFE00 && r <= 0xFE0F) || (r >= 0xE0100 && r <= 0xE01EF) {
+			continue
 		}
+
+		// Filter all Cf (format) category: includes bidi controls, zero-width chars, etc.
+		if unicode.Is(unicode.Cf, r) {
+			continue
+		}
+
+		// Filter tag characters: U+E0000–U+E007F
+		if r >= 0xE0000 && r <= 0xE007F {
+			continue
+		}
+
+		// Allow: Unicode letters (L*), numbers (N*), space, and basic ASCII punctuation
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			out.WriteRune(r)
+			lastWasSpace = false
+		} else if r == ' ' {
+			// Collapse repeated spaces
+			if !lastWasSpace && out.Len() > 0 {
+				out.WriteRune(' ')
+				lastWasSpace = true
+			}
+		} else if r == '.' || r == ',' || r == '-' || r == '_' || r == '\'' {
+			// Basic ASCII punctuation
+			out.WriteRune(r)
+			lastWasSpace = false
+		}
+
 		// Stop if we exceed max length
 		if out.Len() >= maxLen {
 			break
 		}
 	}
+
 	return strings.TrimSpace(out.String())
 }
 
