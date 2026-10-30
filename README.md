@@ -1,110 +1,167 @@
 # Peerline
 
-Peerline is a small personal HTTP relay that lets sysrex's bots talk to each other.
-It is **deny-all by default**: a bot registers, gets an API key, and can do nothing with
-any other bot until that bot explicitly pairs with it and grants scopes.
+**Cross-account bot-to-bot messaging.**  
+A small Go relay so bots belonging to *different people or accounts* can talk — without dumping memory, sharing Slack, or trusting a shared drive.
 
-## Why
+Personal Grok Bot ↔ work Grok Bot. Your bot ↔ a teammate’s bot. Two scripts under two GitHub users. Same wire.
 
-Bots (Grok Bot instances, scripts, home automations) sometimes need to hand each other a
-short message or share a small piece of state. Pushing that through Slack, email, or a
-shared drive leaks context and is hard to scope. Peerline keeps it narrow:
+[![Go](https://img.shields.io/badge/Go-1.27+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![License](https://img.shields.io/badge/license-see%20repo-lightgrey)](https://github.com/sysrex/peerline)
 
-- **Messages**: short (≤ 4 KiB) typed messages to a paired peer's inbox.
-- **Bags**: optional, small (≤ 64 KiB) named blobs with ETag versioning, shared only
-  by name allowlist.
-- **No memory dump**: there is no endpoint to export a bot's memory, list all peers,
-  or bulk-read anything. Every read is either your own inbox or one named bag you were granted.
+---
 
-## Run
+## The point
+
+Grok Bot (and similar agents) are great alone. They’re awkward across accounts: you can’t safely “just sync memory,” and copy-pasting between chats doesn’t scale.
+
+Peerline is the narrow bridge:
+
+| | |
+|---|---|
+| **Who** | Any registered peer — not limited to one human’s bots |
+| **What** | Short messages + optional named bags |
+| **Default** | **Deny-all** — nothing flows until both sides pair and grant scopes |
+| **Not** | Full memory sync, bulk export, or “share everything” |
+
+If Alice’s bot and Bob’s bot both register on the same Peerline, Alice can invite Bob with `messages` (+ optional bags). Until Bob accepts (and Alice granted), Bob gets the same **403** as a stranger.
+
+---
+
+## How it works
+
+```
+  Alice's bot ──Bearer──┐                    ┌──Bearer── Bob's bot
+                        │                    │
+                        ▼                    ▼
+                   ┌────────────────────────────┐
+                   │         Peerline           │
+                   │  invites → grants → inbox  │
+                   │  bags (named, allowlisted) │
+                   └────────────────────────────┘
+```
+
+1. **Register** → `peer_id` + API key (shown once).
+2. **Invite** with scopes (`messages`, `bags:read`, `bags:write`) and an optional bag-name allowlist.
+3. **Accept** (optional reciprocal grant in the same call).
+4. **Send** ≤4 KiB messages to a paired peer; **poll** your inbox.
+5. Optionally **PUT/GET** named bags (≤64 KiB, ETags) only if that bag name was allowlisted.
+
+---
+
+## Quickstart
 
 ```sh
-go build -o /tmp/peerline ./cmd/peerline
-PEERLINE_REGISTER_TOKEN=change-me /tmp/peerline -addr 127.0.0.1:8787 -db ./peerline.db
+git clone https://github.com/sysrex/peerline.git
+cd peerline
 go test ./...
+go build -o peerline ./cmd/peerline
+
+PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline.db
 ```
 
 | Flag / env | Default | Meaning |
 |---|---|---|
-| `-addr` / `PEERLINE_ADDR` | `127.0.0.1:8787` | listen address |
-| `-db` / `PEERLINE_DB` | `peerline.db` | SQLite file (modernc.org/sqlite, no CGO) |
-| `PEERLINE_REGISTER_TOKEN` | unset | if set, required as `X-Peerline-Register-Token` on register |
+| `-addr` / `PEERLINE_ADDR` | `127.0.0.1:8787` | Listen address |
+| `-db` / `PEERLINE_DB` | `peerline.db` | SQLite path (modernc.org/sqlite, no CGO) |
+| `PEERLINE_REGISTER_TOKEN` | unset | If set, required as `X-Peerline-Register-Token` on register |
+
+### Pair two bots (different accounts)
+
+```sh
+# Alice registers
+curl -s -H "X-Peerline-Register-Token: change-me" \
+  -d '{"name":"alice-bot"}' localhost:8787/v1/register
+# → peer_id, api_key  (save the key; shown once)
+
+# Bob registers (another account / machine / bot)
+curl -s -H "X-Peerline-Register-Token: change-me" \
+  -d '{"name":"bob-bot"}' localhost:8787/v1/register
+
+A=pl_alice...   # Alice's api_key
+B=pl_bob...     # Bob's api_key
+
+# Alice invites Bob: messages + read her "status" bag
+curl -s -H "Authorization: Bearer $A" \
+  -d '{"scopes":["messages","bags:read"],"bags":["status"]}' \
+  localhost:8787/v1/invites
+# → code
+
+# Bob accepts (and can grant messages back)
+curl -s -H "Authorization: Bearer $B" \
+  -d '{"code":"inv_...","scopes":["messages"]}' \
+  localhost:8787/v1/invites/accept
+
+# Bob → Alice
+curl -s -H "Authorization: Bearer $B" \
+  -d '{"type":"note","body":"hi from another account"}' \
+  localhost:8787/v1/peers/<alice_peer_id>/messages
+
+curl -s -H "Authorization: Bearer $A" 'localhost:8787/v1/inbox?since=0'
+```
+
+---
 
 ## API (v0)
 
-All `/v1/*` routes except `register` need `Authorization: Bearer <api_key>`.
+All `/v1/*` except `register` need `Authorization: Bearer <api_key>`.
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/healthz` | liveness |
-| POST | `/v1/register` | `{"name"}` → `{peer_id, api_key}`. Key shown **once**. |
-| GET | `/v1/me` | who am I |
-| POST | `/v1/invites` | `{"scopes":[...], "bags":[...], "ttl_seconds"?}` → single-use `code` (default 24h, max 7d) |
-| POST | `/v1/invites/accept` | `{"code", "scopes"?, "bags"?}` — optional reciprocal grant back to the inviter |
-| GET | `/v1/grants` | grants you own or hold |
-| DELETE | `/v1/grants/{peer_id}` | revoke what you granted to that peer |
-| POST | `/v1/peers/{peer_id}/messages` | `{"type","body","reply_to"?}`; needs `messages` from that peer |
-| GET | `/v1/inbox?since=<id>&limit=<n>` | your messages with id > since; returns `next_since` |
-| GET | `/v1/bags/{name}[?owner=<peer_id>]` | raw bytes, `ETag: "vN"`, honors `If-None-Match` (304) |
-| PUT | `/v1/bags/{name}[?owner=<peer_id>]` | raw bytes; `If-Match: "vN"` or `If-None-Match: *`; 412 on mismatch |
+| `GET` | `/healthz` | Liveness |
+| `POST` | `/v1/register` | `{"name"}` → `{peer_id, api_key}` once |
+| `GET` | `/v1/me` | Who am I |
+| `POST` | `/v1/invites` | scopes + bags + optional TTL → single-use `code` |
+| `POST` | `/v1/invites/accept` | Accept; optional reciprocal grant |
+| `GET` | `/v1/grants` | Grants you own or hold |
+| `DELETE` | `/v1/grants/{peer_id}` | Revoke what you granted |
+| `POST` | `/v1/peers/{peer_id}/messages` | `{type, body, reply_to?}` |
+| `GET` | `/v1/inbox?since=&limit=` | Returns `next_since` |
+| `GET`/`PUT` | `/v1/bags/{name}[?owner=]` | Raw bytes, `ETag: "vN"` |
 
-Scopes: `messages`, `bags:read`, `bags:write`. Bag scopes require an explicit bag-name
-allowlist (`^[a-z0-9][a-z0-9._-]{0,63}$`). Without `owner`, bag routes act on your own bags.
+Scopes: `messages`, `bags:read`, `bags:write`. Bag names: `^[a-z0-9][a-z0-9._-]{0,63}$`.
 
-Example pairing (Alice lets Bob message her and read her `status` bag):
-
-```sh
-A=pl_alice...; B=pl_bob...
-curl -s -H "Authorization: Bearer $A" -d '{"scopes":["messages","bags:read"],"bags":["status"]}' localhost:8787/v1/invites
-curl -s -H "Authorization: Bearer $B" -d '{"code":"inv_...","scopes":["messages"]}' localhost:8787/v1/invites/accept
-curl -s -H "Authorization: Bearer $B" -d '{"type":"note","body":"hi"}' localhost:8787/v1/peers/<alice_id>/messages
-curl -s -H "Authorization: Bearer $A" "localhost:8787/v1/inbox?since=0"
-```
+---
 
 ## Security model
 
-- **Deny-all**: grants are directional (`owner → grantee`, scopes, bag allowlist). No grant ⇒ 403.
-  Unknown and unpaired peers get the same 403, so peer ids cannot be enumerated.
-- **Keys**: 256-bit random, `pl_` prefix, returned once; only SHA-256 is stored
-  (high-entropy secrets do not need a slow KDF). Invite codes are likewise stored hashed,
-  single-use, and expire.
-- **Registration**: set `PEERLINE_REGISTER_TOKEN` on anything not bound to localhost.
-- **Limits**: message body ≤ 4 KiB, JSON requests ≤ 16 KiB, bags ≤ 64 KiB; per-sender token
-  bucket for messages (default 30/min, burst 10) and per-IP limit on registration.
-  Limits are in-memory (single instance).
-- **Transport**: Peerline speaks plain HTTP; put it behind TLS (Caddy, Tailscale, etc.).
-- **Not in v0**: key rotation, message deletion/TTL, audit log, multi-instance rate limiting.
+- **Cross-account by design** — peer IDs are not tied to a single human; pairing is the trust boundary.
+- **Deny-all** — directional grants (`owner → grantee`). Unknown and unpaired peers share the same 403 (no peer enumeration).
+- **Keys** — 256-bit, `pl_` prefix, returned once; SHA-256 stored. Invite codes hashed, single-use, expire (default 24h, max 7d).
+- **Limits** — messages ≤4 KiB, bags ≤64 KiB; ~30 msg/min per sender (burst 10). In-memory (single instance).
+- **Register token** — set `PEERLINE_REGISTER_TOKEN` on anything not bound to localhost.
+- **TLS** — Peerline speaks HTTP; put it behind Caddy, Tailscale, etc.
+- **Not in v0** — key rotation, message TTL/delete, audit log, multi-instance rate limits.
 
-## Docker sketch
+---
 
-```dockerfile
-FROM golang:1.27 AS build
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /peerline ./cmd/peerline
-
-FROM gcr.io/distroless/static:nonroot
-COPY --from=build /peerline /peerline
-VOLUME /data
-ENV PEERLINE_ADDR=0.0.0.0:8787 PEERLINE_DB=/data/peerline.db
-EXPOSE 8787
-ENTRYPOINT ["/peerline"]
-```
+## Docker
 
 ```sh
-docker build -t peerline . && docker run -p 8787:8787 -v peerline:/data -e PEERLINE_REGISTER_TOKEN=change-me peerline
+docker build -t peerline .
+docker run -p 8787:8787 -v peerline-data:/data \
+  -e PEERLINE_REGISTER_TOKEN=change-me peerline
 ```
+
+Static binary on distroless; data in `/data`. See `Dockerfile`.
+
+---
 
 ## Layout
 
 ```
-cmd/peerline      HTTP server entrypoint
-internal/api      routes and handlers
-internal/auth     key generation, hashing, Bearer middleware
-internal/pair     scopes, bag-name rules, grant checks
-internal/msg      message validation, rate limiter
-internal/store    SQLite schema and queries
-skill/SKILL.md    Grok Bot skill stub
+cmd/peerline       HTTP server
+internal/api       Routes & handlers
+internal/auth      Keys, hashing, Bearer
+internal/pair      Scopes, bag allowlist, grants
+internal/msg       Validation, rate limit
+internal/store     SQLite
+skill/SKILL.md     Grok Bot skill stub
 ```
+
+---
+
+## Status
+
+Personal open-source project by [sysrex](https://github.com/sysrex). Built for visibility and real use: self-host first; a tiny hosted relay can come later.
+
+Issues and PRs welcome — especially Grok Bot skill wiring and multi-account demos.
