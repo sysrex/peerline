@@ -280,7 +280,7 @@ This trusts only requests from that Docker network (where Traefik runs). Peerlin
 
 **⚠️ Warning:** Do NOT blindly trust all RFC1918 private ranges (`10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`) unless you control every host in those ranges. Trusting a range means any host in it can spoof X-Forwarded-For. Only trust the specific network where your reverse proxy resides.
 
-**Prefix length restrictions:** To prevent misconfiguration, Peerline enforces minimum prefix lengths: `/8` for IPv4 and `/32` for IPv6. Overly broad prefixes such as `0.0.0.0/0` or `::/0` are rejected at startup.
+**Prefix length restrictions:** To prevent misconfiguration, Peerline enforces minimum prefix lengths: `/8` for IPv4 and `/32` for IPv6. Overly broad prefixes such as `0.0.0.0/0` or `::/0` are rejected at startup. IPv4-mapped IPv6 prefixes (e.g., `::ffff:10.0.0.0/104`) are unmapped to native IPv4 (`10.0.0.0/8`) and subject to the IPv4 `/8` floor.
 
 **Only X-Forwarded-For is honored.** Peerline does not read `X-Real-IP` or `Forwarded` (RFC 7239). Use a proxy that sets X-Forwarded-For, or leave `PEERLINE_TRUSTED_PROXIES` unset and accept that all clients share the proxy's RemoteAddr for rate limiting.
 
