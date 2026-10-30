@@ -541,6 +541,31 @@ func TestSMTPSend(t *testing.T) {
 	}
 }
 
+func TestFromEnvRejectsLegacyAllowPlaintext(t *testing.T) {
+	t.Setenv("PEERLINE_SMTP_HOST", "localhost")
+	t.Setenv("PEERLINE_SMTP_FROM", "test@example.com")
+	t.Setenv("PEERLINE_SMTP_ALLOW_PLAINTEXT", "1")
+	if _, err := FromEnv(nil); err == nil || !strings.Contains(err.Error(), "PEERLINE_SMTP_REQUIRE_TLS") {
+		t.Fatalf("want rename error, got %v", err)
+	}
+}
+
+func TestSMTPProbeCredentialsWithoutSTARTTLS(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.1.2.3:0")
+	if err != nil {
+		t.Skip("cannot bind a non-loopback-named address:", err)
+	}
+	srv := &fakeServer{ln: ln, t: t}
+	go srv.serve()
+	defer srv.close()
+
+	s := &SMTP{Host: "127.1.2.3", Port: srv.port(), User: "u", Pass: "p", Timeout: 2 * time.Second, AllowPlaintext: true}
+	err = s.Probe(context.Background(), nil)
+	if err == nil || errors.Is(err, ErrRelayUnreachable) || !strings.Contains(err.Error(), "PLAIN auth") {
+		t.Fatalf("want fatal credentials error, got %v", err)
+	}
+}
+
 func TestSMTPProbe(t *testing.T) {
 	t.Run("STARTTLS offered = ok", func(t *testing.T) {
 		cert := genTestCert(t, "localhost")

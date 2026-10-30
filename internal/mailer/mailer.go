@@ -135,6 +135,9 @@ func FromEnv(lg *slog.Logger) (Sender, error) {
 	if (user == "") != (pass == "") {
 		return nil, errors.New("PEERLINE_SMTP_USER and PEERLINE_SMTP_PASS must be set together")
 	}
+	if os.Getenv("PEERLINE_SMTP_ALLOW_PLAINTEXT") != "" {
+		return nil, errors.New("PEERLINE_SMTP_ALLOW_PLAINTEXT was renamed: use PEERLINE_SMTP_REQUIRE_TLS=false")
+	}
 	// Default: allow plaintext only for loopback, require TLS otherwise
 	allowPlaintext := IsLoopback(host)
 	if v := os.Getenv("PEERLINE_SMTP_REQUIRE_TLS"); v != "" {
@@ -304,6 +307,9 @@ func (s *SMTP) Probe(ctx context.Context, lg *slog.Logger) error {
 		if !hasSTARTTLS && !s.AllowPlaintext {
 			// Missing STARTTLS when required is a config error
 			return fmt.Errorf("smtp probe: STARTTLS not offered by %s:%d but TLS is required (set PEERLINE_SMTP_REQUIRE_TLS=false to allow cleartext)", s.Host, s.Port)
+		}
+		if !hasSTARTTLS && s.User != "" && !IsLoopback(s.Host) {
+			return fmt.Errorf("smtp probe: credentials are set but %s:%d offers no STARTTLS and is not loopback; PLAIN auth would be refused", s.Host, s.Port)
 		}
 		if hasSTARTTLS {
 			// Actually perform the handshake to verify certs
