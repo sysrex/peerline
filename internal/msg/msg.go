@@ -3,6 +3,7 @@ package msg
 
 import (
 	"errors"
+	"hash/fnv"
 	"regexp"
 	"sync"
 	"time"
@@ -39,14 +40,25 @@ func (in Input) Validate() error {
 	return nil
 }
 
-// Limiter is a token bucket per key (e.g. sender peer id). Zero-alloc enough for v0.
+const (
+	shardCount      = 32
+	bucketsPerShard = 2048 // 32×2048 = 65536 total buckets max
+	evictionSamples = 5    // sample this many buckets for eviction candidate
+)
+
+// Limiter is a sharded token-bucket rate limiter with bounded memory.
+// Each shard has its own lock to reduce contention.
 type Limiter struct {
-	mu         sync.Mutex
+	shards     [shardCount]*shard
 	rate       float64 // tokens per second
 	burst      float64
-	buckets    map[string]*bucket
 	now        func() time.Time
 	pruneAfter time.Duration
+}
+
+type shard struct {
+	mu      sync.Mutex
+	buckets map[string]*bucket
 }
 
 type bucket struct {
@@ -65,13 +77,16 @@ func NewLimiter(perMinute, burst int) *Limiter {
 			pruneAfter = minAge
 		}
 	}
-	return &Limiter{
+	l := &Limiter{
 		rate:       rate,
 		burst:      float64(burst),
-		buckets:    map[string]*bucket{},
 		now:        time.Now,
 		pruneAfter: pruneAfter,
 	}
+	for i := range l.shards {
+		l.shards[i] = &shard{buckets: make(map[string]*bucket)}
+	}
+	return l
 }
 
 // NewLimiterPerHour allows `perHour` events per hour with the given burst.
@@ -85,13 +100,16 @@ func NewLimiterPerHour(perHour, burst int) *Limiter {
 			pruneAfter = minAge
 		}
 	}
-	return &Limiter{
+	l := &Limiter{
 		rate:       rate,
 		burst:      float64(burst),
-		buckets:    map[string]*bucket{},
 		now:        time.Now,
 		pruneAfter: pruneAfter,
 	}
+	for i := range l.shards {
+		l.shards[i] = &shard{buckets: make(map[string]*bucket)}
+	}
+	return l
 }
 
 // Allow consumes one token for key; false means rate limited.
@@ -104,13 +122,21 @@ func (l *Limiter) Ready(key string) bool { return l.take(key, false) }
 // Prune removes buckets that haven't been touched in pruneAfter duration.
 // Call periodically to prevent unbounded memory growth.
 func (l *Limiter) Prune() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	var pruned int
+	for i := range l.shards {
+		pruned += l.pruneShard(l.shards[i])
+	}
+	return pruned
+}
+
+func (l *Limiter) pruneShard(s *shard) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	t := l.now()
 	var pruned int
-	for key, b := range l.buckets {
+	for key, b := range s.buckets {
 		if t.Sub(b.last) > l.pruneAfter {
-			delete(l.buckets, key)
+			delete(s.buckets, key)
 			pruned++
 		}
 	}
@@ -118,13 +144,18 @@ func (l *Limiter) Prune() int {
 }
 
 func (l *Limiter) take(key string, consume bool) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	s := l.shards[l.shardIndex(key)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	t := l.now()
-	b, ok := l.buckets[key]
+	b, ok := s.buckets[key]
 	if !ok {
+		// Evict oldest idle bucket if at capacity
+		if len(s.buckets) >= bucketsPerShard {
+			l.evictOneLocked(s, t)
+		}
 		b = &bucket{tokens: l.burst, last: t}
-		l.buckets[key] = b
+		s.buckets[key] = b
 	}
 	b.tokens = min(l.burst, b.tokens+t.Sub(b.last).Seconds()*l.rate)
 	b.last = t
@@ -135,4 +166,53 @@ func (l *Limiter) take(key string, consume bool) bool {
 		b.tokens--
 	}
 	return true
+}
+
+// evictOneLocked removes the oldest idle bucket from the shard.
+// Must be called with s.mu held.
+// Samples evictionSamples random buckets and picks the oldest idle one (tokens == burst).
+// If none are idle, picks the oldest overall.
+// Tradeoff: an attacker spraying IPv6 /128s can still evict hot buckets, but requires
+// sustained traffic to fill the shard. Consider keying IPv6 by /64 in the API layer.
+func (l *Limiter) evictOneLocked(s *shard, now time.Time) {
+	if len(s.buckets) == 0 {
+		return
+	}
+	var oldestKey string
+	var oldestTime time.Time
+	var oldestIdleKey string
+	var oldestIdleTime time.Time
+
+	// Sample random buckets
+	samples := 0
+	for k, b := range s.buckets {
+		if samples >= evictionSamples {
+			break
+		}
+		samples++
+		// Prefer idle buckets (full tokens = not recently used)
+		if b.tokens >= l.burst-0.001 { // floating point tolerance
+			if oldestIdleKey == "" || b.last.Before(oldestIdleTime) {
+				oldestIdleKey = k
+				oldestIdleTime = b.last
+			}
+		}
+		if oldestKey == "" || b.last.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = b.last
+		}
+	}
+
+	// Prefer evicting idle buckets
+	if oldestIdleKey != "" {
+		delete(s.buckets, oldestIdleKey)
+	} else if oldestKey != "" {
+		delete(s.buckets, oldestKey)
+	}
+}
+
+func (l *Limiter) shardIndex(key string) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return h.Sum32() % shardCount
 }

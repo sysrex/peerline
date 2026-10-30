@@ -800,6 +800,44 @@ func TestParseTrustedProxies(t *testing.T) {
 	}
 }
 
+func TestIPv6RateLimitKeyPrefixing(t *testing.T) {
+	tests := []struct {
+		name string
+		ip   string
+		want string
+	}{
+		{
+			name: "IPv6 uses /64 prefix",
+			ip:   "2001:db8:1234:5678:abcd:ef01:2345:6789",
+			want: "2001:db8:1234:5678::",
+		},
+		{
+			name: "IPv6 different host same /64",
+			ip:   "2001:db8:1234:5678:9999:9999:9999:9999",
+			want: "2001:db8:1234:5678::",
+		},
+		{
+			name: "IPv4 unchanged",
+			ip:   "203.0.113.42",
+			want: "203.0.113.42",
+		},
+		{
+			name: "IPv4-mapped IPv6 unmapped then full",
+			ip:   "::ffff:203.0.113.42",
+			want: "203.0.113.42",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := rateLimitKey(tt.ip)
+			if got != tt.want {
+				t.Errorf("rateLimitKey(%q) = %q, want %q", tt.ip, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAuthenticatedGETRateLimiting(t *testing.T) {
 	srv := newServer(t, Config{})
 	a := register(t, srv, "alice")

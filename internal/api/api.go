@@ -251,7 +251,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Now charge the rate limiter after token validation
-	if !s.lim.regLim.Allow(clientIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"), s.trustedNets)) {
+	if !s.lim.regLim.Allow(rateLimitKey(clientIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"), s.trustedNets))) {
 		writeErr(w, http.StatusTooManyRequests, "rate limited")
 		return
 	}
@@ -995,7 +995,7 @@ func (s *Server) acceptPairing(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Rate limit pairing redemptions after token validation
-	if !s.lim.pairLim.Allow(clientIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"), s.trustedNets)) {
+	if !s.lim.pairLim.Allow(rateLimitKey(clientIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"), s.trustedNets))) {
 		writeErr(w, http.StatusTooManyRequests, "rate limited")
 		return
 	}
@@ -1051,7 +1051,7 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 	}
 
 	// Rate limit pairing redemptions after register token check passes
-	if !s.lim.pairLim.Allow(clientIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"), s.trustedNets)) {
+	if !s.lim.pairLim.Allow(rateLimitKey(clientIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"), s.trustedNets))) {
 		writeErr(w, http.StatusTooManyRequests, "rate limited")
 		return
 	}

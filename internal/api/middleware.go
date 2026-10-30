@@ -22,7 +22,8 @@ func securityHeaders(next http.Handler) http.Handler {
 func (s *Server) rateLimitGet(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := clientIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"), s.trustedNets)
-		if !s.lim.getLim.Allow(ip) {
+		key := rateLimitKey(ip)
+		if !s.lim.getLim.Allow(key) {
 			w.Header().Set("Retry-After", "10")
 			writeErr(w, http.StatusTooManyRequests, "rate limited")
 			return

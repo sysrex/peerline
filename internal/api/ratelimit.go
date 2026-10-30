@@ -116,6 +116,29 @@ func parseAndNormalizeIP(s string) string {
 	return addr.String()
 }
 
+// rateLimitKey returns a normalized key for rate limiting.
+// For IPv6 addresses, returns the /64 prefix to prevent attackers from evicting
+// hot buckets by rotating through IPv6 addresses within their allocation.
+// For IPv4, returns the full address.
+func rateLimitKey(ip string) string {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ip
+	}
+
+	// Unmap first (e.g., ::ffff:1.2.3.4 → 1.2.3.4)
+	addr = addr.Unmap()
+
+	// IPv6: use /64 prefix (standard delegation size)
+	if addr.Is6() {
+		prefix := netip.PrefixFrom(addr, 64)
+		return prefix.Masked().Addr().String()
+	}
+
+	// IPv4: use full address
+	return addr.String()
+}
+
 // ParseTrustedProxies parses a list of CIDR strings (or bare IPs) into IPNets.
 func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 	var nets []*net.IPNet

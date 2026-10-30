@@ -3,6 +3,7 @@ package msg
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -110,23 +111,158 @@ func TestSlowButActiveBucketsSurvive(t *testing.T) {
 	}
 }
 
-func TestBucketCapNotExceeded(t *testing.T) {
+func TestBucketCapEnforced(t *testing.T) {
 	l := NewLimiter(60, 10)
 
-	// Fill 1000 unique buckets
-	for i := 0; i < 1000; i++ {
-		l.Allow(fmt.Sprintf("key%d", i))
+	// Fill beyond per-shard capacity to trigger eviction
+	// With 32 shards and 2048 buckets per shard, we need to fill one shard
+	// Use sequential keys to ensure they land in the same shard
+	baseKey := "test-key-"
+	var targetShard uint32
+	var keysInTargetShard []string
+
+	// Find enough keys for one shard to trigger eviction
+	for i := 0; len(keysInTargetShard) < 2100; i++ {
+		key := fmt.Sprintf("%s%d", baseKey, i)
+		shardIdx := l.shardIndex(key)
+		if i == 0 {
+			targetShard = shardIdx
+		}
+		if shardIdx == targetShard {
+			keysInTargetShard = append(keysInTargetShard, key)
+		}
 	}
 
-	l.mu.Lock()
-	count := len(l.buckets)
-	l.mu.Unlock()
-
-	if count != 1000 {
-		t.Errorf("bucket count = %d, want 1000", count)
+	// Insert all keys
+	for _, key := range keysInTargetShard {
+		l.Allow(key)
 	}
 
-	// Note: The current implementation doesn't have a hard cap with eviction,
-	// but pruning is the mechanism to prevent unbounded growth
-	// This test just verifies the buckets are created correctly
+	// Count buckets in target shard
+	s := l.shards[targetShard]
+	s.mu.Lock()
+	count := len(s.buckets)
+	s.mu.Unlock()
+
+	// Should be capped at bucketsPerShard
+	if count > 2048 {
+		t.Errorf("shard bucket count = %d, want <= 2048 (eviction failed)", count)
+	}
+}
+
+func TestEvictionPrefersIdleBuckets(t *testing.T) {
+	l := NewLimiter(60, 10)
+	clock := time.Unix(0, 0)
+	l.now = func() time.Time { return clock }
+
+	// Find keys for one shard
+	var targetShard uint32
+	var keys []string
+	for i := 0; len(keys) < 2060; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		shardIdx := l.shardIndex(key)
+		if i == 0 {
+			targetShard = shardIdx
+		}
+		if shardIdx == targetShard {
+			keys = append(keys, key)
+		}
+	}
+
+	// Fill to capacity
+	for i := 0; i < 2048; i++ {
+		l.Allow(keys[i])
+	}
+
+	// Mark one key as active by consuming tokens
+	activeKey := keys[0]
+	for i := 0; i < 5; i++ {
+		l.Allow(activeKey)
+	}
+
+	// Advance time and let all buckets refill
+	clock = clock.Add(1 * time.Minute)
+
+	// Active key uses tokens again
+	l.Allow(activeKey)
+
+	// Now insert new keys (should evict idle ones, not active)
+	for i := 2048; i < 2060; i++ {
+		l.Allow(keys[i])
+	}
+
+	// Active key should still exist
+	s := l.shards[targetShard]
+	s.mu.Lock()
+	_, exists := s.buckets[activeKey]
+	s.mu.Unlock()
+
+	if !exists {
+		t.Error("active bucket was evicted (should prefer idle buckets)")
+	}
+}
+
+func TestActiveBucketKeepsState(t *testing.T) {
+	l := NewLimiter(60, 10)
+	clock := time.Unix(0, 0)
+	l.now = func() time.Time { return clock }
+
+	key := "test"
+
+	// Consume burst
+	for i := 0; i < 10; i++ {
+		if !l.Allow(key) {
+			t.Fatalf("burst %d failed", i)
+		}
+	}
+
+	// Depleted
+	if l.Allow(key) {
+		t.Fatal("should be rate limited")
+	}
+
+	// Advance 1 second = 1 token refill
+	clock = clock.Add(1 * time.Second)
+
+	// Should have exactly 1 token
+	if !l.Allow(key) {
+		t.Fatal("refill failed")
+	}
+	if l.Allow(key) {
+		t.Fatal("should be depleted again")
+	}
+}
+
+func TestShardedLimiterConcurrency(t *testing.T) {
+	l := NewLimiter(60, 10)
+
+	// Hammer from multiple goroutines
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			key := fmt.Sprintf("goroutine-%d", id)
+			for j := 0; j < 100; j++ {
+				l.Allow(key)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Should not panic or deadlock
+	// Run with -race to detect data races
+}
+
+func BenchmarkShardedLimiterParallel(b *testing.B) {
+	l := NewLimiter(60, 10)
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			key := fmt.Sprintf("bench-%d", i%1000)
+			l.Allow(key)
+			i++
+		}
+	})
 }
