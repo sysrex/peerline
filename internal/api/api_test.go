@@ -2057,7 +2057,9 @@ func TestInviteAcceptGETWithScopesReturns405(t *testing.T) {
 	// Verify no grant was created (both directions should be empty)
 	resp, body = a.do("GET", "/v1/grants", nil, nil)
 	want(t, resp, body, 200)
-	var aGrants struct{ Grants []any `json:"grants"` }
+	var aGrants struct {
+		Grants []any `json:"grants"`
+	}
 	json.Unmarshal(body, &aGrants)
 	if len(aGrants.Grants) != 0 {
 		t.Errorf("alice grants: want 0, got %d: %s", len(aGrants.Grants), body)
@@ -2065,7 +2067,9 @@ func TestInviteAcceptGETWithScopesReturns405(t *testing.T) {
 
 	resp, body = b.do("GET", "/v1/grants", nil, nil)
 	want(t, resp, body, 200)
-	var bGrants struct{ Grants []any `json:"grants"` }
+	var bGrants struct {
+		Grants []any `json:"grants"`
+	}
 	json.Unmarshal(body, &bGrants)
 	if len(bGrants.Grants) != 0 {
 		t.Errorf("bob grants: want 0, got %d: %s", len(bGrants.Grants), body)
@@ -2300,4 +2304,3 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 		t.Errorf("body code: unexpected Link header: %s", resp.Header.Get("Link"))
 	}
 }
-
