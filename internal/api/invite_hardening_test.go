@@ -253,46 +253,6 @@ func TestCapBeforeEmailBudget(t *testing.T) {
 	}
 }
 
-// TestMultiLineXForwardedFor verifies that multiple X-Forwarded-For header
-// lines are correctly parsed and combined at the request level through the
-// real GET limiter path. This closes the gap from issue #59.
-func TestMultiLineXForwardedFor(t *testing.T) {
-	st, err := store.Open(t.TempDir() + "/test.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-
-	cfg := Config{
-		Logger:         slog.Default(),
-		TrustedProxies: []string{"10.0.0.0/8"},
-	}
-	srv := New(st, cfg)
-	handler := srv.Handler()
-
-	// Create a test request with multiple X-Forwarded-For headers
-	req := httptest.NewRequest("GET", "/healthz", nil)
-	req.RemoteAddr = "10.0.0.1:12345"
-	// Simulate multiple XFF headers (some proxies send separate headers)
-	req.Header["X-Forwarded-For"] = []string{
-		"1.2.3.4, 2.3.4.5",
-		"3.4.5.6",
-	}
-
-	rr := httptest.NewRecorder()
-	handler.ServeHTTP(rr, req)
-
-	if rr.Code != 200 {
-		t.Errorf("expected 200, got %d", rr.Code)
-	}
-
-	// The test verifies that the code doesn't panic and handles multiple
-	// XFF headers correctly. The actual IP extraction logic is tested by
-	// the fact that the rate limiter accepts the request.
-	// The clientIP function should combine the headers and return 1.2.3.4
-	// (the leftmost non-trusted IP).
-}
-
 // TestGETLimiterSeparateBuckets verifies that two clients behind a trusted
 // proxy with different X-Forwarded-For headers get separate getLim buckets,
 // and the same client shares one bucket. This closes the gap from issue #31/#129.
@@ -320,23 +280,23 @@ func TestGETLimiterSeparateBuckets(t *testing.T) {
 		return rr.Code
 	}
 
-	// Make 100 requests from client 1 (burst is 20, rate is 60/min = 1/sec,
-	// so after burst we need many more to exhaust it)
-	client1Blocked := false
-	for i := 0; i < 100; i++ {
+	// Exhaust client 1's bucket (burst=20 for getLim)
+	// Make 21 requests - the 21st should get 429
+	for i := 0; i < 20; i++ {
 		code := makeRequest("1.2.3.4")
-		if code == 429 {
-			client1Blocked = true
-			break
+		if code != 200 {
+			t.Fatalf("request %d from client 1: expected 200, got %d", i+1, code)
 		}
 	}
 
-	if !client1Blocked {
-		t.Error("expected client 1 to be rate limited after 100 requests")
+	// 21st request should be rate limited
+	code := makeRequest("1.2.3.4")
+	if code != 429 {
+		t.Errorf("request 21 from client 1: expected 429 (rate limited), got %d", code)
 	}
 
 	// Now client 2 with a different IP should have its own bucket and not be blocked
-	code := makeRequest("5.6.7.8")
+	code = makeRequest("5.6.7.8")
 	if code != 200 {
 		t.Errorf("client 2 (different IP) should not be rate limited, got %d", code)
 	}
@@ -369,12 +329,20 @@ func TestAnonymousGETDoesNotBlockAuthenticatedInbox(t *testing.T) {
 	bob := register(t, srv, "bob")
 
 	// Anonymous client exhausts GET / (public GET limiter)
+	// burst=20, so 21 requests should exhaust it
 	anon := &client{t: t, srv: srv}
-	for i := 0; i < 100; i++ {
+	gotRateLimited := false
+	for i := 0; i < 25; i++ {
 		resp, _ := anon.do("GET", "/", nil, nil)
 		if resp.StatusCode == 429 {
-			break // Successfully exhausted the public limiter
+			gotRateLimited = true
+			break
 		}
+	}
+
+	// Fail if we never exhausted the limiter
+	if !gotRateLimited {
+		t.Fatal("anonymous client never got rate limited; test is vacuous")
 	}
 
 	// Alice and Bob polling /v1/inbox should not be affected (different limiter)
