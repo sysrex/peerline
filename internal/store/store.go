@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -383,29 +384,63 @@ func (s *Store) SetNotifyEmail(ctx context.Context, id, email, token string) err
 	return nil
 }
 
-// GetNotifyEmailWithStatus returns the email, whether it's verified, and the verification token.
-func (s *Store) GetNotifyEmailWithStatus(ctx context.Context, id string) (email string, verified bool, token string, err error) {
+// GetNotifyEmailStatus returns the email and whether it's verified (no token exposure).
+func (s *Store) GetNotifyEmailStatus(ctx context.Context, id string) (email string, verified bool, err error) {
 	var verifiedInt int
-	var tokenNull sql.NullString
-	err = s.db.QueryRowContext(ctx, `SELECT notify_email, notify_email_verified, notify_email_token FROM peers WHERE id=?`, id).Scan(&email, &verifiedInt, &tokenNull)
+	err = s.db.QueryRowContext(ctx, `SELECT notify_email, notify_email_verified FROM peers WHERE id=?`, id).Scan(&email, &verifiedInt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, "", ErrNotFound
+		return "", false, ErrNotFound
 	}
 	if err != nil {
-		return "", false, "", err
+		return "", false, err
 	}
 	verified = verifiedInt != 0
-	if tokenNull.Valid {
-		token = tokenNull.String
-	}
-	return email, verified, token, nil
+	return email, verified, nil
 }
 
-// VerifyNotifyEmail marks the email as verified if the token matches.
-func (s *Store) VerifyNotifyEmail(ctx context.Context, id, token string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE peers SET notify_email_verified=1, notify_email_token=NULL WHERE id=? AND notify_email_token=?`, id, token)
+// VerifyNotifyEmail marks the email as verified if the tokenHash matches and hasn't expired.
+// Token is single-use: cleared on success. Returns ErrNotFound for invalid/expired/used tokens.
+// tokenWithExpiry format: "<unix_issued>:<hash>". Legacy plaintext or malformed values are treated as invalid.
+func (s *Store) VerifyNotifyEmail(ctx context.Context, id, tokenHash string) error {
+	// Fetch stored token
+	var storedToken sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT notify_email_token FROM peers WHERE id=?`, id).Scan(&storedToken)
 	if err != nil {
-		return err
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("fetch notify_email_token: %w", err)
+	}
+	if !storedToken.Valid || storedToken.String == "" {
+		return ErrNotFound
+	}
+
+	// Parse stored token: "<unix_issued>:<hash>"
+	parts := strings.SplitN(storedToken.String, ":", 2)
+	if len(parts) != 2 {
+		// Malformed or legacy plaintext token
+		return ErrNotFound
+	}
+	issuedUnix, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return ErrNotFound
+	}
+	storedHash := parts[1]
+
+	// Check expiry (24 hours: valid at exactly issued+86400, expired at issued+86401)
+	if s.now() > issuedUnix+86400 {
+		return ErrNotFound
+	}
+
+	// Verify hash matches
+	if tokenHash != storedHash {
+		return ErrNotFound
+	}
+
+	// Single-use: clear token and mark verified
+	res, err := s.db.ExecContext(ctx, `UPDATE peers SET notify_email_verified=1, notify_email_token=NULL WHERE id=? AND notify_email_token=?`, id, storedToken.String)
+	if err != nil {
+		return fmt.Errorf("clear token: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
