@@ -231,7 +231,7 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 }
 
 // Probe connects to the SMTP server, checks for STARTTLS availability, and disconnects.
-// It fails fast if TLS is misconfigured. If the server is unreachable (TCP dial failure only),
+// It fails fast if TLS is misconfigured. If the server is unreachable (TCP dial failure),
 // it logs a warning via lg and returns nil. TLS handshake failures on port 465 fail startup.
 func (s *SMTP) Probe(ctx context.Context, lg *slog.Logger) error {
 	if lg == nil {
@@ -254,33 +254,27 @@ func (s *SMTP) Probe(ctx context.Context, lg *slog.Logger) error {
 		tlsCfg = &tls.Config{ServerName: s.Host, MinVersion: tls.VersionTLS12}
 	}
 
-	var conn net.Conn
-	var err error
+	// Always do TCP dial first
 	d := &net.Dialer{}
-	if s.ImplicitTLS {
-		// Implicit TLS on port 465 - TLS failures are fatal
-		conn, err = (&tls.Dialer{NetDialer: d, Config: tlsCfg}).DialContext(ctx, "tcp", addr)
-		if err != nil {
-			// Check if it's a TCP dial error or TLS error
-			if isDialError(err) {
-				lg.Warn("smtp probe: relay unreachable at startup (will retry on send)", "host", s.Host, "port", s.Port, "err", err)
-				return nil
-			}
-			// TLS handshake failure on 465 is fatal
-			return fmt.Errorf("smtp probe: TLS handshake failed on port 465: %w", err)
-		}
-	} else {
-		conn, err = d.DialContext(ctx, "tcp", addr)
-		if err != nil {
-			// TCP dial failure - warn but don't fail startup
-			lg.Warn("smtp probe: relay unreachable at startup (will retry on send)", "host", s.Host, "port", s.Port, "err", err)
-			return nil
-		}
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		// TCP dial failure - warn but don't fail startup
+		lg.Warn("smtp probe: relay unreachable at startup (will retry on send)", "host", s.Host, "port", s.Port, "err", err)
+		return nil
 	}
 	defer conn.Close()
 
 	if dl, ok := ctx.Deadline(); ok {
 		conn.SetDeadline(dl)
+	}
+
+	// For implicit TLS (port 465), perform TLS handshake now
+	if s.ImplicitTLS {
+		tlsConn := tls.Client(conn, tlsCfg)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			return fmt.Errorf("smtp probe: TLS handshake failed on port 465: %w", err)
+		}
+		conn = tlsConn
 	}
 
 	c, err := smtp.NewClient(conn, s.Host)
@@ -296,24 +290,6 @@ func (s *SMTP) Probe(ctx context.Context, lg *slog.Logger) error {
 		}
 	}
 	return nil
-}
-
-// isDialError returns true if err is a TCP connection error (connection refused, etc),
-// false if it's a TLS handshake error or other post-connection error.
-func isDialError(err error) bool {
-	if err == nil {
-		return false
-	}
-	// TLS errors contain "tls:" or "certificate"
-	errStr := err.Error()
-	if strings.Contains(errStr, "tls:") || strings.Contains(errStr, "certificate") || strings.Contains(errStr, "handshake") {
-		return false
-	}
-	// Connection-level errors
-	return strings.Contains(errStr, "connection refused") ||
-		strings.Contains(errStr, "no route to host") ||
-		strings.Contains(errStr, "network is unreachable") ||
-		strings.Contains(errStr, "no such host")
 }
 
 // Compose renders an RFC 5322 plain-text message with CRLF line endings.

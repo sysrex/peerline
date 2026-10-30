@@ -1046,9 +1046,10 @@ func (s *Server) notifyEmail(m *store.Message, to string) mailer.Message {
 
 // bodyPreview is an excerpt of the message body. It drops ASCII controls
 // (except tab and newline), redacts API keys (pl_), invite codes (inv_),
-// pairing tokens (pair_), and a register token of at least 8 characters.
-// The redaction is best-effort: it does not strip tokens with embedded format
-// characters or partial matches, and stays within max runes.
+// pairing tokens (pair_), email verification tokens (eml_), and a register
+// token of at least 8 characters. The redaction is best-effort: it does not
+// strip tokens with embedded format characters or partial matches, and stays
+// within max runes.
 func bodyPreview(body, registerToken string, max int) string {
 	if max < 1 {
 		return ""

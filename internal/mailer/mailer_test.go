@@ -601,7 +601,7 @@ func TestSMTPImplicitTLS(t *testing.T) {
 		}
 	})
 
-	t.Run("port 465 probe TLS failure is fatal", func(t *testing.T) {
+	t.Run("port 465 probe TLS handshake failure is fatal", func(t *testing.T) {
 		ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
 		if err != nil {
 			t.Fatal(err)
@@ -623,6 +623,62 @@ func TestSMTPImplicitTLS(t *testing.T) {
 		// Should be a TLS handshake failure, not just an unreachable warning
 		if !strings.Contains(err.Error(), "TLS handshake") && !strings.Contains(err.Error(), "certificate") {
 			t.Fatalf("expected TLS error, got: %v", err)
+		}
+	})
+
+	t.Run("port 465 probe timeout during handshake is fatal", func(t *testing.T) {
+		// TCP listener that accepts but never speaks TLS
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				// Accept but never write anything (simulates hung handshake)
+				time.Sleep(2 * time.Second)
+				c.Close()
+			}
+		}()
+
+		s := &SMTP{
+			Host:        "127.0.0.1",
+			Port:        ln.Addr().(*net.TCPAddr).Port,
+			Timeout:     500 * time.Millisecond,
+			ImplicitTLS: true,
+		}
+		err = s.Probe(context.Background(), nil)
+		if err == nil {
+			t.Fatal("probe should fail on handshake timeout, got nil")
+		}
+		if !strings.Contains(err.Error(), "handshake") {
+			t.Fatalf("expected handshake error, got: %v", err)
+		}
+	})
+
+	t.Run("port 465 probe closed port only warns", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+		// Use a port that's definitely closed
+		s := &SMTP{
+			Host:        "127.0.0.1",
+			Port:        1, // closed port
+			Timeout:     100 * time.Millisecond,
+			ImplicitTLS: true,
+		}
+		err := s.Probe(context.Background(), logger)
+		if err != nil {
+			t.Fatalf("probe should not fail for closed port, got: %v", err)
+		}
+		logged := buf.String()
+		if !strings.Contains(logged, "unreachable") {
+			t.Fatalf("expected warning about unreachable relay: %s", logged)
 		}
 	})
 }
