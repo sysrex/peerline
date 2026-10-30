@@ -52,7 +52,7 @@ jobs:
         # Validate values (reject spaces, quotes, control chars)
         for val in "$VERSION" "$COMMIT" "$BUILD_TIME"; do
           case "$val" in
-            *[!A-Za-z0-9._+:/-]*)
+            *[!A-Za-z0-9._+:-]*)
               echo "ERROR: Invalid build value contains forbidden characters: $val" >&2
               exit 1
               ;;
@@ -79,6 +79,9 @@ jobs:
 
     - name: Test
       run: go test -race -count=1 -timeout 5m ./...
+
+    - name: Integration tests
+      run: go test -race -count=1 -timeout 5m -tags integration .
 
   security:
     name: Security Scan
@@ -146,47 +149,57 @@ jobs:
 
     - name: Smoke test /version endpoint
       run: |
-        # Start container with tmpfs for database
-        docker run -d --name peerline-test -p 8787:8787 \
-          --tmpfs /data \
-          -e PEERLINE_ADDR=0.0.0.0:8787 \
-          -e PEERLINE_DB=/data/peerline.db \
-          peerline:test
-        
-        # Wait for startup with readiness polling (max 30s)
-        echo "Waiting for server to be ready..."
-        for i in $(seq 1 30); do
-          if curl -sf http://localhost:8787/healthz > /dev/null 2>&1; then
-            echo "Server ready after ${i}s"
-            break
-          fi
-          if [ "$i" -eq 30 ]; then
-            echo "ERROR: Server did not become ready within 30s"
-            docker logs peerline-test
-            exit 1
-          fi
-          sleep 1
-        done
-        
-        # Test /version endpoint
-        curl -f http://localhost:8787/version || (docker logs peerline-test && exit 1)
-        
-        # Verify response structure (should be version-only by default)
-        VERSION_JSON="$(curl -s http://localhost:8787/version)"
-        echo "Version endpoint response: $VERSION_JSON"
-        
-        # Should have "version" key
-        if ! echo "$VERSION_JSON" | grep -q '"version"'; then
-          echo "ERROR: /version response missing 'version' key"
-          exit 1
-        fi
-        
-        # Should NOT have commit or build_time by default
+        start() { # name, extra docker args...
+          name="$1"; shift
+          docker run -d --name "$name" -p 8787:8787 --tmpfs /data \
+            -e PEERLINE_ADDR=0.0.0.0:8787 -e PEERLINE_DB=/data/peerline.db "$@" peerline:test
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8787/healthz > /dev/null 2>&1 && return 0
+            sleep 1
+          done
+          echo "ERROR: $name did not become ready within 30s"
+          docker logs "$name"
+          return 1
+        }
+
+        start peerline-test
+        VERSION_JSON="$(curl -sf http://localhost:8787/version)"
+        echo "default: $VERSION_JSON"
+        echo "$VERSION_JSON" | grep -q '"version"' || { echo "ERROR: missing 'version'"; exit 1; }
         if echo "$VERSION_JSON" | grep -q '"commit"'; then
-          echo "ERROR: /version response should not include 'commit' by default"
+          echo "ERROR: default mode must not include 'commit'"
           exit 1
         fi
-        
-        # Clean up
-        docker stop peerline-test
-        docker rm peerline-test
+        docker rm -f peerline-test
+
+        start peerline-off -e PEERLINE_VERSION_DETAIL=off
+        CODE="$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8787/version)"
+        [ "$CODE" = "404" ] || { echo "ERROR: off mode returned $CODE"; exit 1; }
+        docker rm -f peerline-off
+
+        start peerline-full -e PEERLINE_VERSION_DETAIL=full
+        FULL_JSON="$(curl -sf http://localhost:8787/version)"
+        echo "full: $FULL_JSON"
+        echo "$FULL_JSON" | grep -q "\"commit\":\"${GIT_SHA:0:12}\"" || { echo "ERROR: commit not stamped"; exit 1; }
+        echo "$FULL_JSON" | grep -q '"build_time":"2' || { echo "ERROR: build_time not stamped"; exit 1; }
+
+    - name: Container logs
+      if: always()
+      run: |
+        for c in peerline-test peerline-off peerline-full; do docker logs "$c" 2>&1 || true; done
+        docker rm -f peerline-test peerline-off peerline-full || true
+
+  all-jobs:
+    name: All Jobs Ran
+    if: always()
+    needs: [test, security, docker, docker-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+    - name: Require every job to have succeeded
+      env:
+        RESULTS: ${{ join(needs.*.result, ' ') }}
+      run: |
+        for r in $RESULTS; do
+          [ "$r" = "success" ] || { echo "ERROR: a required job result was '$r'"; exit 1; }
+        done

@@ -460,7 +460,7 @@ docker build \
   -t peerline .
 ```
 
-Deployment platforms like Coolify may pass `SOURCE_COMMIT` automatically; the Dockerfile uses `COMMIT` or `SOURCE_COMMIT` (whichever is set). Build args are validated (alphanumeric, `.`, `_`, `+`, `:`, `/`, `-` only) and empty args fall back to `runtime/debug.ReadBuildInfo` or sensible defaults (`version=dev`, `commit=unknown`).
+Deployment platforms like Coolify may pass `SOURCE_COMMIT` automatically; the Dockerfile uses `COMMIT` or `SOURCE_COMMIT` (whichever is set). Build args are validated (alphanumeric, `.`, `_`, `+`, `:`, `-` only) and empty args fall back to `runtime/debug.ReadBuildInfo` or sensible defaults (`version=dev`, `commit=unknown`).
 
 Check the running version:
 

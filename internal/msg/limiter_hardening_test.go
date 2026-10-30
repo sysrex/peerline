@@ -20,7 +20,6 @@ func TestLargerBurstRatePruneFloor(t *testing.T) {
 
 	// Advance 3 hours and use again (slow but active)
 	clock = clock.Add(3 * time.Hour)
-	l.now = func() time.Time { return clock }
 	l.Allow("slow")
 
 	// Prune (bucket was last touched 0 minutes ago, well within 10h threshold)
@@ -31,7 +30,6 @@ func TestLargerBurstRatePruneFloor(t *testing.T) {
 
 	// Advance another 8 hours without activity (total 11h since creation, 8h since last use)
 	clock = clock.Add(8 * time.Hour)
-	l.now = func() time.Time { return clock }
 
 	// Prune again - still within 10h since last touch, should not be pruned
 	pruned = l.Prune()
@@ -41,7 +39,6 @@ func TestLargerBurstRatePruneFloor(t *testing.T) {
 
 	// Advance another 3 hours (total 11h since last touch, which is >10h)
 	clock = clock.Add(3 * time.Hour)
-	l.now = func() time.Time { return clock }
 
 	// Now it should be pruned (>10h since last touch)
 	pruned = l.Prune()
