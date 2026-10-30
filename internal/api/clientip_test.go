@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -831,5 +832,19 @@ func TestTrustedProxiesStartupLogging(t *testing.T) {
 				t.Errorf("log output %q does not contain %q", logOutput, tt.wantLog)
 			}
 		})
+	}
+}
+
+func TestNewWarnsWhenTrustedProxiesParseToNothing(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	var logs bytes.Buffer
+	srv := mustNew(t, st, Config{TrustedProxies: []string{" ", ""}, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	t.Cleanup(srv.lim.Stop)
+	if !strings.Contains(logs.String(), "no trusted proxies configured") {
+		t.Fatalf("a set-but-empty trusted proxy list must warn, got logs: %q", logs.String())
 	}
 }
