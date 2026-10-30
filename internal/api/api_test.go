@@ -6,15 +6,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
+	"html/template"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/sysrex/peerline/internal/store"
 	"golang.org/x/text/unicode/norm"
@@ -1512,8 +1516,9 @@ func TestCSPHomePageNonce(t *testing.T) {
 		t.Fatalf("no nonce found in CSP: %s", csp)
 	}
 
-	// Verify the nonce appears in both the style and script tags
-	html := string(body)
+	// Unescape HTML entities in body before checking nonces
+	// (html/template escapes '+' to '&#43;' in attributes)
+	html := html.UnescapeString(string(body))
 	expectedStyle := `<style nonce="` + nonce + `">`
 	expectedScript := `<script nonce="` + nonce + `">`
 
@@ -1534,6 +1539,123 @@ func TestCSPHomePageNonce(t *testing.T) {
 	// Verify CSP includes connect-src for fetch() calls
 	if !strings.Contains(csp, "connect-src 'self'") {
 		t.Errorf("CSP missing connect-src 'self': %s", csp)
+	}
+
+	// Verify the style body starts with :root and script body starts with (function
+	styleStart := strings.Index(html, `<style nonce="`+nonce+`">`)
+	if styleStart == -1 {
+		t.Fatal("style tag not found")
+	}
+	styleEnd := strings.Index(html[styleStart:], `</style>`)
+	if styleEnd == -1 {
+		t.Fatal("style closing tag not found")
+	}
+	styleBody := html[styleStart+len(`<style nonce="`+nonce+`">`) : styleStart+styleEnd]
+	styleBody = strings.TrimSpace(styleBody)
+	if !strings.HasPrefix(styleBody, ":root") {
+		previewLen := 50
+		if len(styleBody) < previewLen {
+			previewLen = len(styleBody)
+		}
+		t.Errorf("style body should start with ':root', got: %q", styleBody[:previewLen])
+	}
+
+	scriptStart := strings.Index(html, `<script nonce="`+nonce+`">`)
+	if scriptStart == -1 {
+		t.Fatal("script tag not found")
+	}
+	scriptEnd := strings.Index(html[scriptStart:], `</script>`)
+	if scriptEnd == -1 {
+		t.Fatal("script closing tag not found")
+	}
+	scriptBody := html[scriptStart+len(`<script nonce="`+nonce+`">`) : scriptStart+scriptEnd]
+	scriptBody = strings.TrimSpace(scriptBody)
+	if !strings.HasPrefix(scriptBody, "(function") {
+		previewLen := 50
+		if len(scriptBody) < previewLen {
+			previewLen = len(scriptBody)
+		}
+		t.Errorf("script body should start with '(function', got: %q", scriptBody[:previewLen])
+	}
+}
+
+func TestCSPNonceWithSpecialChars(t *testing.T) {
+	// Deterministic test with a nonce containing '+', '/', and '='
+	// to verify html/template escaping doesn't break the page
+	fixedNonce := "ab+c/d=="
+
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Execute template with fixed nonce
+	var buf bytes.Buffer
+	stats := store.Stats{Peers: 0, Messages: 0, Grants: 0, Bags: 0}
+	statsJSON, _ := json.Marshal(stats)
+
+	err = homeTmpl.Execute(&buf, homeData{
+		BaseURL:      "http://localhost",
+		RegisterOpen: true,
+		Nonce:        fixedNonce,
+		StatsJSON:    template.JS(statsJSON),
+		Stats:        stats,
+	})
+	if err != nil {
+		t.Fatalf("template execution failed: %v", err)
+	}
+
+	rendered := buf.String()
+	unescaped := html.UnescapeString(rendered)
+
+	// Verify tags contain the nonce exactly (after unescaping)
+	expectedStyleTag := `<style nonce="` + fixedNonce + `">`
+	expectedScriptTag := `<script nonce="` + fixedNonce + `">`
+
+	if !strings.Contains(unescaped, expectedStyleTag) {
+		t.Errorf("unescaped HTML missing style tag with nonce: want %q", expectedStyleTag)
+		// Show what we got around where it should be
+		if idx := strings.Index(unescaped, "<style"); idx >= 0 {
+			end := idx + 50
+			if end > len(unescaped) {
+				end = len(unescaped)
+			}
+			t.Errorf("found instead: %q", unescaped[idx:end])
+		}
+	}
+
+	if !strings.Contains(unescaped, expectedScriptTag) {
+		t.Errorf("unescaped HTML missing script tag with nonce: want %q", expectedScriptTag)
+		// Show what we got around where it should be (skip the JSON script block)
+		startSearch := strings.Index(unescaped, "</section>")
+		if startSearch >= 0 {
+			if idx := strings.Index(unescaped[startSearch:], "<script"); idx >= 0 {
+				idx += startSearch
+				end := idx + 50
+				if end > len(unescaped) {
+					end = len(unescaped)
+				}
+				t.Errorf("found instead: %q", unescaped[idx:end])
+			}
+		}
+	}
+
+	// Verify no stray '>' after the tags
+	styleTagStart := strings.Index(unescaped, expectedStyleTag)
+	if styleTagStart >= 0 {
+		afterStyleTag := styleTagStart + len(expectedStyleTag)
+		if afterStyleTag < len(unescaped) && unescaped[afterStyleTag] == '>' {
+			t.Error("style tag has stray '>' after opening tag")
+		}
+	}
+
+	scriptTagStart := strings.Index(unescaped, expectedScriptTag)
+	if scriptTagStart >= 0 && scriptTagStart > strings.Index(unescaped, "</section>") {
+		afterScriptTag := scriptTagStart + len(expectedScriptTag)
+		if afterScriptTag < len(unescaped) && unescaped[afterScriptTag] == '>' {
+			t.Error("script tag has stray '>' after opening tag")
+		}
 	}
 }
 
@@ -1835,28 +1957,29 @@ func TestRevokePreventsPairing(t *testing.T) {
 func TestInviteCapBeforeEmailBudget(t *testing.T) {
 	cfg := Config{}
 	cfg.MaxOutstandingInvites = 2 // Set cap to 2
+	cfg.EmailPerHour = 1          // Tight budget: only 1 email allowed
+	cfg.EmailBurst = 1
+	cfg.EmailRcptPerHour = 10 // Generous recipient budget to isolate sender
 	srv := newServer(t, cfg)
 	alice := register(t, srv, "Alice")
 
-	// Create first invite (should succeed, 1/2)
+	// Create first invite without email (should succeed, 1/2, no budget spent)
 	resp, b := alice.do("POST", "/v1/invites", map[string]any{
-		"to_email": "bob@example.com",
-		"scopes":   []string{"messages"},
+		"scopes": []string{"messages"},
 	}, nil)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
 	}
 
-	// Create second invite (should succeed, 2/2 - at cap)
+	// Create second invite without email (should succeed, 2/2 - at cap, no budget spent)
 	resp, b = alice.do("POST", "/v1/invites", map[string]any{
-		"to_email": "carol@example.com",
-		"scopes":   []string{"messages"},
+		"scopes": []string{"messages"},
 	}, nil)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("second invite (at cap): %d %s", resp.StatusCode, b)
 	}
 
-	// Attempt third invite (one over cap, should fail without spending email budget)
+	// Attempt third invite with to_email (should fail with 429, no budget consumed)
 	resp, b = alice.do("POST", "/v1/invites", map[string]any{
 		"to_email": "dave@example.com",
 		"scopes":   []string{"messages"},
@@ -1869,6 +1992,302 @@ func TestInviteCapBeforeEmailBudget(t *testing.T) {
 	}
 	if !bytes.Contains(b, []byte("limit 2")) {
 		t.Errorf("over-cap error: should mention limit 2")
+	}
+
+	// Revoke one invite to make room
+	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites: %d %s", resp.StatusCode, b)
+	}
+	var listResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(listResp.Invites) < 1 {
+		t.Fatal("no invites to revoke")
+	}
+	revokeID := listResp.Invites[0]["public_id"].(string)
+	resp, b = alice.do("DELETE", "/v1/invites/"+revokeID, nil, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("revoke: %d %s", resp.StatusCode, b)
+	}
+
+	// Now create an invite with to_email (should succeed, proving budget wasn't consumed)
+	// If budget was consumed during cap rejection, this would fail with 429
+	resp, b = alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "dave@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("invite after cap rejection: status %d, want 201, body %s", resp.StatusCode, b)
+		t.Errorf("this proves email budget WAS consumed during the cap rejection")
+	}
+
+	// Verify the invite was actually created and can be listed
+	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites final: %d %s", resp.StatusCode, b)
+	}
+	var finalResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &finalResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(finalResp.Invites) != 2 {
+		t.Errorf("final invite count: %d, want 2 (one revoked, one new with email)", len(finalResp.Invites))
+	}
+}
+
+// TestEmailLimitDeletesInvite verifies invite is deleted when email limit fails (#53)
+func TestEmailLimitDeletesInvite(t *testing.T) {
+	cfg := Config{}
+	cfg.EmailPerHour = 3
+	cfg.EmailBurst = 3
+	srv := newServer(t, cfg)
+	alice := register(t, srv, "Alice")
+
+	// Exhaust sender's email budget (3 burst)
+	for i := 0; i < 3; i++ {
+		resp, b := alice.do("POST", "/v1/invites", map[string]any{
+			"to_email": fmt.Sprintf("user%d@example.com", i),
+			"scopes":   []string{"messages"},
+		}, nil)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("invite %d: %d %s", i, resp.StatusCode, b)
+		}
+	}
+
+	// List invites before next attempt
+	resp, b := alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites: %d %s", resp.StatusCode, b)
+	}
+	var beforeResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &beforeResp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Next invite should fail with rate limit
+	resp, b = alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "ratelimited@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("rate limited invite: status %d, want 429, body %s", resp.StatusCode, b)
+	}
+	if !bytes.Contains(b, []byte("rate limited")) {
+		t.Errorf("rate limit error: %s, want rate limit message", b)
+	}
+
+	// List invites after - count should be the same (invite was deleted)
+	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites after: %d %s", resp.StatusCode, b)
+	}
+	var afterResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &afterResp); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(afterResp.Invites) != len(beforeResp.Invites) {
+		t.Errorf("invite count changed: before=%d, after=%d (invite should have been deleted)", len(beforeResp.Invites), len(afterResp.Invites))
+	}
+}
+
+// TestDeletedInviteCannotBeAccepted verifies hard-deleted invites are unusable (#53)
+func TestDeletedInviteCannotBeAccepted(t *testing.T) {
+	cfg := Config{}
+	cfg.EmailPerHour = 1
+	cfg.EmailBurst = 1
+	srv := newServer(t, cfg)
+	alice := register(t, srv, "Alice")
+	bob := register(t, srv, "Bob")
+
+	// Alice creates an invite with email, consuming her budget
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "bob@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
+	}
+	var inv1 struct {
+		Code string `json:"code"`
+	}
+	json.Unmarshal(b, &inv1)
+
+	// Alice tries to create another invite with email (should fail, invite created then deleted)
+	resp, b = alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "carol@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("rate limited invite: status %d, want 429, body %s", resp.StatusCode, b)
+	}
+
+	// Bob tries to accept the first invite (should succeed)
+	resp, b = bob.do("POST", "/v1/invites/accept?code="+inv1.Code, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("accept first invite: %d %s, want 200", resp.StatusCode, b)
+	}
+}
+
+// TestConcurrentInviteCapRace verifies the concurrent cap check race is fixed (#53).
+//
+// Verified on a scratch branch with the OLD ordering (hook after create, budget check before create):
+// Test FAILS with output: 'budget check: 0 email invites succeeded, want 4'
+// All 5 requests consume budget, leaving 0 tokens available.
+//
+// With NEW ordering (hook before create, create before budget check): PASSES with 4 tokens available.
+func TestConcurrentInviteCapRace(t *testing.T) {
+	cfg := Config{}
+	cfg.MaxOutstandingInvites = 2
+	cfg.EmailPerHour = 10
+	cfg.EmailBurst = 5 // 5 tokens available
+	cfg.EmailRcptPerHour = 20
+
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	rawSrv := New(st, cfg)
+	srv := httptest.NewServer(rawSrv.Handler())
+	defer srv.Close()
+
+	alice := register(t, srv, "Alice")
+
+	// Create first invite to get close to cap (1/2)
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"scopes": []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
+	}
+
+	// Set up N-party barrier: all 5 goroutines wait until all arrive, then release together
+	const concurrent = 5
+	var arrivalCount int
+	var arrivalMu sync.Mutex
+	allArrived := make(chan struct{})
+	var closeOnce sync.Once
+
+	rawSrv.testInviteCreatedHook = func(peerID string) {
+		arrivalMu.Lock()
+		arrivalCount++
+		if arrivalCount == concurrent {
+			closeOnce.Do(func() { close(allArrived) })
+		}
+		arrivalMu.Unlock()
+
+		select {
+		case <-allArrived:
+			// All arrived, proceed
+		case <-time.After(5 * time.Second):
+			t.Error("barrier timeout: not all goroutines arrived")
+		}
+	}
+
+	// Launch concurrent requests at the cap with to_email
+	// One should succeed (2/2), others should fail at atomic cap check
+	// BUG on main: all 5 consume budget before atomic check (5 tokens consumed)
+	// FIX here: only the 1 successful request consumes budget (1 token consumed)
+	results := make(chan int, concurrent)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrent; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, _ := alice.do("POST", "/v1/invites", map[string]any{
+				"to_email": fmt.Sprintf("user%d@example.com", i),
+				"scopes":   []string{"messages"},
+			}, nil)
+			results <- resp.StatusCode
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	// Collect results
+	var created, rejected int
+	for status := range results {
+		if status == http.StatusCreated {
+			created++
+		} else if status == http.StatusTooManyRequests {
+			rejected++
+		} else {
+			t.Errorf("unexpected status: %d", status)
+		}
+	}
+
+	// Exactly one should have succeeded (reaching cap at 2/2)
+	if created != 1 {
+		t.Errorf("concurrent creates: %d succeeded, want 1", created)
+	}
+	if rejected != concurrent-1 {
+		t.Errorf("concurrent rejects: %d, want %d", rejected, concurrent-1)
+	}
+
+	// Verify final state: exactly 2 invites
+	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites: %d %s", resp.StatusCode, b)
+	}
+	var listResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(listResp.Invites) != 2 {
+		t.Errorf("final invite count: %d, want 2 (at cap)", len(listResp.Invites))
+	}
+
+	// Clear hook for budget verification
+	rawSrv.testInviteCreatedHook = nil
+
+	// Revoke one invite to make room for budget check
+	revokeID := listResp.Invites[0]["public_id"].(string)
+	resp, b = alice.do("DELETE", "/v1/invites/"+revokeID, nil, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("revoke: %d %s", resp.StatusCode, b)
+	}
+
+	// Verify budget: check how many more email invites succeed
+	// If bug existed: 5 tokens consumed during race, 0 left
+	// With fix: 1 token consumed during race, 4 left
+	// We should be able to create 4 more email invites
+	var budgetSucceeded int
+	for i := 0; i < 6; i++ { // Try 6, expect 4 to succeed
+		resp, b := alice.do("POST", "/v1/invites", map[string]any{
+			"to_email": fmt.Sprintf("budget%d@example.com", i),
+			"scopes":   []string{"messages"},
+		}, nil)
+		if resp.StatusCode == http.StatusCreated {
+			budgetSucceeded++
+			// Revoke immediately to avoid hitting cap
+			var inv struct {
+				PublicID string `json:"public_id"`
+			}
+			json.Unmarshal(b, &inv)
+			alice.do("DELETE", "/v1/invites/"+inv.PublicID, nil, nil)
+		} else if resp.StatusCode == http.StatusTooManyRequests && bytes.Contains(b, []byte("rate limited")) {
+			break // Hit rate limit as expected
+		}
+	}
+
+	if budgetSucceeded != 4 {
+		t.Errorf("budget check: %d email invites succeeded, want 4 (5 total tokens - 1 consumed in race)", budgetSucceeded)
+		t.Errorf("this proves email budget was over-consumed during concurrent cap rejection")
 	}
 }
 
@@ -2044,11 +2463,17 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Empty string", "", "A Peerline peer"},
 		{"Only spaces", "   ", "A Peerline peer"},
 
-		// Issue #68: Length tests (64 runes max)
+		// Issue #68: Length tests (64 runes max, counted on final NFC output)
 		{"70 ASCII letters", strings.Repeat("a", 70), strings.Repeat("a", 64)},
 		{"30 CJK chars under byte limit", strings.Repeat("日", 30), strings.Repeat("日", 30)},
 		// 64 runes (not bytes): "日" is 3 bytes, 64 copies = 192 bytes, should keep exactly 64 runes
 		{"Long multibyte truncated at 64 runes", strings.Repeat("日", 70), strings.Repeat("日", 64)},
+		// Precomposed characters: é (U+00E9) is 1 rune in NFC
+		{"70 precomposed é gives 64", strings.Repeat("é", 70), strings.Repeat("é", 64)},
+		// Hangul syllables: 한 (U+D55C) is 1 rune in NFC, decomposes to 3 jamo in NFD
+		{"70 Hangul syllables gives 64", strings.Repeat("한", 70), strings.Repeat("한", 64)},
+		// a+acute recomposes to á in NFC, 70 gives 64
+		{"70 a+acute recomposes to 64 á", strings.Repeat("a\u0301", 70), strings.Repeat("á", 64)},
 	}
 
 	for _, tt := range tests {
@@ -2081,6 +2506,95 @@ func TestSanitizerUnicode(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestSanitizerSplitCluster verifies that truncation respects grapheme cluster boundaries
+func TestSanitizerSplitCluster(t *testing.T) {
+	// 63 'a' + e+grave+combining-mark-below (doesn't compose in NFC) + "zzz"
+	// Should give 63 'a' without the partial cluster
+	input := strings.Repeat("a", 63) + "e\u0300\u0316" + "zzz"
+	got := sanitizeInviterName(input)
+	want := strings.Repeat("a", 63)
+
+	if got != want {
+		t.Errorf("sanitizeInviterName split cluster = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
+
+	// Verify UTF-8 validity
+	if !utf8.ValidString(got) {
+		t.Errorf("sanitizeInviterName returned invalid UTF-8")
+	}
+
+	// Verify result is NFC
+	if !norm.NFC.IsNormalString(got) {
+		t.Errorf("sanitizeInviterName result is not NFC normalized")
+	}
+
+	// Verify no trailing combining marks
+	runes := []rune(got)
+	if len(runes) > 0 {
+		lastRune := runes[len(runes)-1]
+		if unicode.Is(unicode.Mn, lastRune) || unicode.Is(unicode.Mc, lastRune) || unicode.Is(unicode.Me, lastRune) {
+			t.Errorf("sanitizeInviterName has trailing combining mark U+%04X", lastRune)
+		}
+	}
+}
+
+// TestSanitizerHugeInput verifies the input guard prevents unbounded normalization work
+func TestSanitizerHugeInput(t *testing.T) {
+	// 100 KB of 'a' characters
+	input := strings.Repeat("a", 100*1024)
+	got := sanitizeInviterName(input)
+
+	// Should return 64 'a' characters (truncated at input guard, then at 64 runes)
+	want := strings.Repeat("a", 64)
+	if got != want {
+		t.Errorf("sanitizeInviterName(100KB input) = %q (len %d), want %q (len %d)", got[:20]+"...", len([]rune(got)), want, len([]rune(want)))
+	}
+}
+
+// TestSanitizerInputGuardInvalidUTF8 verifies the input guard doesn't trim back past invalid bytes elsewhere
+func TestSanitizerInputGuardInvalidUTF8(t *testing.T) {
+	// 2000 bytes of 'a' with 0xff (invalid UTF-8) at byte 10
+	// Should give 64 'a' (not fallback), proving we don't trim back to empty
+	input := strings.Repeat("a", 10) + "\xff" + strings.Repeat("a", 1989)
+	got := sanitizeInviterName(input)
+	want := strings.Repeat("a", 64)
+
+	if got != want {
+		t.Errorf("sanitizeInviterName(2000 bytes with invalid at byte 10) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
+}
+
+// TestSanitizerInputGuardRuneBoundary verifies the input guard respects rune boundaries
+func TestSanitizerInputGuardRuneBoundary(t *testing.T) {
+	// Create input that has a 3-byte UTF-8 character (日) right at the 1024-byte cut
+	// Fill up to 1022 bytes with 'a', then add 日 (3 bytes) so it straddles the boundary
+	base := strings.Repeat("a", 1022)
+	input := base + "日" + strings.Repeat("b", 100)
+
+	got := sanitizeInviterName(input)
+
+	// The guard should cut before 日 (not in the middle), then cap at 64 runes
+	// So we should get 64 'a' characters (first 64 of the 1022)
+	want := strings.Repeat("a", 64)
+	if got != want {
+		t.Errorf("sanitizeInviterName(input with 3-byte rune at boundary) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
+}
+
+// TestSanitizerTrailingSpaceTrim verifies trailing spaces are trimmed after 64-rune cut
+func TestSanitizerTrailingSpaceTrim(t *testing.T) {
+	// 64 'a' followed by space and more text
+	// The 64-rune cut will include the space; it should be trimmed
+	input := strings.Repeat("a", 63) + " b" + strings.Repeat("c", 100)
+	got := sanitizeInviterName(input)
+
+	// Should get 63 'a' (no trailing space)
+	want := strings.Repeat("a", 63)
+	if got != want {
+		t.Errorf("sanitizeInviterName(63a + space + text) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
 	}
 }
 
@@ -2190,5 +2704,345 @@ func TestRateLimitWithMultipleXFFHeaders(t *testing.T) {
 	// The request should succeed (not testing rate limiting here, just that it works)
 	if resp.StatusCode != 200 {
 		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
+// TestInviteAcceptGETDoesNotChangeState verifies that authenticated GET
+// /v1/invites/accept returns 405 and does not consume the invite (issue #28).
+func TestInviteAcceptGETDoesNotChangeState(t *testing.T) {
+	srv := newServer(t, Config{})
+	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+
+	// Alice creates an invite for Bob
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv struct {
+		Code      string `json:"code"`
+		AcceptURL string `json:"accept_url"`
+	}
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
+	}
+
+	// Authenticated GET returns 405 and does not accept the invite
+	resp, body = b.do("GET", "/v1/invites/accept?code="+inv.Code, nil, nil)
+	want(t, resp, body, 405)
+	if !strings.Contains(string(body), "use POST to accept") {
+		t.Errorf("expected 405 error message, got: %s", body)
+	}
+	if resp.Header.Get("Allow") != "POST" {
+		t.Errorf("expected Allow: POST header, got: %s", resp.Header.Get("Allow"))
+	}
+
+	// Verify invite is still pending: Bob can still accept with POST
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv.Code}, nil)
+	want(t, resp, body, 200)
+
+	// Verify pairing succeeded: Bob can now message Alice
+	resp, body = b.do("POST", "/v1/peers/"+a.id+"/messages", map[string]any{"type": "note", "body": "test"}, nil)
+	want(t, resp, body, 201)
+}
+
+// TestInviteAcceptUnauthenticatedGETShowsLanding verifies that unauthenticated
+// GET /v1/invites/accept shows the landing page and does not consume the invite.
+func TestInviteAcceptUnauthenticatedGETShowsLanding(t *testing.T) {
+	srv := newServer(t, Config{})
+	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+
+	// Alice creates an invite
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv struct{ Code string }
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unauthenticated GET shows landing page (no key)
+	bNoAuth := &client{t: t, srv: srv, key: ""}
+	resp, body = bNoAuth.do("GET", "/v1/invites/accept?code="+inv.Code, nil, nil)
+	want(t, resp, body, 200)
+	if resp.Header.Get("Content-Type") != "text/plain; charset=utf-8" {
+		t.Errorf("expected text/plain content type, got: %s", resp.Header.Get("Content-Type"))
+	}
+	if !strings.Contains(string(body), "Peerline invite") {
+		t.Errorf("expected landing page content, got: %s", body)
+	}
+	if !strings.Contains(string(body), "curl -X POST") {
+		t.Errorf("expected POST instruction in landing page, got: %s", body)
+	}
+	// Landing page should show code in body format (JSON)
+	if !strings.Contains(string(body), `"code":"`) || !strings.Contains(string(body), "Content-Type: application/json") {
+		t.Errorf("expected code in JSON body format in landing page, got: %s", body)
+	}
+
+	// Verify invite is still pending: Bob can accept with POST
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv.Code}, nil)
+	want(t, resp, body, 200)
+}
+
+// TestInviteAcceptGETWithScopesReturns405 verifies that authenticated GET with
+// &scopes= and &bags= returns 405 and creates no grant (issue #28).
+func TestInviteAcceptGETWithScopesReturns405(t *testing.T) {
+	srv := newServer(t, Config{})
+	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+
+	// Alice creates an invite for Bob
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv struct{ Code string }
+	json.Unmarshal(body, &inv)
+
+	// Authenticated GET with &scopes= and &bags= returns 405
+	resp, body = b.do("GET", "/v1/invites/accept?code="+inv.Code+"&scopes=messages&bags=x", nil, nil)
+	want(t, resp, body, 405)
+
+	// Verify no grant was created (both directions should be empty)
+	resp, body = a.do("GET", "/v1/grants", nil, nil)
+	want(t, resp, body, 200)
+	var aGrants struct {
+		Grants []any `json:"grants"`
+	}
+	json.Unmarshal(body, &aGrants)
+	if len(aGrants.Grants) != 0 {
+		t.Errorf("alice grants: want 0, got %d: %s", len(aGrants.Grants), body)
+	}
+
+	resp, body = b.do("GET", "/v1/grants", nil, nil)
+	want(t, resp, body, 200)
+	var bGrants struct {
+		Grants []any `json:"grants"`
+	}
+	json.Unmarshal(body, &bGrants)
+	if len(bGrants.Grants) != 0 {
+		t.Errorf("bob grants: want 0, got %d: %s", len(bGrants.Grants), body)
+	}
+
+	// Invite is still pending: Bob can accept with POST
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv.Code}, nil)
+	want(t, resp, body, 200)
+}
+
+// TestInviteAcceptPathsNeverLogCode verifies that invite codes never appear in
+// logs across all accept paths: POST body, POST query, GET 405, HEAD, landing, failed (issue #28, #146).
+func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+	srv := newServer(t, Config{Logger: logger})
+	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+
+	// Create multiple invites for different paths
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv1 struct{ Code string }
+	json.Unmarshal(body, &inv1)
+
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv2 struct{ Code string }
+	json.Unmarshal(body, &inv2)
+
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv3 struct{ Code string }
+	json.Unmarshal(body, &inv3)
+
+	// Test all accept paths:
+	// 1. POST with body code (successful)
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv1.Code}, nil)
+	want(t, resp, body, 200)
+
+	// 2. POST with query code (successful)
+	resp, body = b.do("POST", "/v1/invites/accept?code="+inv2.Code, nil, nil)
+	want(t, resp, body, 200)
+
+	// 3. Authenticated GET (405)
+	resp, body = b.do("GET", "/v1/invites/accept?code="+inv3.Code, nil, nil)
+	want(t, resp, body, 405)
+
+	// 4. HEAD with auth (405)
+	req, _ := http.NewRequest("HEAD", srv.URL+"/v1/invites/accept?code="+inv3.Code, nil)
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 405 {
+		t.Errorf("HEAD: want 405, got %d", resp2.StatusCode)
+	}
+
+	// 5. Unauthenticated landing page
+	anon := &client{t: t, srv: srv, key: ""}
+	resp, body = anon.do("GET", "/v1/invites/accept?code="+inv3.Code, nil, nil)
+	want(t, resp, body, 200)
+
+	// 6. Failed accept (invalid code)
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": "inv_doesnotexist"}, nil)
+	want(t, resp, body, 404)
+
+	// Check logs don't contain any of the codes or their prefixes
+	logs := logBuf.String()
+	for _, code := range []string{inv1.Code, inv2.Code, inv3.Code, "inv_doesnotexist"} {
+		if strings.Contains(logs, code) {
+			t.Errorf("invite code %s found in logs", code)
+		}
+		if len(code) >= 10 && strings.Contains(logs, code[:10]) {
+			t.Errorf("invite code prefix %s found in logs", code[:10])
+		}
+	}
+}
+
+// TestInviteAccept405Comprehensive covers all the edge cases from issue #146.
+func TestInviteAccept405Comprehensive(t *testing.T) {
+	srv := newServer(t, Config{})
+	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+
+	// Create three invites: valid, to-be-used, to-be-expired
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv1 struct{ Code string }
+	json.Unmarshal(body, &inv1)
+
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv2 struct{ Code string }
+	json.Unmarshal(body, &inv2)
+
+	// Use inv2
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
+	want(t, resp, body, 200)
+
+	// Test 1: HEAD with auth returns 405 and does not consume invite
+	req, _ := http.NewRequest("HEAD", srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 405 {
+		t.Errorf("HEAD with auth: want 405, got %d", resp2.StatusCode)
+	}
+	if resp2.Header.Get("Allow") != "POST" {
+		t.Errorf("HEAD Allow header: want POST, got %s", resp2.Header.Get("Allow"))
+	}
+
+	// Test 2: HEAD without auth shows landing page (ServeMux routes HEAD to GET)
+	req, _ = http.NewRequest("HEAD", srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
+	resp2, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 200 {
+		t.Errorf("HEAD without auth: want 200, got %d", resp2.StatusCode)
+	}
+
+	// Test 3: GET with invalid/bogus Bearer token returns 405 (not 401)
+	// The handler checks Authorization != "" before key validation
+	resp, body = b.do("GET", "/v1/invites/accept?code="+inv1.Code, nil, map[string]string{"Authorization": "Bearer pl_bogus"})
+	want(t, resp, body, 405)
+	if !strings.Contains(string(body), "use POST to accept") {
+		t.Errorf("bogus key GET body: %s", body)
+	}
+
+	// Test 4: 405 body and headers are identical for valid, used, missing codes
+	get405 := func(code string) ([]byte, http.Header) {
+		r, b := b.do("GET", "/v1/invites/accept?code="+code, nil, nil)
+		if r.StatusCode != 405 {
+			t.Fatalf("expected 405 for code %s, got %d", code, r.StatusCode)
+		}
+		return b, r.Header
+	}
+	validBody, validHdr := get405(inv1.Code)
+	usedBody, usedHdr := get405(inv2.Code)
+	missingBody, missingHdr := get405("inv_doesnotexist")
+	if !bytes.Equal(validBody, usedBody) || !bytes.Equal(validBody, missingBody) {
+		t.Errorf("405 bodies differ:\nvalid: %s\nused: %s\nmissing: %s", validBody, usedBody, missingBody)
+	}
+	if validHdr.Get("Allow") != usedHdr.Get("Allow") || validHdr.Get("Allow") != missingHdr.Get("Allow") {
+		t.Errorf("Allow headers differ: valid=%s used=%s missing=%s", validHdr.Get("Allow"), usedHdr.Get("Allow"), missingHdr.Get("Allow"))
+	}
+
+	// Test 5: Body and query code mismatch returns 400
+	resp, body = b.do("POST", "/v1/invites/accept?code="+inv1.Code, map[string]any{"code": "inv_other"}, nil)
+	want(t, resp, body, 400)
+	if !strings.Contains(string(body), "code in body and query differ") {
+		t.Errorf("mismatch error: %s", body)
+	}
+
+	// Test 6: Other methods (PUT, PATCH, DELETE) return 405 or 404 and don't change state
+	for _, method := range []string{"PUT", "PATCH", "DELETE"} {
+		r, _ := http.NewRequest(method, srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
+		r.Header.Set("Authorization", "Bearer "+b.key)
+		rsp, err := http.DefaultClient.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rsp.Body.Close()
+		if rsp.StatusCode != 405 && rsp.StatusCode != 404 {
+			t.Errorf("%s: want 405 or 404, got %d", method, rsp.StatusCode)
+		}
+	}
+
+	// Test 7: Trailing slash doesn't accept
+	resp, body = b.do("POST", "/v1/invites/accept/?code="+inv1.Code, nil, nil)
+	if resp.StatusCode != 404 && resp.StatusCode != 301 {
+		t.Errorf("trailing slash: want 404 or 301, got %d", resp.StatusCode)
+	}
+
+	// Test 8: Unauthenticated landing with bad code returns 400
+	anon := &client{t: t, srv: srv, key: ""}
+	resp, body = anon.do("GET", "/v1/invites/accept?code=inv_bad", nil, nil)
+	want(t, resp, body, 400)
+	if !strings.Contains(string(body), "malformed") {
+		t.Errorf("bad code landing: %s", body)
+	}
+
+	// Verify inv1 is still pending after all the above
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv1.Code}, nil)
+	want(t, resp, body, 200)
+}
+
+// TestInviteAcceptDeprecationHeaders verifies that query-only codes get
+// Deprecation and Link headers, but body codes do not (issue #28, #146).
+func TestInviteAcceptDeprecationHeaders(t *testing.T) {
+	srv := newServer(t, Config{})
+	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv1 struct{ Code string }
+	json.Unmarshal(body, &inv1)
+
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv2 struct{ Code string }
+	json.Unmarshal(body, &inv2)
+
+	// Query-only code: should have Deprecation and Link headers
+	resp, body = b.do("POST", "/v1/invites/accept?code="+inv1.Code, nil, nil)
+	want(t, resp, body, 200)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("query-only code: missing Deprecation header")
+	}
+	if !strings.HasPrefix(resp.Header.Get("Deprecation"), "@") {
+		t.Errorf("Deprecation header format: want @<unix>, got %s", resp.Header.Get("Deprecation"))
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("query-only code: missing Link header")
+	}
+	if !strings.Contains(resp.Header.Get("Link"), "rel=\"deprecation\"") {
+		t.Errorf("Link header: want rel=deprecation, got %s", resp.Header.Get("Link"))
+	}
+
+	// Body code: should NOT have Deprecation or Link headers
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
+	want(t, resp, body, 200)
+	if resp.Header.Get("Deprecation") != "" {
+		t.Errorf("body code: unexpected Deprecation header: %s", resp.Header.Get("Deprecation"))
+	}
+	if resp.Header.Get("Link") != "" {
+		t.Errorf("body code: unexpected Link header: %s", resp.Header.Get("Link"))
 	}
 }
