@@ -631,8 +631,8 @@ func TestPairingAcceptStatusCodes(t *testing.T) {
 	}
 	token := strings.Split(inv.PairingURL, "/v1/pairing/")[1]
 
-	// Test 404: Invalid/nonexistent token
-	resp, body = anon.do("POST", "/v1/pairing/invalid_token", map[string]any{
+	// Test 404: Invalid/nonexistent token (must be properly formatted but not in DB)
+	resp, body = anon.do("POST", "/v1/pairing/pair_nonexistenttoken1234", map[string]any{
 		"name": "Bob",
 	}, nil)
 	want(t, resp, body, 404)
