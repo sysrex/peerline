@@ -69,3 +69,13 @@ func TestBlankTrustedProxyEntriesWarn(t *testing.T) {
 		t.Errorf("expected warning for blank entries, got %q", buf.String())
 	}
 }
+
+func TestMessageBudgetIndependentOfWriteBucket(t *testing.T) {
+	srv := newServer(t, Config{MsgPerMinute: 60, MsgBurst: 20, WritePerMinute: 1, WriteBurst: 3})
+	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+	pairUp(t, a, b, []string{"messages"}, nil, nil)
+	for i := 0; i < 10; i++ {
+		resp, body := b.do("POST", "/v1/peers/"+a.id+"/messages", map[string]any{"type": "note", "body": "x"}, nil)
+		want(t, resp, body, 201)
+	}
+}
