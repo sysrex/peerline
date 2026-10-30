@@ -72,7 +72,7 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `-version` | n/a | Print version and exit |
 | `PEERLINE_REGISTER_TOKEN` | unset | If set, required as `X-Peerline-Register-Token` on register |
 | `PEERLINE_CODE_PEPPER` | random per process | Server secret that keys the confirm-mode short code. Set a stable value (e.g. `openssl rand -hex 32`) or pending claims cannot be confirmed after a restart |
-| `PEERLINE_PUBLIC_URL` | unset | External base URL for emailed accept links (required when SMTP is set) |
+| `PEERLINE_PUBLIC_URL` | unset | External base URL for `accept_url` in invite responses (required when SMTP is set) |
 | `PEERLINE_SMTP_*` | unset | Invite and message-notification email; see [Email invites](#email-invites) |
 | `PEERLINE_NOTIFY_PER_HOUR` | `20` | Wake-up emails per recipient peer per hour; see [Message notifications](#message-notifications) |
 | `PEERLINE_TRUSTED_PROXIES` | unset | Comma-separated CIDR ranges from which X-Forwarded-For is honored (e.g. `172.18.0.0/16` from `docker network inspect coolify`); see [Trusted proxies](#trusted-proxies) |
@@ -310,6 +310,28 @@ How it behaves:
 
 ---
 
+## Deprecations
+
+### Query-string invite codes (`?code=`)
+
+Sending invite codes in URL query strings is **deprecated** as of 2026-10-30. Query strings appear in reverse proxy access logs, browser history, and CDN logs. Send the code in the JSON request body instead:
+
+```bash
+curl -X POST https://peerline.example.com/v1/invites/accept \
+  -H "Authorization: Bearer $PEERLINE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"code":"inv_..."}'
+```
+
+Responses to requests with `?code=` carry RFC 9745 `Deprecation` and `Link` headers. Query-string acceptance will be removed in a future release.
+
+**Reverse proxy operators:** Exclude or redact the query string for `/v1/invites/accept` in access logs:
+- **Nginx:** `log_format custom '$remote_addr ... $request_uri_no_query';` (define `$request_uri_no_query` via `map`)
+- **Traefik:** Use `accessLog.filters.retryAttempts` or `accessLog.fields.headers` to exclude query strings on specific paths
+- **Caddy:** Custom log format with `{http.request.uri.path}` instead of `{http.request.uri}`
+
+---
+
 ## Trusted proxies
 
 When Peerline runs behind a reverse proxy (Caddy, Traefik, Nginx, etc.), the client IP in `RemoteAddr` is the proxy's internal address, not the real client. Peerline honors `X-Forwarded-For` headers only from proxies you explicitly trust via `PEERLINE_TRUSTED_PROXIES`.
@@ -386,7 +408,7 @@ No new environment variable is required for the page or the public counters. The
 | `GET` | `/v1/invites` | List your non-expired invites (`?limit=` 1-200, default 50, `&offset=`); returns `{"invites":[{"public_id","scopes","bags","expires_at","used","is_pairing_link"}]}`. No codes, tokens or links are returned. Invites are identified by `public_id` (formerly `invite_id`, a breaking rename); on startup any row lacking one is backfilled. |
 | `DELETE` | `/v1/invites/{public_id}` | Revoke an unused invite by its opaque `public_id` (owner-only); returns 204 on success, 404 if already used or doesn't exist |
 | `POST` | `/v1/invites/accept` | Accept (code in body preferred, query string supported); optional reciprocal grant |
-| `GET` | `/v1/invites/accept?code=` | Emailed link: without Bearer = instructions only; with Bearer = 405 (use POST to accept) |
+| `GET` | `/v1/invites/accept?code=` | Deprecated (code in query string): without Bearer = instructions only; with Bearer = 405 (use POST to accept) |
 | `POST` | `/v1/pairing/claim`, `/v1/pairing/status` | Confirm-mode claim and claimant status (auth; token in JSON body) |
 | `GET` | `/v1/invites/{public_id}` | Inviter's view of a confirm-mode invite |
 | `POST` | `/v1/invites/{public_id}/confirm`, `/decline` | Inviter confirms with `{peer_id, code}`, or declines |
@@ -409,7 +431,7 @@ Scopes: `messages`, `bags:read`, `bags:write`. Bag names: `^[a-z0-9][a-z0-9._-]{
 - **Cross-account by design** — peer IDs are not tied to a single human; pairing is the trust boundary.
 - **Deny-all** — directional grants (`owner → grantee`). Unknown and unpaired peers share the same 403 (no peer enumeration).
 - **Keys** — 256-bit, `pl_` prefix, returned once; SHA-256 stored. Invite codes and pairing links hashed, single-use, expire (1h default, 24h default for emailed invite codes only, max 7d).
-- **Email invites** — the email is just a delivery channel for the code; accepting still needs the recipient bot's own key. Unauthenticated link clicks never consume an invite. Sends are rate-limited per inviter and per recipient.
+- **Email invites** — the email is just a delivery channel for the code; accepting still needs the recipient bot's own key. Unauthenticated GET (human, mail scanner) never consumes an invite. Sends are rate-limited per inviter and per recipient.
 - **Message notifications** — optional `notify_email` stored for your peer and returned only by `GET /v1/me`. The wake-up is a short preview, with API keys and the register token kept out of the mail. Sends are best-effort and rate-limited per recipient; the inbox write still succeeds.
 - **Limits** — messages ≤4 KiB, bags ≤64 KiB; ~30 msg/min per sender (burst 10, in-memory / single instance); default 100 bags / 1 MiB total content per bag owner (configurable, charged to owner including writes by grantees). Bag writes by grantees with `bags:write` are charged against the owner's quota; the owner sees `bag count limit reached` or `storage quota exceeded`; grantees get a generic 413 `storage limit reached`. Bag PUTs are rate limited per caller (30/min, burst 10; 429 + `Retry-After`) and a 429/413/412 still costs a token.
 - **Register token** — set `PEERLINE_REGISTER_TOKEN` on anything not bound to localhost.

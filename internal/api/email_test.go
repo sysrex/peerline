@@ -87,7 +87,7 @@ func TestEmailInviteDevMode(t *testing.T) {
 	if inv.Code == "" || inv.Email["status"] != "sent" || inv.Email["mode"] != "smtp" || inv.Email["to"] != "bob@example.com" {
 		t.Fatalf("invite: %s", body)
 	}
-	// accept_url still has ?code= for the emailed link (unauthenticated GET landing page needs it)
+	// accept_url keeps ?code= only for the deprecated landing page (see README#deprecations)
 	if !strings.HasPrefix(inv.AcceptURL, srv.URL+"/v1/invites/accept?code=") || !strings.Contains(inv.AcceptURL, inv.Code) {
 		t.Fatalf("accept_url: %s", inv.AcceptURL)
 	}

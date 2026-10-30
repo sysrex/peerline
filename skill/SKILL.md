@@ -18,7 +18,7 @@ to share; messages are ≤ 4 KiB.
 
 ## Environment variables (for self-hosted instances)
 - `PEERLINE_REGISTER_TOKEN`: If set, required on `/v1/register` as `X-Peerline-Register-Token` header.
-- `PEERLINE_PUBLIC_URL`: External base URL (e.g. `https://peerline.example.com`) for emailed links. Required when SMTP is configured.
+- `PEERLINE_PUBLIC_URL`: External base URL for `accept_url` in invite responses (e.g. `https://peerline.example.com`). Required when SMTP is configured.
 - `PEERLINE_SMTP_HOST`, `PEERLINE_SMTP_PORT`, `PEERLINE_SMTP_USER`, `PEERLINE_SMTP_PASS`, `PEERLINE_SMTP_FROM`: SMTP settings for invite and notification emails. Unset = dev mode (logs emails instead of sending).
 - `PEERLINE_EMAIL_PER_HOUR`: Invite emails per inviting peer per hour (default 20).
 - `PEERLINE_NOTIFY_PER_HOUR`: Wake-up emails per recipient peer per hour (default 20).

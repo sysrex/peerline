@@ -6,6 +6,20 @@ import (
 	"github.com/sysrex/peerline/internal/auth"
 )
 
+// deprecateQueryCodeOnAccept adds RFC 9745 deprecation headers to /v1/invites/accept responses
+// when ?code= is in the URL. Runs outside auth and body decoding so 401, 400, 413 also carry them.
+func deprecateQueryCodeOnAccept(deprecationDate, linkURL string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v1/invites/accept" && r.URL.Query().Get("code") != "" {
+				w.Header().Set("Deprecation", deprecationDate)
+				w.Header().Set("Link", linkURL)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // securityHeaders adds security-hardening HTTP headers to all responses.
 // The home page sets its own CSP with a nonce; API routes get a strict policy.
 func securityHeaders(next http.Handler) http.Handler {
