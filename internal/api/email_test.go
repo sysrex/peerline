@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sysrex/peerline/internal/mailer"
 )
@@ -41,18 +42,30 @@ func TestEmailInviteDevMode(t *testing.T) {
 	if inv.Code == "" || inv.Email["status"] != "logged" || inv.Email["mode"] != "log" || inv.Email["to"] != "bob@example.com" {
 		t.Fatalf("invite: %s", body)
 	}
-	// accept_url still has ?code= for the emailed link (unauthenticated GET landing page needs it)
+	// accept_url has ?code= for backward compatibility (deprecated; issue #145).
 	if !strings.HasPrefix(inv.AcceptURL, srv.URL+"/v1/invites/accept?code=") || !strings.Contains(inv.AcceptURL, inv.Code) {
 		t.Fatalf("accept_url: %s", inv.AcceptURL)
 	}
-	l := logs.String()
-	if !strings.Contains(l, "bob@example.com") || !strings.Contains(l, inv.Code) || !strings.Contains(l, "dev mode") {
-		t.Fatalf("email body not logged: %s", l)
+
+	// Test the email template directly (independent of mailer log format, issue #174).
+	publicBase := srv.URL
+	email := inviteEmail("alice", a.id, "bob@example.com", inv.Code, publicBase, []string{"messages"}, nil, time.Now().Add(24*time.Hour))
+	if !strings.Contains(email.Body, `curl -X POST`) {
+		t.Errorf("email body should show POST: %s", email.Body)
 	}
-	// Email should show code in body format (JSON), not query string
-	if !strings.Contains(l, `'{\"code\":\"`) || !strings.Contains(l, "POST") || !strings.Contains(l, "Content-Type: application/json") {
-		t.Fatalf("email should show POST with code in JSON body: %s", l)
+	if !strings.Contains(email.Body, `"code":"`+inv.Code+`"`) {
+		t.Errorf("email body should show code in JSON: %s", email.Body)
 	}
+	if !strings.Contains(email.Body, "Content-Type: application/json") {
+		t.Errorf("email body should show Content-Type header: %s", email.Body)
+	}
+	if !strings.Contains(email.Body, publicBase+"/v1/invites/accept") {
+		t.Errorf("email body should have clean URL (no query): %s", email.Body)
+	}
+
+	// Note: Before PR #126 merges, dev-mode mailer logs the full email body including the code (issue #174).
+	// After #126, the log will show only body_len. We test the email template output directly above,
+	// which is independent of the mailer's log format.
 
 	// Unauthenticated click (human / mail scanner) shows instructions and does not consume.
 	anon := &client{t: t, srv: srv}
@@ -68,14 +81,14 @@ func TestEmailInviteDevMode(t *testing.T) {
 		t.Fatal("landing echoed bad code")
 	}
 
-	// Bob's bot follows the magic link with its key (POST, reciprocal scopes in body).
-	resp, body = b.do("POST", path, map[string]any{"scopes": []string{"messages"}}, nil)
+	// Bob's bot accepts with POST (code in body, not query string).
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv.Code, "scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 200)
 	if !strings.Contains(string(body), `"granted_by_you"`) {
 		t.Fatalf("accept: %s", body)
 	}
 	// single use
-	resp, body = b.do("POST", path, nil, nil)
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv.Code}, nil)
 	want(t, resp, body, 404)
 	// grant works both ways
 	resp, body = b.do("POST", "/v1/peers/"+a.id+"/messages", map[string]any{"type": "note", "body": "hi"}, nil)
