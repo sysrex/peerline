@@ -114,6 +114,18 @@ func New(st *store.Store, cfg Config) *Server {
 	if cfg.MaxOutstandingInvites <= 0 {
 		cfg.MaxOutstandingInvites = 10
 	}
+	if cfg.BagPerMinute <= 0 {
+		cfg.BagPerMinute = 10
+	}
+	if cfg.BagBurst <= 0 {
+		cfg.BagBurst = 5
+	}
+	if cfg.MaxBagsPerPeer <= 0 {
+		cfg.MaxBagsPerPeer = 100
+	}
+	if cfg.MaxBagBytesPerPeer <= 0 {
+		cfg.MaxBagBytesPerPeer = 1048576 // 1 MiB
+	}
 	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
 
 	trustedNets, err := ParseTrustedProxies(cfg.TrustedProxies)
@@ -1198,43 +1210,20 @@ func (s *Server) putBag(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusRequestEntityTooLarge, "bag exceeds 64KiB")
 		return
 	}
-	// Check storage limits before creating a new bag (only if configured)
-	if s.cfg.MaxBagsPerPeer > 0 || s.cfg.MaxBagBytesPerPeer > 0 {
-		if ifVersion == 0 || ifVersion < 0 {
-			stats, err := s.st.GetBagStats(r.Context(), owner)
-			if err != nil {
-				s.internal(w, err)
-				return
-			}
-			// For conditional creates (If-None-Match: *), only check if bag doesn't exist
-			// For unconditional writes, check if creating vs updating by checking existence
-			checkLimits := ifVersion == 0 // explicit create
-			if ifVersion < 0 {
-				// Unconditional write: need to check if bag exists
-				_, err := s.st.GetBag(r.Context(), owner, name)
-				checkLimits = errors.Is(err, store.ErrNotFound)
-			}
-			if checkLimits {
-				// Check bag count limit
-				if s.cfg.MaxBagsPerPeer > 0 && stats.Count >= s.cfg.MaxBagsPerPeer {
-					writeErr(w, http.StatusForbidden, "bag limit exceeded")
-					return
-				}
-				// Check total bytes limit
-				newTotal := stats.TotalBytes + int64(len(body))
-				if s.cfg.MaxBagBytesPerPeer > 0 && newTotal > s.cfg.MaxBagBytesPerPeer {
-					writeErr(w, http.StatusForbidden, "storage quota exceeded")
-					return
-				}
-			}
-		}
-	}
-	v, err := s.st.PutBag(r.Context(), owner, name, body, auth.PeerID(r.Context()), ifVersion)
+	v, err := s.st.PutBag(r.Context(), owner, name, body, auth.PeerID(r.Context()), ifVersion, s.cfg.MaxBagsPerPeer, s.cfg.MaxBagBytesPerPeer)
 	if errors.Is(err, store.ErrConflict) {
 		if v > 0 {
 			w.Header().Set("ETag", etag(v))
 		}
 		writeErr(w, http.StatusPreconditionFailed, "version mismatch")
+		return
+	}
+	if errors.Is(err, store.ErrBagLimitExceeded) {
+		writeErr(w, http.StatusForbidden, "bag limit exceeded")
+		return
+	}
+	if errors.Is(err, store.ErrStorageQuotaExceeded) {
+		writeErr(w, http.StatusForbidden, "storage quota exceeded")
 		return
 	}
 	if err != nil {

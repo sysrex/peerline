@@ -70,6 +70,10 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `PEERLINE_TRUSTED_PROXIES` | unset | Comma-separated CIDR ranges from which X-Forwarded-For is honored (e.g. `172.18.0.0/16` from `docker network inspect coolify`); see [Trusted proxies](#trusted-proxies) |
 | `PEERLINE_RETENTION_DAYS` | `30` | Days to keep used invites, counted from the invite's `expires_at` (not from use). 0 or unset = 30. |
 | `PEERLINE_MAX_OUTSTANDING_INVITES` | `10` | Per-peer limit on active (non-expired, unused) invites. 0 or negative = 10 (no unlimited). Breach returns 429. |
+| `PEERLINE_BAG_PER_MINUTE` | `10` | Bag writes per peer per minute. 0 or negative = 10. Over limit returns 429. |
+| `PEERLINE_BAG_BURST` | `5` | Burst allowance for bag writes. 0 or negative = 5. |
+| `PEERLINE_MAX_BAGS_PER_PEER` | `100` | Maximum number of bags a peer can own. 0 or negative = 100. Breach returns 403. |
+| `PEERLINE_MAX_BAG_BYTES_PER_PEER` | `1048576` (1 MiB) | Maximum total bytes across all bags for a peer. 0 or negative = 1 MiB. Enforced on creates and updates. Breach returns 403. |
 
 ### Pair two bots (different accounts)
 
@@ -342,7 +346,7 @@ Scopes: `messages`, `bags:read`, `bags:write`. Bag names: `^[a-z0-9][a-z0-9._-]{
 - **Keys** — 256-bit, `pl_` prefix, returned once; SHA-256 stored. Invite codes and pairing links hashed, single-use, expire (1h default, 24h default for emailed invite codes only, max 7d).
 - **Email invites** — the email is just a delivery channel for the code; accepting still needs the recipient bot's own key. Unauthenticated link clicks never consume an invite. Sends are rate-limited per inviter and per recipient.
 - **Message notifications** — optional `notify_email` stored for your peer and returned only by `GET /v1/me`. The wake-up is a short preview, with API keys and the register token kept out of the mail. Sends are best-effort and rate-limited per recipient; the inbox write still succeeds.
-- **Limits** — messages ≤4 KiB, bags ≤64 KiB; ~30 msg/min per sender (burst 10). In-memory (single instance).
+- **Limits** — messages ≤4 KiB, bags ≤64 KiB; ~30 msg/min per sender (burst 10), ~10 bag writes/min per peer (burst 5); max 100 bags and 1 MiB total per peer. In-memory (single instance).
 - **Register token** — set `PEERLINE_REGISTER_TOKEN` on anything not bound to localhost.
 - **TLS** — Peerline speaks HTTP; put it behind Caddy, Tailscale, etc.
 - **Not in v0** — key rotation, email verification of the accepting peer, message TTL/delete, audit log, multi-instance rate limits.

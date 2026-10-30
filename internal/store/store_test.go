@@ -61,10 +61,10 @@ func TestStoreBasics(t *testing.T) {
 	if _, err := s.AcceptInvite(ctx, "c1", "b", nil, nil); !errors.Is(err, ErrNotFound) {
 		t.Fatal("expired invite accepted")
 	}
-	if v, err := s.PutBag(ctx, "a", "n", []byte("x"), "a", 0); err != nil || v != 1 {
+	if v, err := s.PutBag(ctx, "a", "n", []byte("x"), "a", 0, 0, 0); err != nil || v != 1 {
 		t.Fatal(v, err)
 	}
-	if _, err := s.PutBag(ctx, "a", "n", []byte("y"), "a", 0); !errors.Is(err, ErrConflict) {
+	if _, err := s.PutBag(ctx, "a", "n", []byte("y"), "a", 0, 0, 0); !errors.Is(err, ErrConflict) {
 		t.Fatal("expected conflict")
 	}
 }
@@ -95,7 +95,7 @@ func TestStats(t *testing.T) {
 	if err := s.InsertMessage(ctx, &Message{From: "b", To: "a", Type: "note", Body: "hi"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PutBag(ctx, "a", "status", []byte("ok"), "a", -1); err != nil {
+	if _, err := s.PutBag(ctx, "a", "status", []byte("ok"), "a", -1, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	st, err = s.Stats(ctx)
@@ -1968,51 +1968,99 @@ func TestBagStats(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Initially no bags
-	stats, err := s.GetBagStats(ctx, "alice")
+	// Test bag count limit
+	_, err = s.PutBag(ctx, "alice", "notes", []byte("hello"), "alice", -1, 2, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.Count != 0 || stats.TotalBytes != 0 {
-		t.Errorf("got %+v, want Count=0 TotalBytes=0", stats)
+	_, err = s.PutBag(ctx, "alice", "tasks", []byte("tasks"), "alice", -1, 2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Third bag should fail
+	_, err = s.PutBag(ctx, "alice", "third", []byte("third"), "alice", -1, 2, 0)
+	if !errors.Is(err, ErrBagLimitExceeded) {
+		t.Errorf("got %v, want ErrBagLimitExceeded", err)
 	}
 
-	// Add a bag
-	_, err = s.PutBag(ctx, "alice", "notes", []byte("hello world"), "alice", -1)
+	// Test byte quota
+	s2, err := Open(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
-	stats, err = s.GetBagStats(ctx, "alice")
+	defer s2.Close()
+	if err := s2.CreatePeer(ctx, "bob", "Bob", "hbob", ""); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s2.PutBag(ctx, "bob", "a", []byte("12345"), "bob", -1, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.Count != 1 || stats.TotalBytes != 11 {
-		t.Errorf("got %+v, want Count=1 TotalBytes=11", stats)
+	// Second bag that would exceed quota
+	_, err = s2.PutBag(ctx, "bob", "b", []byte("123456"), "bob", -1, 0, 10)
+	if !errors.Is(err, ErrStorageQuotaExceeded) {
+		t.Errorf("got %v, want ErrStorageQuotaExceeded", err)
 	}
 
-	// Add another bag
-	_, err = s.PutBag(ctx, "alice", "tasks", []byte("do stuff"), "alice", -1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stats, err = s.GetBagStats(ctx, "alice")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stats.Count != 2 || stats.TotalBytes != 19 {
-		t.Errorf("got %+v, want Count=2 TotalBytes=19", stats)
+	// Update that grows beyond quota
+	_, err = s2.PutBag(ctx, "bob", "a", []byte("12345678901"), "bob", -1, 0, 10)
+	if !errors.Is(err, ErrStorageQuotaExceeded) {
+		t.Errorf("update growth: got %v, want ErrStorageQuotaExceeded", err)
 	}
 
-	// Update a bag (should not change count, only bytes)
-	_, err = s.PutBag(ctx, "alice", "notes", []byte("goodbye"), "alice", -1)
+	// Update that shrinks then grows again should work if within quota
+	_, err = s2.PutBag(ctx, "bob", "a", []byte("123"), "bob", -1, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	stats, err = s.GetBagStats(ctx, "alice")
+	_, err = s2.PutBag(ctx, "bob", "b", []byte("1234567"), "bob", -1, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.Count != 2 || stats.TotalBytes != 15 {
-		t.Errorf("got %+v, want Count=2 TotalBytes=15", stats)
+}
+
+func TestBagLimitsConcurrency(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.CreatePeer(ctx, "carol", "Carol", "hcarol", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Try to create 10 bags concurrently with a limit of 5
+	// Only 5 should succeed
+	const limit = 5
+	const attempts = 10
+	results := make(chan error, attempts)
+
+	for i := 0; i < attempts; i++ {
+		i := i
+		go func() {
+			name := fmt.Sprintf("bag%d", i)
+			_, err := s.PutBag(ctx, "carol", name, []byte("test"), "carol", -1, limit, 0)
+			results <- err
+		}()
+	}
+
+	var successes, limitExceeded int
+	for i := 0; i < attempts; i++ {
+		err := <-results
+		if err == nil {
+			successes++
+		} else if errors.Is(err, ErrBagLimitExceeded) {
+			limitExceeded++
+		} else {
+			t.Errorf("unexpected error: %v", err)
+		}
+	}
+
+	if successes != limit {
+		t.Errorf("got %d successes, want %d", successes, limit)
+	}
+	if limitExceeded != attempts-limit {
+		t.Errorf("got %d limit exceeded, want %d", limitExceeded, attempts-limit)
 	}
 }

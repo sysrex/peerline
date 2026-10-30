@@ -74,6 +74,10 @@ func main() {
 	}
 	emailPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_EMAIL_PER_HOUR"))
 	notifyPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_NOTIFY_PER_HOUR"))
+	bagPerMinute, _ := strconv.Atoi(os.Getenv("PEERLINE_BAG_PER_MINUTE"))
+	bagBurst, _ := strconv.Atoi(os.Getenv("PEERLINE_BAG_BURST"))
+	maxBagsPerPeer, _ := strconv.Atoi(os.Getenv("PEERLINE_MAX_BAGS_PER_PEER"))
+	maxBagBytesPerPeer, _ := strconv.ParseInt(os.Getenv("PEERLINE_MAX_BAG_BYTES_PER_PEER"), 10, 64)
 	retentionDays, _ := strconv.Atoi(os.Getenv("PEERLINE_RETENTION_DAYS"))
 	if retentionDays <= 0 {
 		retentionDays = 30 // default
@@ -90,6 +94,10 @@ func main() {
 		TrustedProxies:        trustedProxies,
 		MaxOutstandingInvites: maxOutstandingInvites,
 		RetentionSeconds:      retentionSeconds,
+		BagPerMinute:          bagPerMinute,
+		BagBurst:              bagBurst,
+		MaxBagsPerPeer:        maxBagsPerPeer,
+		MaxBagBytesPerPeer:    maxBagBytesPerPeer,
 	})
 
 	srv := &http.Server{
