@@ -383,7 +383,11 @@ func TestBagStorageShrinkOverQuota(t *testing.T) {
 	defer st.Close()
 
 	// Server with large cap
-	srv1 := httptest.NewServer(New(st, Config{MaxBagBytesPerPeer: 1000}).Handler())
+	rawSrv1, err := New(st, Config{MaxBagBytesPerPeer: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv1 := httptest.NewServer(rawSrv1.Handler())
 	defer srv1.Close()
 	a1 := &client{t: t, srv: srv1}
 
@@ -407,7 +411,11 @@ func TestBagStorageShrinkOverQuota(t *testing.T) {
 	want(t, resp, body, 201)
 
 	// Now create a server with 50-byte cap (alice is over quota)
-	srv2 := httptest.NewServer(New(st, Config{MaxBagBytesPerPeer: 50}).Handler())
+	rawSrv2, err := New(st, Config{MaxBagBytesPerPeer: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv2 := httptest.NewServer(rawSrv2.Handler())
 	defer srv2.Close()
 	a2 := &client{t: t, srv: srv2, key: a1.key, id: a1.id}
 
@@ -506,7 +514,11 @@ func TestBagLimitsNonGrantee403(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st1.Close()
-	srv1 := httptest.NewServer(New(st1, Config{MaxBagsPerPeer: 2, MaxBagBytesPerPeer: 100}).Handler())
+	rawSrv1, err := New(st1, Config{MaxBagsPerPeer: 2, MaxBagBytesPerPeer: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv1 := httptest.NewServer(rawSrv1.Handler())
 	defer srv1.Close()
 
 	owner1 := register(t, srv1, "owner")
@@ -538,7 +550,11 @@ func TestBagLimitsNonGrantee403(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st2.Close()
-	srv2 := httptest.NewServer(New(st2, Config{MaxBagsPerPeer: 10, MaxBagBytesPerPeer: 50}).Handler())
+	rawSrv2, err := New(st2, Config{MaxBagsPerPeer: 10, MaxBagBytesPerPeer: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv2 := httptest.NewServer(rawSrv2.Handler())
 	defer srv2.Close()
 
 	owner2 := register(t, srv2, "owner2")
@@ -571,7 +587,10 @@ func TestBagStorageDefaults(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	srv := New(st, Config{})
+	srv, err := New(st, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if srv.cfg.MaxBagsPerPeer != 100 {
 		t.Errorf("got MaxBagsPerPeer %d, want 100", srv.cfg.MaxBagsPerPeer)
 	}
@@ -2403,7 +2422,10 @@ func TestSameRecipientRaceNoExtraTokenLoss(t *testing.T) {
 	}
 	defer st.Close()
 
-	rawSrv := New(st, cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := httptest.NewServer(rawSrv.Handler())
 	defer srv.Close()
 
@@ -2558,7 +2580,10 @@ func TestCompensatingDeleteWithCancelledContext(t *testing.T) {
 	}
 	defer st.Close()
 
-	rawSrv := New(st, cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := httptest.NewServer(rawSrv.Handler())
 	defer srv.Close()
 
@@ -2621,7 +2646,10 @@ func TestCompensatingDeleteOnAllowFailure(t *testing.T) {
 	}
 	defer st.Close()
 
-	rawSrv := New(st, cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Capture logs to verify cleanup-failure log path
 	var logBuf bytes.Buffer
@@ -2680,7 +2708,10 @@ func TestConcurrentCapRaceWithPairing(t *testing.T) {
 	}
 	defer st.Close()
 
-	rawSrv := New(st, cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := httptest.NewServer(rawSrv.Handler())
 	defer srv.Close()
 
