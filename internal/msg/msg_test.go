@@ -312,3 +312,23 @@ func TestFullShardNeverRefillsThrottledBucket(t *testing.T) {
 		t.Fatalf("shard size %d, a throttled bucket was evicted", len(s.buckets))
 	}
 }
+
+func TestLimiterRefund(t *testing.T) {
+	l := NewLimiter(1, 2)
+	l.Allow("k")
+	l.Allow("k")
+	if l.Allow("k") {
+		t.Fatal("bucket should be empty")
+	}
+	l.Refund("k")
+	if !l.Allow("k") {
+		t.Fatal("refund should restore one token")
+	}
+	l.Refund("k")
+	l.Refund("k")
+	l.Refund("k")
+	if !l.Allow("k") || !l.Allow("k") || l.Allow("k") {
+		t.Fatal("refund must cap at burst")
+	}
+	l.Refund("never-seen") // no bucket: no-op, no panic
+}

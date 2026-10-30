@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -550,5 +551,50 @@ func TestSingleLogRecordUnauthenticatedPairing(t *testing.T) {
 	// (a second differently-worded line would indicate a bug)
 	if totalRecords > 1 {
 		t.Errorf("expected 1 total log record for pairing, got %d\nLogs:\n%s", totalRecords, logs)
+	}
+}
+
+// A grantee exhausts its own bag-write budget; the owner's writes are unaffected (#139, #170).
+func TestBagWriteRateLimitedPerCaller(t *testing.T) {
+	srv := newServer(t, Config{})
+	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+	pairUp(t, a, b, []string{"bags:write"}, []string{"notes"}, nil)
+
+	var last *http.Response
+	for i := 0; i < 6; i++ {
+		last, _ = b.do("PUT", "/v1/bags/notes?owner="+a.id, []byte("x"), nil)
+	}
+	if last.StatusCode != 429 || last.Header.Get("Retry-After") == "" {
+		t.Fatalf("grantee burst: status %d Retry-After %q, want 429 with header", last.StatusCode, last.Header.Get("Retry-After"))
+	}
+	resp, body := a.do("PUT", "/v1/bags/other", []byte("x"), nil)
+	want(t, resp, body, 201)
+}
+
+// The email rate-limit rollback must not depend on the client staying connected (#184).
+func TestRejectEmailRateLimitedSurvivesCancelledRequest(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	s := New(st, Config{})
+	if err := st.CreatePeer(context.Background(), "p_a", "A", "h", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	id, err := st.CreateInviteAtomic(context.Background(), "ch", "p_a", []string{"messages"}, nil, time.Now().Add(time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := httptest.NewRequest("POST", "/v1/invites", nil).WithContext(ctx)
+	w := httptest.NewRecorder()
+	s.rejectEmailRateLimited(w, r, id, "p_a")
+	if w.Code != 429 {
+		t.Fatalf("status %d, want 429", w.Code)
+	}
+	if n, _ := st.CountOutstandingInvites(context.Background(), "p_a"); n != 0 {
+		t.Fatalf("orphan invite left behind: %d outstanding", n)
 	}
 }

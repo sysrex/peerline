@@ -140,6 +140,17 @@ func (l *Limiter) Allow(key string) bool { return l.take(key, true) }
 // Use it to check several limiters before consuming from any of them.
 func (l *Limiter) Ready(key string) bool { return l.take(key, false) }
 
+// Refund returns one token to key, capped at burst. Use it to undo an Allow whose
+// operation was abandoned. A missing bucket is already full, so nothing to do.
+func (l *Limiter) Refund(key string) {
+	s := l.shards[l.shardIndex(key)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if b, ok := s.buckets[key]; ok {
+		b.tokens = min(l.burst, b.tokens+1)
+	}
+}
+
 // Prune removes buckets that haven't been touched in pruneAfter duration.
 // Call periodically to prevent unbounded memory growth.
 func (l *Limiter) Prune() int {
