@@ -2925,12 +2925,12 @@ func FuzzSanitizeInviterName(f *testing.F) {
 			}
 		}
 
-		// Invariant 9: Truncated output never ends in CCC 9 (virama) unless it's the only rune
-		// This only applies when the 64-rune cap was hit (force truncation by appending text)
+		// Invariant 9: Truncated output never ends in CCC 9 (virama)
+		// Force truncation by appending ब×70, then assert the output doesn't end in virama
 		truncationTest := input + strings.Repeat("ब", 70)
 		gotTruncated := sanitizeInviterName(truncationTest)
 		runesTruncated := []rune(gotTruncated)
-		if len(runesTruncated) > 1 && utf8.RuneCountInString(gotTruncated) == 64 {
+		if len(runesTruncated) > 0 {
 			lastRune := runesTruncated[len(runesTruncated)-1]
 			props := norm.NFC.PropertiesString(string(lastRune))
 			if props.CCC() == 9 {

@@ -975,9 +975,6 @@ func sanitizeInviterName(name string) string {
 		}
 
 		for len(truncated) > 0 {
-			if len(truncated) == 0 {
-				break
-			}
 			lastRune := truncated[len(truncated)-1]
 			props := norm.NFC.PropertiesString(string(lastRune))
 			if props.CCC() == 9 {
