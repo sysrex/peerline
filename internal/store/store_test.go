@@ -831,6 +831,16 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 		t.Error("token should exist 1 second before expiry")
 	}
 
+	// Token is still live exactly at expires_at (expired means expires_at < now)
+	s.now = func() int64 { return currentTime + 100 }
+	exists, err = s.PairingTokenExists(ctx, pairingHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Error("token should exist exactly at expires_at")
+	}
+
 	// 3. Token is invalid 1 second after expiry
 	s.now = func() int64 { return currentTime + 101 }
 	exists, err = s.PairingTokenExists(ctx, pairingHash)
