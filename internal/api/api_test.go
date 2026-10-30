@@ -156,6 +156,19 @@ func want(t *testing.T, resp *http.Response, body []byte, code int) {
 	}
 }
 
+func assertSecurityHeaders(t *testing.T, hdr http.Header, context string) {
+	t.Helper()
+	if got := hdr.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("%s: Cache-Control = %q, want no-store", context, got)
+	}
+	if got := hdr.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("%s: X-Content-Type-Options = %q, want nosniff", context, got)
+	}
+	if got := hdr.Get("Referrer-Policy"); got != "no-referrer" {
+		t.Errorf("%s: Referrer-Policy = %q, want no-referrer", context, got)
+	}
+}
+
 func pairUp(t *testing.T, a, b *client, scopes, bags []string, back []string) {
 	t.Helper()
 	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": scopes, "bags": bags}, nil)
@@ -3120,8 +3133,6 @@ func TestInviteAcceptGETWithScopesReturns405(t *testing.T) {
 }
 
 // TestInviteAcceptPathsNeverLogCode verifies that invite codes never appear in
-// logs across all accept paths: POST body, POST query, GET 405, HEAD, landing, failed (issue #28, #146).
-// TestInviteAcceptPathsNeverLogCode verifies that invite codes never appear in
 // logs across all accept paths, including success, error, and failure cases (issue #28, #146, #174).
 // This test captures only the slog logger; there is no http.Server.ErrorLog or access-log middleware today.
 func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
@@ -3239,13 +3250,24 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	want(t, resp, body, 201)
 	var inv3 struct{ Code string }
 	json.Unmarshal(body, &inv3)
-	time.Sleep(2 * time.Second) // Let it expire
+	// Wait for inv3 to expire: poll until POST returns 404 (expired/not found)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		testResp, _ := b.do("POST", "/v1/invites/accept?code="+inv3.Code, nil, nil)
+		if testResp.StatusCode == 404 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	// Use inv2
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
 	want(t, resp, body, 200)
 
 	missingCode := auth.NewSecret("inv_")
+
+	const wantDeprecation = "@1793318400"
+	const wantLink = `<https://github.com/sysrex/peerline#deprecations>; rel="deprecation"; type="text/html"`
 
 	// Test 1: HEAD with auth returns 405 with deprecation headers
 	req, _ := http.NewRequest("HEAD", srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
@@ -3258,15 +3280,16 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	if resp2.StatusCode != 405 {
 		t.Errorf("HEAD with auth: want 405, got %d", resp2.StatusCode)
 	}
-	if resp2.Header.Get("Allow") != "POST" {
-		t.Errorf("HEAD Allow header: want POST, got %s", resp2.Header.Get("Allow"))
+	if got := resp2.Header.Get("Allow"); got != "POST" {
+		t.Errorf("HEAD Allow: got %q, want POST", got)
 	}
-	if resp2.Header.Get("Deprecation") == "" {
-		t.Error("HEAD with auth: missing Deprecation header")
+	if got := resp2.Header.Get("Deprecation"); got != wantDeprecation {
+		t.Errorf("HEAD Deprecation: got %q, want %q", got, wantDeprecation)
 	}
-	if resp2.Header.Get("Link") == "" {
-		t.Error("HEAD with auth: missing Link header")
+	if got := resp2.Header.Get("Link"); got != wantLink {
+		t.Errorf("HEAD Link: got %q, want %q", got, wantLink)
 	}
+	assertSecurityHeaders(t, resp2.Header, "HEAD with auth")
 
 	// Test 2: HEAD without auth shows landing page (ServeMux routes HEAD to GET)
 	req, _ = http.NewRequest("HEAD", srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
@@ -3278,9 +3301,13 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	if resp2.StatusCode != 200 {
 		t.Errorf("HEAD without auth: want 200, got %d", resp2.StatusCode)
 	}
-	if resp2.Header.Get("Cache-Control") != "no-store" {
-		t.Errorf("HEAD without auth: want Cache-Control no-store, got %s", resp2.Header.Get("Cache-Control"))
+	if got := resp2.Header.Get("Deprecation"); got != wantDeprecation {
+		t.Errorf("HEAD without auth: Deprecation = %q, want %q", got, wantDeprecation)
 	}
+	if got := resp2.Header.Get("Link"); got != wantLink {
+		t.Errorf("HEAD without auth: Link = %q, want %q", got, wantLink)
+	}
+	assertSecurityHeaders(t, resp2.Header, "HEAD without auth")
 
 	// Test 3: GET with invalid/bogus Bearer token returns 405 (not 401)
 	resp, body = b.do("GET", "/v1/invites/accept?code="+inv1.Code, nil, map[string]string{"Authorization": "Bearer pl_bogus"})
@@ -3423,101 +3450,187 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 	var inv3 struct{ Code string }
 	json.Unmarshal(body, &inv3)
 
+	const wantDeprecation = "@1793318400"
+	const wantLink = `<https://github.com/sysrex/peerline#deprecations>; rel="deprecation"; type="text/html"`
+
 	// 1. Query-only POST success: should have headers and Cache-Control
 	resp, body = b.do("POST", "/v1/invites/accept?code="+inv1.Code, nil, nil)
 	want(t, resp, body, 200)
-	if resp.Header.Get("Deprecation") == "" {
-		t.Error("query-only POST success: missing Deprecation header")
+	if got := resp.Header.Get("Deprecation"); got != wantDeprecation {
+		t.Errorf("query-only POST success: Deprecation = %q, want %q", got, wantDeprecation)
 	}
-	if !strings.HasPrefix(resp.Header.Get("Deprecation"), "@") {
-		t.Errorf("Deprecation format: want @<unix>, got %s", resp.Header.Get("Deprecation"))
+	if got := resp.Header.Get("Link"); got != wantLink {
+		t.Errorf("query-only POST success: Link = %q, want %q", got, wantLink)
 	}
-	if resp.Header.Get("Link") == "" {
-		t.Error("query-only POST success: missing Link header")
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("query-only POST success: Cache-Control = %q, want no-store", got)
 	}
-	if !strings.Contains(resp.Header.Get("Link"), "rel=\"deprecation\"") {
-		t.Errorf("Link rel: want deprecation, got %s", resp.Header.Get("Link"))
-	}
-	if resp.Header.Get("Cache-Control") != "no-store" {
-		t.Errorf("query-only POST success: want Cache-Control no-store, got %s", resp.Header.Get("Cache-Control"))
-	}
+	assertSecurityHeaders(t, resp.Header, "query-only POST success")
 
 	// 2. Body-only POST success: should NOT have deprecation headers
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
 	want(t, resp, body, 200)
-	if resp.Header.Get("Deprecation") != "" {
-		t.Errorf("body-only POST: unexpected Deprecation header: %s", resp.Header.Get("Deprecation"))
+	if got := resp.Header.Get("Deprecation"); got != "" {
+		t.Errorf("body-only POST: unexpected Deprecation header: %q", got)
 	}
-	if resp.Header.Get("Link") != "" {
-		t.Errorf("body-only POST: unexpected Link header: %s", resp.Header.Get("Link"))
+	if got := resp.Header.Get("Link"); got != "" {
+		t.Errorf("body-only POST: unexpected Link header: %q", got)
 	}
-	if resp.Header.Get("Cache-Control") != "no-store" {
-		t.Errorf("body-only POST: want Cache-Control no-store, got %s", resp.Header.Get("Cache-Control"))
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("body-only POST: Cache-Control = %q, want no-store", got)
 	}
+	assertSecurityHeaders(t, resp.Header, "body-only POST")
 
 	// 3. Query-only POST error (404): should have headers (issue #173)
 	resp, body = b.do("POST", "/v1/invites/accept?code="+inv1.Code, nil, nil) // already used
 	want(t, resp, body, 404)
-	if resp.Header.Get("Deprecation") == "" {
-		t.Error("query-only POST 404: missing Deprecation header")
+	if got := resp.Header.Get("Deprecation"); got != wantDeprecation {
+		t.Errorf("query-only POST 404: Deprecation = %q, want %q", got, wantDeprecation)
 	}
-	if resp.Header.Get("Link") == "" {
-		t.Error("query-only POST 404: missing Link header")
+	if got := resp.Header.Get("Link"); got != wantLink {
+		t.Errorf("query-only POST 404: Link = %q, want %q", got, wantLink)
 	}
+	assertSecurityHeaders(t, resp.Header, "query-only POST 404")
 
 	// 4. Query-only POST error (400: bad scopes): should have headers
 	resp, body = b.do("POST", "/v1/invites/accept?code="+inv3.Code, map[string]any{"scopes": []string{"BadScope"}}, nil)
 	want(t, resp, body, 400)
-	if resp.Header.Get("Deprecation") == "" {
-		t.Error("query-only POST 400 bad scopes: missing Deprecation header")
+	if got := resp.Header.Get("Deprecation"); got != wantDeprecation {
+		t.Errorf("query-only POST 400 bad scopes: Deprecation = %q, want %q", got, wantDeprecation)
 	}
-	if resp.Header.Get("Link") == "" {
-		t.Error("query-only POST 400 bad scopes: missing Link header")
+	if got := resp.Header.Get("Link"); got != wantLink {
+		t.Errorf("query-only POST 400 bad scopes: Link = %q, want %q", got, wantLink)
 	}
+	assertSecurityHeaders(t, resp.Header, "query-only POST 400 bad scopes")
 
 	// 5. Query-only POST error (400: own invite): should have headers
 	resp, body = a.do("POST", "/v1/invites/accept?code="+inv3.Code, nil, nil)
 	want(t, resp, body, 400)
-	if resp.Header.Get("Deprecation") == "" {
-		t.Error("query-only POST 400 own invite: missing Deprecation header")
+	if got := resp.Header.Get("Deprecation"); got != wantDeprecation {
+		t.Errorf("query-only POST 400 own invite: Deprecation = %q, want %q", got, wantDeprecation)
 	}
-	if resp.Header.Get("Link") == "" {
-		t.Error("query-only POST 400 own invite: missing Link header")
+	if got := resp.Header.Get("Link"); got != wantLink {
+		t.Errorf("query-only POST 400 own invite: Link = %q, want %q", got, wantLink)
 	}
+	assertSecurityHeaders(t, resp.Header, "query-only POST 400 own invite")
 
 	// 6. Body+query POST (body wins): should have headers (issue #173)
 	resp, body = b.do("POST", "/v1/invites/accept?code="+inv3.Code, map[string]any{"code": inv3.Code}, nil)
 	want(t, resp, body, 200)
-	if resp.Header.Get("Deprecation") == "" {
-		t.Error("body+query POST: missing Deprecation header")
+	if got := resp.Header.Get("Deprecation"); got != wantDeprecation {
+		t.Errorf("body+query POST: Deprecation = %q, want %q", got, wantDeprecation)
 	}
-	if resp.Header.Get("Link") == "" {
-		t.Error("body+query POST: missing Link header")
+	if got := resp.Header.Get("Link"); got != wantLink {
+		t.Errorf("body+query POST: Link = %q, want %q", got, wantLink)
 	}
+	assertSecurityHeaders(t, resp.Header, "body+query POST")
 
 	// 7. Unauthenticated landing GET with ?code=: should have headers (issue #173)
 	anon := &client{t: t, srv: srv, key: ""}
 	resp, body = anon.do("GET", "/v1/invites/accept?code="+inv2.Code, nil, nil)
 	want(t, resp, body, 200)
-	if resp.Header.Get("Deprecation") == "" {
-		t.Error("unauthenticated landing GET: missing Deprecation header")
+	if got := resp.Header.Get("Deprecation"); got != wantDeprecation {
+		t.Errorf("unauthenticated landing GET: Deprecation = %q, want %q", got, wantDeprecation)
 	}
-	if resp.Header.Get("Link") == "" {
-		t.Error("unauthenticated landing GET: missing Link header")
+	if got := resp.Header.Get("Link"); got != wantLink {
+		t.Errorf("unauthenticated landing GET: Link = %q, want %q", got, wantLink)
 	}
-	if resp.Header.Get("Cache-Control") != "no-store" {
-		t.Errorf("unauthenticated landing GET: want Cache-Control no-store, got %s", resp.Header.Get("Cache-Control"))
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("unauthenticated landing GET: Cache-Control = %q, want no-store", got)
 	}
+	assertSecurityHeaders(t, resp.Header, "unauthenticated landing GET")
 
 	// 8. Authenticated GET 405 with ?code=: should have headers (already tested in 405 comprehensive)
 	resp, body = b.do("GET", "/v1/invites/accept?code="+inv2.Code, nil, nil)
 	want(t, resp, body, 405)
-	if resp.Header.Get("Deprecation") == "" {
-		t.Error("authenticated GET 405: missing Deprecation header")
+	if got := resp.Header.Get("Deprecation"); got != wantDeprecation {
+		t.Errorf("authenticated GET 405: Deprecation = %q, want %q", got, wantDeprecation)
 	}
-	if resp.Header.Get("Link") == "" {
-		t.Error("authenticated GET 405: missing Link header")
+	if got := resp.Header.Get("Link"); got != wantLink {
+		t.Errorf("authenticated GET 405: Link = %q, want %q", got, wantLink)
 	}
+	assertSecurityHeaders(t, resp.Header, "authenticated GET 405")
+
+	// 9. 401 (bad key) with ?code=: should have deprecation headers (P1-1)
+	resp, body = b.do("POST", "/v1/invites/accept?code="+inv2.Code, nil, map[string]string{"Authorization": "Bearer pl_bogus"})
+	want(t, resp, body, 401)
+	if got := resp.Header.Get("Deprecation"); got != wantDeprecation {
+		t.Errorf("POST 401 bad key: Deprecation = %q, want %q", got, wantDeprecation)
+	}
+	if got := resp.Header.Get("Link"); got != wantLink {
+		t.Errorf("POST 401 bad key: Link = %q, want %q", got, wantLink)
+	}
+	assertSecurityHeaders(t, resp.Header, "POST 401 bad key")
+
+	// 10. 400 (malformed JSON) with ?code=: should have deprecation headers (P1-1)
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/invites/accept?code="+inv2.Code, strings.NewReader("{bad json"))
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	req.Header.Set("Content-Type", "application/json")
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if resp2.StatusCode != 400 {
+		t.Fatalf("POST 400 bad JSON: want 400, got %d", resp2.StatusCode)
+	}
+	if got := resp2.Header.Get("Deprecation"); got != wantDeprecation {
+		t.Errorf("POST 400 bad JSON: Deprecation = %q, want %q", got, wantDeprecation)
+	}
+	if got := resp2.Header.Get("Link"); got != wantLink {
+		t.Errorf("POST 400 bad JSON: Link = %q, want %q", got, wantLink)
+	}
+	assertSecurityHeaders(t, resp2.Header, "POST 400 bad JSON")
+
+	// 11. 413 (oversized body) with ?code=: should have deprecation headers (P1-1)
+	// Create a valid JSON object that exceeds maxJSONBytes (16 KB)
+	largeScopes := make([]string, 0, 2000)
+	for i := 0; i < 2000; i++ {
+		largeScopes = append(largeScopes, "scope_"+strings.Repeat("x", 10))
+	}
+	largeJSON, _ := json.Marshal(map[string]any{"code": inv2.Code, "scopes": largeScopes})
+	req, _ = http.NewRequest("POST", srv.URL+"/v1/invites/accept?code="+inv2.Code, bytes.NewReader(largeJSON))
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	req.Header.Set("Content-Type", "application/json")
+	resp2, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if resp2.StatusCode != 413 {
+		t.Fatalf("POST 413 oversized: want 413, got %d: %s", resp2.StatusCode, body)
+	}
+	if got := resp2.Header.Get("Deprecation"); got != wantDeprecation {
+		t.Errorf("POST 413 oversized: Deprecation = %q, want %q", got, wantDeprecation)
+	}
+	if got := resp2.Header.Get("Link"); got != wantLink {
+		t.Errorf("POST 413 oversized: Link = %q, want %q", got, wantLink)
+	}
+	assertSecurityHeaders(t, resp2.Header, "POST 413 oversized")
+
+	// 12. Body-only 400 (bad scopes) should NOT have deprecation headers (negative control)
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv3.Code, "scopes": []string{"BadScope"}}, nil)
+	want(t, resp, body, 400)
+	if got := resp.Header.Get("Deprecation"); got != "" {
+		t.Errorf("body-only POST 400: unexpected Deprecation = %q", got)
+	}
+	if got := resp.Header.Get("Link"); got != "" {
+		t.Errorf("body-only POST 400: unexpected Link = %q", got)
+	}
+	assertSecurityHeaders(t, resp.Header, "body-only POST 400")
+
+	// 13. Body-only 401 (bad key) should NOT have deprecation headers (negative control)
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, map[string]string{"Authorization": "Bearer pl_bogus"})
+	want(t, resp, body, 401)
+	if got := resp.Header.Get("Deprecation"); got != "" {
+		t.Errorf("body-only POST 401: unexpected Deprecation = %q", got)
+	}
+	if got := resp.Header.Get("Link"); got != "" {
+		t.Errorf("body-only POST 401: unexpected Link = %q", got)
+	}
+	assertSecurityHeaders(t, resp.Header, "body-only POST 401")
 }
 
 func TestPairingLookupsBoundedPerIP(t *testing.T) {
