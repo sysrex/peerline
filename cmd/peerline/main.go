@@ -45,17 +45,16 @@ func main() {
 	}
 
 	// Parse trusted proxy CIDRs
+	tp := os.Getenv("PEERLINE_TRUSTED_PROXIES")
+	warnTrustedProxies(log, tp)
 	var trustedProxies []string
-	if tp := os.Getenv("PEERLINE_TRUSTED_PROXIES"); tp != "" {
+	if tp != "" {
 		trustedProxies = strings.Split(tp, ",")
 		// Validate at startup
 		if _, err := api.ParseTrustedProxies(trustedProxies); err != nil {
 			log.Error("invalid PEERLINE_TRUSTED_PROXIES CIDR", "err", err)
 			os.Exit(1)
 		}
-	} else {
-		// Warn when running without trusted proxies (#52)
-		log.Warn("PEERLINE_TRUSTED_PROXIES unset: X-Forwarded-For headers are ignored; client IPs will be taken from RemoteAddr only")
 	}
 
 	maxOutstandingInvites, _ := strconv.Atoi(os.Getenv("PEERLINE_MAX_OUTSTANDING_INVITES"))
@@ -81,7 +80,7 @@ func main() {
 	}
 	retentionSeconds := int64(retentionDays * 24 * 60 * 60)
 
-	apiServer := api.New(st, api.Config{
+	apiServer, err := api.New(st, api.Config{
 		RegisterToken:         regTok,
 		Logger:                log,
 		Mailer:                ml,
@@ -92,6 +91,10 @@ func main() {
 		MaxOutstandingInvites: maxOutstandingInvites,
 		RetentionSeconds:      retentionSeconds,
 	})
+	if err != nil {
+		log.Error("failed to create API server", "err", err)
+		os.Exit(1)
+	}
 
 	srv := &http.Server{
 		Addr:              *addr,
