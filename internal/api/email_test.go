@@ -32,7 +32,8 @@ type inviteResp struct {
 // Dev mode: no SMTP configured -> email is logged, invite still created and usable.
 func TestEmailInviteDevMode(t *testing.T) {
 	var logs syncBuf
-	srv := newServer(t, Config{Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	lg := slog.New(slog.NewTextHandler(&logs, nil))
+	srv := newServer(t, Config{Logger: lg, Mailer: mailer.Log{Logger: lg, FullBody: true}})
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
 
 	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "bob@example.com"}, nil)
