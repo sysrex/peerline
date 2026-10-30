@@ -19,6 +19,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/sysrex/peerline/internal/auth"
 	"github.com/sysrex/peerline/internal/store"
 	"golang.org/x/text/unicode/norm"
 )
@@ -1069,8 +1070,8 @@ func TestDeleteInviteByID(t *testing.T) {
 }
 
 func TestInviteCodeNeverLogged(t *testing.T) {
-	var logBuf bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+	var logs syncBuf
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 
 	srv := newServer(t, Config{Logger: logger})
 	a := register(t, srv, "alice")
@@ -1087,18 +1088,19 @@ func TestInviteCodeNeverLogged(t *testing.T) {
 	// Delete the invite (triggers log)
 	a.do("DELETE", fmt.Sprintf("/v1/invites/%s", inv.PublicID), nil, nil)
 
+	// Positive control: logs should contain expected events
+	logStr := logs.String()
+	if !strings.Contains(logStr, inv.PublicID) {
+		t.Error("public_id should be logged (positive control)")
+	}
+
 	// Check logs don't contain the code or any prefix
-	logs := logBuf.String()
-	if strings.Contains(logs, inv.Code) {
+	if strings.Contains(logStr, inv.Code) {
 		t.Error("invite code found in logs")
 	}
 	codePrefix := inv.Code[:10]
-	if strings.Contains(logs, codePrefix) {
+	if strings.Contains(logStr, codePrefix) {
 		t.Error("invite code prefix found in logs")
-	}
-	// Should contain public_id
-	if !strings.Contains(logs, inv.PublicID) {
-		t.Error("public_id not found in logs")
 	}
 }
 
@@ -2583,13 +2585,17 @@ func TestInviteAcceptGETWithScopesReturns405(t *testing.T) {
 
 // TestInviteAcceptPathsNeverLogCode verifies that invite codes never appear in
 // logs across all accept paths: POST body, POST query, GET 405, HEAD, landing, failed (issue #28, #146).
+// TestInviteAcceptPathsNeverLogCode verifies that invite codes never appear in
+// logs across all accept paths, including success, error, and failure cases (issue #28, #146, #174).
+// This test captures only the slog logger; there is no http.Server.ErrorLog or access-log middleware today.
 func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
-	var logBuf bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+	var logs syncBuf
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 	srv := newServer(t, Config{Logger: logger})
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+	c := register(t, srv, "carol")
 
-	// Create multiple invites for different paths
+	// Create invites for different test cases
 	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv1 struct{ Code string }
@@ -2605,22 +2611,27 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	var inv3 struct{ Code string }
 	json.Unmarshal(body, &inv3)
 
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv4 struct{ Code string }
+	json.Unmarshal(body, &inv4)
+
 	// Test all accept paths:
 	// 1. POST with body code (successful)
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv1.Code}, nil)
 	want(t, resp, body, 200)
 
-	// 2. POST with query code (successful)
+	// 2. POST with query code (successful, deprecated)
 	resp, body = b.do("POST", "/v1/invites/accept?code="+inv2.Code, nil, nil)
 	want(t, resp, body, 200)
 
 	// 3. Authenticated GET (405)
-	resp, body = b.do("GET", "/v1/invites/accept?code="+inv3.Code, nil, nil)
+	resp, body = c.do("GET", "/v1/invites/accept?code="+inv3.Code, nil, nil)
 	want(t, resp, body, 405)
 
 	// 4. HEAD with auth (405)
 	req, _ := http.NewRequest("HEAD", srv.URL+"/v1/invites/accept?code="+inv3.Code, nil)
-	req.Header.Set("Authorization", "Bearer "+b.key)
+	req.Header.Set("Authorization", "Bearer "+c.key)
 	resp2, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -2635,28 +2646,49 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	resp, body = anon.do("GET", "/v1/invites/accept?code="+inv3.Code, nil, nil)
 	want(t, resp, body, 200)
 
-	// 6. Failed accept (invalid code)
-	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": "inv_doesnotexist"}, nil)
+	// 6. Failed accept (well-formed but unknown code)
+	unknownCode := auth.NewSecret("inv_")
+	resp, body = c.do("POST", "/v1/invites/accept", map[string]any{"code": unknownCode}, nil)
 	want(t, resp, body, 404)
 
+	// 7. Failed: bad scopes (code stays valid)
+	resp, body = c.do("POST", "/v1/invites/accept", map[string]any{"code": inv3.Code, "scopes": []string{"BadScope"}}, nil)
+	want(t, resp, body, 400)
+
+	// 8. Failed: accepting own invite (code stays valid)
+	resp, body = a.do("POST", "/v1/invites/accept", map[string]any{"code": inv4.Code}, nil)
+	want(t, resp, body, 400)
+
+	// 9. Failed: body/query mismatch (both codes stay valid)
+	resp, body = c.do("POST", "/v1/invites/accept?code="+inv3.Code, map[string]any{"code": inv4.Code}, nil)
+	want(t, resp, body, 400)
+
+	// Positive control: assert logs captured expected events
+	logStr := logs.String()
+	if !strings.Contains(logStr, "pairing accepted") {
+		t.Error("logs should contain 'pairing accepted' (positive control)")
+	}
+	if !strings.Contains(logStr, "peer registered") {
+		t.Error("logs should contain 'peer registered' (positive control)")
+	}
+
 	// Check logs don't contain any of the codes or their prefixes
-	logs := logBuf.String()
-	for _, code := range []string{inv1.Code, inv2.Code, inv3.Code, "inv_doesnotexist"} {
-		if strings.Contains(logs, code) {
+	for _, code := range []string{inv1.Code, inv2.Code, inv3.Code, inv4.Code, unknownCode} {
+		if strings.Contains(logStr, code) {
 			t.Errorf("invite code %s found in logs", code)
 		}
-		if len(code) >= 10 && strings.Contains(logs, code[:10]) {
+		if len(code) >= 10 && strings.Contains(logStr, code[:10]) {
 			t.Errorf("invite code prefix %s found in logs", code[:10])
 		}
 	}
 }
 
-// TestInviteAccept405Comprehensive covers all the edge cases from issue #146.
+// TestInviteAccept405Comprehensive covers all the edge cases from issue #146 and #174.
 func TestInviteAccept405Comprehensive(t *testing.T) {
 	srv := newServer(t, Config{})
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
 
-	// Create three invites: valid, to-be-used, to-be-expired
+	// Create invites with different states: valid, used, expired, missing
 	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv1 struct{ Code string }
@@ -2667,11 +2699,19 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	var inv2 struct{ Code string }
 	json.Unmarshal(body, &inv2)
 
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
+	want(t, resp, body, 201)
+	var inv3 struct{ Code string }
+	json.Unmarshal(body, &inv3)
+	time.Sleep(2 * time.Second) // Let it expire
+
 	// Use inv2
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
 	want(t, resp, body, 200)
 
-	// Test 1: HEAD with auth returns 405 and does not consume invite
+	missingCode := auth.NewSecret("inv_")
+
+	// Test 1: HEAD with auth returns 405 with deprecation headers
 	req, _ := http.NewRequest("HEAD", srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
 	req.Header.Set("Authorization", "Bearer "+b.key)
 	resp2, err := http.DefaultClient.Do(req)
@@ -2685,6 +2725,12 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	if resp2.Header.Get("Allow") != "POST" {
 		t.Errorf("HEAD Allow header: want POST, got %s", resp2.Header.Get("Allow"))
 	}
+	if resp2.Header.Get("Deprecation") == "" {
+		t.Error("HEAD with auth: missing Deprecation header")
+	}
+	if resp2.Header.Get("Link") == "" {
+		t.Error("HEAD with auth: missing Link header")
+	}
 
 	// Test 2: HEAD without auth shows landing page (ServeMux routes HEAD to GET)
 	req, _ = http.NewRequest("HEAD", srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
@@ -2696,16 +2742,18 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	if resp2.StatusCode != 200 {
 		t.Errorf("HEAD without auth: want 200, got %d", resp2.StatusCode)
 	}
+	if resp2.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("HEAD without auth: want Cache-Control no-store, got %s", resp2.Header.Get("Cache-Control"))
+	}
 
 	// Test 3: GET with invalid/bogus Bearer token returns 405 (not 401)
-	// The handler checks Authorization != "" before key validation
 	resp, body = b.do("GET", "/v1/invites/accept?code="+inv1.Code, nil, map[string]string{"Authorization": "Bearer pl_bogus"})
 	want(t, resp, body, 405)
 	if !strings.Contains(string(body), "use POST to accept") {
 		t.Errorf("bogus key GET body: %s", body)
 	}
 
-	// Test 4: 405 body and headers are identical for valid, used, missing codes
+	// Test 4: 405 responses are identical for valid, used, expired, missing codes (no oracle)
 	get405 := func(code string) ([]byte, http.Header) {
 		r, b := b.do("GET", "/v1/invites/accept?code="+code, nil, nil)
 		if r.StatusCode != 405 {
@@ -2715,12 +2763,27 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	}
 	validBody, validHdr := get405(inv1.Code)
 	usedBody, usedHdr := get405(inv2.Code)
-	missingBody, missingHdr := get405("inv_doesnotexist")
-	if !bytes.Equal(validBody, usedBody) || !bytes.Equal(validBody, missingBody) {
-		t.Errorf("405 bodies differ:\nvalid: %s\nused: %s\nmissing: %s", validBody, usedBody, missingBody)
-	}
-	if validHdr.Get("Allow") != usedHdr.Get("Allow") || validHdr.Get("Allow") != missingHdr.Get("Allow") {
-		t.Errorf("Allow headers differ: valid=%s used=%s missing=%s", validHdr.Get("Allow"), usedHdr.Get("Allow"), missingHdr.Get("Allow"))
+	expiredBody, expiredHdr := get405(inv3.Code)
+	missingBody, missingHdr := get405(missingCode)
+
+	for i, pair := range []struct {
+		name string
+		body []byte
+		hdr  http.Header
+	}{
+		{"used", usedBody, usedHdr},
+		{"expired", expiredBody, expiredHdr},
+		{"missing", missingBody, missingHdr},
+	} {
+		if !bytes.Equal(validBody, pair.body) {
+			t.Errorf("405 body differs for %s:\nvalid: %s\n%s: %s", pair.name, validBody, pair.name, pair.body)
+		}
+		for _, h := range []string{"Allow", "Content-Type", "Deprecation", "Link"} {
+			if validHdr.Get(h) != pair.hdr.Get(h) {
+				t.Errorf("405 header %s differs for %s (test %d): valid=%q %s=%q",
+					h, pair.name, i, validHdr.Get(h), pair.name, pair.hdr.Get(h))
+			}
+		}
 	}
 
 	// Test 5: Body and query code mismatch returns 400
@@ -2730,8 +2793,10 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 		t.Errorf("mismatch error: %s", body)
 	}
 
-	// Test 6: Other methods (PUT, PATCH, DELETE) return 405 or 404 and don't change state
-	for _, method := range []string{"PUT", "PATCH", "DELETE"} {
+	// Test 6: Other methods (strict, issue #174)
+	// PUT/PATCH should get 405 from the authed mux (handler exists but wrong method).
+	// DELETE gets 404 (no handler at all in authed mux).
+	for _, method := range []string{"PUT", "PATCH"} {
 		r, _ := http.NewRequest(method, srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
 		r.Header.Set("Authorization", "Bearer "+b.key)
 		rsp, err := http.DefaultClient.Do(r)
@@ -2739,18 +2804,54 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 			t.Fatal(err)
 		}
 		rsp.Body.Close()
-		if rsp.StatusCode != 405 && rsp.StatusCode != 404 {
-			t.Errorf("%s: want 405 or 404, got %d", method, rsp.StatusCode)
+		if rsp.StatusCode != 405 {
+			t.Errorf("%s: want 405, got %d", method, rsp.StatusCode)
+		}
+		if rsp.Header.Get("Allow") == "" {
+			t.Errorf("%s: missing Allow header", method)
 		}
 	}
-
-	// Test 7: Trailing slash doesn't accept
-	resp, body = b.do("POST", "/v1/invites/accept/?code="+inv1.Code, nil, nil)
-	if resp.StatusCode != 404 && resp.StatusCode != 301 {
-		t.Errorf("trailing slash: want 404 or 301, got %d", resp.StatusCode)
+	// DELETE: no handler in authed mux, should get 404
+	r, _ := http.NewRequest("DELETE", srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
+	r.Header.Set("Authorization", "Bearer "+b.key)
+	rsp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsp.Body.Close()
+	if rsp.StatusCode != 404 {
+		t.Errorf("DELETE: want 404, got %d", rsp.StatusCode)
 	}
 
-	// Test 8: Unauthenticated landing with bad code returns 400
+	// Test 7: Trailing slash returns 404 (strict, issue #174)
+	resp, body = b.do("POST", "/v1/invites/accept/?code="+inv1.Code, nil, nil)
+	if resp.StatusCode != 404 {
+		t.Errorf("trailing slash POST: want 404, got %d", resp.StatusCode)
+	}
+	req, _ = http.NewRequest("GET", srv.URL+"/v1/invites/accept/?code="+inv1.Code, nil)
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	resp2, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 404 {
+		t.Errorf("trailing slash GET: want 404, got %d", resp2.StatusCode)
+	}
+
+	// Test 8: HEAD trailing slash
+	req, _ = http.NewRequest("HEAD", srv.URL+"/v1/invites/accept/?code="+inv1.Code, nil)
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	resp2, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 404 {
+		t.Errorf("HEAD trailing slash: want 404, got %d", resp2.StatusCode)
+	}
+
+	// Test 9: Unauthenticated landing with bad code returns 400
 	anon := &client{t: t, srv: srv, key: ""}
 	resp, body = anon.do("GET", "/v1/invites/accept?code=inv_bad", nil, nil)
 	want(t, resp, body, 400)
@@ -2765,6 +2866,8 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 
 // TestInviteAcceptDeprecationHeaders verifies that query-only codes get
 // Deprecation and Link headers, but body codes do not (issue #28, #146).
+// TestInviteAcceptDeprecationHeaders verifies RFC 9745 deprecation headers
+// on all responses where the request has ?code= (issue #28, #146, #173, #174).
 func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 	srv := newServer(t, Config{})
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
@@ -2779,29 +2882,104 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 	var inv2 struct{ Code string }
 	json.Unmarshal(body, &inv2)
 
-	// Query-only code: should have Deprecation and Link headers
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv3 struct{ Code string }
+	json.Unmarshal(body, &inv3)
+
+	// 1. Query-only POST success: should have headers and Cache-Control
 	resp, body = b.do("POST", "/v1/invites/accept?code="+inv1.Code, nil, nil)
 	want(t, resp, body, 200)
 	if resp.Header.Get("Deprecation") == "" {
-		t.Error("query-only code: missing Deprecation header")
+		t.Error("query-only POST success: missing Deprecation header")
 	}
 	if !strings.HasPrefix(resp.Header.Get("Deprecation"), "@") {
-		t.Errorf("Deprecation header format: want @<unix>, got %s", resp.Header.Get("Deprecation"))
+		t.Errorf("Deprecation format: want @<unix>, got %s", resp.Header.Get("Deprecation"))
 	}
 	if resp.Header.Get("Link") == "" {
-		t.Error("query-only code: missing Link header")
+		t.Error("query-only POST success: missing Link header")
 	}
 	if !strings.Contains(resp.Header.Get("Link"), "rel=\"deprecation\"") {
-		t.Errorf("Link header: want rel=deprecation, got %s", resp.Header.Get("Link"))
+		t.Errorf("Link rel: want deprecation, got %s", resp.Header.Get("Link"))
+	}
+	if resp.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("query-only POST success: want Cache-Control no-store, got %s", resp.Header.Get("Cache-Control"))
 	}
 
-	// Body code: should NOT have Deprecation or Link headers
+	// 2. Body-only POST success: should NOT have deprecation headers
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
 	want(t, resp, body, 200)
 	if resp.Header.Get("Deprecation") != "" {
-		t.Errorf("body code: unexpected Deprecation header: %s", resp.Header.Get("Deprecation"))
+		t.Errorf("body-only POST: unexpected Deprecation header: %s", resp.Header.Get("Deprecation"))
 	}
 	if resp.Header.Get("Link") != "" {
-		t.Errorf("body code: unexpected Link header: %s", resp.Header.Get("Link"))
+		t.Errorf("body-only POST: unexpected Link header: %s", resp.Header.Get("Link"))
+	}
+	if resp.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("body-only POST: want Cache-Control no-store, got %s", resp.Header.Get("Cache-Control"))
+	}
+
+	// 3. Query-only POST error (404): should have headers (issue #173)
+	resp, body = b.do("POST", "/v1/invites/accept?code="+inv1.Code, nil, nil) // already used
+	want(t, resp, body, 404)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("query-only POST 404: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("query-only POST 404: missing Link header")
+	}
+
+	// 4. Query-only POST error (400: bad scopes): should have headers
+	resp, body = b.do("POST", "/v1/invites/accept?code="+inv3.Code, map[string]any{"scopes": []string{"BadScope"}}, nil)
+	want(t, resp, body, 400)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("query-only POST 400 bad scopes: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("query-only POST 400 bad scopes: missing Link header")
+	}
+
+	// 5. Query-only POST error (400: own invite): should have headers
+	resp, body = a.do("POST", "/v1/invites/accept?code="+inv3.Code, nil, nil)
+	want(t, resp, body, 400)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("query-only POST 400 own invite: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("query-only POST 400 own invite: missing Link header")
+	}
+
+	// 6. Body+query POST (body wins): should have headers (issue #173)
+	resp, body = b.do("POST", "/v1/invites/accept?code="+inv3.Code, map[string]any{"code": inv3.Code}, nil)
+	want(t, resp, body, 200)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("body+query POST: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("body+query POST: missing Link header")
+	}
+
+	// 7. Unauthenticated landing GET with ?code=: should have headers (issue #173)
+	anon := &client{t: t, srv: srv, key: ""}
+	resp, body = anon.do("GET", "/v1/invites/accept?code="+inv2.Code, nil, nil)
+	want(t, resp, body, 200)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("unauthenticated landing GET: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("unauthenticated landing GET: missing Link header")
+	}
+	if resp.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("unauthenticated landing GET: want Cache-Control no-store, got %s", resp.Header.Get("Cache-Control"))
+	}
+
+	// 8. Authenticated GET 405 with ?code=: should have headers (already tested in 405 comprehensive)
+	resp, body = b.do("GET", "/v1/invites/accept?code="+inv2.Code, nil, nil)
+	want(t, resp, body, 405)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("authenticated GET 405: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("authenticated GET 405: missing Link header")
 	}
 }

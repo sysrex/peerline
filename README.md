@@ -41,8 +41,8 @@ If Alice’s bot and Bob’s bot both register on the same Peerline, Alice can i
 ```
 
 1. **Register** → `peer_id` + API key (shown once). Optional `notify_email` so a later message can wake your bot.
-2. **Invite** with scopes (`messages`, `bags:read`, `bags:write`) and an optional bag-name allowlist — share the code yourself, or pass `to_email` and Peerline emails the other person a magic link + one-time code.
-3. **Accept** with the code or by following the emailed link with your bot's key (optional reciprocal grant in the same call).
+2. **Invite** with scopes (`messages`, `bags:read`, `bags:write`) and an optional bag-name allowlist — share the code yourself, or pass `to_email` and Peerline emails the other person a one-time code with a POST example.
+3. **Accept** with the code using POST with your bot's key (optional reciprocal grant in the same call).
 4. **Send** ≤4 KiB messages to a paired peer. The recipient **polls** `GET /v1/inbox`, or has set `notify_email` and gets an email wake-up.
 5. Optionally **PUT/GET** named bags (≤64 KiB, ETags) only if that bag name was allowlisted.
 
@@ -110,7 +110,7 @@ curl -s -H "Authorization: Bearer $A" 'localhost:8787/v1/inbox?since=0'
 
 ## Email invites
 
-Alice doesn't need a side channel to Bob: she can invite by email address. Peerline emails Bob a **magic link** plus the same **one-time code**; Bob's bot accepts with **its own API key**, and the grant is created exactly as with the code path. Different accounts, different people — the email only carries the invite, never any data.
+Alice doesn't need a side channel to Bob: she can invite by email address. Peerline emails Bob a **one-time code** and a POST command example; Bob's bot accepts with **its own API key**, and the grant is created exactly as with the code path. Different accounts, different people — the email only carries the invite, never any data.
 
 ## Shareable pairing links
 
@@ -179,8 +179,8 @@ curl -s -X POST -H "Authorization: Bearer $B" \
 How it behaves:
 
 - **Same invite, same rules.** Code is 192-bit random, stored only as a SHA-256 hash, single-use, same TTL (default 1h, 24h for emailed invites, max 7d). The code is still returned in the JSON so the code path keeps working as a fallback (and for debugging).
-- **Link is safe to click.** Opening the link *without* an `Authorization` header (a human, a mail scanner, a link preview) only returns plain-text instructions — it never consumes the invite. Only a POST request with a valid Bearer key accepts the invite.
-- **Query strings are logged.** The `accept_url` returned by `/v1/invites` includes `?code=` for backward compatibility with existing clients. This URL appears in reverse proxy logs, browser history, and access logs. Send the code in the JSON body to keep it out of URLs: `POST /v1/invites/accept` with `{"code":"inv_..."}`. Query-string acceptance is deprecated (RFC 9745 `Deprecation` and `Link` headers are sent).
+- **Peerline doesn't log query strings.** The `accept_url` returned by `/v1/invites` includes `?code=` for backward compatibility, but invite codes never appear in Peerline's own logs. Reverse proxies and CDNs usually *do* log the full query string in access logs. Send the code in the JSON body to keep it out of URLs: `POST /v1/invites/accept` with `{"code":"inv_..."}`. Query-string acceptance is deprecated (RFC 9745 `Deprecation` and `Link` headers are sent). If you use a reverse proxy, exclude or redact the query string for `/v1/invites/accept` in your access logs (see [Trusted proxies](#trusted-proxies)).
+- **Backward compatibility for `accept_url`.** Older clients may have stored or cached `accept_url` values containing `?code=`. These continue to work via POST. Opening `accept_url` *without* an `Authorization` header (a human, a mail scanner, a link preview) only returns plain-text instructions — it never consumes the invite. Only a POST request with a valid Bearer key accepts the invite.
 - **Delivery never blocks the invite.** `email.status` is `sent` (SMTP accepted it), `logged` (dev mode, no SMTP), or `failed` (SMTP error — the invite still exists; share the code yourself). The response is `201` in all three cases.
 - **Rate limited.** Per inviting peer: 20 emails/hour, burst 5 (`PEERLINE_EMAIL_PER_HOUR` to change the hourly rate). Per recipient address (case-insensitive): 3/hour. Over the limit → `429` and **no invite is created**; invites without `to_email` are unaffected. Limits are in-memory (single instance).
 - **Strict addresses.** `to_email` must be a single bare address (`bob@example.com`) — no display names, lists, or CR/LF.
