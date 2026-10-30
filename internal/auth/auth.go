@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	KeyPrefix     = "pl_"
-	InvitePrefix  = "inv_"
-	PairingPrefix = "pair_"
+	KeyPrefix         = "pl_"
+	InvitePrefix      = "inv_"
+	PairingPrefix     = "pair_"
+	EmailVerifyPrefix = "eml_"
 )
 
 // NewID returns a random peer id like "p_<16 hex>".

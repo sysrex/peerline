@@ -72,9 +72,14 @@ func main() {
 		log.Error("PEERLINE_PUBLIC_URL is required when SMTP is configured (used in emailed accept links)")
 		os.Exit(1)
 	} else if smtp, ok := ml.(*mailer.SMTP); ok {
+		// Probe SMTP server at startup to fail fast if TLS is misconfigured
+		if err := smtp.Probe(context.Background(), log); err != nil {
+			log.Error("smtp probe failed", "err", err)
+			os.Exit(1)
+		}
 		// Log TLS mode at startup
 		var tlsMode string
-		if smtp.Port == 465 {
+		if smtp.ImplicitTLS {
 			tlsMode = "implicit TLS (port 465)"
 		} else if smtp.AllowPlaintext {
 			tlsMode = "STARTTLS optional (plaintext allowed)"

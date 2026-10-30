@@ -373,21 +373,50 @@ func TestBodyPreview(t *testing.T) {
 	// Test with real generated tokens from auth package
 	realInvCode := auth.NewSecret(auth.InvitePrefix)
 	realPairToken := auth.NewPairingToken()
+	realEmailToken := auth.NewSecret(auth.EmailVerifyPrefix)
 	realAPIKey := auth.NewKey()
 	// Test tokens in prose
-	got = bodyPreview("code "+realInvCode+" and "+realPairToken+" key "+realAPIKey, "", 200)
-	if strings.Contains(got, realInvCode) || strings.Contains(got, realPairToken) || strings.Contains(got, realAPIKey) {
+	got = bodyPreview("code "+realInvCode+" and "+realPairToken+" eml "+realEmailToken+" key "+realAPIKey, "", 300)
+	if strings.Contains(got, realInvCode) || strings.Contains(got, realPairToken) || strings.Contains(got, realEmailToken) || strings.Contains(got, realAPIKey) {
 		t.Fatalf("real generated tokens leaked in prose: %q", got)
 	}
-	// Test tokens in URLs (accept_url and pairing_url patterns)
+	// Test tokens in URLs (accept_url, pairing_url, and email verify patterns)
 	acceptURL := "https://example.com/v1/invites/accept?code=" + realInvCode
 	pairingURL := "https://example.com/v1/pairing/" + realPairToken
-	got = bodyPreview("link "+acceptURL+" and "+pairingURL, "", 400)
-	if strings.Contains(got, realInvCode) || strings.Contains(got, realPairToken) {
+	verifyURL := "https://example.com/v1/me/verify-email?token=" + realEmailToken
+	got = bodyPreview("links: "+acceptURL+" and "+pairingURL+" verify "+verifyURL, "", 500)
+	if strings.Contains(got, realInvCode) || strings.Contains(got, realPairToken) || strings.Contains(got, realEmailToken) {
 		t.Fatalf("tokens leaked in URLs: %q", got)
 	}
 	// Verify redaction markers present
 	if !strings.Contains(got, "[redacted]") {
 		t.Fatalf("no redaction markers in URL test: %q", got)
+	}
+}
+
+func TestNotifyDevModeNoBodyLeakage(t *testing.T) {
+	var logs syncBuf
+	srv := newServer(t, Config{Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	a := register(t, srv, "alice")
+	b := registerNotify(t, srv, "bob", "bob@example.com")
+	pairUp(t, b, a, []string{"messages"}, nil, nil)
+	secretBody := "secret content with inv_" + strings.Repeat("x", 20) + " and pair_" + strings.Repeat("y", 20)
+	resp, body := a.do("POST", "/v1/peers/"+b.id+"/messages", map[string]any{"type": "note", "body": secretBody}, nil)
+	want(t, resp, body, 201)
+
+	l := logs.String()
+	// Dev mode should log metadata but NOT the body or preview
+	if !strings.Contains(l, "dev mode") {
+		t.Fatalf("log missing dev mode marker: %s", l)
+	}
+	if !strings.Contains(l, "body_len=") {
+		t.Fatalf("log missing body_len: %s", l)
+	}
+	// Body content and preview must not appear in logs
+	if strings.Contains(l, "secret content") || strings.Contains(l, "inv_") || strings.Contains(l, "pair_") {
+		t.Fatalf("dev mode log leaked body content: %s", l)
+	}
+	if strings.Contains(l, "Type: note") || strings.Contains(l, "Preview:") {
+		t.Fatalf("dev mode log leaked email structure: %s", l)
 	}
 }

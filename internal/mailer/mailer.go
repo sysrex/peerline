@@ -87,10 +87,10 @@ type SMTP struct {
 	// Zero value (false) requires TLS, failing the send if STARTTLS is not offered.
 	// Only set to true for loopback relays or with explicit PEERLINE_SMTP_REQUIRE_TLS=false.
 	AllowPlaintext bool
+	// ImplicitTLS is true for port 465 (implicit TLS without STARTTLS).
+	ImplicitTLS bool
 	// TLSConfig is optional (tests); defaults to ServerName=Host.
 	TLSConfig *tls.Config
-	// skipProbe skips the startup connectivity check (tests only).
-	skipProbe bool
 }
 
 func (s *SMTP) Mode() string { return "smtp" }
@@ -144,12 +144,17 @@ func FromEnv(lg *slog.Logger) (Sender, error) {
 			return nil, fmt.Errorf("PEERLINE_SMTP_REQUIRE_TLS: invalid value %q (must be 1/0/true/false/yes/no)", v)
 		}
 	}
-	s := &SMTP{Host: host, Port: port, User: user, Pass: pass, From: from, Timeout: 10 * time.Second, AllowPlaintext: allowPlaintext}
-	// Probe at startup to fail fast if TLS is misconfigured
-	if err := s.Probe(context.Background()); err != nil {
-		return nil, err
-	}
-	return s, nil
+	implicitTLS := port == 465
+	return &SMTP{
+		Host:           host,
+		Port:           port,
+		User:           user,
+		Pass:           pass,
+		From:           from,
+		Timeout:        10 * time.Second,
+		AllowPlaintext: allowPlaintext,
+		ImplicitTLS:    implicitTLS,
+	}, nil
 }
 
 func (s *SMTP) Send(ctx context.Context, m Message) error {
@@ -175,7 +180,7 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 
 	var conn net.Conn
 	d := &net.Dialer{}
-	if s.Port == 465 {
+	if s.ImplicitTLS {
 		conn, err = (&tls.Dialer{NetDialer: d, Config: tlsCfg}).DialContext(ctx, "tcp", addr)
 	} else {
 		conn, err = d.DialContext(ctx, "tcp", addr)
@@ -192,7 +197,7 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 		return fmt.Errorf("smtp hello: %w", err)
 	}
 	defer c.Close()
-	if s.Port != 465 {
+	if !s.ImplicitTLS {
 		if ok, _ := c.Extension("STARTTLS"); ok {
 			if err := c.StartTLS(tlsCfg); err != nil {
 				return fmt.Errorf("smtp starttls: %w", err)
@@ -226,10 +231,11 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 }
 
 // Probe connects to the SMTP server, checks for STARTTLS availability, and disconnects.
-// It fails fast if TLS is misconfigured, logging a warning if the server is unreachable.
-func (s *SMTP) Probe(ctx context.Context) error {
-	if s.skipProbe {
-		return nil
+// It fails fast if TLS is misconfigured. If the server is unreachable (TCP dial failure only),
+// it logs a warning via lg and returns nil. TLS handshake failures on port 465 fail startup.
+func (s *SMTP) Probe(ctx context.Context, lg *slog.Logger) error {
+	if lg == nil {
+		lg = slog.Default()
 	}
 	timeout := s.Timeout
 	if timeout <= 0 {
@@ -251,16 +257,25 @@ func (s *SMTP) Probe(ctx context.Context) error {
 	var conn net.Conn
 	var err error
 	d := &net.Dialer{}
-	if s.Port == 465 {
-		// Implicit TLS on port 465
+	if s.ImplicitTLS {
+		// Implicit TLS on port 465 - TLS failures are fatal
 		conn, err = (&tls.Dialer{NetDialer: d, Config: tlsCfg}).DialContext(ctx, "tcp", addr)
+		if err != nil {
+			// Check if it's a TCP dial error or TLS error
+			if isDialError(err) {
+				lg.Warn("smtp probe: relay unreachable at startup (will retry on send)", "host", s.Host, "port", s.Port, "err", err)
+				return nil
+			}
+			// TLS handshake failure on 465 is fatal
+			return fmt.Errorf("smtp probe: TLS handshake failed on port 465: %w", err)
+		}
 	} else {
 		conn, err = d.DialContext(ctx, "tcp", addr)
-	}
-	if err != nil {
-		// Log a warning but don't fail startup for unreachable relays
-		slog.Warn("smtp probe: relay unreachable at startup (will retry on send)", "host", s.Host, "port", s.Port, "err", err)
-		return nil
+		if err != nil {
+			// TCP dial failure - warn but don't fail startup
+			lg.Warn("smtp probe: relay unreachable at startup (will retry on send)", "host", s.Host, "port", s.Port, "err", err)
+			return nil
+		}
 	}
 	defer conn.Close()
 
@@ -274,13 +289,31 @@ func (s *SMTP) Probe(ctx context.Context) error {
 	}
 	defer c.Quit()
 
-	if s.Port != 465 {
+	if !s.ImplicitTLS {
 		hasSTARTTLS, _ := c.Extension("STARTTLS")
 		if !hasSTARTTLS && !s.AllowPlaintext {
 			return fmt.Errorf("smtp probe: STARTTLS not offered by %s:%d but TLS is required (set PEERLINE_SMTP_REQUIRE_TLS=false to allow cleartext)", s.Host, s.Port)
 		}
 	}
 	return nil
+}
+
+// isDialError returns true if err is a TCP connection error (connection refused, etc),
+// false if it's a TLS handshake error or other post-connection error.
+func isDialError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// TLS errors contain "tls:" or "certificate"
+	errStr := err.Error()
+	if strings.Contains(errStr, "tls:") || strings.Contains(errStr, "certificate") || strings.Contains(errStr, "handshake") {
+		return false
+	}
+	// Connection-level errors
+	return strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "no route to host") ||
+		strings.Contains(errStr, "network is unreachable") ||
+		strings.Contains(errStr, "no such host")
 }
 
 // Compose renders an RFC 5322 plain-text message with CRLF line endings.

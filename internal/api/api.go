@@ -266,7 +266,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	// Generate verification token if email is set
 	token := ""
 	if notify != "" {
-		token = auth.NewSecret("eml_")
+		token = auth.NewSecret(auth.EmailVerifyPrefix)
 	}
 
 	id, key := auth.NewID(), auth.NewKey()
@@ -342,7 +342,7 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 	// Generate verification token if setting email
 	token := ""
 	if email != "" {
-		token = auth.NewSecret("eml_")
+		token = auth.NewSecret(auth.EmailVerifyPrefix)
 	}
 
 	if err := s.st.SetNotifyEmail(r.Context(), me, email, token); err != nil {
@@ -982,11 +982,11 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 
 // apiKeyInBody matches Peerline API keys (pl_ + secret). Peer ids are p_ + hex
 // and do not match. Used to keep stored secrets out of notification previews.
-var apiKeyInBody = regexp.MustCompile(regexp.QuoteMeta(auth.KeyPrefix) + `[A-Za-z0-9_-]{16,}`)
+var apiKeyInBody = regexp.MustCompile(regexp.QuoteMeta(auth.KeyPrefix) + `[A-Za-z0-9_-]{8,}`)
 
-// secretTokenInBody matches invite codes (inv_) and pairing tokens (pair_).
+// secretTokenInBody matches invite codes (inv_), pairing tokens (pair_), and email verify tokens (eml_).
 // Uses {16,} to handle generator changes; greedy match captures the whole token.
-var secretTokenInBody = regexp.MustCompile(`(?:` + regexp.QuoteMeta(auth.InvitePrefix[:len(auth.InvitePrefix)-1]) + `|` + regexp.QuoteMeta(auth.PairingPrefix[:len(auth.PairingPrefix)-1]) + `)_[A-Za-z0-9_-]{16,}`)
+var secretTokenInBody = regexp.MustCompile(`(?:` + regexp.QuoteMeta(auth.InvitePrefix) + `|` + regexp.QuoteMeta(auth.PairingPrefix) + `|` + regexp.QuoteMeta(auth.EmailVerifyPrefix) + `)[A-Za-z0-9_-]{16,}`)
 
 const notifyPreviewMax = 200
 

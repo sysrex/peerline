@@ -104,29 +104,31 @@ func TestIsLoopback(t *testing.T) {
 
 func TestFromEnv(t *testing.T) {
 	tests := []struct {
-		name           string
-		host           string
-		port           string
-		user           string
-		pass           string
-		from           string
-		requireTLS     string
-		wantMode       string
-		wantPlaintext  bool
-		wantErr        bool
-		wantLogBody    bool
-		devLogEmailEnv string
+		name            string
+		host            string
+		port            string
+		user            string
+		pass            string
+		from            string
+		requireTLS      string
+		wantMode        string
+		wantPlaintext   bool
+		wantImplicitTLS bool
+		wantErr         bool
+		wantLogBody     bool
+		devLogEmailEnv  string
 	}{
-		{"no host = log mode", "", "", "", "", "", "", "log", false, false, false, ""},
-		{"no host with opt-in body", "", "", "", "", "", "", "log", false, false, true, "1"},
-		{"localhost no auth = plaintext ok", "localhost", "", "", "", "test@example.com", "", "smtp", true, false, false, ""},
-		{"localhost with auth = plaintext ok", "localhost", "", "u", "p", "test@example.com", "", "smtp", true, false, false, ""},
-		{"non-loopback no auth = TLS required", "mail.example.com", "", "", "", "test@example.com", "", "smtp", false, false, false, ""},
-		{"non-loopback with auth = TLS required", "mail.example.com", "", "u", "p", "test@example.com", "", "smtp", false, false, false, ""},
-		{"explicit require TLS", "localhost", "", "", "", "test@example.com", "1", "smtp", false, false, false, ""},
-		{"explicit allow plaintext", "mail.example.com", "", "", "", "test@example.com", "0", "smtp", true, false, false, ""},
-		{"invalid require TLS", "localhost", "", "", "", "test@example.com", "ture", "", false, true, false, ""},
-		{"user without pass", "localhost", "", "u", "", "test@example.com", "", "", false, true, false, ""},
+		{"no host = log mode", "", "", "", "", "", "", "log", false, false, false, false, ""},
+		{"no host with opt-in body", "", "", "", "", "", "", "log", false, false, false, true, "1"},
+		{"localhost no auth = plaintext ok", "localhost", "", "", "", "test@example.com", "", "smtp", true, false, false, false, ""},
+		{"localhost with auth = plaintext ok", "localhost", "", "u", "p", "test@example.com", "", "smtp", true, false, false, false, ""},
+		{"non-loopback no auth = TLS required", "192.168.1.1", "", "", "", "test@example.com", "", "smtp", false, false, false, false, ""},
+		{"non-loopback with auth = TLS required", "192.168.1.1", "", "u", "p", "test@example.com", "", "smtp", false, false, false, false, ""},
+		{"explicit require TLS", "localhost", "", "", "", "test@example.com", "1", "smtp", false, false, false, false, ""},
+		{"explicit allow plaintext", "192.168.1.1", "", "", "", "test@example.com", "0", "smtp", true, false, false, false, ""},
+		{"port 465 = implicit TLS", "192.168.1.1", "465", "", "", "test@example.com", "", "smtp", false, true, false, false, ""},
+		{"invalid require TLS", "localhost", "", "", "", "test@example.com", "ture", "", false, false, true, false, ""},
+		{"user without pass", "localhost", "", "u", "", "test@example.com", "", "", false, false, true, false, ""},
 	}
 
 	for _, tt := range tests {
@@ -160,9 +162,11 @@ func TestFromEnv(t *testing.T) {
 				}
 			} else if tt.wantMode == "smtp" {
 				smtp := s.(*SMTP)
-				smtp.skipProbe = true // disable probe for this unit test
 				if smtp.AllowPlaintext != tt.wantPlaintext {
 					t.Fatalf("AllowPlaintext = %v, want %v", smtp.AllowPlaintext, tt.wantPlaintext)
+				}
+				if smtp.ImplicitTLS != tt.wantImplicitTLS {
+					t.Fatalf("ImplicitTLS = %v, want %v", smtp.ImplicitTLS, tt.wantImplicitTLS)
 				}
 			}
 		})
@@ -315,16 +319,14 @@ func genTestCert(t *testing.T, hostname string) tls.Certificate {
 
 func TestSMTPZeroValueFailsClosed(t *testing.T) {
 	// Zero-value SMTP{} must fail without STARTTLS (AllowPlaintext defaults to false)
-	cert := genTestCert(t, "localhost")
-	srv := newFakeServer(t, false, &cert) // no STARTTLS
+	srv := newFakeServer(t, false, nil) // no STARTTLS
 	defer srv.close()
 
 	s := &SMTP{
-		Host:      "127.0.0.1",
-		Port:      srv.port(),
-		From:      "test@example.com",
-		Timeout:   2 * time.Second,
-		skipProbe: true,
+		Host:    "127.0.0.1",
+		Port:    srv.port(),
+		From:    "test@example.com",
+		Timeout: 2 * time.Second,
 	}
 	err := s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
 	if err == nil || !strings.Contains(err.Error(), "STARTTLS required") {
@@ -357,7 +359,6 @@ func TestSMTPSTARTTLSUpgrade(t *testing.T) {
 		Timeout:        5 * time.Second,
 		AllowPlaintext: false,
 		TLSConfig:      &tls.Config{RootCAs: certPool, ServerName: "localhost"},
-		skipProbe:      true,
 	}
 	err := s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
 	if err != nil {
@@ -394,7 +395,6 @@ func TestSMTPUntrustedCert(t *testing.T) {
 		From:           "test@example.com",
 		Timeout:        2 * time.Second,
 		AllowPlaintext: false,
-		skipProbe:      true,
 	}
 	err := s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
 	if err == nil || !strings.Contains(err.Error(), "certificate") {
@@ -425,7 +425,6 @@ func TestSMTPHostnameMismatch(t *testing.T) {
 		Timeout:        2 * time.Second,
 		AllowPlaintext: false,
 		TLSConfig:      &tls.Config{RootCAs: certPool, ServerName: "localhost"},
-		skipProbe:      true,
 	}
 	err := s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
 	if err == nil || !strings.Contains(err.Error(), "certificate") {
@@ -443,7 +442,6 @@ func TestSMTPAllowPlaintext(t *testing.T) {
 		From:           "test@example.com",
 		Timeout:        2 * time.Second,
 		AllowPlaintext: true,
-		skipProbe:      true,
 	}
 	err := s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
 	if err != nil {
@@ -478,7 +476,7 @@ func TestSMTPProbe(t *testing.T) {
 			AllowPlaintext: false,
 			TLSConfig:      &tls.Config{RootCAs: certPool, ServerName: "localhost"},
 		}
-		err := s.Probe(context.Background())
+		err := s.Probe(context.Background(), nil)
 		if err != nil {
 			t.Fatalf("probe should succeed: %v", err)
 		}
@@ -494,7 +492,7 @@ func TestSMTPProbe(t *testing.T) {
 			Timeout:        2 * time.Second,
 			AllowPlaintext: false,
 		}
-		err := s.Probe(context.Background())
+		err := s.Probe(context.Background(), nil)
 		if err == nil || !strings.Contains(err.Error(), "PEERLINE_SMTP_REQUIRE_TLS") {
 			t.Fatalf("probe should fail and mention env var, got: %v", err)
 		}
@@ -503,7 +501,6 @@ func TestSMTPProbe(t *testing.T) {
 	t.Run("unreachable = warning only", func(t *testing.T) {
 		var buf bytes.Buffer
 		logger := slog.New(slog.NewTextHandler(&buf, nil))
-		slog.SetDefault(logger)
 
 		s := &SMTP{
 			Host:           "127.0.0.1",
@@ -511,13 +508,121 @@ func TestSMTPProbe(t *testing.T) {
 			Timeout:        100 * time.Millisecond,
 			AllowPlaintext: false,
 		}
-		err := s.Probe(context.Background())
+		err := s.Probe(context.Background(), logger)
 		if err != nil {
 			t.Fatalf("probe should not fail for unreachable: %v", err)
 		}
 		logged := buf.String()
 		if !strings.Contains(logged, "unreachable") {
 			t.Fatalf("expected warning about unreachable relay: %s", logged)
+		}
+	})
+}
+
+func TestSMTPImplicitTLS(t *testing.T) {
+	cert := genTestCert(t, "localhost")
+
+	t.Run("port 465 success with trusted cert", func(t *testing.T) {
+		ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		fs := &fakeServer{
+			ln:                ln,
+			advertiseSTARTTLS: false,
+			cert:              &cert,
+			t:                 t,
+		}
+		go fs.serve()
+
+		certPool := x509.NewCertPool()
+		parsed, _ := x509.ParseCertificate(cert.Certificate[0])
+		certPool.AddCert(parsed)
+
+		s := &SMTP{
+			Host:        "127.0.0.1",
+			Port:        ln.Addr().(*net.TCPAddr).Port,
+			From:        "test@example.com",
+			Timeout:     2 * time.Second,
+			ImplicitTLS: true,
+			TLSConfig:   &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+		}
+		err = s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
+		if err != nil {
+			t.Fatalf("implicit TLS should succeed: %v", err)
+		}
+		cmds := fs.receivedCommands()
+		hasDATA := false
+		for _, cmd := range cmds {
+			if cmd == "DATA" {
+				hasDATA = true
+			}
+		}
+		if !hasDATA {
+			t.Fatal("DATA not sent over implicit TLS")
+		}
+	})
+
+	t.Run("port 465 failure with untrusted cert", func(t *testing.T) {
+		ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		fs := &fakeServer{
+			ln:                ln,
+			advertiseSTARTTLS: false,
+			cert:              &cert,
+			t:                 t,
+		}
+		go fs.serve()
+
+		s := &SMTP{
+			Host:        "127.0.0.1",
+			Port:        ln.Addr().(*net.TCPAddr).Port,
+			From:        "test@example.com",
+			Timeout:     2 * time.Second,
+			ImplicitTLS: true,
+			// No custom TLSConfig - will use system roots and fail
+		}
+		err = s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
+		if err == nil || !strings.Contains(err.Error(), "certificate") {
+			t.Fatalf("expected certificate error, got: %v", err)
+		}
+		// No MAIL or DATA should have been sent
+		cmds := fs.receivedCommands()
+		for _, cmd := range cmds {
+			if strings.HasPrefix(cmd, "MAIL") || cmd == "DATA" {
+				t.Fatalf("command %q sent despite TLS failure: %v", cmd, cmds)
+			}
+		}
+	})
+
+	t.Run("port 465 probe TLS failure is fatal", func(t *testing.T) {
+		ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		// Shorter timeout to fail fast on cert validation
+		s := &SMTP{
+			Host:        "127.0.0.1",
+			Port:        ln.Addr().(*net.TCPAddr).Port,
+			Timeout:     500 * time.Millisecond,
+			ImplicitTLS: true,
+			// No custom TLSConfig - will use system roots and fail cert validation
+		}
+		err = s.Probe(context.Background(), nil)
+		if err == nil {
+			t.Fatal("probe should fail on port 465 TLS error, got nil")
+		}
+		// Should be a TLS handshake failure, not just an unreachable warning
+		if !strings.Contains(err.Error(), "TLS handshake") && !strings.Contains(err.Error(), "certificate") {
+			t.Fatalf("expected TLS error, got: %v", err)
 		}
 	})
 }
