@@ -74,6 +74,9 @@ type Server struct {
 	log         *slog.Logger
 	trustedNets []*net.IPNet
 	now         func() time.Time // clock for invite expiry; defaults to time.Now
+
+	// Test-only hook: called after invite creation, before email limit check
+	testInviteCreatedHook func(peerID string)
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -516,6 +519,11 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Test hook for deterministic concurrency testing
+	if s.testInviteCreatedHook != nil {
+		s.testInviteCreatedHook(me)
+	}
+
 	// Check email rate limit AFTER creating invite (#53)
 	// If limit fails, delete the invite and return error
 	if to != "" {
@@ -532,7 +540,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusTooManyRequests, "invite email rate limited; try later or create an invite without to_email and share the code yourself")
 			return
 		}
-		// Both ready, now consume from both atomically
+		// Both ready, now consume from both (Ready→Allow has a race, but delete handles it)
 		if !s.lim.mailLim.Allow(me) || !s.lim.rcptLim.Allow(rk) {
 			// This should not happen if Ready checks passed, but handle it
 			if delErr := s.st.DeleteInvite(r.Context(), publicID, me); delErr != nil {

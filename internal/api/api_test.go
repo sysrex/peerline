@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode"
@@ -1634,13 +1635,24 @@ func TestDeletedInviteCannotBeAccepted(t *testing.T) {
 }
 
 // TestConcurrentInviteCapRace verifies the concurrent cap check race is fixed (#53)
+// This test was verified to FAIL on main (236eabc) and PASS on this branch.
 func TestConcurrentInviteCapRace(t *testing.T) {
 	cfg := Config{}
 	cfg.MaxOutstandingInvites = 2
-	cfg.EmailPerHour = 10 // Enough budget that if bug existed, multiple would consume
-	cfg.EmailBurst = 5    // Burst allows 5, so bug would consume 5 tokens
+	cfg.EmailPerHour = 10
+	cfg.EmailBurst = 5 // 5 tokens available
 	cfg.EmailRcptPerHour = 20
-	srv := newServer(t, cfg)
+
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	rawSrv := New(st, cfg)
+	srv := httptest.NewServer(rawSrv.Handler())
+	defer srv.Close()
+
 	alice := register(t, srv, "Alice")
 
 	// Create first invite to get close to cap (1/2)
@@ -1651,15 +1663,32 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
 	}
 
+	// Set up deterministic concurrent race using test hook
+	// All goroutines will pause after invite creation, before budget check
+	const concurrent = 5
+	barrier := make(chan struct{})
+	var barrierOnce sync.Once
+	rawSrv.testInviteCreatedHook = func(peerID string) {
+		// First goroutine closes barrier, others wait on it
+		barrierOnce.Do(func() {
+			// Let all goroutines reach this point
+			time.Sleep(50 * time.Millisecond)
+			close(barrier)
+		})
+		<-barrier
+	}
+
 	// Launch concurrent requests at the cap with to_email
 	// One should succeed (2/2), others should fail at atomic cap check
-	// BUG: without fix, all 5 would consume budget before atomic check
-	// FIX: only the 1 successful request consumes budget
-	const concurrent = 5
+	// BUG on main: all 5 consume budget before atomic check (5 tokens consumed)
+	// FIX here: only the 1 successful request consumes budget (1 token consumed)
 	results := make(chan int, concurrent)
+	var wg sync.WaitGroup
 	for i := 0; i < concurrent; i++ {
 		i := i
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			resp, _ := alice.do("POST", "/v1/invites", map[string]any{
 				"to_email": fmt.Sprintf("user%d@example.com", i),
 				"scopes":   []string{"messages"},
@@ -1667,11 +1696,12 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 			results <- resp.StatusCode
 		}()
 	}
+	wg.Wait()
+	close(results)
 
 	// Collect results
 	var created, rejected int
-	for i := 0; i < concurrent; i++ {
-		status := <-results
+	for status := range results {
 		if status == http.StatusCreated {
 			created++
 		} else if status == http.StatusTooManyRequests {
@@ -1704,29 +1734,42 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 		t.Errorf("final invite count: %d, want 2 (at cap)", len(listResp.Invites))
 	}
 
-	// Verify budget was only consumed once (for the 1 successful invite)
-	// If bug existed: 5 tokens consumed, only 0 left (burst=5)
-	// With fix: 1 token consumed, 4 left, so 4 more invites should succeed
-	for i := 0; i < 4; i++ {
+	// Clear hook for budget verification
+	rawSrv.testInviteCreatedHook = nil
+
+	// Revoke one invite to make room for budget check
+	revokeID := listResp.Invites[0]["public_id"].(string)
+	resp, b = alice.do("DELETE", "/v1/invites/"+revokeID, nil, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("revoke: %d %s", resp.StatusCode, b)
+	}
+
+	// Verify budget: check how many more email invites succeed
+	// If bug existed: 5 tokens consumed during race, 0 left
+	// With fix: 1 token consumed during race, 4 left
+	// We should be able to create 4 more email invites
+	var budgetSucceeded int
+	for i := 0; i < 6; i++ { // Try 6, expect 4 to succeed
 		resp, b := alice.do("POST", "/v1/invites", map[string]any{
-			"to_email": fmt.Sprintf("verify%d@example.com", i),
+			"to_email": fmt.Sprintf("budget%d@example.com", i),
 			"scopes":   []string{"messages"},
 		}, nil)
-		// First should succeed (refills cap slot), next 3 should fail at cap
-		if i == 0 {
-			if resp.StatusCode == http.StatusTooManyRequests && bytes.Contains(b, []byte("rate limited")) {
-				t.Errorf("verify invite %d: got rate limit, proves budget was over-consumed in concurrent race", i)
-				break
+		if resp.StatusCode == http.StatusCreated {
+			budgetSucceeded++
+			// Revoke immediately to avoid hitting cap
+			var inv struct {
+				PublicID string `json:"public_id"`
 			}
-			// Revoke it to test next ones
-			if resp.StatusCode == http.StatusCreated {
-				var inv struct {
-					PublicID string `json:"public_id"`
-				}
-				json.Unmarshal(b, &inv)
-				alice.do("DELETE", "/v1/invites/"+inv.PublicID, nil, nil)
-			}
+			json.Unmarshal(b, &inv)
+			alice.do("DELETE", "/v1/invites/"+inv.PublicID, nil, nil)
+		} else if resp.StatusCode == http.StatusTooManyRequests && bytes.Contains(b, []byte("rate limited")) {
+			break // Hit rate limit as expected
 		}
+	}
+
+	if budgetSucceeded != 4 {
+		t.Errorf("budget check: %d email invites succeeded, want 4 (5 total tokens - 1 consumed in race)", budgetSucceeded)
+		t.Errorf("this proves email budget was over-consumed during concurrent cap rejection")
 	}
 }
 
