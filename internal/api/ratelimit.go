@@ -168,6 +168,9 @@ func rateLimitKey(ip string) string {
 // ParseTrustedProxies parses a list of CIDR strings (or bare IPs) into IPNets.
 // Rejects overly broad prefixes (0.0.0.0/0, ::/0, and prefixes shorter than
 // /8 for IPv4 or /32 for IPv6) to prevent misconfiguration (#62).
+// IPv4-mapped IPv6 prefixes (e.g., ::ffff:10.0.0.0/104) are unmapped and
+// converted to IPv4 (10.0.0.0/8), with the IPv4 /8 floor applied.
+// Rejects zone identifiers (e.g., fe80::1%eth0).
 func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 	var nets []*net.IPNet
 	for _, cidr := range cidrs {
@@ -176,45 +179,83 @@ func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 			continue
 		}
 
-		// If it doesn't contain a slash, treat it as a single IP
-		if !strings.Contains(cidr, "/") {
-			// Parse as IP and make it a /32 or /128
+		// Reject zone identifiers
+		if strings.Contains(cidr, "%") {
+			return nil, fmt.Errorf("parsing %q: zone identifiers are not allowed", cidr)
+		}
+
+		// Parse as prefix or bare IP
+		var prefix netip.Prefix
+		var err error
+		if strings.Contains(cidr, "/") {
+			// CIDR notation
+			prefix, err = netip.ParsePrefix(cidr)
+			if err != nil {
+				return nil, fmt.Errorf("parsing %q: %w", cidr, err)
+			}
+		} else {
+			// Bare IP - convert to /32 or /128
 			addr, err := netip.ParseAddr(cidr)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("parsing %q: %w", cidr, err)
 			}
-			var ipnet *net.IPNet
+			// Bare IPv4-mapped IPv6 addresses like ::ffff:10.0.0.1 should unmap to IPv4/32
+			if addr.Is4In6() {
+				addr = addr.Unmap()
+			}
 			if addr.Is4() {
-				_, ipnet, _ = net.ParseCIDR(cidr + "/32")
+				prefix = netip.PrefixFrom(addr, 32)
 			} else {
-				_, ipnet, _ = net.ParseCIDR(cidr + "/128")
+				prefix = netip.PrefixFrom(addr, 128)
 			}
-			nets = append(nets, ipnet)
-			continue
 		}
 
-		_, ipnet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			return nil, err
+		// Check for IPv4-mapped IPv6 prefixes BEFORE masking
+		addr := prefix.Addr()
+		if addr.Is4In6() {
+			// This is an IPv4-mapped IPv6 prefix like ::ffff:10.0.0.0/104
+			bits := prefix.Bits()
+			if bits < 96 {
+				return nil, fmt.Errorf("parsing %q: IPv4-mapped IPv6 prefix must be at least /96", cidr)
+			}
+			ipv4PrefixLen := bits - 96
+			// Apply IPv4 rules: reject /0, require at least /8
+			if ipv4PrefixLen == 0 {
+				return nil, fmt.Errorf("parsing %q: IPv4-mapped prefix covers all of IPv4 (equivalent to 0.0.0.0/0)", cidr)
+			}
+			if ipv4PrefixLen < 8 {
+				return nil, fmt.Errorf("parsing %q: IPv4-mapped prefix must map to at least /8 in IPv4 (need /%d or longer)", cidr, 96+8)
+			}
+			// Unmap to native IPv4 prefix
+			unmapped := addr.Unmap()
+			prefix = netip.PrefixFrom(unmapped, ipv4PrefixLen)
 		}
 
-		// Check prefix length to prevent overly broad trust (#62)
-		ones, bits := ipnet.Mask.Size()
-		isIPv4 := bits == 32
+		// Normalize the prefix (mask it)
+		prefix = prefix.Masked()
 
-		// Reject /0 for both IPv4 and IPv6
-		if ones == 0 {
+		// Check prefix length
+		bits := prefix.Bits()
+		if bits == 0 {
 			return nil, fmt.Errorf("parsing %q: prefix length /0 is too broad", cidr)
 		}
-
-		// Enforce minimum prefix length
-		if isIPv4 && ones < 8 {
-			return nil, fmt.Errorf("parsing %q: IPv4 prefix must be at least /8", cidr)
+		if prefix.Addr().Is4() {
+			if bits < 8 {
+				return nil, fmt.Errorf("parsing %q: IPv4 prefix must be at least /8", cidr)
+			}
+		} else {
+			if bits < 32 {
+				return nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /32", cidr)
+			}
 		}
-		if !isIPv4 && ones < 32 {
-			return nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /32", cidr)
-		}
 
+		// Convert netip.Prefix to *net.IPNet
+		// We need to convert because clientIP uses []*net.IPNet
+		ipnetStr := prefix.String()
+		_, ipnet, err := net.ParseCIDR(ipnetStr)
+		if err != nil {
+			return nil, fmt.Errorf("converting %q to IPNet: %w", ipnetStr, err)
+		}
 		nets = append(nets, ipnet)
 	}
 	return nets, nil
@@ -239,6 +280,16 @@ type LimiterManager struct {
 	wg     sync.WaitGroup
 }
 
+// Rate limit constants for public GET endpoints and authenticated endpoints.
+const (
+	getPerMinute        = 60
+	getBurst            = 20
+	versionPerMinute    = 120
+	versionBurst        = 30
+	authGetPerMinute    = 120
+	authGetBurst        = 40
+)
+
 // NewLimiterManager creates and starts a new limiter manager.
 func NewLimiterManager(cfg Config) *LimiterManager {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -247,9 +298,9 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 		regLim:        msg.NewLimiter(10, 5),
 		pairLim:       msg.NewLimiter(10, 5),
 		failLim:       msg.NewLimiter(30, 10), // Failed pairing lookups: more lenient per-IP budget
-		getLim:        msg.NewLimiter(60, 20),
-		versionLim:    msg.NewLimiter(120, 30), // Separate limiter for /version to avoid monitor conflicts
-		authLim:       msg.NewLimiter(120, 40), // Higher limit for authenticated polling
+		getLim:        msg.NewLimiter(getPerMinute, getBurst),
+		versionLim:    msg.NewLimiter(versionPerMinute, versionBurst), // Separate limiter for /version to avoid monitor conflicts
+		authLim:       msg.NewLimiter(authGetPerMinute, authGetBurst),
 		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst),
 		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour),
 		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst),
@@ -262,6 +313,23 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 	go lm.pruneLoop()
 
 	return lm
+}
+
+// all returns all limiters in a single list for iteration.
+func (lm *LimiterManager) all() []*msg.Limiter {
+	return []*msg.Limiter{
+		lm.msgLim,
+		lm.regLim,
+		lm.pairLim,
+		lm.failLim,
+		lm.getLim,
+		lm.versionLim,
+		lm.authLim,
+		lm.mailLim,
+		lm.rcptLim,
+		lm.notifyLim,
+		lm.notifyAddrLim,
+	}
 }
 
 // pruneLoop periodically prunes stale buckets from all limiters.
@@ -281,9 +349,10 @@ func (lm *LimiterManager) pruneLoop() {
 }
 
 func (lm *LimiterManager) prune() {
-	pruned := lm.msgLim.Prune() + lm.regLim.Prune() + lm.pairLim.Prune() + lm.failLim.Prune() +
-		lm.getLim.Prune() + lm.versionLim.Prune() + lm.authLim.Prune() +
-		lm.mailLim.Prune() + lm.rcptLim.Prune() + lm.notifyLim.Prune() + lm.notifyAddrLim.Prune()
+	pruned := 0
+	for _, lim := range lm.all() {
+		pruned += lim.Prune()
+	}
 	_ = pruned // Could log if needed
 }
 
