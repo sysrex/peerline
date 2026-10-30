@@ -269,6 +269,7 @@ type LimiterManager struct {
 	failLim       *msg.Limiter // Failed pairing token lookups (per-IP)
 	getLim        *msg.Limiter
 	authLim       *msg.Limiter
+	bagWriteLim   *msg.Limiter // Bag PUTs, keyed by authenticated caller (never the bag owner)
 	mailLim       *msg.Limiter
 	rcptLim       *msg.Limiter
 	notifyLim     *msg.Limiter
@@ -297,6 +298,7 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 		failLim:       msg.NewLimiter(30, 10), // Failed pairing lookups: more lenient per-IP budget
 		getLim:        msg.NewLimiter(getPerMinute, getBurst),
 		authLim:       msg.NewLimiter(authGetPerMinute, authGetBurst),
+		bagWriteLim:   msg.NewLimiter(30, 10),
 		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst),
 		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour),
 		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst),
@@ -320,6 +322,7 @@ func (lm *LimiterManager) all() []*msg.Limiter {
 		lm.failLim,
 		lm.getLim,
 		lm.authLim,
+		lm.bagWriteLim,
 		lm.mailLim,
 		lm.rcptLim,
 		lm.notifyLim,
