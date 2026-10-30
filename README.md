@@ -224,7 +224,7 @@ How it behaves:
 
 | Env | Default | Meaning |
 |---|---|---|
-| `PEERLINE_SMTP_HOST` | unset | SMTP server. **Unset = dev mode**: the email's recipient, subject and body length are logged at WARN and the invite succeeds. Set `PEERLINE_DEV_LOG_EMAIL_BODY=1` to log the full body (invite codes and message previews) on a trusted dev box only. |
+| `PEERLINE_SMTP_HOST` | unset | SMTP server. **Unset = dev mode**: the email's recipient, subject and body length are logged at WARN and the invite succeeds. Set `PEERLINE_DEV_LOG_EMAIL_BODY=1` to log the full body (invite codes and message previews). A startup warning is logged, and startup is refused unless `PEERLINE_ADDR` is a loopback address. |
 | `PEERLINE_SMTP_PORT` | `587` | `465` = implicit TLS (`PEERLINE_SMTP_REQUIRE_TLS` is ignored). Anything else = STARTTLS, **required** unless the host is `localhost`, `127.0.0.1` or `::1` (plaintext allowed by default there) or `PEERLINE_SMTP_REQUIRE_TLS=false`. |
 | `PEERLINE_SMTP_USER` / `PEERLINE_SMTP_PASS` | unset | PLAIN auth; set both or neither. |
 | `PEERLINE_SMTP_REQUIRE_TLS` | unset | `1`/`true`/`yes` forces STARTTLS even for loopback; `0`/`false`/`no` allows cleartext to any host (a startup warning is logged for non-loopback). Other values abort startup. |
