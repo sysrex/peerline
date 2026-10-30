@@ -1618,7 +1618,7 @@ func TestSanitizerUnicode(t *testing.T) {
 
 		// Issue #84: Combining marks constraints
 		// Note: NFKC normalizes "a\u0301" to "á" (U+00E1), so test expectations must account for this
-		{"3 marks allowed", "a\u0301\u0302\u0303", "á\u0302\u0303"}, // NFKC: a+mark1 -> á, then 2 more marks
+		{"3 marks allowed", "a\u0301\u0302\u0303", "á\u0302\u0303"},                                     // NFKC: a+mark1 -> á, then 2 more marks
 		{"20 marks capped at 3", "a" + strings.Repeat("\u0301", 20), "á" + strings.Repeat("\u0301", 3)}, // NFKC: á + 19 marks -> á + 3 marks
 		{"64 marks alone becomes fallback", strings.Repeat("\u0301", 64), "A Peerline peer"},
 		{"100 marks capped at 3", "a" + strings.Repeat("\u0301", 100), "á" + strings.Repeat("\u0301", 3)},

@@ -527,9 +527,9 @@ func (s *Server) inviterName(ctx context.Context, id string) string {
 // and require application-level awareness or visual similarity detection.
 func sanitizeInviterName(name string) string {
 	const (
-		maxRunes              = 64
-		maxConsecutiveMarks   = 3
-		fallbackName          = "A Peerline peer"
+		maxRunes            = 64
+		maxConsecutiveMarks = 3
+		fallbackName        = "A Peerline peer"
 	)
 
 	// Apply NFKC normalization (compatibility decomposition + canonical composition)
@@ -628,12 +628,12 @@ func sanitizeInviterName(name string) string {
 	}
 
 	result := strings.TrimSpace(out.String())
-	
+
 	// Return fallback if result is empty
 	if result == "" {
 		return fallbackName
 	}
-	
+
 	return result
 }
 
