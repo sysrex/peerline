@@ -2,8 +2,10 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http/httptest"
@@ -12,16 +14,17 @@ import (
 	"time"
 
 	"github.com/sysrex/peerline/internal/auth"
+	"github.com/sysrex/peerline/internal/store"
 )
 
 // TestEmailVerificationIdenticalFailures tests that all verification failures return byte-identical 404s.
 func TestEmailVerificationIdenticalFailures(t *testing.T) {
 	cap := &captureMailer{}
-	srv, _, st := newServerWithAccess(t, Config{Mailer: cap})
+	srv, _, _, db := newServerWithDB(t, Config{Mailer: cap})
 
 	// Helper to write token directly to DB
 	writeToken := func(peerID, token string) {
-		_, err := st.DB().Exec(`UPDATE peers SET notify_email_token=? WHERE id=?`, token, peerID)
+		_, err := db.Exec(`UPDATE peers SET notify_email_token=? WHERE id=?`, token, peerID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -85,7 +88,7 @@ func TestEmailVerificationIdenticalFailures(t *testing.T) {
 	now := time.Now().Unix()
 	expiredIssuedTime := now - 86401
 	expiredTokenValue := fmt.Sprintf("%d:%s", expiredIssuedTime, auth.Hash(eveToken))
-	_, err := st.DB().Exec(`UPDATE peers SET notify_email_token=? WHERE id=?`, expiredTokenValue, eve.id)
+	_, err := db.Exec(`UPDATE peers SET notify_email_token=? WHERE id=?`, expiredTokenValue, eve.id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +297,7 @@ func TestTokenNotInLogs(t *testing.T) {
 // TestEmailVerificationExpiry tests that tokens expire after 24 hours.
 func TestEmailVerificationExpiry(t *testing.T) {
 	cap := &captureMailer{}
-	srv, _, st := newServerWithAccess(t, Config{Mailer: cap})
+	srv, _, _, db := newServerWithDB(t, Config{Mailer: cap})
 
 	alice := &client{t: t, srv: srv}
 	resp, body := alice.do("POST", "/v1/register", map[string]string{"name": "alice", "notify_email": "alice@example.com"}, nil)
@@ -312,7 +315,7 @@ func TestEmailVerificationExpiry(t *testing.T) {
 	now := time.Now().Unix()
 	validIssuedTime := now - 86400 // exactly 24 hours ago
 	validTokenValue := fmt.Sprintf("%d:%s", validIssuedTime, auth.Hash(token))
-	_, err := st.DB().Exec(`UPDATE peers SET notify_email_token=? WHERE id=?`, validTokenValue, alice.id)
+	_, err := db.Exec(`UPDATE peers SET notify_email_token=? WHERE id=?`, validTokenValue, alice.id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +337,7 @@ func TestEmailVerificationExpiry(t *testing.T) {
 	// Write a token that's expired (issued 86401 seconds ago = 24 hours + 1 second)
 	expiredIssuedTime := now - 86401
 	expiredTokenValue := fmt.Sprintf("%d:%s", expiredIssuedTime, auth.Hash(bobToken))
-	_, err = st.DB().Exec(`UPDATE peers SET notify_email_token=? WHERE id=?`, expiredTokenValue, bob.id)
+	_, err = db.Exec(`UPDATE peers SET notify_email_token=? WHERE id=?`, expiredTokenValue, bob.id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,21 +349,47 @@ func TestEmailVerificationExpiry(t *testing.T) {
 }
 
 // TestEmailVerificationDBError tests that DB errors return 500, not 404.
-// TODO: This test is difficult to implement without mocking because closing the DB
-// breaks the auth middleware first. A better approach would be to test the
-// Store.VerifyNotifyEmail method directly with a mocked DB connection.
 func TestEmailVerificationDBError(t *testing.T) {
-	t.Skip("DB error testing requires mocking infrastructure")
+	// Store level test: close store and verify VerifyNotifyEmail returns a DB error (not ErrNotFound)
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a peer with a verification token
+	ctx := context.Background()
+	peerID := "p_test"
+	keyHash := auth.Hash("test-key")
+	token := auth.NewSecret("eml_")
+	issuedAt := time.Now().Unix()
+	tokenWithExpiry := fmt.Sprintf("%d:%s", issuedAt, auth.Hash(token))
+
+	err = st.CreatePeer(ctx, peerID, "test", keyHash, "test@example.com", tokenWithExpiry)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Close the store to simulate DB error
+	st.Close()
+
+	// Verify that VerifyNotifyEmail returns an error that is NOT ErrNotFound
+	err = st.VerifyNotifyEmail(ctx, peerID, auth.Hash(token))
+	if err == nil {
+		t.Fatal("expected DB error, got nil")
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		t.Errorf("DB error was mapped to ErrNotFound, should be a wrapped DB error")
+	}
 }
 
 // TestEmailVerificationLegacyAndMalformed tests that legacy plaintext and malformed tokens fail.
 func TestEmailVerificationLegacyAndMalformed(t *testing.T) {
 	cap := &captureMailer{}
-	srv, _, st := newServerWithAccess(t, Config{Mailer: cap})
+	srv, _, _, db := newServerWithDB(t, Config{Mailer: cap})
 
 	// Helper to write token directly to DB
 	writeToken := func(peerID, token string) {
-		_, err := st.DB().Exec(`UPDATE peers SET notify_email_token=? WHERE id=?`, token, peerID)
+		_, err := db.Exec(`UPDATE peers SET notify_email_token=? WHERE id=?`, token, peerID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -426,7 +455,7 @@ func TestEmailVerificationLegacyAndMalformed(t *testing.T) {
 // TestTokenHashedInDB verifies the DB never stores the raw token.
 func TestTokenHashedInDB(t *testing.T) {
 	cap := &captureMailer{}
-	srv, _, st := newServerWithAccess(t, Config{Mailer: cap})
+	srv, _, _, db := newServerWithDB(t, Config{Mailer: cap})
 
 	alice := &client{t: t, srv: srv}
 	resp, body := alice.do("POST", "/v1/register", map[string]string{"name": "alice", "notify_email": "alice@example.com"}, nil)
@@ -442,7 +471,7 @@ func TestTokenHashedInDB(t *testing.T) {
 
 	// Read token from DB
 	var dbToken sql.NullString
-	err := st.DB().QueryRow(`SELECT notify_email_token FROM peers WHERE id=?`, alice.id).Scan(&dbToken)
+	err := db.QueryRow(`SELECT notify_email_token FROM peers WHERE id=?`, alice.id).Scan(&dbToken)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -618,5 +647,48 @@ func TestRegisterWithExhaustedAddressBudget(t *testing.T) {
 	}
 	if count != 3 {
 		t.Errorf("sent %d emails, want 3", count)
+	}
+}
+
+// TestUpdateMePerAddressLimitDoesNotSpendPerPeerBudget verifies that hitting the
+// per-address limit in updateMe doesn't consume the per-peer budget.
+func TestUpdateMePerAddressLimitDoesNotSpendPerPeerBudget(t *testing.T) {
+	cap := &captureMailer{}
+	srv := newServer(t, Config{Mailer: cap})
+
+	alice := register(t, srv, "alice")
+	bob := register(t, srv, "bob")
+	carol := register(t, srv, "carol")
+
+	// Exhaust per-address budget with alice, bob, and carol (3 emails to same address)
+	for _, c := range []*client{alice, bob, carol} {
+		resp, body := c.do("PUT", "/v1/me", map[string]string{"notify_email": "shared@example.com"}, nil)
+		want(t, resp, body, 200)
+	}
+
+	// Dave tries the same address - should hit per-address limit
+	dave := register(t, srv, "dave")
+	resp, body := dave.do("PUT", "/v1/me", map[string]string{"notify_email": "shared@example.com"}, nil)
+	want(t, resp, body, 429)
+	if !strings.Contains(string(body), "per-address") {
+		t.Errorf("expected per-address rate limit error, got: %s", body)
+	}
+
+	// Dave's per-peer budget should NOT have been spent
+	// Try with a different address - should succeed
+	resp, body = dave.do("PUT", "/v1/me", map[string]string{"notify_email": "dave@example.com"}, nil)
+	want(t, resp, body, 200)
+
+	// Verify the verification email was sent to dave@example.com
+	msgs := cap.all()
+	found := false
+	for _, m := range msgs {
+		if m.To == "dave@example.com" && strings.Contains(m.Subject, "Verify") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("dave's per-peer budget was spent when it shouldn't have been")
 	}
 }

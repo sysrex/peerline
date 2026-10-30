@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -37,7 +38,9 @@ func newServer(t *testing.T, cfg Config) *httptest.Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	srv := httptest.NewServer(New(st, cfg).Handler())
+	s := New(st, cfg)
+	t.Cleanup(s.Stop)
+	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -45,15 +48,41 @@ func newServer(t *testing.T, cfg Config) *httptest.Server {
 // newServerWithAccess returns a test server along with the underlying Server and Store for tests that need internal access.
 func newServerWithAccess(t *testing.T, cfg Config) (*httptest.Server, *Server, *store.Store) {
 	t.Helper()
-	st, err := store.Open(t.TempDir() + "/t.db")
+	dbPath := t.TempDir() + "/t.db"
+	st, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
 	s := New(st, cfg)
+	t.Cleanup(s.Stop)
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 	return srv, s, st
+}
+
+// newServerWithDB returns a test server along with a raw database connection for tests that need to manipulate DB state directly.
+func newServerWithDB(t *testing.T, cfg Config) (*httptest.Server, *Server, *store.Store, *sql.DB) {
+	t.Helper()
+	dbPath := t.TempDir() + "/t.db"
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	// Open a second connection for test manipulation
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	s := New(st, cfg)
+	t.Cleanup(s.Stop)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	return srv, s, st, db
 }
 
 func (c *client) do(method, path string, body any, hdr map[string]string) (*http.Response, []byte) {

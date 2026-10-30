@@ -322,9 +322,6 @@ func migrateV4EmailVerification(tx *sql.Tx) error {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-// DB returns the underlying database handle for testing.
-func (s *Store) DB() *sql.DB { return s.db }
-
 // generatePublicID returns a random 16-byte hex string for invite public_id.
 func generatePublicID() (string, error) {
 	b := make([]byte, 16)
