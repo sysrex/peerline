@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -18,6 +19,8 @@ import (
 var ErrNotFound = errors.New("not found")
 var ErrConflict = errors.New("conflict")
 var ErrTooManyInvites = errors.New("too many outstanding invites")
+var ErrBagLimitExceeded = errors.New("bag limit exceeded")
+var ErrStorageQuotaExceeded = errors.New("storage quota exceeded")
 
 var memDBCounter uint64
 
@@ -469,29 +472,63 @@ func (s *Store) SetNotifyEmail(ctx context.Context, id, email, token string) err
 	return nil
 }
 
-// GetNotifyEmailWithStatus returns the email, whether it's verified, and the verification token.
-func (s *Store) GetNotifyEmailWithStatus(ctx context.Context, id string) (email string, verified bool, token string, err error) {
+// GetNotifyEmailStatus returns the email and whether it's verified (no token exposure).
+func (s *Store) GetNotifyEmailStatus(ctx context.Context, id string) (email string, verified bool, err error) {
 	var verifiedInt int
-	var tokenNull sql.NullString
-	err = s.db.QueryRowContext(ctx, `SELECT notify_email, notify_email_verified, notify_email_token FROM peers WHERE id=?`, id).Scan(&email, &verifiedInt, &tokenNull)
+	err = s.db.QueryRowContext(ctx, `SELECT notify_email, notify_email_verified FROM peers WHERE id=?`, id).Scan(&email, &verifiedInt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, "", ErrNotFound
+		return "", false, ErrNotFound
 	}
 	if err != nil {
-		return "", false, "", err
+		return "", false, err
 	}
 	verified = verifiedInt != 0
-	if tokenNull.Valid {
-		token = tokenNull.String
-	}
-	return email, verified, token, nil
+	return email, verified, nil
 }
 
-// VerifyNotifyEmail marks the email as verified if the token matches.
-func (s *Store) VerifyNotifyEmail(ctx context.Context, id, token string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE peers SET notify_email_verified=1, notify_email_token=NULL WHERE id=? AND notify_email_token=?`, id, token)
+// VerifyNotifyEmail marks the email as verified if the tokenHash matches and hasn't expired.
+// Token is single-use: cleared on success. Returns ErrNotFound for invalid/expired/used tokens.
+// tokenWithExpiry format: "<unix_issued>:<hash>". Legacy plaintext or malformed values are treated as invalid.
+func (s *Store) VerifyNotifyEmail(ctx context.Context, id, tokenHash string) error {
+	// Fetch stored token
+	var storedToken sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT notify_email_token FROM peers WHERE id=?`, id).Scan(&storedToken)
 	if err != nil {
-		return err
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("fetch notify_email_token: %w", err)
+	}
+	if !storedToken.Valid || storedToken.String == "" {
+		return ErrNotFound
+	}
+
+	// Parse stored token: "<unix_issued>:<hash>"
+	parts := strings.SplitN(storedToken.String, ":", 2)
+	if len(parts) != 2 {
+		// Malformed or legacy plaintext token
+		return ErrNotFound
+	}
+	issuedUnix, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return ErrNotFound
+	}
+	storedHash := parts[1]
+
+	// Check expiry (24 hours: valid at exactly issued+86400, expired at issued+86401)
+	if s.now() > issuedUnix+86400 {
+		return ErrNotFound
+	}
+
+	// Verify hash matches
+	if tokenHash != storedHash {
+		return ErrNotFound
+	}
+
+	// Single-use: clear token and mark verified
+	res, err := s.db.ExecContext(ctx, `UPDATE peers SET notify_email_verified=1, notify_email_token=NULL WHERE id=? AND notify_email_token=?`, id, storedToken.String)
+	if err != nil {
+		return fmt.Errorf("clear token: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
@@ -1161,20 +1198,55 @@ func (s *Store) GetBag(ctx context.Context, owner, name string) (*Bag, error) {
 
 // PutBag writes a bag. If ifVersion >= 0 it must match the current version
 // (0 = must not exist yet); otherwise ErrConflict. ifVersion < 0 = unconditional.
-func (s *Store) PutBag(ctx context.Context, owner, name string, content []byte, by string, ifVersion int64) (int64, error) {
+// maxBagsPerPeer and maxBagBytesPerPeer enforce caps (must be positive; no zero = unlimited).
+func (s *Store) PutBag(ctx context.Context, owner, name string, content []byte, by string, ifVersion int64, maxBagsPerPeer int, maxBagBytesPerPeer int64) (int64, error) {
+	if maxBagsPerPeer <= 0 || maxBagBytesPerPeer <= 0 {
+		return 0, errors.New("bag limits must be positive")
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
+
+	// Get current version and content size
 	var cur int64
-	err = tx.QueryRowContext(ctx, `SELECT version FROM bags WHERE owner=? AND name=?`, owner, name).Scan(&cur)
+	var oldSize int
+	err = tx.QueryRowContext(ctx, `SELECT version, LENGTH(content) FROM bags WHERE owner=? AND name=?`, owner, name).Scan(&cur, &oldSize)
+	exists := err == nil
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
 	}
+
 	if ifVersion >= 0 && ifVersion != cur {
 		return cur, ErrConflict
 	}
+
+	// Enforce storage limits for creates and updates
+	var count int
+	var totalBytes int64
+	err = tx.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(LENGTH(content)), 0) FROM bags WHERE owner=?`,
+		owner).Scan(&count, &totalBytes)
+	if err != nil {
+		return 0, err
+	}
+
+	newSize := int64(len(content))
+
+	// For new bag creation: enforce bag count limit
+	if !exists && count >= maxBagsPerPeer {
+		return 0, ErrBagLimitExceeded
+	}
+
+	// For both creates and updates: enforce byte quota
+	// Allow updates that don't grow (newSize <= oldSize) even when over quota
+	newTotal := totalBytes - int64(oldSize) + newSize
+	if newSize > int64(oldSize) && newTotal > maxBagBytesPerPeer {
+		return 0, ErrStorageQuotaExceeded
+	}
+
 	next := cur + 1
 	_, err = tx.ExecContext(ctx, `INSERT INTO bags(owner,name,content,version,updated_by,updated_at) VALUES(?,?,?,?,?,?)
 		ON CONFLICT(owner,name) DO UPDATE SET content=excluded.content, version=excluded.version,

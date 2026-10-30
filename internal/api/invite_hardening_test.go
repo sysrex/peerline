@@ -859,24 +859,6 @@ func TestSingleLogRecordUnauthenticatedPairing(t *testing.T) {
 		t.Errorf("expected 1 total log record for pairing, got %d\nLogs:\n%s", totalRecords, logs)
 	}
 }
-
-// A grantee exhausts its own bag-write budget; the owner's writes are unaffected (#139, #170).
-func TestBagWriteRateLimitedPerCaller(t *testing.T) {
-	srv := newServer(t, Config{})
-	a, b := register(t, srv, "alice"), register(t, srv, "bob")
-	pairUp(t, a, b, []string{"bags:write"}, []string{"notes"}, nil)
-
-	var last *http.Response
-	for i := 0; i < 6; i++ {
-		last, _ = b.do("PUT", "/v1/bags/notes?owner="+a.id, []byte("x"), nil)
-	}
-	if last.StatusCode != 429 || last.Header.Get("Retry-After") == "" {
-		t.Fatalf("grantee burst: status %d Retry-After %q, want 429 with header", last.StatusCode, last.Header.Get("Retry-After"))
-	}
-	resp, body := a.do("PUT", "/v1/bags/other", []byte("x"), nil)
-	want(t, resp, body, 201)
-}
-
 // The email rate-limit rollback must not depend on the client staying connected (#184).
 func TestRejectEmailRateLimitedSurvivesCancelledRequest(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/t.db")

@@ -47,12 +47,12 @@ func (s *Server) rateLimitAuth(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// rateLimitBagWrite limits bag writes per authenticated caller, never per ?owner=,
-// so a grantee spends its own budget and cannot starve the owner's writes.
+// rateLimitBagWrite limits bag writes per authenticated caller, so a grantee
+// spends its own budget and never the bag owner's.
 func (s *Server) rateLimitBagWrite(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.lim.bagLim.Allow(auth.PeerID(r.Context())) {
-			w.Header().Set("Retry-After", "6")
+		if !s.lim.bagWriteLim.Allow(auth.PeerID(r.Context())) {
+			w.Header().Set("Retry-After", "10")
 			writeErr(w, http.StatusTooManyRequests, "rate limited")
 			return
 		}

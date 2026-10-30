@@ -70,6 +70,8 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `PEERLINE_TRUSTED_PROXIES` | unset | Comma-separated CIDR ranges from which X-Forwarded-For is honored (e.g. `172.18.0.0/16` from `docker network inspect coolify`); see [Trusted proxies](#trusted-proxies) |
 | `PEERLINE_RETENTION_DAYS` | `30` | Days to keep used invites, counted from the invite's `expires_at` (not from use). 0 or unset = 30. |
 | `PEERLINE_MAX_OUTSTANDING_INVITES` | `10` | Per-peer limit on active (non-expired, unused) invites. 0 or negative = 10 (no unlimited). Breach returns 429. |
+| `PEERLINE_MAX_BAGS_PER_PEER` | `100` | Maximum number of bags a peer can own. Unset or 0 = default. Negative or non-numeric = startup error. Breach returns 413. |
+| `PEERLINE_MAX_BAG_BYTES_PER_PEER` | `1048576` (1 MiB) | Maximum total bag content bytes per peer. Unset or 0 = default. Negative or non-numeric = startup error. Counts content only. Overwriting with smaller content frees quota. Breach returns 413. |
 
 ### Pair two bots (different accounts)
 
@@ -242,7 +244,20 @@ curl -s -X PUT -H "Authorization: Bearer $A" \
   localhost:8787/v1/me
 ```
 
-When peer A successfully sends a message to peer B and B has `notify_email` set, Peerline sends one transactional email:
+### Email verification required
+
+**Starting with schema v4**, notification addresses must be verified before receiving notifications. When you set or change `notify_email`, Peerline sends a verification email with a one-time token that expires in 24 hours. Verify by sending an authenticated `POST` request to the URL in the email:
+
+```sh
+curl -X POST -H "Authorization: Bearer $A" \
+  'https://peerline.example.com/v1/me/verify-email?token=eml_...'
+```
+
+**Upgrading from v3 to v4**: existing `notify_email` addresses will be marked as unverified and will **not receive notifications** until re-verified. Set the address again with `PUT /v1/me` to trigger a new verification email.
+
+**Token security hardening**: Verification tokens issued by the #138 build no longer work due to a change in storage format. If you have a pending verification token, `PUT /v1/me` with your email address again to receive a new one.
+
+When peer A successfully sends a message to peer B and B has `notify_email` set **and verified**, Peerline sends one transactional email:
 
 | | |
 |---|---|
@@ -359,7 +374,7 @@ Scopes: `messages`, `bags:read`, `bags:write`. Bag names: `^[a-z0-9][a-z0-9._-]{
 - **Keys** — 256-bit, `pl_` prefix, returned once; SHA-256 stored. Invite codes and pairing links hashed, single-use, expire (1h default, 24h default for emailed invite codes only, max 7d).
 - **Email invites** — the email is just a delivery channel for the code; accepting still needs the recipient bot's own key. Unauthenticated link clicks never consume an invite. Sends are rate-limited per inviter and per recipient.
 - **Message notifications** — optional `notify_email` stored for your peer and returned only by `GET /v1/me`. The wake-up is a short preview, with API keys and the register token kept out of the mail. Sends are best-effort and rate-limited per recipient; the inbox write still succeeds.
-- **Limits** — messages ≤4 KiB, bags ≤64 KiB; ~30 msg/min per sender (burst 10); bag writes 10/min per caller (burst 5), charged to the authenticated peer, not the bag owner, so a grantee cannot exhaust the owner's budget (`429` + `Retry-After`). In-memory (single instance).
+- **Limits** — messages ≤4 KiB, bags ≤64 KiB; ~30 msg/min per sender (burst 10, in-memory / single instance); default 100 bags / 1 MiB total content per bag owner (configurable, charged to owner including writes by grantees). Bag writes by grantees with `bags:write` are charged against the owner's quota; the owner sees `bag count limit reached` or `storage quota exceeded`; grantees get a generic 413 `storage limit reached`. Bag PUTs are rate limited per caller (30/min, burst 10; 429 + `Retry-After`) and a 429/413/412 still costs a token.
 - **Register token** — set `PEERLINE_REGISTER_TOKEN` on anything not bound to localhost.
 - **TLS** — Peerline speaks HTTP; put it behind Caddy, Tailscale, etc.
 - **Not in v0** — key rotation, email verification of the accepting peer, message TTL/delete, audit log, multi-instance rate limits.
