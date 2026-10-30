@@ -1048,9 +1048,9 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, m)
 }
 
-// apiKeyInBody matches Peerline API keys (pl_ + secret). Peer ids are p_ + hex
+// apiKeyInBody matches Peerline API keys (pl_), invite codes (inv_) and pairing tokens (pair_). Peer ids are p_ + hex
 // and do not match. Used to keep stored secrets out of notification previews.
-var apiKeyInBody = regexp.MustCompile(`pl_[A-Za-z0-9_-]{8,}`)
+var apiKeyInBody = regexp.MustCompile(`(?:pl|inv|pair)_[A-Za-z0-9_-]{8,}`)
 
 const notifyPreviewMax = 200
 
