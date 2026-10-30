@@ -329,24 +329,30 @@ func TestBagStorageShrinkOverQuota(t *testing.T) {
 	a1.id = reg.PeerID
 	a1.key = reg.APIKey
 
-	// Create a 200-byte bag
-	largeContent := bytes.Repeat([]byte("x"), 200)
-	resp, body = a1.do("PUT", "/v1/bags/data", largeContent, nil)
+	// Create two bags totaling 100 bytes
+	resp, body = a1.do("PUT", "/v1/bags/data1", bytes.Repeat([]byte("x"), 60), nil)
+	want(t, resp, body, 201)
+	resp, body = a1.do("PUT", "/v1/bags/data2", bytes.Repeat([]byte("y"), 40), nil)
 	want(t, resp, body, 201)
 
-	// Now create a server with smaller cap pointing at same store
-	srv2 := httptest.NewServer(New(st, Config{MaxBagBytesPerPeer: 100}).Handler())
+	// Now create a server with 50-byte cap (alice is over quota)
+	srv2 := httptest.NewServer(New(st, Config{MaxBagBytesPerPeer: 50}).Handler())
 	defer srv2.Close()
 	a2 := &client{t: t, srv: srv2, key: a1.key, id: a1.id}
 
-	// Shrinking should work
-	smallContent := []byte("small")
-	resp, body = a2.do("PUT", "/v1/bags/data", smallContent, nil)
+	// Shrinking data1 from 60→55 should work even though total stays over (95 > 50)
+	resp, body = a2.do("PUT", "/v1/bags/data1", bytes.Repeat([]byte("x"), 55), nil)
 	want(t, resp, body, 200)
 
-	// Growing should fail
-	mediumContent := bytes.Repeat([]byte("y"), 150)
-	resp, body = a2.do("PUT", "/v1/bags/data", mediumContent, nil)
+	// Growing data1 by 1 byte should fail
+	resp, body = a2.do("PUT", "/v1/bags/data1", bytes.Repeat([]byte("x"), 56), nil)
+	want(t, resp, body, 413)
+	if !strings.Contains(string(body), "storage quota exceeded") {
+		t.Errorf("expected storage quota exceeded, got: %s", body)
+	}
+
+	// Creating a new bag should fail
+	resp, body = a2.do("PUT", "/v1/bags/data3", []byte("z"), nil)
 	want(t, resp, body, 413)
 	if !strings.Contains(string(body), "storage quota exceeded") {
 		t.Errorf("expected storage quota exceeded, got: %s", body)
@@ -391,6 +397,24 @@ func TestBagLimitsGranteeChargedToOwner(t *testing.T) {
 	want(t, resp, body, 413)
 	if !strings.Contains(string(body), "storage quota exceeded") {
 		t.Errorf("expected storage quota exceeded, got: %s", body)
+	}
+}
+
+func TestBagLimitsNonGrantee403(t *testing.T) {
+	// Owner at bag count limit
+	srv := newServer(t, Config{MaxBagsPerPeer: 2, MaxBagBytesPerPeer: 100})
+	owner := register(t, srv, "owner")
+	nonGrantee := register(t, srv, "other")
+
+	// Owner creates 2 bags (at limit)
+	owner.do("PUT", "/v1/bags/bag1", []byte("data1"), nil)
+	owner.do("PUT", "/v1/bags/bag2", []byte("data2"), nil)
+
+	// Non-grantee (no pairing) tries to write to owner's bag - should get 403, not 413
+	resp, body := nonGrantee.do("PUT", "/v1/bags/bag1?owner="+owner.id, []byte("attempt"), nil)
+	want(t, resp, body, 403)
+	if !strings.Contains(string(body), "not permitted") {
+		t.Errorf("expected not permitted, got: %s", body)
 	}
 }
 
