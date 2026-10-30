@@ -3,7 +3,9 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -15,6 +17,7 @@ import (
 
 var ErrNotFound = errors.New("not found")
 var ErrConflict = errors.New("conflict")
+var ErrTooManyInvites = errors.New("too many outstanding invites")
 
 var memDBCounter uint64
 
@@ -36,7 +39,8 @@ CREATE TABLE IF NOT EXISTS invites (
   bags TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
   used_by TEXT,
-  pairing_token_hash TEXT
+  pairing_token_hash TEXT,
+  public_id TEXT
 );
 -- grants are directional: grantee may act on owner's resources within scopes/bags.
 CREATE TABLE IF NOT EXISTS grants (
@@ -109,6 +113,7 @@ func migrate(db *sql.DB) error {
 	migrations := []func(*sql.Tx) error{
 		migrateV1NotifyEmail,
 		migrateV2PairingTokenHash,
+		migrateV3InvitePublicID,
 	}
 
 	for i, mig := range migrations {
@@ -223,9 +228,75 @@ func migrateV2PairingTokenHash(tx *sql.Tx) error {
 	return nil
 }
 
+// migrateV3InvitePublicID adds the public_id column to invites and backfills existing rows.
+// public_id is a random 16-byte hex string used in the API to avoid exposing reusable ROWIDs.
+func migrateV3InvitePublicID(tx *sql.Tx) error {
+	var n int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('invites') WHERE name = 'public_id'`).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		if _, err := tx.Exec(`ALTER TABLE invites ADD COLUMN public_id TEXT`); err != nil {
+			return err
+		}
+	}
+
+	// Backfill existing rows with random public_id
+	rows, err := tx.Query(`SELECT ROWID FROM invites WHERE public_id IS NULL`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var rowids []int64
+	for rows.Next() {
+		var rowid int64
+		if err := rows.Scan(&rowid); err != nil {
+			return err
+		}
+		rowids = append(rowids, rowid)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Update each row with a unique public_id
+	for _, rowid := range rowids {
+		publicID, err := generatePublicID()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE invites SET public_id = ? WHERE ROWID = ?`, publicID, rowid); err != nil {
+			return err
+		}
+	}
+
+	// Create unique index if it doesn't exist
+	var hasIndex int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='invites_public_id'`).Scan(&hasIndex); err != nil {
+		return err
+	}
+	if hasIndex == 0 {
+		if _, err := tx.Exec(`CREATE UNIQUE INDEX invites_public_id ON invites(public_id) WHERE public_id IS NOT NULL`); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (s *Store) Close() error { return s.db.Close() }
 
-func now() int64 { return time.Now().Unix() }
+var now = func() int64 { return time.Now().Unix() }
+
+// generatePublicID returns a random 16-byte hex string for invite public_id.
+func generatePublicID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
 
 // ---- peers ----
 
@@ -331,15 +402,195 @@ func split(v string) []string {
 }
 
 func (s *Store) CreateInvite(ctx context.Context, codeHash, from string, scopes, bags []string, expires time.Time) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO invites(code_hash,from_peer,scopes,bags,expires_at) VALUES(?,?,?,?,?)`,
-		codeHash, from, join(scopes), join(bags), expires.Unix())
+	publicID, err := generatePublicID()
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO invites(code_hash,from_peer,scopes,bags,expires_at,public_id) VALUES(?,?,?,?,?,?)`,
+		codeHash, from, join(scopes), join(bags), expires.Unix(), publicID)
 	return err
 }
 
 func (s *Store) CreateInviteWithPairing(ctx context.Context, codeHash, pairingTokenHash, from string, scopes, bags []string, expires time.Time) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO invites(code_hash,from_peer,scopes,bags,expires_at,pairing_token_hash) VALUES(?,?,?,?,?,?)`,
-		codeHash, from, join(scopes), join(bags), expires.Unix(), pairingTokenHash)
+	publicID, err := generatePublicID()
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO invites(code_hash,from_peer,scopes,bags,expires_at,pairing_token_hash,public_id) VALUES(?,?,?,?,?,?,?)`,
+		codeHash, from, join(scopes), join(bags), expires.Unix(), pairingTokenHash, publicID)
 	return err
+}
+
+// CreateInviteAtomic checks the per-peer invite cap and creates an invite atomically within one transaction.
+// Returns ErrTooManyInvites if the cap would be exceeded. Returns the invite's public_id on success.
+func (s *Store) CreateInviteAtomic(ctx context.Context, codeHash, from string, scopes, bags []string, expires time.Time, cap int) (string, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+
+	var count int
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`, from, now()).Scan(&count)
+	if err != nil {
+		return "", err
+	}
+	if count >= cap {
+		return "", ErrTooManyInvites
+	}
+
+	publicID, err := generatePublicID()
+	if err != nil {
+		return "", err
+	}
+
+	_, err = tx.ExecContext(ctx, `INSERT INTO invites(code_hash,from_peer,scopes,bags,expires_at,public_id) VALUES(?,?,?,?,?,?)`,
+		codeHash, from, join(scopes), join(bags), expires.Unix(), publicID)
+	if err != nil {
+		return "", err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+
+	return publicID, nil
+}
+
+// CreateInviteWithPairingAtomic checks the per-peer invite cap and creates a pairing invite atomically within one transaction.
+// Returns ErrTooManyInvites if the cap would be exceeded. Returns the invite's public_id on success.
+func (s *Store) CreateInviteWithPairingAtomic(ctx context.Context, codeHash, pairingTokenHash, from string, scopes, bags []string, expires time.Time, cap int) (string, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+
+	var count int
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`, from, now()).Scan(&count)
+	if err != nil {
+		return "", err
+	}
+	if count >= cap {
+		return "", ErrTooManyInvites
+	}
+
+	publicID, err := generatePublicID()
+	if err != nil {
+		return "", err
+	}
+
+	_, err = tx.ExecContext(ctx, `INSERT INTO invites(code_hash,from_peer,scopes,bags,expires_at,pairing_token_hash,public_id) VALUES(?,?,?,?,?,?,?)`,
+		codeHash, from, join(scopes), join(bags), expires.Unix(), pairingTokenHash, publicID)
+	if err != nil {
+		return "", err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+
+	return publicID, nil
+}
+
+// InviteMetadata holds non-secret information about an invite for listing.
+type InviteMetadata struct {
+	PublicID      string    `json:"public_id"`
+	Scopes        []string  `json:"scopes"`
+	Bags          []string  `json:"bags"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	Used          bool      `json:"used"`
+	IsPairingLink bool      `json:"is_pairing_link"`
+}
+
+// CountOutstandingInvites returns the number of active (non-expired, unused) invites created by the peer.
+func (s *Store) CountOutstandingInvites(ctx context.Context, peerID string) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`,
+		peerID, now()).Scan(&count)
+	return count, err
+}
+
+// ListInvitesByPeer returns non-secret metadata for active invites created by the peer.
+// Results are ordered by creation (ROWID) and support pagination.
+func (s *Store) ListInvitesByPeer(ctx context.Context, peerID string, limit, offset int) ([]InviteMetadata, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT COALESCE(public_id, ''), scopes, bags, expires_at, used_by IS NOT NULL, 
+		        pairing_token_hash IS NOT NULL
+		 FROM invites 
+		 WHERE from_peer=? AND expires_at>=? AND public_id IS NOT NULL
+		 ORDER BY ROWID
+		 LIMIT ? OFFSET ?`,
+		peerID, now(), limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var invites []InviteMetadata
+	for rows.Next() {
+		var im InviteMetadata
+		var scopes, bags string
+		var exp int64
+		var used, hasPairingToken bool
+		if err := rows.Scan(&im.PublicID, &scopes, &bags, &exp, &used, &hasPairingToken); err != nil {
+			return nil, err
+		}
+		// Skip entries with empty public_id (defensive, should not happen after v3 migration)
+		if im.PublicID == "" {
+			continue
+		}
+		im.Scopes = split(scopes)
+		im.Bags = split(bags)
+		im.ExpiresAt = time.Unix(exp, 0).UTC()
+		im.Used = used
+		im.IsPairingLink = hasPairingToken
+		invites = append(invites, im)
+	}
+	return invites, rows.Err()
+}
+
+// DeleteInvite revokes an unused invite by public_id (owner-only).
+// Returns ErrNotFound if the invite doesn't exist, already used, or doesn't belong to owner.
+func (s *Store) DeleteInvite(ctx context.Context, publicID, ownerID string) error {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM invites WHERE public_id=? AND from_peer=? AND used_by IS NULL`,
+		publicID, ownerID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// PurgeExpiredInvites removes expired unused invites and old used invites.
+// Unused invites: deleted when expires_at < now.
+// Used invites: deleted when expires_at < now - retentionSeconds (default 30 days).
+func (s *Store) PurgeExpiredInvites(ctx context.Context, retentionSeconds int64) (int, error) {
+	if retentionSeconds <= 0 {
+		retentionSeconds = 30 * 24 * 60 * 60 // 30 days default
+	}
+
+	ts := now()
+	retentionCutoff := ts - retentionSeconds
+
+	// Delete unused expired invites and used invites older than retention window
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM invites WHERE 
+			(used_by IS NULL AND expires_at < ?) OR 
+			(used_by IS NOT NULL AND expires_at < ?)`,
+		ts, retentionCutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 type InviteInfo struct {
@@ -406,6 +657,19 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 		return nil, err
 	}
 	return grant, nil
+}
+
+// PairingTokenExists checks if a pairing token exists (is valid and not yet redeemed).
+func (s *Store) PairingTokenExists(ctx context.Context, pairingTokenHash string) (bool, error) {
+	var exists int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM invites WHERE pairing_token_hash=? AND used_by IS NULL AND expires_at >= ?`, pairingTokenHash, time.Now().Unix()).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // AcceptInvite atomically consumes an invite and creates the inviter->accepter grant

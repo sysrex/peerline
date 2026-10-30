@@ -2,12 +2,17 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sysrex/peerline/internal/store"
 )
@@ -675,5 +680,954 @@ func TestPairingAcceptStatusCodes(t *testing.T) {
 	want(t, resp, body, 404)
 	if !strings.Contains(string(body), "invalid, used, or expired") {
 		t.Errorf("unexpected 404 for used token: %s", body)
+	}
+}
+
+// Security hardening tests for #17, #18, #21-#24, #31-#39
+
+func TestXFFParsing(t *testing.T) {
+	trustedNets, _ := ParseTrustedProxies([]string{"10.0.0.0/8", "192.168.1.1"})
+
+	tests := []struct {
+		name        string
+		remoteAddr  string
+		xff         []string
+		trustedNets []*net.IPNet
+		want        string
+	}{
+		{
+			name:        "client-forged leftmost entry",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         []string{"1.2.3.4, 203.0.113.5"},
+			trustedNets: trustedNets,
+			want:        "203.0.113.5", // rightmost untrusted
+		},
+		{
+			name:        "untrusted RemoteAddr ignores XFF",
+			remoteAddr:  "203.0.113.1:5678",
+			xff:         []string{"1.2.3.4, 10.0.0.5"},
+			trustedNets: trustedNets,
+			want:        "203.0.113.1",
+		},
+		{
+			name:        "chain of trusted proxies",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         []string{"203.0.113.99, 10.0.0.2, 10.0.0.3"},
+			trustedNets: trustedNets,
+			want:        "203.0.113.99",
+		},
+		{
+			name:        "IPv4-mapped IPv6 normalization",
+			remoteAddr:  "[::ffff:203.0.113.5]:1234",
+			xff:         nil,
+			trustedNets: nil,
+			want:        "203.0.113.5",
+		},
+		{
+			name:        "IPv6 canonical form",
+			remoteAddr:  "[2001:0db8:0000:0000:0000:0000:0000:0001]:1234",
+			xff:         nil,
+			trustedNets: nil,
+			want:        "2001:db8::1",
+		},
+		{
+			name:        "bare IP trusted proxy",
+			remoteAddr:  "192.168.1.1:1234",
+			xff:         []string{"203.0.113.10"},
+			trustedNets: trustedNets,
+			want:        "203.0.113.10",
+		},
+		{
+			name:        "multiple XFF headers combined",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         []string{"1.2.3.4, 203.0.113.20", "10.0.0.5"},
+			trustedNets: trustedNets,
+			want:        "203.0.113.20", // attacker in first header, proxy in second
+		},
+		{
+			name:        "missing XFF header",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         nil,
+			trustedNets: trustedNets,
+			want:        "10.0.0.1", // falls back to RemoteAddr
+		},
+		{
+			name:        "empty XFF header value",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         []string{""},
+			trustedNets: trustedNets,
+			want:        "10.0.0.1", // falls back to RemoteAddr
+		},
+		{
+			name:        "whitespace and empty entries in XFF",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         []string{"  , , 203.0.113.30, , 10.0.0.2  "},
+			trustedNets: trustedNets,
+			want:        "203.0.113.30", // skips empty/whitespace entries
+		},
+		{
+			name:        "all XFF entries trusted fallback",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         []string{"10.0.0.2, 10.0.0.3, 192.168.1.1"},
+			trustedNets: trustedNets,
+			want:        "10.0.0.1", // all XFF trusted, falls back to RemoteAddr
+		},
+		{
+			name:        "IPv6 in XFF chain",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         []string{"2001:db8::42, 10.0.0.2"},
+			trustedNets: trustedNets,
+			want:        "2001:db8::42", // IPv6 address returned in canonical form
+		},
+		{
+			name:        "spoofed leftmost never used",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         []string{"99.99.99.99", "203.0.113.50, 10.0.0.5"},
+			trustedNets: trustedNets,
+			want:        "203.0.113.50", // rightmost untrusted, not leftmost spoof
+		},
+		{
+			name:        "malformed IP in XFF skipped",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         []string{"not-an-ip, 203.0.113.60, 10.0.0.2"},
+			trustedNets: trustedNets,
+			want:        "203.0.113.60", // skips malformed, takes next valid untrusted
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := clientIP(tt.remoteAddr, tt.xff, tt.trustedNets)
+			if got != tt.want {
+				t.Errorf("clientIP() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseTrustedProxies(t *testing.T) {
+	tests := []struct {
+		name    string
+		cidrs   []string
+		wantErr bool
+		wantLen int
+	}{
+		{
+			name:    "valid CIDRs",
+			cidrs:   []string{"10.0.0.0/8", "192.168.0.0/16"},
+			wantErr: false,
+			wantLen: 2,
+		},
+		{
+			name:    "bare IPs",
+			cidrs:   []string{"10.0.0.1", "192.168.1.1"},
+			wantErr: false,
+			wantLen: 2,
+		},
+		{
+			name:    "mixed",
+			cidrs:   []string{"10.0.0.0/8", "192.168.1.1"},
+			wantErr: false,
+			wantLen: 2,
+		},
+		{
+			name:    "invalid CIDR",
+			cidrs:   []string{"10.0.0.0/999"},
+			wantErr: true,
+		},
+		{
+			name:    "invalid IP",
+			cidrs:   []string{"not-an-ip"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nets, err := ParseTrustedProxies(tt.cidrs)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ParseTrustedProxies() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && len(nets) != tt.wantLen {
+				t.Errorf("ParseTrustedProxies() len = %d, want %d", len(nets), tt.wantLen)
+			}
+		})
+	}
+}
+
+func TestIPv6RateLimitKeyPrefixing(t *testing.T) {
+	tests := []struct {
+		name string
+		ip   string
+		want string
+	}{
+		{
+			name: "IPv6 uses /64 prefix",
+			ip:   "2001:db8:1234:5678:abcd:ef01:2345:6789",
+			want: "2001:db8:1234:5678::",
+		},
+		{
+			name: "IPv6 different host same /64",
+			ip:   "2001:db8:1234:5678:9999:9999:9999:9999",
+			want: "2001:db8:1234:5678::",
+		},
+		{
+			name: "IPv4 unchanged",
+			ip:   "203.0.113.42",
+			want: "203.0.113.42",
+		},
+		{
+			name: "IPv4-mapped IPv6 unmapped then full",
+			ip:   "::ffff:203.0.113.42",
+			want: "203.0.113.42",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := rateLimitKey(tt.ip)
+			if got != tt.want {
+				t.Errorf("rateLimitKey(%q) = %q, want %q", tt.ip, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAuthenticatedGETRateLimiting(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+	b := register(t, srv, "bob")
+
+	// Authenticated GETs are per-peer-id (120/min, burst 40)
+	// Alice hammers /v1/me, Bob should be unaffected
+	for i := 0; i < 45; i++ {
+		resp, body := a.do("GET", "/v1/me", nil, nil)
+		if i < 40 {
+			want(t, resp, body, 200)
+		} else {
+			// After burst exhausted, should be rate limited
+			if resp.StatusCode != 429 {
+				t.Fatalf("iteration %d: expected 429, got %d", i, resp.StatusCode)
+			}
+			break
+		}
+	}
+
+	// Bob should still be fine
+	resp, body := b.do("GET", "/v1/me", nil, nil)
+	want(t, resp, body, 200)
+}
+
+func TestInboxPollingNoRateLimit(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+
+	// Realistic polling: authLim is 120/min = 2/s sustained, burst 40
+	// Test that we can use the full burst without hitting 429
+	for i := 0; i < 40; i++ {
+		resp, body := a.do("GET", "/v1/inbox", nil, nil)
+		if resp.StatusCode == 429 {
+			t.Fatalf("iteration %d: unexpected 429 during burst polling", i)
+		}
+		want(t, resp, body, 200)
+	}
+
+	// After burst, wait for refill (1 second gives us 2 more tokens)
+	time.Sleep(1 * time.Second)
+
+	// Should be able to make 2 more requests
+	for i := 0; i < 2; i++ {
+		resp, body := a.do("GET", "/v1/inbox", nil, nil)
+		if resp.StatusCode == 429 {
+			t.Fatalf("after refill: unexpected 429 during polling")
+		}
+		want(t, resp, body, 200)
+	}
+}
+
+func TestRegisterRateLimitAfterTokenCheck(t *testing.T) {
+	srv := newServer(t, Config{RegisterToken: "secret123"})
+
+	// Without register token, should fail with 403 before charging rate limit
+	// We can hammer this without getting 429
+	for i := 0; i < 20; i++ {
+		resp, body := doAnon(t, srv, "POST", "/v1/register", map[string]any{"name": "test"}, nil)
+		want(t, resp, body, 403)
+		if strings.Contains(string(body), "rate limited") {
+			t.Fatal("got 429 before token check")
+		}
+	}
+}
+
+func TestPairingRateLimitAfterTokenValidation(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+
+	// Create a pairing invite
+	resp, body := a.do("POST", "/v1/invites", map[string]any{
+		"scopes":           []string{"messages"},
+		"generate_pairing": true,
+	}, nil)
+	want(t, resp, body, 201)
+	var inv struct {
+		PairingURL string `json:"pairing_url"`
+	}
+	json.Unmarshal(body, &inv)
+	validToken := strings.Split(inv.PairingURL, "/v1/pairing/")[1]
+
+	// Invalid token format should fail validation before charging pairLim (returns 400)
+	// Use token that doesn't match the regex (too short or wrong prefix)
+	for i := 0; i < 15; i++ {
+		resp, body := doAnon(t, srv, "POST", "/v1/pairing/bad", map[string]any{"name": "test"}, nil)
+		want(t, resp, body, 400)
+		if strings.Contains(string(body), "rate limited") {
+			t.Fatal("got rate limit before format check")
+		}
+	}
+
+	// Valid token should work (charges pairLim after format validation)
+	resp, body = doAnon(t, srv, "POST", "/v1/pairing/"+validToken, map[string]any{"name": "bob"}, nil)
+	want(t, resp, body, 201)
+}
+
+func TestInviteListPagination(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+	b := register(t, srv, "bob")
+
+	// Alice creates 5 invites
+	for i := 0; i < 5; i++ {
+		resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+		want(t, resp, body, 201)
+	}
+
+	// List with limit=2
+	resp, body := a.do("GET", "/v1/invites?limit=2", nil, nil)
+	want(t, resp, body, 200)
+	var list1 struct {
+		Invites []store.InviteMetadata `json:"invites"`
+	}
+	json.Unmarshal(body, &list1)
+	if len(list1.Invites) != 2 {
+		t.Fatalf("expected 2 invites, got %d", len(list1.Invites))
+	}
+
+	// List with limit=2&offset=2
+	resp, body = a.do("GET", "/v1/invites?limit=2&offset=2", nil, nil)
+	want(t, resp, body, 200)
+	var list2 struct {
+		Invites []store.InviteMetadata `json:"invites"`
+	}
+	json.Unmarshal(body, &list2)
+	if len(list2.Invites) != 2 {
+		t.Fatalf("expected 2 invites, got %d", len(list2.Invites))
+	}
+
+	// Bob can't see Alice's invites
+	resp, body = b.do("GET", "/v1/invites", nil, nil)
+	want(t, resp, body, 200)
+	var listB struct {
+		Invites []store.InviteMetadata `json:"invites"`
+	}
+	json.Unmarshal(body, &listB)
+	if len(listB.Invites) != 0 {
+		t.Fatalf("Bob should see 0 invites, got %d", len(listB.Invites))
+	}
+}
+
+func TestDeleteInviteByID(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+	b := register(t, srv, "bob")
+
+	// Alice creates an invite
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv struct {
+		PublicID string `json:"public_id"`
+	}
+	json.Unmarshal(body, &inv)
+
+	// Bob can't delete Alice's invite
+	resp, body = b.do("DELETE", fmt.Sprintf("/v1/invites/%s", inv.PublicID), nil, nil)
+	want(t, resp, body, 404)
+
+	// Alice can delete her own invite
+	resp, body = a.do("DELETE", fmt.Sprintf("/v1/invites/%s", inv.PublicID), nil, nil)
+	want(t, resp, body, 204)
+
+	// Repeat delete returns 404
+	resp, body = a.do("DELETE", fmt.Sprintf("/v1/invites/%s", inv.PublicID), nil, nil)
+	want(t, resp, body, 404)
+}
+
+func TestInviteCodeNeverLogged(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	srv := newServer(t, Config{Logger: logger})
+	a := register(t, srv, "alice")
+
+	// Create an invite
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv struct {
+		Code     string `json:"code"`
+		PublicID string `json:"public_id"`
+	}
+	json.Unmarshal(body, &inv)
+
+	// Delete the invite (triggers log)
+	a.do("DELETE", fmt.Sprintf("/v1/invites/%s", inv.PublicID), nil, nil)
+
+	// Check logs don't contain the code or any prefix
+	logs := logBuf.String()
+	if strings.Contains(logs, inv.Code) {
+		t.Error("invite code found in logs")
+	}
+	codePrefix := inv.Code[:10]
+	if strings.Contains(logs, codePrefix) {
+		t.Error("invite code prefix found in logs")
+	}
+	// Should contain public_id
+	if !strings.Contains(logs, inv.PublicID) {
+		t.Error("public_id not found in logs")
+	}
+}
+
+func TestInviteCapEnforcedAtomically(t *testing.T) {
+	srv := newServer(t, Config{MaxOutstandingInvites: 3})
+	a := register(t, srv, "alice")
+
+	// Create 3 invites (at cap)
+	for i := 0; i < 3; i++ {
+		resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+		want(t, resp, body, 201)
+	}
+
+	// 4th should fail
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 429)
+	if !strings.Contains(string(body), "too many outstanding invites") {
+		t.Errorf("unexpected error: %s", body)
+	}
+}
+
+func TestInviteTTLDefaults(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+
+	// No TTL specified, should default to 1h
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv struct {
+		ExpiresAt string `json:"expires_at"`
+	}
+	json.Unmarshal(body, &inv)
+	expTime, _ := time.Parse(time.RFC3339, inv.ExpiresAt)
+	if time.Until(expTime) > 65*time.Minute || time.Until(expTime) < 55*time.Minute {
+		t.Errorf("expiry not ~1h from now: %v", expTime)
+	}
+
+	// TTL > 7 days should fail
+	resp, body = a.do("POST", "/v1/invites", map[string]any{
+		"scopes":      []string{"messages"},
+		"ttl_seconds": 604801,
+	}, nil)
+	want(t, resp, body, 400)
+	if !strings.Contains(string(body), "must not exceed") {
+		t.Errorf("unexpected error: %s", body)
+	}
+}
+
+func TestGeneratePairingReturnsOnlyURL(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+
+	resp, body := a.do("POST", "/v1/invites", map[string]any{
+		"scopes":           []string{"messages"},
+		"generate_pairing": true,
+	}, nil)
+	want(t, resp, body, 201)
+
+	var result map[string]any
+	json.Unmarshal(body, &result)
+
+	// Should have pairing_url and public_id
+	if _, ok := result["pairing_url"]; !ok {
+		t.Error("missing pairing_url")
+	}
+	if _, ok := result["public_id"]; !ok {
+		t.Error("missing public_id")
+	}
+
+	// Should NOT have code or accept_url
+	if _, ok := result["code"]; ok {
+		t.Error("code should not be present")
+	}
+	if _, ok := result["accept_url"]; ok {
+		t.Error("accept_url should not be present")
+	}
+}
+
+func TestGeneratePairingWithEmailRejected(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+
+	resp, body := a.do("POST", "/v1/invites", map[string]any{
+		"scopes":           []string{"messages"},
+		"generate_pairing": true,
+		"to_email":         "bob@example.com",
+	}, nil)
+	want(t, resp, body, 400)
+	if !strings.Contains(string(body), "cannot combine") {
+		t.Errorf("unexpected error: %s", body)
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	srv := newServer(t, Config{})
+
+	resp, _ := doAnon(t, srv, "GET", "/", nil, nil)
+
+	headers := []struct {
+		name string
+		want string
+	}{
+		{"X-Frame-Options", "DENY"},
+		{"Referrer-Policy", "no-referrer"},
+		{"X-Content-Type-Options", "nosniff"},
+	}
+
+	for _, h := range headers {
+		if got := resp.Header.Get(h.name); got != h.want {
+			t.Errorf("%s = %q, want %q", h.name, got, h.want)
+		}
+	}
+
+	csp := resp.Header.Get("Content-Security-Policy")
+	if !strings.Contains(csp, "frame-ancestors 'none'") {
+		t.Errorf("CSP missing frame-ancestors 'none': %s", csp)
+	}
+}
+
+func TestNameSanitization(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "tag characters",
+			input: "alice\U000E0020test",
+			want:  "alicetest",
+		},
+		{
+			name:  "bidi override",
+			input: "alice\u202Etest",
+			want:  "alicetest",
+		},
+		{
+			name:  "bidi isolate",
+			input: "alice\u2066test",
+			want:  "alicetest",
+		},
+		{
+			name:  "zero-width space",
+			input: "alice\u200Btest",
+			want:  "alicetest",
+		},
+		{
+			name:  "length cap",
+			input: strings.Repeat("a", 100),
+			want:  strings.Repeat("a", 64),
+		},
+		{
+			name:  "allowed chars preserved",
+			input: "Alice-123 O'Brien",
+			want:  "Alice-123 O'Brien",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeInviterName(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeInviterName(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPairingGETNoPrefilledScopes(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+
+	// Create pairing link with specific scopes
+	resp, body := a.do("POST", "/v1/invites", map[string]any{
+		"scopes":           []string{"messages"},
+		"generate_pairing": true,
+	}, nil)
+	want(t, resp, body, 201)
+	var inv struct {
+		PairingURL string `json:"pairing_url"`
+	}
+	json.Unmarshal(body, &inv)
+	token := strings.Split(inv.PairingURL, "/v1/pairing/")[1]
+
+	// GET the pairing page
+	resp, body = doAnon(t, srv, "GET", "/v1/pairing/"+token, nil, nil)
+	want(t, resp, body, 200)
+
+	var pairingResp map[string]any
+	json.Unmarshal(body, &pairingResp)
+
+	// Should contain consent language in instructions
+	instructions, ok := pairingResp["instructions"].(map[string]any)
+	if !ok {
+		t.Fatal("missing instructions")
+	}
+	summary, ok := instructions["summary"].(string)
+	if !ok || !strings.Contains(strings.ToLower(summary), "approval") {
+		t.Error("instructions missing consent/approval language")
+	}
+
+	// Check that example POST bodies show empty scopes
+	auth, ok := instructions["authenticated"].(map[string]any)
+	if !ok {
+		t.Fatal("missing authenticated instructions")
+	}
+	authBody, ok := auth["body"].(string)
+	if !ok || !strings.Contains(authBody, `"scopes":[]`) {
+		t.Error("authenticated example should show empty scopes")
+	}
+
+	unauth, ok := instructions["unauthenticated"].(map[string]any)
+	if !ok {
+		t.Fatal("missing unauthenticated instructions")
+	}
+	unauthBody, ok := unauth["body"].(string)
+	if !ok || !strings.Contains(unauthBody, `"scopes":[]`) {
+		t.Error("unauthenticated example should show empty scopes")
+	}
+
+	// Top-level scopes field should show what the inviter is offering (can be non-empty)
+	// That's intentional and not a security issue
+	topScopes, ok := pairingResp["scopes"].([]any)
+	if !ok {
+		t.Error("missing top-level scopes field")
+	}
+	if len(topScopes) == 0 {
+		t.Error("top-level scopes should show what inviter is offering")
+	}
+}
+
+func doAnon(t *testing.T, srv *httptest.Server, method, path string, body any, hdr map[string]string) (*http.Response, []byte) {
+	t.Helper()
+	anon := &client{t: t, srv: srv}
+	return anon.do(method, path, body, hdr)
+}
+
+// Lifecycle tests for LimiterManager and MaintenanceManager
+
+func TestLimiterManagerStops(t *testing.T) {
+	cfg := Config{
+		MsgPerMinute:     60,
+		MsgBurst:         10,
+		EmailPerHour:     10,
+		EmailBurst:       5,
+		EmailRcptPerHour: 10,
+		NotifyPerHour:    10,
+		NotifyBurst:      5,
+	}
+	mgr := NewLimiterManager(cfg)
+
+	// Let it run a bit
+	time.Sleep(100 * time.Millisecond)
+
+	// Call Stop
+	mgr.Stop()
+
+	// Calling Stop again should not panic
+	mgr.Stop()
+}
+
+func TestMaintenanceManagerStops(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	mgr := NewMaintenanceManager(ctx, st, logger, 30*24*60*60)
+
+	// Let it run a bit
+	time.Sleep(100 * time.Millisecond)
+
+	// Call Stop
+	mgr.Stop()
+
+	// Calling Stop again should not panic
+	mgr.Stop()
+}
+
+// TestRevokePreventsPairing verifies DELETE by public_id causes pairing to fail (#59 partial)
+func TestRevokePreventsPairing(t *testing.T) {
+	cfg := Config{}
+	srv := newServer(t, cfg)
+	alice := register(t, srv, "Alice")
+	bob := register(t, srv, "Bob")
+
+	// Create a pairing invite
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"generate_pairing": true,
+		"scopes":           []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create invite: %d %s", resp.StatusCode, b)
+	}
+	var invResp struct {
+		PublicID   string `json:"public_id"`
+		PairingURL string `json:"pairing_url"`
+	}
+	json.Unmarshal(b, &invResp)
+
+	// Delete the invite by public_id
+	resp, b = alice.do("DELETE", "/v1/invites/"+invResp.PublicID, nil, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete invite: %d %s", resp.StatusCode, b)
+	}
+
+	// Extract pairing token from URL
+	parts := strings.Split(invResp.PairingURL, "/v1/pairing/")
+	pairingToken := parts[len(parts)-1]
+
+	// Attempt pairing (should fail with 404)
+	c := &client{t: t, srv: srv}
+	resp, b = c.do("POST", "/v1/pairing/"+pairingToken, map[string]string{
+		"name": "Bob",
+	}, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("pairing after revoke: status %d, want 404, body %s", resp.StatusCode, b)
+	}
+
+	// Second DELETE is idempotent (returns 404 per documented behavior)
+	resp, b = alice.do("DELETE", "/v1/invites/"+invResp.PublicID, nil, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("second DELETE: status %d, want 404 (idempotent/not found)", resp.StatusCode)
+	}
+
+	// Unknown public_id returns 404
+	resp, b = alice.do("DELETE", "/v1/invites/ffffffffffffffffffffffffffffffff", nil, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown public_id DELETE: status %d, want 404", resp.StatusCode)
+	}
+
+	// Bob creates an invite
+	resp, b = bob.do("POST", "/v1/invites", map[string]any{
+		"scopes": []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("bob create invite: %d %s", resp.StatusCode, b)
+	}
+	var bobInv struct {
+		PublicID string `json:"public_id"`
+	}
+	json.Unmarshal(b, &bobInv)
+
+	// Alice tries to delete Bob's invite (returns 404, not found or not owner)
+	resp, b = alice.do("DELETE", "/v1/invites/"+bobInv.PublicID, nil, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("other owner's public_id DELETE: status %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestInviteCapBeforeEmailBudget verifies cap check doesn't consume email quota (#53)
+func TestInviteCapBeforeEmailBudget(t *testing.T) {
+	cfg := Config{}
+	cfg.MaxOutstandingInvites = 2 // Set cap to 2
+	srv := newServer(t, cfg)
+	alice := register(t, srv, "Alice")
+
+	// Create first invite (should succeed, 1/2)
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "bob@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
+	}
+
+	// Create second invite (should succeed, 2/2 - at cap)
+	resp, b = alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "carol@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("second invite (at cap): %d %s", resp.StatusCode, b)
+	}
+
+	// Attempt third invite (one over cap, should fail without spending email budget)
+	resp, b = alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "dave@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("over-cap invite: status %d, want 429, body %s", resp.StatusCode, b)
+	}
+	if !bytes.Contains(b, []byte("too many outstanding invites")) {
+		t.Errorf("over-cap error: %s, want cap message", b)
+	}
+	if !bytes.Contains(b, []byte("limit 2")) {
+		t.Errorf("over-cap error: should mention limit 2")
+	}
+}
+
+// TestSingleLogLineUnauthenticatedPairing verifies exactly one log line (#54)
+func TestSingleLogLineUnauthenticatedPairing(t *testing.T) {
+	// Capture log output
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	cfg := Config{}
+	cfg.Logger = logger
+	srv := httptest.NewServer(New(st, cfg).Handler())
+	defer srv.Close()
+
+	alice := register(t, srv, "Alice")
+
+	// Create a pairing invite
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"generate_pairing": true,
+		"scopes":           []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create: %d %s", resp.StatusCode, b)
+	}
+	var invResp struct {
+		PairingURL string `json:"pairing_url"`
+	}
+	json.Unmarshal(b, &invResp)
+
+	parts := strings.Split(invResp.PairingURL, "/v1/pairing/")
+	pairingToken := parts[len(parts)-1]
+
+	// Clear buffer
+	buf.Reset()
+
+	// Redeem pairing link (unauthenticated)
+	c := &client{t: t, srv: srv}
+	resp, b = c.do("POST", "/v1/pairing/"+pairingToken, map[string]string{
+		"name": "Bob",
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("pairing: %d %s", resp.StatusCode, b)
+	}
+
+	// Check log output
+	logs := buf.String()
+	count := strings.Count(logs, "\"msg\":\"peer registered and paired\"")
+	if count != 1 {
+		t.Errorf("log lines with 'peer registered and paired': %d, want 1\nLogs:\n%s", count, logs)
+	}
+
+	// Verify no pairing token in logs
+	if strings.Contains(logs, pairingToken) {
+		t.Errorf("pairing token found in logs")
+	}
+}
+
+// TestSanitizerUnicode verifies Unicode handling in sanitizeInviterName
+func TestSanitizerUnicode(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		// Basic cases
+		{"ASCII", "Alice Smith", "Alice Smith"},
+		{"Unicode letters", "José García", "José García"},
+		{"Chinese", "李明", "李明"},
+		{"Japanese", "田中太郎", "田中太郎"},
+		{"Arabic", "محمد علي", "محمد علي"},
+		{"Mixed valid", "Alice-O'Neil, Jr.", "Alice-O'Neil, Jr."},
+		{"Hindi with combining marks", "राजेश कुमार", "राजेश कुमार"},
+		{"Thai with combining marks", "สมชาย ใจดี", "สมชาย ใจดี"},
+
+		// Bidi controls (Cf category) - all filtered
+		{"Bidi LRE", "Alice\u202AEvil", "AliceEvil"},
+		{"Bidi RLE", "Alice\u202BEvil", "AliceEvil"},
+		{"Bidi PDF", "Alice\u202CEvil", "AliceEvil"},
+		{"Bidi LRO", "Alice\u202DEvil", "AliceEvil"},
+		{"Bidi RLO", "Alice\u202EEvil", "AliceEvil"},
+		{"Bidi LRI", "Alice\u2066Evil", "AliceEvil"},
+		{"Bidi RLI", "Alice\u2067Evil", "AliceEvil"},
+		{"Bidi FSI", "Alice\u2068Evil", "AliceEvil"},
+		{"Bidi PDI", "Alice\u2069Evil", "AliceEvil"},
+		{"Bidi LRM", "Alice\u200EEvil", "AliceEvil"},
+		{"Bidi RLM", "Alice\u200FEvil", "AliceEvil"},
+
+		// Zero-width and format characters (Cf category)
+		{"Zero-width space", "Alice\u200BEvil", "AliceEvil"},
+		{"Zero-width non-joiner", "Alice\u200CEvil", "AliceEvil"},
+		{"Zero-width joiner", "Alice\u200DEvil", "AliceEvil"},
+		{"BOM", "Alice\uFEFFEvil", "AliceEvil"},
+
+		// Tag characters
+		{"Tag space", "Alice\U000E0020Evil", "AliceEvil"},
+		{"Tag char", "Alice\U000E0041Evil", "AliceEvil"},
+
+		// Hangul fillers
+		{"Hangul filler U+115F", "Alice\u115FEvil", "AliceEvil"},
+		{"Hangul filler U+1160", "Alice\u1160Evil", "AliceEvil"},
+		{"Hangul filler U+3164", "Alice\u3164Evil", "AliceEvil"},
+		{"Hangul filler U+FFA0", "Alice\uFFA0Evil", "AliceEvil"},
+
+		// Variation selectors
+		{"Variation selector FE00", "Alice\uFE00Evil", "AliceEvil"},
+		{"Variation selector FE0F", "Alice\uFE0FEvil", "AliceEvil"},
+		{"Variation selector E0100", "Alice\U000E0100Evil", "AliceEvil"},
+
+		// NFKC normalization
+		{"Fullwidth ASCII", "Ａｌｉｃｅ", "Alice"},  // Fullwidth → ASCII
+		{"Superscript", "Alice²", "Alice2"},    // ² → 2
+		{"Ligature", "ﬁle", "file"},            // ﬁ → fi
+		{"Circled number", "Alice①", "Alice1"}, // ① → 1
+		{"Compatibility ideograph", "塚", "塚"},  // U+FA10 → U+585A
+
+		// Space collapsing
+		{"Multiple spaces", "Alice   Smith", "Alice Smith"},
+		{"Leading spaces", "   Alice", "Alice"},
+		{"Trailing spaces", "Alice   ", "Alice"},
+		{"Mixed whitespace", "Alice  \t  Smith", "Alice Smith"}, // Tab becomes space, then collapsed
+
+		// Emoji and symbols (filtered out)
+		{"Emoji removed", "Alice 😀 Smith", "Alice Smith"},
+		{"Symbol removed", "Alice ★ Smith", "Alice Smith"},
+
+		// Edge cases
+		{"Empty string", "", ""},
+		{"Only spaces", "   ", ""},
+		{"Only filtered chars", "\u200B\u200C\uFEFF", ""},
+		// 64 runes (not bytes): "日" is 3 bytes, 64 copies = 192 bytes, should keep exactly 64 runes
+		{"Long multibyte truncated at 64 runes", strings.Repeat("日", 70), strings.Repeat("日", 64)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeInviterName(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeInviterName(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
 	}
 }

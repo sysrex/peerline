@@ -210,8 +210,8 @@ func TestV0SchemaMigration(t *testing.T) {
 
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 2 {
-		t.Fatalf("user_version = %d, want 2", version)
+	if version != 3 {
+		t.Fatalf("user_version = %d, want 3", version)
 	}
 
 	email, err := s.NotifyEmail(ctx, "alice")
@@ -278,8 +278,8 @@ func TestV1SchemaMigration(t *testing.T) {
 
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 2 {
-		t.Fatalf("user_version = %d, want 2", version)
+	if version != 3 {
+		t.Fatalf("user_version = %d, want 3", version)
 	}
 
 	email, err := s.NotifyEmail(ctx, "alice")
@@ -497,8 +497,8 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 			// Verify user_version is 2
 			var version int
 			migratedStore.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-			if version != 2 {
-				t.Fatalf("user_version = %d, want 2", version)
+			if version != 3 {
+				t.Fatalf("user_version = %d, want 3", version)
 			}
 
 			// Compare full schema
@@ -1199,8 +1199,8 @@ func TestPR11AlreadyMigrated(t *testing.T) {
 
 	// Verify user_version advanced to 2
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 2 {
-		t.Fatalf("user_version = %d, want 2", version)
+	if version != 3 {
+		t.Fatalf("user_version = %d, want 3", version)
 	}
 
 	// Verify columns still exist
@@ -1248,8 +1248,8 @@ func TestPR11AlreadyMigrated(t *testing.T) {
 
 	// Verify user_version unchanged
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 2 {
-		t.Fatalf("user_version after second migrate = %d, want 2", version)
+	if version != 3 {
+		t.Fatalf("user_version after second migrate = %d, want 3", version)
 	}
 
 	// Verify columns still present
@@ -1406,5 +1406,340 @@ func TestPragmasInEffect(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+func TestV3MigrationFreshDB(t *testing.T) {
+	s, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Create a peer and invite
+	if err := s.CreatePeer(ctx, "alice", "Alice", "hash1", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	publicID, err := s.CreateInviteAtomic(ctx, "code1", "alice", []string{"messages"}, nil, time.Now().Add(time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify public_id is not empty
+	if publicID == "" {
+		t.Error("public_id should not be empty")
+	}
+
+	// Verify it's 32 hex chars
+	if len(publicID) != 32 {
+		t.Errorf("public_id length = %d, want 32", len(publicID))
+	}
+
+	// Query back and verify
+	var checkID string
+	err = s.db.QueryRowContext(ctx, `SELECT public_id FROM invites WHERE code_hash=?`, "code1").Scan(&checkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkID != publicID {
+		t.Errorf("public_id mismatch: got %q, want %q", checkID, publicID)
+	}
+}
+
+// Test v2 to v3 migration with backfill
+func TestV2ToV3Migration(t *testing.T) {
+	dbPath := t.TempDir() + "/test.db"
+
+	// Create a v2 database manually
+	db, err := sql.Open("sqlite", dbPath+"?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create schema without public_id
+	_, err = db.Exec(`
+		PRAGMA journal_mode=WAL;
+		CREATE TABLE peers (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			key_hash TEXT NOT NULL UNIQUE,
+			created_at INTEGER NOT NULL,
+			notify_email TEXT NOT NULL DEFAULT ''
+		);
+		CREATE TABLE invites (
+			code_hash TEXT PRIMARY KEY,
+			from_peer TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
+			scopes TEXT NOT NULL,
+			bags TEXT NOT NULL,
+			expires_at INTEGER NOT NULL,
+			used_by TEXT,
+			pairing_token_hash TEXT
+		);
+		CREATE UNIQUE INDEX invites_pairing_token_hash ON invites(pairing_token_hash) WHERE pairing_token_hash IS NOT NULL;
+		PRAGMA user_version = 2;
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert test data
+	_, err = db.Exec(`INSERT INTO peers (id, name, key_hash, created_at) VALUES ('alice', 'Alice', 'hash1', ?)`, time.Now().Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.Exec(`INSERT INTO invites (code_hash, from_peer, scopes, bags, expires_at) VALUES ('code1', 'alice', 'messages', '', ?)`, time.Now().Add(time.Hour).Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.Exec(`INSERT INTO invites (code_hash, from_peer, scopes, bags, expires_at) VALUES ('code2', 'alice', 'messages', '', ?)`, time.Now().Add(time.Hour).Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db.Close()
+
+	// Open with migration
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Verify user_version is now 3
+	var version int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 3 {
+		t.Errorf("user_version = %d, want 3", version)
+	}
+
+	// Verify all rows have public_id
+	rows, err := s.db.Query(`SELECT code_hash, public_id FROM invites ORDER BY code_hash`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	count := 0
+	seen := make(map[string]bool)
+	for rows.Next() {
+		var codeHash, publicID string
+		if err := rows.Scan(&codeHash, &publicID); err != nil {
+			t.Fatal(err)
+		}
+		count++
+		if publicID == "" {
+			t.Errorf("code_hash %q has empty public_id", codeHash)
+		}
+		if len(publicID) != 32 {
+			t.Errorf("code_hash %q public_id length = %d, want 32", codeHash, len(publicID))
+		}
+		if seen[publicID] {
+			t.Errorf("duplicate public_id %q", publicID)
+		}
+		seen[publicID] = true
+	}
+	if count != 2 {
+		t.Errorf("expected 2 backfilled rows, got %d", count)
+	}
+}
+
+// Test v3 migration idempotence
+func TestV3MigrationIdempotent(t *testing.T) {
+	dbPath := t.TempDir() + "/test.db"
+
+	// Create v2 DB
+	db, err := sql.Open("sqlite", dbPath+"?_txlock=immediate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		PRAGMA journal_mode=WAL;
+		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+		CREATE TABLE invites (code_hash TEXT PRIMARY KEY, from_peer TEXT, scopes TEXT, bags TEXT, expires_at INTEGER, used_by TEXT, pairing_token_hash TEXT);
+		PRAGMA user_version = 2;
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Exec(`INSERT INTO peers VALUES ('alice', 'Alice', 'hash1', ?, '')`, time.Now().Unix())
+	db.Exec(`INSERT INTO invites VALUES ('code1', 'alice', 'messages', '', ?, NULL, NULL)`, time.Now().Add(time.Hour).Unix())
+	db.Close()
+
+	// Run migration once
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var publicID1 string
+	s.db.QueryRow(`SELECT public_id FROM invites WHERE code_hash='code1'`).Scan(&publicID1)
+	s.Close()
+
+	// Run migration again (should be idempotent)
+	s, err = Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	var publicID2 string
+	s.db.QueryRow(`SELECT public_id FROM invites WHERE code_hash='code1'`).Scan(&publicID2)
+
+	// public_id should be unchanged
+	if publicID1 != publicID2 {
+		t.Errorf("public_id changed after re-migration: %q -> %q", publicID1, publicID2)
+	}
+
+	// Verify user_version is still 3
+	var version int
+	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
+	if version != 3 {
+		t.Errorf("user_version = %d, want 3", version)
+	}
+}
+
+// TestPurgeExpiredInvitesRetention verifies that used invites are retained
+// for the configured retention period and then purged.
+func TestPurgeExpiredInvitesRetention(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Create peers
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mock time
+	origNow := now
+	defer func() { now = origNow }()
+
+	// Start at a base time
+	currentTime := int64(2000000)
+	now = func() int64 { return currentTime }
+
+	// Create and immediately accept invites at different points in time
+
+	// 1. Unused expired invite (expires 100s ago) - should be purged
+	exp1 := time.Unix(currentTime-100, 0)
+	if err := s.CreateInvite(ctx, "code1", "alice", []string{"messages"}, nil, exp1); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Used invite that expired 10 days ago - should be KEPT (within 30-day retention)
+	// Create it 10 days ago, accept it then, and it expires 10 days ago
+	tenDaysAgo := currentTime - 10*24*60*60
+	exp2 := time.Unix(tenDaysAgo-100, 0) // expired 10 days + 100s ago
+	// Temporarily go back in time to create and accept it
+	now = func() int64 { return tenDaysAgo - 200 } // before exp2
+	if err := s.CreateInvite(ctx, "code2", "alice", []string{"messages"}, nil, exp2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptInvite(ctx, "code2", "bob", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Return to current time
+	now = func() int64 { return currentTime }
+
+	// 3. Used invite that expired 40 days ago - should be PURGED (beyond 30-day retention)
+	fortyDaysAgo := currentTime - 40*24*60*60
+	exp3 := time.Unix(fortyDaysAgo-100, 0) // expired 40 days + 100s ago
+	// Temporarily go back in time to create and accept it
+	now = func() int64 { return fortyDaysAgo - 200 } // before exp3
+	if err := s.CreateInvite(ctx, "code3", "alice", []string{"messages"}, nil, exp3); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "charlie", "Charlie", "hc", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptInvite(ctx, "code3", "charlie", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Return to current time
+	now = func() int64 { return currentTime }
+
+	// 4. Used invite not yet expired - should be KEPT
+	exp4 := time.Unix(currentTime+24*60*60, 0) // expires in 1 day
+	if err := s.CreateInvite(ctx, "code4", "alice", []string{"messages"}, nil, exp4); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "dave", "Dave", "hd", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptInvite(ctx, "code4", "dave", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Before purge: 4 invites
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM invites`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 4 {
+		t.Errorf("before purge: got %d invites, want 4", count)
+	}
+
+	// Purge with 30-day retention (2592000 seconds)
+	purged, err := s.PurgeExpiredInvites(ctx, 30*24*60*60)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should purge: code1 (unused expired) + code3 (used, expired 40 days ago) = 2
+	if purged != 2 {
+		t.Errorf("purged %d invites, want 2", purged)
+	}
+
+	// After purge: code2 (used, expired 10 days ago) and code4 (used, not expired) remain
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM invites`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Errorf("after purge: got %d invites, want 2", count)
+	}
+
+	// Verify the right ones remain
+	var codes []string
+	rows, err := s.db.Query(`SELECT code_hash FROM invites ORDER BY code_hash`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ch string
+		if err := rows.Scan(&ch); err != nil {
+			t.Fatal(err)
+		}
+		codes = append(codes, ch)
+	}
+	if len(codes) != 2 {
+		t.Errorf("got %d remaining codes, want 2", len(codes))
+	}
+	// code2 and code4 should remain (their hashes)
+	wantHash2 := "code2"
+	wantHash4 := "code4"
+	found2, found4 := false, false
+	for _, ch := range codes {
+		if ch == wantHash2 {
+			found2 = true
+		}
+		if ch == wantHash4 {
+			found4 = true
+		}
+	}
+	if !found2 || !found4 {
+		t.Errorf("expected code2 and code4 to remain, got hashes: %v", codes)
 	}
 }
