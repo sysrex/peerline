@@ -170,7 +170,7 @@ func TestPurgeOrphanClaimPeers(t *testing.T) {
 
 // v4 -> v5 keeps rows, backfills NULL public_id and applies the CHECKs (#77).
 func TestMigrateV5FromV4(t *testing.T) {
-	path := t.TempDir() + "/p.db"
+	path := secureTempDir(t) + "/p.db"
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
