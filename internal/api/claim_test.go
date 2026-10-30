@@ -255,7 +255,6 @@ func TestClaimLimiterIgnoresTokenValidity(t *testing.T) {
 	want(t, r, b, 429)
 }
 
-
 func TestLegacyJSONRoutesRequireJSON(t *testing.T) {
 	srv := newServer(t, Config{})
 	c := &client{t: t, srv: srv}
