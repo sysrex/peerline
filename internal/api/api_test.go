@@ -1632,7 +1632,9 @@ func TestSanitizerUnicode(t *testing.T) {
 	}
 }
 
-// TestAPIClock verifies that api.Server.now is used in createInvite
+// TestAPIClock verifies that api.Server.now is used in createInvite.
+// Note: the API clock (Server.now, time.Time) and the store clock (Store.now, int64)
+// are independent and can disagree; this test only fakes the API clock.
 func TestAPIClock(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/t.db")
 	if err != nil {
@@ -1641,8 +1643,12 @@ func TestAPIClock(t *testing.T) {
 	defer st.Close()
 
 	srv := New(st, Config{})
+	defer srv.Stop()
 
-	// Stub the clock
+	// Stub the clock and verify non-nil default
+	if srv.now == nil {
+		t.Fatal("New() should set non-nil default clock")
+	}
 	fixedTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
 	srv.now = func() time.Time { return fixedTime }
 
@@ -1655,24 +1661,47 @@ func TestAPIClock(t *testing.T) {
 	resp, body := c.do("POST", "/v1/register", map[string]string{"name": "alice"}, nil)
 	want(t, resp, body, 201)
 	var reg struct{ PeerID, APIKey string }
-	json.Unmarshal(body, &struct {
+	if err := json.Unmarshal(body, &struct {
 		PeerID *string `json:"peer_id"`
 		APIKey *string `json:"api_key"`
-	}{&reg.PeerID, &reg.APIKey})
+	}{&reg.PeerID, &reg.APIKey}); err != nil {
+		t.Fatal(err)
+	}
 	c.id, c.key = reg.PeerID, reg.APIKey
 
-	// Create an invite
+	// Create an invite with default TTL (1h)
 	resp, body = c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 
 	var inv struct {
 		ExpiresAt string `json:"expires_at"`
 	}
-	json.Unmarshal(body, &inv)
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
+	}
 
-	expTime, _ := time.Parse(time.RFC3339, inv.ExpiresAt)
+	expTime, err := time.Parse(time.RFC3339, inv.ExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
 	expected := fixedTime.Add(time.Hour).UTC()
 	if !expTime.Equal(expected) {
 		t.Errorf("expires_at = %v, want %v", expTime, expected)
+	}
+
+	// Boundary test: advance clock by 100 seconds and create another invite
+	srv.now = func() time.Time { return fixedTime.Add(100 * time.Second) }
+	resp, body = c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
+	}
+	expTime, err = time.Parse(time.RFC3339, inv.ExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected = fixedTime.Add(100*time.Second + time.Hour).UTC()
+	if !expTime.Equal(expected) {
+		t.Errorf("expires_at after +100s = %v, want %v", expTime, expected)
 	}
 }

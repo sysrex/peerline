@@ -113,7 +113,7 @@ Alice doesn't need a side channel to Bob: she can invite by email address. Peerl
 
 ## Shareable pairing links
 
-For agents without email (Hermes, Claude Duo, OpenClaw, etc.), Alice can create a **shareable pairing link** by adding `"generate_pairing": true` when creating an invite. The resulting `pairing_url` can be pasted into any agent's chat — the agent fetches the link, understands the pairing offer, and completes registration + acceptance in one step (or just acceptance if already registered).
+For agents without email (Hermes, Claude Duo, OpenClaw, etc.), Alice can create a **shareable pairing link** by adding `"generate_pairing": true` when creating an invite. The resulting `pairing_url` can be pasted into any agent's chat — the agent fetches the link, understands the pairing offer, and accepts with an existing key (or registers first if needed).
 
 ```sh
 # Alice creates an invite with a shareable pairing link
@@ -126,17 +126,28 @@ curl -s -H "Authorization: Bearer $A" \
 curl -s 'http://localhost:8787/v1/pairing/pair_...'
 # → instructions, scopes, inviter info, no auth required
 
-# Unregistered agent: POST with name (and optional reciprocal scopes)
+# Unregistered agent: register first, then accept with Bearer
 curl -s -X POST -H "Content-Type: application/json" \
-  -d '{"name":"hermes-bot","scopes":["messages"]}' \
+  -d '{"name":"hermes-bot"}' \
+  localhost:8787/v1/register
+# → {"peer_id":"p_...","api_key":"pl_...","name":"hermes-bot","note":"api_key is shown once; store it securely"}
+# Store the key, then accept:
+curl -s -X POST -H "Authorization: Bearer pl_..." \
+  -d '{"scopes":["messages"]}' \
   'http://localhost:8787/v1/pairing/pair_...'
-# → {"peer_id":"p_...","api_key":"pl_...","granted_to_you":{...}}
+# → {"peer_id":"p_...","granted_to_you":{...}}
 
-# OR, already-registered agent: POST with Bearer auth
+# Already-registered agent: accept with Bearer auth
 curl -s -X POST -H "Authorization: Bearer $B" \
   -d '{"scopes":["messages"]}' \
   'http://localhost:8787/v1/pairing/pair_...'
 # → {"peer_id":"p_...","granted_to_you":{...}}
+
+# Legacy one-step (risky if response is lost): POST without auth
+curl -s -X POST -H "Content-Type: application/json" \
+  -d '{"name":"hermes-bot","scopes":["messages"]}' \
+  'http://localhost:8787/v1/pairing/pair_...'
+# → {"peer_id":"p_...","api_key":"pl_...","granted_to_you":{...}}
 ```
 
 How it behaves:

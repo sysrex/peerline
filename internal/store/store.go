@@ -75,9 +75,8 @@ CREATE TABLE IF NOT EXISTS bags (
 );
 `
 
-// Open opens (and migrates) the database at path. Use ":memory:" for tests.
-// Open opens the database, applies migrations, and returns a Store.
-// It is the only Store constructor; a zero-value Store{} has a nil now func and must not be used directly.
+// Open opens the database at path, applies migrations, and returns a Store.
+// Use ":memory:" for tests. It is the only Store constructor; a zero-value Store{} has a nil now func and must not be used directly.
 func Open(path string) (*Store, error) {
 	dsn := buildDSN(path)
 	db, err := sql.Open("sqlite", dsn)

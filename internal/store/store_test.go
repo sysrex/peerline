@@ -1762,18 +1762,12 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Inject fake clock using state flag
+	// Inject fake clock
 	origNow := s.now
 	defer func() { s.now = origNow }()
 
 	currentTime := int64(1000000)
-	expired := false
-	s.now = func() int64 {
-		if expired {
-			return currentTime + 10000 // Far in the future
-		}
-		return currentTime
-	}
+	s.now = func() int64 { return currentTime }
 
 	// Create a pairing invite that expires at currentTime + 100
 	codeHash := "code_test"
