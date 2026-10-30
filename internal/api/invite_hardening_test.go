@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -859,6 +858,7 @@ func TestSingleLogRecordUnauthenticatedPairing(t *testing.T) {
 		t.Errorf("expected 1 total log record for pairing, got %d\nLogs:\n%s", totalRecords, logs)
 	}
 }
+
 // The email rate-limit rollback must not depend on the client staying connected (#184).
 func TestRejectEmailRateLimitedSurvivesCancelledRequest(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/t.db")
