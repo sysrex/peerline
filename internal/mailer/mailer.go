@@ -70,14 +70,14 @@ func (l Log) Send(_ context.Context, m Message) error {
 // ---- SMTP ----
 
 // SMTP sends via an SMTP relay. Port 465 uses implicit TLS; any other port
-// uses STARTTLS when the server offers it (required when User is set and the
-// host is not localhost, as enforced by net/smtp's PLAIN auth).
+// uses STARTTLS when the server offers it.
 type SMTP struct {
 	Host, User, Pass, From string
 	Port                   int
 	Timeout                time.Duration
 	// RequireTLS fails the send if STARTTLS is not available (non-465 ports only).
-	// Defaults to true when User is set, false otherwise.
+	// Defaults to true when User is set, false otherwise. No localhost exemption:
+	// for local dev relays without TLS support, set PEERLINE_SMTP_REQUIRE_TLS=false.
 	RequireTLS bool
 	// TLSConfig is optional (tests); defaults to ServerName=Host.
 	TLSConfig *tls.Config
@@ -113,7 +113,14 @@ func FromEnv(lg *slog.Logger) (Sender, error) {
 	}
 	requireTLS := user != "" // default: require TLS when authenticated
 	if v := os.Getenv("PEERLINE_SMTP_REQUIRE_TLS"); v != "" {
-		requireTLS = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes":
+			requireTLS = true
+		case "0", "false", "no":
+			requireTLS = false
+		default:
+			return nil, fmt.Errorf("PEERLINE_SMTP_REQUIRE_TLS: invalid value %q (must be 1/0/true/false/yes/no)", v)
+		}
 	}
 	return &SMTP{Host: host, Port: port, User: user, Pass: pass, From: from, Timeout: 10 * time.Second, RequireTLS: requireTLS}, nil
 }

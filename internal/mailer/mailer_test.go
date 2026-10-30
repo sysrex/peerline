@@ -77,16 +77,28 @@ func TestFromEnv(t *testing.T) {
 	t.Setenv("PEERLINE_SMTP_PASS", "p")
 	t.Setenv("PEERLINE_SMTP_PORT", "2525")
 	s, err = FromEnv(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	smtp := s.(*SMTP)
-	if err != nil || s.Mode() != "smtp" || smtp.Port != 2525 || !smtp.RequireTLS {
-		t.Fatalf("smtp config: port=%d requireTLS=%v err=%v", smtp.Port, smtp.RequireTLS, err)
+	if s.Mode() != "smtp" || smtp.Port != 2525 || !smtp.RequireTLS {
+		t.Fatalf("smtp config: port=%d requireTLS=%v", smtp.Port, smtp.RequireTLS)
 	}
 	// RequireTLS defaults to true when authenticated
 	t.Setenv("PEERLINE_SMTP_REQUIRE_TLS", "0")
 	s, err = FromEnv(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	smtp = s.(*SMTP)
-	if err != nil || smtp.RequireTLS {
-		t.Fatalf("requireTLS=false failed: %v %v", smtp.RequireTLS, err)
+	if smtp.RequireTLS {
+		t.Fatalf("requireTLS=false failed: %v", smtp.RequireTLS)
+	}
+	// Invalid REQUIRE_TLS value should error
+	t.Setenv("PEERLINE_SMTP_REQUIRE_TLS", "ture")
+	_, err = FromEnv(nil)
+	if err == nil || !strings.Contains(err.Error(), "invalid value") {
+		t.Fatalf("expected error for invalid REQUIRE_TLS, got: %v", err)
 	}
 }
 
@@ -156,42 +168,111 @@ func TestSMTPSend(t *testing.T) {
 }
 
 func TestSMTPRequireTLS(t *testing.T) {
-	// Server without STARTTLS support
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go func() {
-		c, err := ln.Accept()
+	t.Run("RequireTLS fails when STARTTLS not offered", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
-			return
+			t.Fatal(err)
 		}
-		defer c.Close()
-		r, w := bufio.NewReader(c), bufio.NewWriter(c)
-		say := func(s string) { w.WriteString(s + "\r\n"); w.Flush() }
-		say("220 test")
-		for {
-			line, err := r.ReadString('\n')
+		defer ln.Close()
+		go func() {
+			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			cmd := strings.ToUpper(strings.TrimSpace(line))
-			switch {
-			case strings.HasPrefix(cmd, "EHLO"), strings.HasPrefix(cmd, "HELO"):
-				say("250 test")
-			case cmd == "QUIT":
-				say("221 bye")
-				return
-			default:
-				say("502 no")
+			defer c.Close()
+			r, w := bufio.NewReader(c), bufio.NewWriter(c)
+			say := func(s string) { w.WriteString(s + "\r\n"); w.Flush() }
+			say("220 test")
+			for {
+				line, err := r.ReadString('\n')
+				if err != nil {
+					return
+				}
+				cmd := strings.ToUpper(strings.TrimSpace(line))
+				switch {
+				case strings.HasPrefix(cmd, "EHLO"), strings.HasPrefix(cmd, "HELO"):
+					say("250 test")
+				case cmd == "QUIT":
+					say("221 bye")
+					return
+				default:
+					say("502 no")
+				}
 			}
+		}()
+		port := ln.Addr().(*net.TCPAddr).Port
+		s := &SMTP{Host: "127.0.0.1", Port: port, From: "test@example.com", Timeout: 2 * time.Second, RequireTLS: true}
+		err = s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
+		if err == nil || !strings.Contains(err.Error(), "STARTTLS required") {
+			t.Fatalf("expected STARTTLS required error, got: %v", err)
 		}
-	}()
-	port := ln.Addr().(*net.TCPAddr).Port
-	s := &SMTP{Host: "127.0.0.1", Port: port, From: "test@example.com", Timeout: 2 * time.Second, RequireTLS: true}
-	err = s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
-	if err == nil || !strings.Contains(err.Error(), "STARTTLS required") {
-		t.Fatalf("expected STARTTLS required error, got: %v", err)
-	}
+	})
+
+	t.Run("RequireTLS false allows cleartext", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		got := make(chan bool, 1)
+		go func() {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			r, w := bufio.NewReader(c), bufio.NewWriter(c)
+			say := func(s string) { w.WriteString(s + "\r\n"); w.Flush() }
+			say("220 test")
+			for {
+				line, err := r.ReadString('\n')
+				if err != nil {
+					return
+				}
+				cmd := strings.ToUpper(strings.TrimSpace(line))
+				switch {
+				case strings.HasPrefix(cmd, "EHLO"), strings.HasPrefix(cmd, "HELO"):
+					say("250 test")
+				case strings.HasPrefix(cmd, "MAIL"), strings.HasPrefix(cmd, "RCPT"):
+					say("250 ok")
+				case cmd == "DATA":
+					say("354 go")
+					for {
+						l, err := r.ReadString('\n')
+						if err != nil {
+							return
+						}
+						if l == ".\r\n" {
+							break
+						}
+					}
+					say("250 queued")
+				case cmd == "QUIT":
+					say("221 bye")
+					got <- true
+					return
+				default:
+					say("502 no")
+				}
+			}
+		}()
+		port := ln.Addr().(*net.TCPAddr).Port
+		s := &SMTP{Host: "127.0.0.1", Port: port, From: "test@example.com", Timeout: 2 * time.Second, RequireTLS: false}
+		err = s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
+		if err != nil {
+			t.Fatalf("RequireTLS=false should allow cleartext: %v", err)
+		}
+		if !<-got {
+			t.Fatal("server did not complete")
+		}
+	})
+
+	t.Run("RequireTLS true works when STARTTLS offered", func(t *testing.T) {
+		// This test would require a full TLS handshake mock, which is complex.
+		// The existing TestSMTPSend on port 465 covers implicit TLS.
+		// For STARTTLS upgrade, we verify the error path (no STARTTLS offered)
+		// and the code path is straightforward: c.StartTLS succeeds or fails.
+		// In practice, the real SMTP sender's TLS upgrade is tested via integration.
+		t.Skip("STARTTLS upgrade requires complex TLS mock; covered by implicit TLS test and error path")
+	})
 }

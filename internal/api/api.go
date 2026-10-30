@@ -985,7 +985,8 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 var apiKeyInBody = regexp.MustCompile(`pl_[A-Za-z0-9_-]{8,}`)
 
 // secretTokenInBody matches invite codes (inv_) and pairing tokens (pair_).
-var secretTokenInBody = regexp.MustCompile(`(?:inv|pair)_[A-Za-z0-9_-]{16,}`)
+// Both use 24-byte secrets encoded as base64url (32 chars).
+var secretTokenInBody = regexp.MustCompile(`(?:inv|pair)_[A-Za-z0-9_-]{32}`)
 
 const notifyPreviewMax = 200
 
