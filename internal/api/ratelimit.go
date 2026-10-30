@@ -188,7 +188,6 @@ type LimiterManager struct {
 	mailLim   *msg.Limiter
 	rcptLim   *msg.Limiter
 	notifyLim *msg.Limiter
-	bagLim    *msg.Limiter
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -208,7 +207,6 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 		mailLim:   msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst),
 		rcptLim:   msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour),
 		notifyLim: msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst),
-		bagLim:    msg.NewLimiter(cfg.BagPerMinute, cfg.BagBurst),
 		ctx:       ctx,
 		cancel:    cancel,
 	}
@@ -238,7 +236,7 @@ func (lm *LimiterManager) pruneLoop() {
 func (lm *LimiterManager) prune() {
 	pruned := lm.msgLim.Prune() + lm.regLim.Prune() + lm.pairLim.Prune() + lm.failLim.Prune() +
 		lm.getLim.Prune() + lm.authLim.Prune() +
-		lm.mailLim.Prune() + lm.rcptLim.Prune() + lm.notifyLim.Prune() + lm.bagLim.Prune()
+		lm.mailLim.Prune() + lm.rcptLim.Prune() + lm.notifyLim.Prune()
 	_ = pruned // Could log if needed
 }
 

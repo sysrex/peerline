@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -61,10 +62,10 @@ func TestStoreBasics(t *testing.T) {
 	if _, err := s.AcceptInvite(ctx, "c1", "b", nil, nil); !errors.Is(err, ErrNotFound) {
 		t.Fatal("expired invite accepted")
 	}
-	if v, err := s.PutBag(ctx, "a", "n", []byte("x"), "a", 0, 0, 0); err != nil || v != 1 {
+	if v, err := s.PutBag(ctx, "a", "n", []byte("x"), "a", 0, 100, 1048576); err != nil || v != 1 {
 		t.Fatal(v, err)
 	}
-	if _, err := s.PutBag(ctx, "a", "n", []byte("y"), "a", 0, 0, 0); !errors.Is(err, ErrConflict) {
+	if _, err := s.PutBag(ctx, "a", "n", []byte("y"), "a", 0, 100, 1048576); !errors.Is(err, ErrConflict) {
 		t.Fatal("expected conflict")
 	}
 }
@@ -95,7 +96,7 @@ func TestStats(t *testing.T) {
 	if err := s.InsertMessage(ctx, &Message{From: "b", To: "a", Type: "note", Body: "hi"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PutBag(ctx, "a", "status", []byte("ok"), "a", -1, 0, 0); err != nil {
+	if _, err := s.PutBag(ctx, "a", "status", []byte("ok"), "a", -1, 100, 1048576); err != nil {
 		t.Fatal(err)
 	}
 	st, err = s.Stats(ctx)
@@ -1969,16 +1970,16 @@ func TestBagStats(t *testing.T) {
 	}
 
 	// Test bag count limit
-	_, err = s.PutBag(ctx, "alice", "notes", []byte("hello"), "alice", -1, 2, 0)
+	_, err = s.PutBag(ctx, "alice", "notes", []byte("hello"), "alice", -1, 2, 1048576)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.PutBag(ctx, "alice", "tasks", []byte("tasks"), "alice", -1, 2, 0)
+	_, err = s.PutBag(ctx, "alice", "tasks", []byte("tasks"), "alice", -1, 2, 1048576)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Third bag should fail
-	_, err = s.PutBag(ctx, "alice", "third", []byte("third"), "alice", -1, 2, 0)
+	_, err = s.PutBag(ctx, "alice", "third", []byte("third"), "alice", -1, 2, 1048576)
 	if !errors.Is(err, ErrBagLimitExceeded) {
 		t.Errorf("got %v, want ErrBagLimitExceeded", err)
 	}
@@ -1992,28 +1993,28 @@ func TestBagStats(t *testing.T) {
 	if err := s2.CreatePeer(ctx, "bob", "Bob", "hbob", ""); err != nil {
 		t.Fatal(err)
 	}
-	_, err = s2.PutBag(ctx, "bob", "a", []byte("12345"), "bob", -1, 0, 10)
+	_, err = s2.PutBag(ctx, "bob", "a", []byte("12345"), "bob", -1, 100, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Second bag that would exceed quota
-	_, err = s2.PutBag(ctx, "bob", "b", []byte("123456"), "bob", -1, 0, 10)
+	_, err = s2.PutBag(ctx, "bob", "b", []byte("123456"), "bob", -1, 100, 10)
 	if !errors.Is(err, ErrStorageQuotaExceeded) {
 		t.Errorf("got %v, want ErrStorageQuotaExceeded", err)
 	}
 
 	// Update that grows beyond quota
-	_, err = s2.PutBag(ctx, "bob", "a", []byte("12345678901"), "bob", -1, 0, 10)
+	_, err = s2.PutBag(ctx, "bob", "a", []byte("12345678901"), "bob", -1, 100, 10)
 	if !errors.Is(err, ErrStorageQuotaExceeded) {
 		t.Errorf("update growth: got %v, want ErrStorageQuotaExceeded", err)
 	}
 
 	// Update that shrinks then grows again should work if within quota
-	_, err = s2.PutBag(ctx, "bob", "a", []byte("123"), "bob", -1, 0, 10)
+	_, err = s2.PutBag(ctx, "bob", "a", []byte("123"), "bob", -1, 100, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = s2.PutBag(ctx, "bob", "b", []byte("1234567"), "bob", -1, 0, 10)
+	_, err = s2.PutBag(ctx, "bob", "b", []byte("1234567"), "bob", -1, 100, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2040,7 +2041,7 @@ func TestBagLimitsConcurrency(t *testing.T) {
 		i := i
 		go func() {
 			name := fmt.Sprintf("bag%d", i)
-			_, err := s.PutBag(ctx, "carol", name, []byte("test"), "carol", -1, limit, 0)
+			_, err := s.PutBag(ctx, "carol", name, []byte("test"), "carol", -1, limit, 1048576)
 			results <- err
 		}()
 	}
@@ -2062,5 +2063,150 @@ func TestBagLimitsConcurrency(t *testing.T) {
 	}
 	if limitExceeded != attempts-limit {
 		t.Errorf("got %d limit exceeded, want %d", limitExceeded, attempts-limit)
+	}
+}
+
+func TestBagLimitsFileDB(t *testing.T) {
+	ctx := context.Background()
+	tmpFile := t.TempDir() + "/test.db"
+
+	// Open two separate Store handles on the same file
+	s1, err := Open(tmpFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s1.Close()
+
+	s2, err := Open(tmpFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	if err := s1.CreatePeer(ctx, "dave", "Dave", "hdave", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create bags concurrently using both handles
+	const limit = 5
+	const attempts = 10
+	results := make(chan error, attempts)
+
+	for i := 0; i < attempts; i++ {
+		i := i
+		go func() {
+			// Alternate between handles
+			s := s1
+			if i%2 == 1 {
+				s = s2
+			}
+			name := fmt.Sprintf("bag%d", i)
+			_, err := s.PutBag(ctx, "dave", name, []byte("test"), "dave", -1, limit, 1048576)
+			results <- err
+		}()
+	}
+
+	var successes, limitExceeded int
+	for i := 0; i < attempts; i++ {
+		err := <-results
+		if err == nil {
+			successes++
+		} else if errors.Is(err, ErrBagLimitExceeded) {
+			limitExceeded++
+		} else {
+			t.Errorf("unexpected error: %v", err)
+		}
+	}
+
+	if successes != limit {
+		t.Errorf("got %d successes, want %d (atomicity failure)", successes, limit)
+	}
+	if limitExceeded != attempts-limit {
+		t.Errorf("got %d limit exceeded, want %d", limitExceeded, attempts-limit)
+	}
+
+	// Verify actual count in database
+	var count int
+	err = s1.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM bags WHERE owner='dave'`).Scan(&count)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != limit {
+		t.Errorf("database has %d bags, want %d (atomicity failure)", count, limit)
+	}
+}
+
+func TestBagLimitsShrinkWhileOverQuota(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.CreatePeer(ctx, "eve", "Eve", "heve", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a bag at the limit
+	_, err = s.PutBag(ctx, "eve", "bag1", bytes.Repeat([]byte("x"), 100), "eve", -1, 100, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Shrinking should work even though we're at quota
+	_, err = s.PutBag(ctx, "eve", "bag1", []byte("small"), "eve", -1, 100, 100)
+	if err != nil {
+		t.Errorf("shrink failed: %v", err)
+	}
+
+	// Growing should still fail when over quota
+	_, err = s.PutBag(ctx, "eve", "bag1", bytes.Repeat([]byte("x"), 101), "eve", -1, 100, 100)
+	if !errors.Is(err, ErrStorageQuotaExceeded) {
+		t.Errorf("grow while over quota: got %v, want ErrStorageQuotaExceeded", err)
+	}
+}
+
+func TestBagLimitsUpdateAtCountCap(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.CreatePeer(ctx, "frank", "Frank", "hfrank", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create bags up to the count limit
+	for i := 0; i < 3; i++ {
+		name := fmt.Sprintf("bag%d", i)
+		_, err = s.PutBag(ctx, "frank", name, []byte("content"), "frank", -1, 3, 1048576)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Creating a new bag should fail
+	_, err = s.PutBag(ctx, "frank", "bag3", []byte("new"), "frank", -1, 3, 1048576)
+	if !errors.Is(err, ErrBagLimitExceeded) {
+		t.Errorf("new bag at count cap: got %v, want ErrBagLimitExceeded", err)
+	}
+
+	// Updating an existing bag should succeed
+	_, err = s.PutBag(ctx, "frank", "bag0", []byte("updated content"), "frank", -1, 3, 1048576)
+	if err != nil {
+		t.Errorf("update at count cap failed: %v", err)
+	}
+}
+
+func TestDSNContainsTxLockImmediate(t *testing.T) {
+	dsn := buildDSN("/tmp/test.db")
+	if !strings.Contains(dsn, "_txlock=immediate") {
+		t.Errorf("DSN missing _txlock=immediate: %s", dsn)
+	}
+
+	dsn = buildDSN(":memory:")
+	if !strings.Contains(dsn, "_txlock=immediate") {
+		t.Errorf("memory DSN missing _txlock=immediate: %s", dsn)
 	}
 }

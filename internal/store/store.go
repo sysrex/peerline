@@ -1044,8 +1044,12 @@ func (s *Store) GetBag(ctx context.Context, owner, name string) (*Bag, error) {
 
 // PutBag writes a bag. If ifVersion >= 0 it must match the current version
 // (0 = must not exist yet); otherwise ErrConflict. ifVersion < 0 = unconditional.
-// maxBagsPerPeer and maxBagBytesPerPeer are enforced atomically (0 = unlimited).
+// maxBagsPerPeer and maxBagBytesPerPeer enforce caps (must be positive; no zero = unlimited).
 func (s *Store) PutBag(ctx context.Context, owner, name string, content []byte, by string, ifVersion int64, maxBagsPerPeer int, maxBagBytesPerPeer int64) (int64, error) {
+	if maxBagsPerPeer <= 0 || maxBagBytesPerPeer <= 0 {
+		return 0, errors.New("bag limits must be positive")
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -1066,30 +1070,27 @@ func (s *Store) PutBag(ctx context.Context, owner, name string, content []byte, 
 	}
 
 	// Enforce storage limits for creates and updates
-	if maxBagsPerPeer > 0 || maxBagBytesPerPeer > 0 {
-		var count int
-		var totalBytes int64
-		err := tx.QueryRowContext(ctx,
-			`SELECT COUNT(*), COALESCE(SUM(LENGTH(content)), 0) FROM bags WHERE owner=?`,
-			owner).Scan(&count, &totalBytes)
-		if err != nil {
-			return 0, err
-		}
+	var count int
+	var totalBytes int64
+	err = tx.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(LENGTH(content)), 0) FROM bags WHERE owner=?`,
+		owner).Scan(&count, &totalBytes)
+	if err != nil {
+		return 0, err
+	}
 
-		// For new bag creation
-		if !exists {
-			if maxBagsPerPeer > 0 && count >= maxBagsPerPeer {
-				return 0, ErrBagLimitExceeded
-			}
-		}
+	newSize := int64(len(content))
 
-		// For both creates and updates: check byte quota
-		// newTotal = currentTotal - oldSize + newSize
-		newSize := int64(len(content))
-		newTotal := totalBytes - int64(oldSize) + newSize
-		if maxBagBytesPerPeer > 0 && newTotal > maxBagBytesPerPeer {
-			return 0, ErrStorageQuotaExceeded
-		}
+	// For new bag creation: enforce bag count limit
+	if !exists && count >= maxBagsPerPeer {
+		return 0, ErrBagLimitExceeded
+	}
+
+	// For both creates and updates: enforce byte quota
+	// Allow updates that don't grow (newSize <= oldSize) even when over quota
+	newTotal := totalBytes - int64(oldSize) + newSize
+	if newSize > int64(oldSize) && newTotal > maxBagBytesPerPeer {
+		return 0, ErrStorageQuotaExceeded
 	}
 
 	next := cur + 1

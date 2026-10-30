@@ -64,12 +64,11 @@ type Config struct {
 	// RetentionSeconds is how long (in seconds) to keep used invites before purging.
 	// Default is 30 days (2592000 seconds). Set to 0 for the default.
 	RetentionSeconds int64
-	// BagPerMinute / BagBurst limit PUT /v1/bags writes per peer.
-	BagPerMinute int
-	BagBurst     int
-	// MaxBagsPerPeer is the maximum number of bags a peer can own (0 = unlimited).
+	// MaxBagsPerPeer is the maximum number of bags a peer can own.
+	// <= 0 uses the default (100).
 	MaxBagsPerPeer int
-	// MaxBagBytesPerPeer is the maximum total bytes across all bags for a peer (0 = unlimited).
+	// MaxBagBytesPerPeer is the maximum total bytes across all bags for a peer.
+	// <= 0 uses the default (1 MiB).
 	MaxBagBytesPerPeer int64
 }
 
@@ -113,12 +112,6 @@ func New(st *store.Store, cfg Config) *Server {
 	}
 	if cfg.MaxOutstandingInvites <= 0 {
 		cfg.MaxOutstandingInvites = 10
-	}
-	if cfg.BagPerMinute <= 0 {
-		cfg.BagPerMinute = 10
-	}
-	if cfg.BagBurst <= 0 {
-		cfg.BagBurst = 5
 	}
 	if cfg.MaxBagsPerPeer <= 0 {
 		cfg.MaxBagsPerPeer = 100
@@ -1189,11 +1182,6 @@ func (s *Server) putBag(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Rate limit bag writes per owner (only if configured)
-	if s.cfg.BagPerMinute > 0 && !s.lim.bagLim.Allow(owner) {
-		writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
-		return
-	}
 	ifVersion := int64(-1)
 	if im := r.Header.Get("If-Match"); im != "" {
 		v, ok := parseETag(im)
@@ -1219,11 +1207,11 @@ func (s *Server) putBag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if errors.Is(err, store.ErrBagLimitExceeded) {
-		writeErr(w, http.StatusForbidden, "bag limit exceeded")
+		writeErr(w, http.StatusRequestEntityTooLarge, "bag count limit reached")
 		return
 	}
 	if errors.Is(err, store.ErrStorageQuotaExceeded) {
-		writeErr(w, http.StatusForbidden, "storage quota exceeded")
+		writeErr(w, http.StatusRequestEntityTooLarge, "storage quota exceeded")
 		return
 	}
 	if err != nil {

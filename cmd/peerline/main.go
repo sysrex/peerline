@@ -74,10 +74,18 @@ func main() {
 	}
 	emailPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_EMAIL_PER_HOUR"))
 	notifyPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_NOTIFY_PER_HOUR"))
-	bagPerMinute, _ := strconv.Atoi(os.Getenv("PEERLINE_BAG_PER_MINUTE"))
-	bagBurst, _ := strconv.Atoi(os.Getenv("PEERLINE_BAG_BURST"))
-	maxBagsPerPeer, _ := strconv.Atoi(os.Getenv("PEERLINE_MAX_BAGS_PER_PEER"))
-	maxBagBytesPerPeer, _ := strconv.ParseInt(os.Getenv("PEERLINE_MAX_BAG_BYTES_PER_PEER"), 10, 64)
+
+	maxBagsPerPeer, err := parsePositiveInt(os.Getenv("PEERLINE_MAX_BAGS_PER_PEER"))
+	if err != nil {
+		log.Error("invalid PEERLINE_MAX_BAGS_PER_PEER", "err", err)
+		os.Exit(1)
+	}
+	maxBagBytesPerPeer, err := parsePositiveInt64(os.Getenv("PEERLINE_MAX_BAG_BYTES_PER_PEER"))
+	if err != nil {
+		log.Error("invalid PEERLINE_MAX_BAG_BYTES_PER_PEER", "err", err)
+		os.Exit(1)
+	}
+
 	retentionDays, _ := strconv.Atoi(os.Getenv("PEERLINE_RETENTION_DAYS"))
 	if retentionDays <= 0 {
 		retentionDays = 30 // default
@@ -94,8 +102,6 @@ func main() {
 		TrustedProxies:        trustedProxies,
 		MaxOutstandingInvites: maxOutstandingInvites,
 		RetentionSeconds:      retentionSeconds,
-		BagPerMinute:          bagPerMinute,
-		BagBurst:              bagBurst,
 		MaxBagsPerPeer:        maxBagsPerPeer,
 		MaxBagBytesPerPeer:    maxBagBytesPerPeer,
 	})
@@ -128,4 +134,32 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(shutCtx)
 	log.Info("peerline stopped")
+}
+
+func parsePositiveInt(s string) (int, error) {
+	if s == "" {
+		return 0, nil
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, err
+	}
+	if v < 0 {
+		return 0, errors.New("must be non-negative")
+	}
+	return v, nil
+}
+
+func parsePositiveInt64(s string) (int64, error) {
+	if s == "" {
+		return 0, nil
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if v < 0 {
+		return 0, errors.New("must be non-negative")
+	}
+	return v, nil
 }

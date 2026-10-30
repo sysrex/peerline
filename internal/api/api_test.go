@@ -258,19 +258,6 @@ func TestReadOnlyBagScope(t *testing.T) {
 	want(t, resp, body, 201)
 }
 
-func TestBagRateLimit(t *testing.T) {
-	srv := newServer(t, Config{BagPerMinute: 2, BagBurst: 2})
-	a := register(t, srv, "alice")
-	// burst allows 2 writes
-	resp, body := a.do("PUT", "/v1/bags/a", []byte("x"), nil)
-	want(t, resp, body, 201)
-	resp, body = a.do("PUT", "/v1/bags/b", []byte("y"), nil)
-	want(t, resp, body, 201)
-	// third write is rate limited
-	resp, body = a.do("PUT", "/v1/bags/c", []byte("z"), nil)
-	want(t, resp, body, 429)
-}
-
 func TestBagStorageLimits(t *testing.T) {
 	// limit to 3 bags and 100 bytes total
 	srv := newServer(t, Config{MaxBagsPerPeer: 3, MaxBagBytesPerPeer: 100})
@@ -286,10 +273,24 @@ func TestBagStorageLimits(t *testing.T) {
 
 	// 4th bag exceeds count limit
 	resp, body = a.do("PUT", "/v1/bags/d", []byte("w"), nil)
-	want(t, resp, body, 403)
+	want(t, resp, body, 413)
+	if !strings.Contains(string(body), "bag count limit reached") {
+		t.Errorf("count limit body: %s", body)
+	}
 
-	// updating existing bag should still work
+	// updating existing bag should still work (at count cap)
 	resp, body = a.do("PUT", "/v1/bags/a", bytes.Repeat([]byte("x"), 35), nil)
+	want(t, resp, body, 200)
+
+	// growing beyond byte quota
+	resp, body = a.do("PUT", "/v1/bags/a", bytes.Repeat([]byte("x"), 100), nil)
+	want(t, resp, body, 413)
+	if !strings.Contains(string(body), "storage quota exceeded") {
+		t.Errorf("quota body: %s", body)
+	}
+
+	// shrinking while over quota should work
+	resp, body = a.do("PUT", "/v1/bags/a", []byte("small"), nil)
 	want(t, resp, body, 200)
 
 	// new bag that would exceed byte limit
@@ -298,7 +299,24 @@ func TestBagStorageLimits(t *testing.T) {
 	resp, body = b.do("PUT", "/v1/bags/small", bytes.Repeat([]byte("x"), 40), nil)
 	want(t, resp, body, 201)
 	resp, body = b.do("PUT", "/v1/bags/big", bytes.Repeat([]byte("y"), 20), nil)
-	want(t, resp, body, 403)
+	want(t, resp, body, 413)
+}
+
+func TestBagStorageDefaults(t *testing.T) {
+	// Test that New applies defaults
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	srv := New(st, Config{})
+	if srv.cfg.MaxBagsPerPeer != 100 {
+		t.Errorf("got MaxBagsPerPeer %d, want 100", srv.cfg.MaxBagsPerPeer)
+	}
+	if srv.cfg.MaxBagBytesPerPeer != 1048576 {
+		t.Errorf("got MaxBagBytesPerPeer %d, want 1048576", srv.cfg.MaxBagBytesPerPeer)
+	}
 }
 
 func TestInviteValidation(t *testing.T) {
