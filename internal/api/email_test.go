@@ -41,12 +41,17 @@ func TestEmailInviteDevMode(t *testing.T) {
 	if inv.Code == "" || inv.Email["status"] != "logged" || inv.Email["mode"] != "log" || inv.Email["to"] != "bob@example.com" {
 		t.Fatalf("invite: %s", body)
 	}
+	// accept_url still has ?code= for the emailed link (unauthenticated GET landing page needs it)
 	if !strings.HasPrefix(inv.AcceptURL, srv.URL+"/v1/invites/accept?code=") || !strings.Contains(inv.AcceptURL, inv.Code) {
 		t.Fatalf("accept_url: %s", inv.AcceptURL)
 	}
 	l := logs.String()
 	if !strings.Contains(l, "bob@example.com") || !strings.Contains(l, inv.Code) || !strings.Contains(l, "dev mode") {
 		t.Fatalf("email body not logged: %s", l)
+	}
+	// Email should show code in body format (JSON), not query string
+	if !strings.Contains(l, `'{\"code\":\"`) || !strings.Contains(l, "POST") || !strings.Contains(l, "Content-Type: application/json") {
+		t.Fatalf("email should show POST with code in JSON body: %s", l)
 	}
 
 	// Unauthenticated click (human / mail scanner) shows instructions and does not consume.

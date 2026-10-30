@@ -760,9 +760,13 @@ func inviteEmail(inviter, inviterID, to, code, acceptURL string, scopes, bags []
 		fmt.Fprintf(&b, "Bags: %s\n", strings.Join(bags, ", "))
 	}
 	fmt.Fprintf(&b, "Expires: %s (single use)\n\n", exp.Format(time.RFC3339))
-	b.WriteString("Accept with your bot's own Peerline API key (use POST to accept):\n\n")
-	fmt.Fprintf(&b, "  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" \\\n    '%s'\n\n", acceptURL)
-	fmt.Fprintf(&b, "Or give your bot this one-time code:\n\n  %s\n\n", code)
+	b.WriteString("Accept with your bot's own Peerline API key (POST with code in body):\n\n")
+	baseURL := acceptURL[:strings.Index(acceptURL, "/v1/invites/accept")+len("/v1/invites/accept")]
+	fmt.Fprintf(&b, "  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" \\\n")
+	fmt.Fprintf(&b, "    -H \"Content-Type: application/json\" \\\n")
+	fmt.Fprintf(&b, "    -d '{\"code\":\"%s\"}' \\\n", code)
+	fmt.Fprintf(&b, "    '%s'\n\n", baseURL)
+	fmt.Fprintf(&b, "Or give your bot this one-time code to paste:\n\n  %s\n\n", code)
 	b.WriteString("Accepting only lets your bot act within the scopes above on the inviter's side;\nnothing of yours is shared unless you grant scopes back.\n")
 	b.WriteString("If you don't recognise the inviter, ignore this email. The code expires on its own.\n")
 	return mailer.Message{To: to, Subject: "Peerline: " + inviter + " invited your bot to pair", Body: b.String()}
@@ -780,11 +784,14 @@ func (s *Server) acceptLanding(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "Peerline: missing or malformed invite code.\n")
 		return
 	}
-	u := s.publicBase(r) + "/v1/invites/accept?code=" + url.QueryEscape(code)
-	fmt.Fprintf(w, "Peerline invite\n\nAccept with your bot's Peerline API key (use POST, not GET):\n\n"+
-		"  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" '%s'\n\n"+
-		"Optionally grant scopes back in the same call with a JSON body, e.g. {\"scopes\":[\"messages\"]}.\n"+
-		"Or paste the one-time code into your bot: %s\n\nNothing has been accepted yet.\n", u, code)
+	u := s.publicBase(r) + "/v1/invites/accept"
+	fmt.Fprintf(w, "Peerline invite\n\nAccept with your bot's Peerline API key (use POST with code in body):\n\n"+
+		"  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" \\\n"+
+		"    -H \"Content-Type: application/json\" \\\n"+
+		"    -d '{\"code\":\"%s\"}' \\\n"+
+		"    '%s'\n\n"+
+		"Optionally grant scopes back in the same call: {\"code\":\"%s\",\"scopes\":[\"messages\"]}.\n"+
+		"Or paste the one-time code into your bot: %s\n\nNothing has been accepted yet.\n", code, u, code, code)
 }
 
 func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {

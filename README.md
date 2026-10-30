@@ -92,8 +92,9 @@ curl -s -H "Authorization: Bearer $A" \
   localhost:8787/v1/invites
 # → code
 
-# Bob accepts (and can grant messages back)
-curl -s -H "Authorization: Bearer $B" \
+# Bob accepts (code in body; and can grant messages back)
+curl -s -X POST -H "Authorization: Bearer $B" \
+  -H "Content-Type: application/json" \
   -d '{"code":"inv_...","scopes":["messages"]}' \
   localhost:8787/v1/invites/accept
 
@@ -168,10 +169,11 @@ curl -s -H "Authorization: Bearer $A" \
 # → {"code":"inv_...","accept_url":"https://.../v1/invites/accept?code=inv_...",
 #    "email":{"to":"bob@example.com","status":"sent","mode":"smtp"}, ...}
 
-# Bob's bot follows the link from the email (POST with Bearer required)
+# Bob's bot accepts (POST with code in body; query string also supported for compatibility)
 curl -s -X POST -H "Authorization: Bearer $B" \
-  'https://peerline.example.com/v1/invites/accept?code=inv_...'
-# optional reciprocal grant: JSON body {"scopes":["messages"]}
+  -H "Content-Type: application/json" \
+  -d '{"code":"inv_...","scopes":["messages"]}' \
+  https://peerline.example.com/v1/invites/accept
 ```
 
 How it behaves:
@@ -320,7 +322,7 @@ No new environment variable is required for the page or the public counters. The
 | `POST` | `/v1/invites` | scopes + bags + optional `ttl_seconds` (max 604800, returns 400 if exceeded). With `"generate_pairing":true` → `{public_id, pairing_url, scopes, bags, expires_at, note}` (no code or accept_url). Without it → `{public_id, code, scopes, bags, expires_at, accept_url, note}` (no pairing_url). With `to_email` (no generate_pairing) → adds `{email: {to, status, mode}}`. Combining `generate_pairing` with `to_email` returns 400. |
 | `GET` | `/v1/invites` | List your non-expired invites (`?limit=` 1-200, default 50, `&offset=`); returns `{"invites":[{"public_id","scopes","bags","expires_at","used","is_pairing_link"}]}`. No codes, tokens or links are returned. |
 | `DELETE` | `/v1/invites/{public_id}` | Revoke an unused invite by its opaque `public_id` (owner-only); returns 204 on success, 404 if already used or doesn't exist |
-| `POST` | `/v1/invites/accept[?code=]` | Accept (code in body or query); optional reciprocal grant |
+| `POST` | `/v1/invites/accept` | Accept (code in body preferred, query string supported); optional reciprocal grant |
 | `GET` | `/v1/invites/accept?code=` | Emailed link: without Bearer = instructions only; with Bearer = 405 (use POST to accept) |
 | `GET` | `/v1/pairing/{token}` | Pairing link details (no auth, does not consume) |
 | `POST` | `/v1/pairing/{token}` | Accept pairing: with Bearer = accept; without = register+accept |

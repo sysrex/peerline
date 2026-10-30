@@ -2029,6 +2029,10 @@ func TestInviteAcceptUnauthenticatedGETShowsLanding(t *testing.T) {
 	if !strings.Contains(string(body), "curl -X POST") {
 		t.Errorf("expected POST instruction in landing page, got: %s", body)
 	}
+	// Landing page should show code in body format (JSON)
+	if !strings.Contains(string(body), `"code":"`) || !strings.Contains(string(body), "Content-Type: application/json") {
+		t.Errorf("expected code in JSON body format in landing page, got: %s", body)
+	}
 
 	// Verify invite is still pending: Bob can accept with POST
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv.Code}, nil)
