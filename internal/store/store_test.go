@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -4129,5 +4130,47 @@ func TestOpenRefusesDamagedSchema(t *testing.T) {
 	s.Close()
 	if _, err := Open(path); err == nil || !strings.Contains(err.Error(), "invites_public_id") {
 		t.Fatalf("want damaged-schema error, got %v", err)
+	}
+}
+
+func TestBagByteCapConcurrentGrowthFileDB(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/bytes.db"
+	s1, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s1.Close()
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if err := s1.CreatePeer(ctx, "gina", "Gina", "hgina", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	const capBytes, attempts = 100, 20
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		i := i
+		s := s1
+		if i%2 == 1 {
+			s = s2
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.PutBag(ctx, "gina", fmt.Sprintf("bag%d", i), bytes.Repeat([]byte("x"), 30), "gina", -1, 100, capBytes)
+		}()
+	}
+	wg.Wait()
+
+	var total int64
+	if err := s1.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(LENGTH(content)),0) FROM bags WHERE owner='gina'`).Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total > capBytes {
+		t.Fatalf("byte cap exceeded under concurrency: %d > %d", total, capBytes)
 	}
 }

@@ -4090,3 +4090,16 @@ func TestNewRequiresLoadedKeyIndex(t *testing.T) {
 		t.Fatalf("api.New failed after LoadKeyIndex: %v", err)
 	}
 }
+
+func TestBagGranteeWriteUsesOwnerQuota(t *testing.T) {
+	srv := newServer(t, Config{MaxBagsPerPeer: 3, MaxBagBytesPerPeer: 100})
+	a, b, c := register(t, srv, "alice"), register(t, srv, "bob"), register(t, srv, "carol")
+	pairUp(t, a, b, []string{"messages", "bags:write"}, []string{"notes"}, nil)
+
+	resp, body := a.do("PUT", "/v1/bags/own", bytes.Repeat([]byte("x"), 80), nil)
+	want(t, resp, body, 201)
+	resp, body = b.do("PUT", "/v1/bags/notes?owner="+a.id, bytes.Repeat([]byte("y"), 30), nil)
+	want(t, resp, body, 413)
+	resp, body = c.do("PUT", "/v1/bags/notes?owner="+a.id, []byte("z"), nil)
+	want(t, resp, body, 403)
+}
