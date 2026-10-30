@@ -3469,6 +3469,17 @@ func TestVersionEndpoint(t *testing.T) {
 					t.Fatalf("failed to decode response: %v", err)
 				}
 
+				// Assert exact key set
+				expectedKeys := make(map[string]bool)
+				for _, key := range tt.wantKeys {
+					expectedKeys[key] = true
+				}
+				for key := range info {
+					if !expectedKeys[key] {
+						t.Errorf("unexpected key %q in response (expected only %v)", key, tt.wantKeys)
+					}
+				}
+				
 				// Check expected keys are present and non-empty
 				for _, key := range tt.wantKeys {
 					val, ok := info[key]
@@ -3498,6 +3509,20 @@ func TestVersionEndpoint(t *testing.T) {
 				version := info["version"]
 				if strings.Contains(version, "/") || strings.Contains(version, "merge") {
 					t.Errorf("version should not contain branch-like strings, got %q", version)
+				}
+				
+				// Assert security headers from securityHeaders wrapper
+				headers := map[string]string{
+					"Content-Security-Policy": "default-src 'none'",
+					"X-Frame-Options":         "DENY",
+					"X-Content-Type-Options":  "nosniff",
+					"Referrer-Policy":         "no-referrer",
+				}
+				for header, expectedSubstring := range headers {
+					value := resp.Header.Get(header)
+					if !strings.Contains(value, expectedSubstring) {
+						t.Errorf("header %s should contain %q, got: %s", header, expectedSubstring, value)
+					}
 				}
 			}
 
@@ -3529,7 +3554,6 @@ func TestVersionEndpointNoAuth(t *testing.T) {
 func TestVersionEndpointRateLimit(t *testing.T) {
 	srv := newServer(t, Config{})
 	client := http.Client{Timeout: 2 * time.Second}
-	var lastStatus int
 	foundRateLimit := false
 
 	// The version endpoint has a separate limiter with burst of 30
@@ -3539,21 +3563,36 @@ func TestVersionEndpointRateLimit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		lastStatus = resp.StatusCode
-		resp.Body.Close()
 
-		if lastStatus == http.StatusTooManyRequests {
+		if resp.StatusCode == http.StatusTooManyRequests {
 			foundRateLimit = true
+			
 			// Check for Retry-After header
 			if ra := resp.Header.Get("Retry-After"); ra == "" {
 				t.Error("429 response should include Retry-After header")
 			}
+			
+			// Check uniform 429 body
+			var errResp map[string]string
+			if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+				t.Errorf("failed to decode 429 body: %v", err)
+			} else if errMsg, ok := errResp["error"]; !ok || !strings.Contains(errMsg, "rate") {
+				t.Errorf("429 response should contain rate limit error, got: %v", errResp)
+			}
+			
+			// Verify security headers are present on 429
+			if csp := resp.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'none'") {
+				t.Errorf("429 missing strict CSP, got: %s", csp)
+			}
+			
+			resp.Body.Close()
 			break
 		}
+		resp.Body.Close()
 	}
 
 	if !foundRateLimit {
-		t.Log("Did not hit rate limit in 50 requests (versionLim burst may be high)")
+		t.Fatal("versionLim not wired: no 429 returned after 50 requests (burst is 30)")
 	}
 }
 

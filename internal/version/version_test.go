@@ -68,17 +68,6 @@ func TestShortCommit(t *testing.T) {
 	}
 }
 
-func TestInfoWithInjectedValues(t *testing.T) {
-	// This test must run in a separate process to reset sync.Once
-	// Here we just document the expected behavior when ldflags are set
-	t.Run("defaults", func(t *testing.T) {
-		// Default version is "dev"
-		if Version != "dev" && Version != "v1.0.0-test" {
-			t.Logf("Version is set to non-default: %s", Version)
-		}
-	})
-}
-
 func TestInfoFallbackBehavior(t *testing.T) {
 	// Save originals
 	origCommit := Commit
@@ -168,6 +157,38 @@ func TestInfoFallbackBehavior(t *testing.T) {
 		{
 			name:         "dirty tag becomes dev",
 			version:      "v1.2.3-dirty",
+			commit:       "abc123",
+			buildTime:    "2024-01-15T10:30:00Z",
+			wantVersion:  "dev",
+			checkUnknown: false,
+		},
+		{
+			name:         "leading zero major",
+			version:      "v01.2.3",
+			commit:       "abc123",
+			buildTime:    "2024-01-15T10:30:00Z",
+			wantVersion:  "dev",
+			checkUnknown: false,
+		},
+		{
+			name:         "leading zero minor",
+			version:      "v1.02.3",
+			commit:       "abc123",
+			buildTime:    "2024-01-15T10:30:00Z",
+			wantVersion:  "dev",
+			checkUnknown: false,
+		},
+		{
+			name:         "leading zero patch",
+			version:      "v1.2.03",
+			commit:       "abc123",
+			buildTime:    "2024-01-15T10:30:00Z",
+			wantVersion:  "dev",
+			checkUnknown: false,
+		},
+		{
+			name:         "very long component (11 digits)",
+			version:      "v1.12345678901.3",
 			commit:       "abc123",
 			buildTime:    "2024-01-15T10:30:00Z",
 			wantVersion:  "dev",
