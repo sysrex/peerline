@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -70,10 +71,15 @@ type Server struct {
 	st          *store.Store
 	cfg         Config
 	lim         *LimiterManager
+	verifyLim   *msg.Limiter // Per-peer/per-address verification email rate limit (3/hour)
 	maint       *MaintenanceManager
 	log         *slog.Logger
 	trustedNets []*net.IPNet
 	now         func() time.Time // clock for invite expiry; defaults to time.Now
+
+	// For pruning verifyLim
+	pruneDone chan struct{}
+	pruneOnce sync.Once
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -121,9 +127,14 @@ func New(st *store.Store, cfg Config) *Server {
 		cfg:         cfg,
 		log:         cfg.Logger,
 		lim:         NewLimiterManager(cfg),
+		verifyLim:   msg.NewLimiterPerHour(3, 3), // 3 verification emails per peer/address per hour
 		trustedNets: trustedNets,
 		now:         time.Now,
+		pruneDone:   make(chan struct{}),
 	}
+
+	// Start pruning verifyLim every 15 minutes
+	go s.pruneVerifyLoop()
 
 	// Start maintenance tasks
 	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, cfg.RetentionSeconds)
@@ -138,6 +149,23 @@ func (s *Server) Stop() {
 	}
 	if s.maint != nil {
 		s.maint.Stop()
+	}
+	// Stop verifyLim pruning
+	s.pruneOnce.Do(func() { close(s.pruneDone) })
+}
+
+// pruneVerifyLoop periodically prunes stale buckets from verifyLim.
+func (s *Server) pruneVerifyLoop() {
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.pruneDone:
+			return
+		case <-ticker.C:
+			s.verifyLim.Prune()
+		}
 	}
 }
 
@@ -267,15 +295,16 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	var tokenWithExpiry string
 	var rawToken string
 	if notify != "" {
-		// Rate limit verification emails per-address only
+		// Rate limit verification emails per-address
 		normalizedAddr := strings.ToLower(notify)
-		if !s.lim.verifyLim.Allow(normalizedAddr) {
-			writeErr(w, http.StatusTooManyRequests, "rate limited")
-			return
+		if !s.verifyLim.Allow(normalizedAddr) {
+			// Per-address budget exhausted: register anyway but skip email
+			tokenWithExpiry = "" // Leave unverified
+		} else {
+			rawToken = auth.NewSecret("eml_")
+			issuedAt := s.now().Unix()
+			tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
 		}
-		rawToken = auth.NewSecret("eml_")
-		issuedAt := s.now().Unix()
-		tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
 	}
 
 	id, key := auth.NewID(), auth.NewKey()
@@ -352,15 +381,20 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 	var tokenWithExpiry string
 	var rawToken string
 	if email != "" {
-		// Rate limit verification emails per-peer and per-address
+		// Rate limit verification emails: check per-address first, then per-peer
 		normalizedAddr := strings.ToLower(email)
-		if !s.lim.verifyLim.Allow(me) || !s.lim.verifyLim.Allow(normalizedAddr) {
+		if !s.verifyLim.Allow(normalizedAddr) {
+			// Per-address budget exhausted
+			writeErr(w, http.StatusTooManyRequests, "verification email rate limited (per-address); try later")
+			return
+		} else if !s.verifyLim.Allow(me) {
 			writeErr(w, http.StatusTooManyRequests, "verification email rate limited; try later")
 			return
+		} else {
+			rawToken = auth.NewSecret("eml_")
+			issuedAt := s.now().Unix()
+			tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
 		}
-		rawToken = auth.NewSecret("eml_")
-		issuedAt := s.now().Unix()
-		tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
 	}
 
 	if err := s.st.SetNotifyEmail(r.Context(), me, email, tokenWithExpiry); err != nil {

@@ -60,16 +60,34 @@ func TestEmailVerificationIdenticalFailures(t *testing.T) {
 		APIKey *string `json:"api_key"`
 	}{&dave.id, &dave.key})
 
+	eve := &client{t: t, srv: srv}
+	resp, body = eve.do("POST", "/v1/register", map[string]string{"name": "eve", "notify_email": "eve@example.com"}, nil)
+	want(t, resp, body, 201)
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&eve.id, &eve.key})
+
 	// Extract alice's token
 	msgs := cap.all()
 	var aliceToken string
+	var eveToken string
 	for _, m := range msgs {
 		if m.To == "alice@example.com" {
 			aliceToken = extractVerifyToken(m.Body)
-			if aliceToken != "" {
-				break
-			}
 		}
+		if m.To == "eve@example.com" {
+			eveToken = extractVerifyToken(m.Body)
+		}
+	}
+
+	// Write an expired token for eve (issued more than 24 hours ago)
+	now := time.Now().Unix()
+	expiredIssuedTime := now - 86401
+	expiredTokenValue := fmt.Sprintf("%d:%s", expiredIssuedTime, auth.Hash(eveToken))
+	_, err := st.DB().Exec(`UPDATE peers SET notify_email_token=? WHERE id=?`, expiredTokenValue, eve.id)
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	// Test 1: Wrong token
@@ -96,6 +114,9 @@ func TestEmailVerificationIdenticalFailures(t *testing.T) {
 	writeToken(dave.id, "malformed:value")
 	resp7, body7 := dave.do("POST", "/v1/me/verify-email?token=anything", nil, nil)
 
+	// Test 8: Expired token
+	resp8, body8 := eve.do("POST", "/v1/me/verify-email?token="+eveToken, nil, nil)
+
 	// All failures must return identical 404s
 	failures := []struct {
 		name string
@@ -108,6 +129,7 @@ func TestEmailVerificationIdenticalFailures(t *testing.T) {
 		{"missing token", resp5.StatusCode, body5},
 		{"legacy plaintext", resp6.StatusCode, body6},
 		{"malformed", resp7.StatusCode, body7},
+		{"expired", resp8.StatusCode, body8},
 	}
 
 	var canonical []byte
@@ -286,9 +308,9 @@ func TestEmailVerificationExpiry(t *testing.T) {
 	msgs := cap.all()
 	token := extractVerifyToken(msgs[0].Body)
 
-	// Test 1: Write a token that's still valid (issued 23 hours 59 minutes ago)
+	// Test 1: Write a token that's still valid (issued exactly 86400 seconds ago = 24 hours)
 	now := time.Now().Unix()
-	validIssuedTime := now - 86399
+	validIssuedTime := now - 86400 // exactly 24 hours ago
 	validTokenValue := fmt.Sprintf("%d:%s", validIssuedTime, auth.Hash(token))
 	_, err := st.DB().Exec(`UPDATE peers SET notify_email_token=? WHERE id=?`, validTokenValue, alice.id)
 	if err != nil {
@@ -309,8 +331,8 @@ func TestEmailVerificationExpiry(t *testing.T) {
 	msgs = cap.all()
 	bobToken := extractVerifyToken(msgs[len(msgs)-1].Body)
 
-	// Write a token that's expired (issued exactly 24 hours ago)
-	expiredIssuedTime := now - 86400
+	// Write a token that's expired (issued 86401 seconds ago = 24 hours + 1 second)
+	expiredIssuedTime := now - 86401
 	expiredTokenValue := fmt.Sprintf("%d:%s", expiredIssuedTime, auth.Hash(bobToken))
 	_, err = st.DB().Exec(`UPDATE peers SET notify_email_token=? WHERE id=?`, expiredTokenValue, bob.id)
 	if err != nil {
@@ -321,6 +343,14 @@ func TestEmailVerificationExpiry(t *testing.T) {
 	if !strings.Contains(string(body), "not found") {
 		t.Errorf("unexpected error: %s", body)
 	}
+}
+
+// TestEmailVerificationDBError tests that DB errors return 500, not 404.
+// TODO: This test is difficult to implement without mocking because closing the DB
+// breaks the auth middleware first. A better approach would be to test the
+// Store.VerifyNotifyEmail method directly with a mocked DB connection.
+func TestEmailVerificationDBError(t *testing.T) {
+	t.Skip("DB error testing requires mocking infrastructure")
 }
 
 // TestEmailVerificationLegacyAndMalformed tests that legacy plaintext and malformed tokens fail.
@@ -558,5 +588,35 @@ func TestPerAddressNotificationRateLimit(t *testing.T) {
 	msgs = cap.all()
 	if len(msgs) != 2 {
 		t.Fatalf("expected still 2 notifications (rate limited), got %d", len(msgs))
+	}
+}
+
+// TestRegisterWithExhaustedAddressBudget tests that registration succeeds even when
+// the per-address verification email budget is exhausted.
+func TestRegisterWithExhaustedAddressBudget(t *testing.T) {
+	cap := &captureMailer{}
+	srv := newServer(t, Config{Mailer: cap})
+
+	// Register 3 peers with the same email to exhaust the per-address budget (3/hour)
+	for i := 0; i < 3; i++ {
+		name := fmt.Sprintf("peer%d", i)
+		resp, body := (&client{t: t, srv: srv}).do("POST", "/v1/register", map[string]string{"name": name, "notify_email": "shared@example.com"}, nil)
+		want(t, resp, body, 201)
+	}
+
+	// 4th registration with same email should succeed (201) but skip sending email
+	resp, body := (&client{t: t, srv: srv}).do("POST", "/v1/register", map[string]string{"name": "peer3", "notify_email": "shared@example.com"}, nil)
+	want(t, resp, body, 201)
+
+	// Verify only 3 emails were sent
+	msgs := cap.all()
+	count := 0
+	for _, m := range msgs {
+		if m.To == "shared@example.com" {
+			count++
+		}
+	}
+	if count != 3 {
+		t.Errorf("sent %d emails, want 3", count)
 	}
 }

@@ -322,11 +322,8 @@ func migrateV4EmailVerification(tx *sql.Tx) error {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-// DB exposes the underlying database for testing.
+// DB returns the underlying database handle for testing.
 func (s *Store) DB() *sql.DB { return s.db }
-
-// SetNow allows tests to control time.
-func (s *Store) SetNow(fn func() int64) { s.now = fn }
 
 // generatePublicID returns a random 16-byte hex string for invite public_id.
 func generatePublicID() (string, error) {
@@ -409,11 +406,14 @@ func (s *Store) VerifyNotifyEmail(ctx context.Context, id, tokenHash string) err
 	// Fetch stored token
 	var storedToken sql.NullString
 	err := s.db.QueryRowContext(ctx, `SELECT notify_email_token FROM peers WHERE id=?`, id).Scan(&storedToken)
-	if errors.Is(err, sql.ErrNoRows) || !storedToken.Valid || storedToken.String == "" {
-		return ErrNotFound
-	}
 	if err != nil {
-		return err
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("fetch notify_email_token: %w", err)
+	}
+	if !storedToken.Valid || storedToken.String == "" {
+		return ErrNotFound
 	}
 
 	// Parse stored token: "<unix_issued>:<hash>"
@@ -428,8 +428,8 @@ func (s *Store) VerifyNotifyEmail(ctx context.Context, id, tokenHash string) err
 	}
 	storedHash := parts[1]
 
-	// Check expiry (24 hours, exclusive: issued + 86400 is the first expired second)
-	if s.now() >= issuedUnix+24*3600 {
+	// Check expiry (24 hours: valid at exactly issued+86400, expired at issued+86401)
+	if s.now() > issuedUnix+86400 {
 		return ErrNotFound
 	}
 
@@ -441,7 +441,7 @@ func (s *Store) VerifyNotifyEmail(ctx context.Context, id, tokenHash string) err
 	// Single-use: clear token and mark verified
 	res, err := s.db.ExecContext(ctx, `UPDATE peers SET notify_email_verified=1, notify_email_token=NULL WHERE id=? AND notify_email_token=?`, id, storedToken.String)
 	if err != nil {
-		return err
+		return fmt.Errorf("clear token: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
