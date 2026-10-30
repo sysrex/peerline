@@ -34,6 +34,8 @@ const (
 	defaultInviteTTL = 1 * time.Hour
 	maxInviteTTL     = 7 * 24 * time.Hour
 	maxInviteTTLSec  = 604800 // 7 days in seconds, checked before multiplication
+	// deprecationDate is 2026-10-30 00:00:00 UTC, the date query-string code acceptance was deprecated (PR #128).
+	deprecationDate = "@1793318400"
 )
 
 type Config struct {
@@ -251,6 +253,11 @@ func (s *Server) Handler() http.Handler {
 	// The emailed accept link: only unauthenticated GET shows instructions.
 	// Authenticated GET returns 405; only POST accepts the invite.
 	mux.HandleFunc("GET /v1/invites/accept", func(w http.ResponseWriter, r *http.Request) {
+		// RFC 9745 deprecation headers when ?code= is in the URL (issue #173).
+		if r.URL.Query().Get("code") != "" {
+			w.Header().Set("Deprecation", deprecationDate)
+			w.Header().Set("Link", `<https://github.com/sysrex/peerline#email-invites>; rel="deprecation"; type="text/html"`)
+		}
 		if r.Header.Get("Authorization") != "" {
 			w.Header().Set("Allow", "POST")
 			writeErr(w, http.StatusMethodNotAllowed, "use POST to accept the invite")
@@ -972,6 +979,7 @@ var inviteCodeRE = regexp.MustCompile(`^inv_[A-Za-z0-9_-]{16,64}$`)
 func (s *Server) acceptLanding(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	if !inviteCodeRE.MatchString(code) {
 		w.WriteHeader(http.StatusBadRequest)
 		io.WriteString(w, "Peerline: missing or malformed invite code.\n")
@@ -1000,14 +1008,18 @@ func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	q := r.URL.Query()
-	queryOnlyCode := false
+	hasQueryCode := q.Get("code") != ""
+	// RFC 9745 deprecation headers when ?code= is in the URL (issue #173).
+	// Set before validation so all responses on this path carry them.
+	// TODO: confirm-mode invites (#3) will return 404 on this path.
+	if hasQueryCode {
+		w.Header().Set("Deprecation", deprecationDate)
+		w.Header().Set("Link", `<https://github.com/sysrex/peerline#email-invites>; rel="deprecation"; type="text/html"`)
+	}
 	if qc := q.Get("code"); qc != "" {
 		if in.Code != "" && in.Code != qc {
 			writeErr(w, http.StatusBadRequest, "code in body and query differ")
 			return
-		}
-		if in.Code == "" {
-			queryOnlyCode = true
 		}
 		in.Code = qc
 	}
@@ -1033,12 +1045,7 @@ func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
-	// RFC 9745 deprecation headers for query-string-only code path (legacy).
-	// TODO: confirm-mode invites (#3) will return 404 on this path.
-	if queryOnlyCode {
-		w.Header().Set("Deprecation", "@1767225600") // 2026-01-01 00:00:00 UTC
-		w.Header().Set("Link", `<https://github.com/sysrex/peerline#email-invites>; rel="deprecation"; type="text/html"`)
-	}
+	w.Header().Set("Cache-Control", "no-store")
 	resp := map[string]any{"peer_id": g.Owner, "granted_to_you": g}
 	if len(sc) > 0 {
 		resp["granted_by_you"] = store.Grant{Owner: me, Grantee: g.Owner, Scopes: sc, Bags: bg}
