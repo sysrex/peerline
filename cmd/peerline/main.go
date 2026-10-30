@@ -50,18 +50,20 @@ func main() {
 	}
 	publicURL := strings.TrimRight(os.Getenv("PEERLINE_PUBLIC_URL"), "/")
 	if ml.Mode() == "log" {
-		log.Warn("PEERLINE_SMTP_HOST unset: invite emails are logged, not sent (dev mode)")
+		log.Warn("PEERLINE_SMTP_HOST unset: transactional emails (invites and message notifications) are logged, not sent (dev mode)")
 	} else if publicURL == "" {
 		// Emailed links must not be built from a client-supplied Host header.
 		log.Error("PEERLINE_PUBLIC_URL is required when SMTP is configured (used in emailed accept links)")
 		os.Exit(1)
 	}
 	emailPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_EMAIL_PER_HOUR"))
+	notifyPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_NOTIFY_PER_HOUR"))
 	srv := &http.Server{
 		Addr: *addr,
 		Handler: api.New(st, api.Config{
 			RegisterToken: regTok, Logger: log,
 			Mailer: ml, PublicURL: publicURL, EmailPerHour: emailPerHour,
+			NotifyPerHour: notifyPerHour,
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
