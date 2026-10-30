@@ -112,7 +112,7 @@ curl -s -H "Authorization: Bearer $A" 'localhost:8787/v1/inbox?since=0'
 
 ## Email invites
 
-Alice doesn't need a side channel to Bob: she can invite by email address. Peerline emails Bob a **magic link** plus the same **one-time code**; Bob's bot accepts with **its own API key**, and the grant is created exactly as with the code path. Different accounts, different people — the email only carries the invite, never any data.
+Alice doesn't need a side channel to Bob: she can invite by email address. Peerline emails Bob the **one-time code** and a `POST` example (no link); Bob's bot accepts with **its own API key**, and the grant is created exactly as with the code path. Different accounts, different people — the email only carries the invite, never any data.
 
 ## Shareable pairing links
 
@@ -191,9 +191,10 @@ How it behaves:
 
 | Env | Default | Meaning |
 |---|---|---|
-| `PEERLINE_SMTP_HOST` | unset | SMTP server. **Unset = dev mode**: the full email (link + code) is written to the server log at WARN and the invite succeeds. |
-| `PEERLINE_SMTP_PORT` | `587` | `465` = implicit TLS; anything else = STARTTLS when offered (mandatory for auth to a non-localhost server). |
+| `PEERLINE_SMTP_HOST` | unset | SMTP server. **Unset = dev mode**: the email's recipient, subject and body length are logged at WARN and the invite succeeds. Set `PEERLINE_DEV_LOG_EMAIL_BODY=1` to log the full body (invite codes and message previews) on a trusted dev box only. |
+| `PEERLINE_SMTP_PORT` | `587` | `465` = implicit TLS; anything else = STARTTLS, **required**: the send fails if the server does not offer it. |
 | `PEERLINE_SMTP_USER` / `PEERLINE_SMTP_PASS` | unset | PLAIN auth; set both or neither. |
+| `PEERLINE_SMTP_ALLOW_PLAINTEXT` | unset | `1` allows sending without TLS (local dev relay only; a startup warning is logged). |
 | `PEERLINE_SMTP_FROM` | — | Required with a host, e.g. `Peerline <peerline@example.com>`. |
 | `PEERLINE_PUBLIC_URL` | — | Required with a host, e.g. `https://peerline.example.com`. Links are never built from the request's `Host` header when real email is sent. In dev mode it falls back to the request host. |
 | `PEERLINE_EMAIL_PER_HOUR` | `20` | Invite emails per inviting peer per hour. |
@@ -210,6 +211,12 @@ PEERLINE_SMTP_FROM='Peerline <peerline@example.com>' \
 The server refuses to start if the SMTP settings are inconsistent (e.g. host without `FROM` or `PUBLIC_URL`), rather than silently dropping invites. Note that dev mode logs live invite codes and message previews — don't run it that way on a shared box.
 
 The same SMTP settings deliver [message notifications](#message-notifications).
+
+---
+
+## Reverse proxy logging
+
+Pairing tokens travel in the URL path (`/v1/pairing/pair_...`) and legacy invite codes in the query (`/v1/invites/accept?code=...`), so access logs can hold live secrets until the link expires (default 1h, max 7d). Redact the path segment after `/v1/pairing/` and drop the query string for `/v1/invites/accept` in your proxy's access log (nginx: log `$uri` instead of `$request_uri` and rewrite the pairing path through a `map`; Caddy: `replace` / `delete` filters on `request>uri`). Prefer short `ttl_seconds` for pairing links.
 
 ---
 
@@ -258,7 +265,7 @@ When peer A successfully sends a message to peer B and B has `notify_email` set 
 | **Body** | from, to, message id, type, `created_at`, and a preview of the body (≤200 characters) |
 | **Not included** | API keys, the register token, or any other peer's address |
 
-The preview is the message text. Don't put secrets in a message body. Anything that looks like a Peerline API key (`pl_…`) is stripped, and so is the configured register token when it is at least 8 characters. The inbox still has the original body; the email is only a wake-up. `GET /v1/inbox` is where the bot should read.
+The preview is the message text. Don't put secrets in a message body. Anything that looks like a Peerline API key, invite code or pairing token (`pl_…`, `inv_…`, `pair_…`) is stripped (best-effort), and so is the configured register token when it is at least 8 characters. The inbox still has the original body; the email is only a wake-up. `GET /v1/inbox` is where the bot should read.
 
 How it behaves:
 
@@ -315,7 +322,7 @@ IPv4-mapped IPv6 prefixes meeting the floor (e.g., `::ffff:10.0.0.0/104`) are au
 
 Peerline runs a background maintenance task hourly (and once at startup) that purges:
 
-- **Unused expired invites:** Deleted when `expires_at < now` during the hourly sweep.
+- **Unused expired invites:** Deleted when `expires_at < now - 300` (a fixed 5-minute grace window, not configurable). They are already rejected at `expires_at`; the grace only delays deletion and does not extend validity.
 - **Used invites:** Kept for the retention window (default 30 days) counted from the invite's `expires_at` (not from when it was used), then deleted. An invite is purged when `used_by IS NOT NULL AND expires_at < now - retention_window`.
 
 The retention window is configured via `PEERLINE_RETENTION_DAYS` (default `30`). Set it to `0` to use the default. Examples:
@@ -323,7 +330,7 @@ The retention window is configured via `PEERLINE_RETENTION_DAYS` (default `30`).
 - `PEERLINE_RETENTION_DAYS=90` → keep used invites for 90 days after their expiry
 - `PEERLINE_RETENTION_DAYS=7` → purge used invites 7 days after expiry
 
-The maintenance task starts immediately on server boot and then runs hourly. Purge counts are logged at INFO level when invites are deleted.
+The maintenance task starts immediately on server boot and then runs hourly. Purge counts are logged at INFO level when invites are deleted. Each run is capped at 100 batches of 500 rows; if a backlog remains, the next run follows after about a minute instead of an hour.
 
 ---
 
@@ -342,7 +349,7 @@ No new environment variable is required for the page or the public counters. The
 | `GET` | `/v1/me` | `peer_id` and your own `notify_email` |
 | `PUT` | `/v1/me` | `{"notify_email"}` set or `""` to clear; returns the same shape as GET |
 | `POST` | `/v1/invites` | scopes + bags + optional `ttl_seconds` (max 604800, returns 400 if exceeded). With `"generate_pairing":true` → `{public_id, pairing_url, scopes, bags, expires_at, note}` (no code or accept_url). Without it → `{public_id, code, scopes, bags, expires_at, accept_url, note}` (no pairing_url). With `to_email` (no generate_pairing) → adds `{email: {to, status, mode}}`. Combining `generate_pairing` with `to_email` returns 400. |
-| `GET` | `/v1/invites` | List your non-expired invites (`?limit=` 1-200, default 50, `&offset=`); returns `{"invites":[{"public_id","scopes","bags","expires_at","used","is_pairing_link"}]}`. No codes, tokens or links are returned. |
+| `GET` | `/v1/invites` | List your non-expired invites (`?limit=` 1-200, default 50, `&offset=`); returns `{"invites":[{"public_id","scopes","bags","expires_at","used","is_pairing_link"}]}`. No codes, tokens or links are returned. Invites are identified by `public_id` (formerly `invite_id`, a breaking rename); on startup any row lacking one is backfilled. |
 | `DELETE` | `/v1/invites/{public_id}` | Revoke an unused invite by its opaque `public_id` (owner-only); returns 204 on success, 404 if already used or doesn't exist |
 | `POST` | `/v1/invites/accept` | Accept (code in body preferred, query string supported); optional reciprocal grant |
 | `GET` | `/v1/invites/accept?code=` | Emailed link: without Bearer = instructions only; with Bearer = 405 (use POST to accept) |

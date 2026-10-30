@@ -30,6 +30,9 @@ func NewSecret(prefix string) string { return prefix + randB64(24) }
 // NewPairingToken returns a random pairing token.
 func NewPairingToken() string { return "pair_" + randB64(24) }
 
+// NewNonce returns 128 random bits.
+func NewNonce() []byte { return randBytes(16) }
+
 // Hash returns the hex SHA-256 of a secret.
 func Hash(secret string) string {
 	h := sha256.Sum256([]byte(secret))

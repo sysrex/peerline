@@ -2,7 +2,9 @@ package mailer
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"log/slog"
 	"net"
 	"strings"
 	"testing"
@@ -111,7 +113,7 @@ func TestSMTPSend(t *testing.T) {
 		}
 	}()
 	port := ln.Addr().(*net.TCPAddr).Port
-	s := &SMTP{Host: "127.0.0.1", Port: port, From: "Peerline <noreply@example.com>", Timeout: 5 * time.Second}
+	s := &SMTP{Host: "127.0.0.1", Port: port, From: "Peerline <noreply@example.com>", Timeout: 5 * time.Second, AllowPlaintext: true}
 	if err := s.Send(context.Background(), Message{To: "bob@example.com", Subject: "Invite", Body: "code inv_x"}); err != nil {
 		t.Fatal(err)
 	}
@@ -120,5 +122,59 @@ func TestSMTPSend(t *testing.T) {
 		if !strings.Contains(d, w) {
 			t.Fatalf("missing %q in %q", w, d)
 		}
+	}
+}
+
+func TestSMTPRequiresSTARTTLS(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	seen := make(chan string, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		r := bufio.NewReader(c)
+		c.Write([]byte("220 test\r\n"))
+		var cmds strings.Builder
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				break
+			}
+			cmds.WriteString(line)
+			if strings.HasPrefix(strings.ToUpper(line), "EHLO") {
+				c.Write([]byte("250 test\r\n"))
+			} else {
+				c.Write([]byte("221 bye\r\n"))
+			}
+		}
+		seen <- cmds.String()
+	}()
+	s := &SMTP{Host: "127.0.0.1", Port: ln.Addr().(*net.TCPAddr).Port, From: "a@example.com", Timeout: 5 * time.Second}
+	if err := s.Send(context.Background(), Message{To: "bob@example.com", Subject: "s", Body: "secret"}); err == nil || !strings.Contains(err.Error(), "STARTTLS") {
+		t.Fatalf("want STARTTLS error, got %v", err)
+	}
+	if got := <-seen; strings.Contains(got, "MAIL") || strings.Contains(got, "DATA") || strings.Contains(got, "secret") {
+		t.Fatalf("mail sent in cleartext: %q", got)
+	}
+}
+
+func TestLogRedactsBodyByDefault(t *testing.T) {
+	var buf bytes.Buffer
+	lg := slog.New(slog.NewTextHandler(&buf, nil))
+	m := Message{To: "a@b.co", Subject: "s", Body: "code inv_SECRETSECRETSECRET"}
+	Log{Logger: lg}.Send(context.Background(), m)
+	if strings.Contains(buf.String(), "SECRET") {
+		t.Fatalf("body logged: %s", buf.String())
+	}
+	buf.Reset()
+	Log{Logger: lg, FullBody: true}.Send(context.Background(), m)
+	if !strings.Contains(buf.String(), "SECRET") {
+		t.Fatalf("opt-in body missing: %s", buf.String())
 	}
 }

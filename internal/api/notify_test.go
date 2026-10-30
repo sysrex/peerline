@@ -10,6 +10,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"github.com/sysrex/peerline/internal/auth"
 	"github.com/sysrex/peerline/internal/mailer"
 )
 
@@ -364,5 +365,15 @@ func TestBodyPreview(t *testing.T) {
 	// Short tokens are left alone so a tiny token cannot erase the preview.
 	if got := bodyPreview("keep short", "short", 200); got != "keep short" {
 		t.Fatal(got)
+	}
+}
+
+func TestBodyPreviewRedactsAllTokenKinds(t *testing.T) {
+	for _, tok := range []string{auth.NewSecret("inv_"), auth.NewPairingToken(), auth.NewKey(), "inv_" + strings.Repeat("a", 64)} {
+		for _, in := range []string{"code " + tok + " ok", "http://x/v1/pairing/" + tok, "?code=" + tok} {
+			if got := bodyPreview(in, "", 500); strings.Contains(got, tok[4:]) {
+				t.Errorf("%q leaked token: %q", in, got)
+			}
+		}
 	}
 }
