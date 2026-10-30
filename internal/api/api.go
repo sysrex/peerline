@@ -14,6 +14,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -75,8 +77,13 @@ type Server struct {
 	trustedNets []*net.IPNet
 	now         func() time.Time // clock for invite expiry; defaults to time.Now
 
-	// Test-only hook: called after invite creation, before email limit check
-	testInviteCreatedHook func(peerID string)
+	// limiterMu makes Ready/Allow atomic across both email limiters (#183)
+	limiterMu sync.Mutex
+
+	// testBeforeCreateHook is a test-only hook called before CreateInviteAtomic.
+	// Nil in production. Test: N-party barrier synchronizes concurrent requests.
+	testBeforeCreateHook     func(peerID string)
+	testBeforeCreateHookGate atomic.Bool
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -437,6 +444,14 @@ func (s *Server) verifyEmail(w http.ResponseWriter, r *http.Request) {
 
 // ---- pairing ----
 
+// rollbackInvite deletes a just-created invite using a context that survives
+// client disconnect (#184), with a short timeout to ensure cleanup finishes.
+func (s *Server) rollbackInvite(r *http.Request, publicID, owner string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 3*time.Second)
+	defer cancel()
+	return s.st.DeleteInvite(ctx, publicID, owner)
+}
+
 func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Scopes          []string `json:"scopes"`
@@ -495,10 +510,10 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	var pairingToken string
 	var publicID string
 
-	// testInviteCreatedHook is called before the atomic cap check for deterministic testing.
-	// Production: nil. Test: N-party barrier synchronizes concurrent requests.
-	if s.testInviteCreatedHook != nil {
-		s.testInviteCreatedHook(me)
+	// testBeforeCreateHook: called before CreateInviteAtomic, nil in production,
+	// N-party barrier in tests for deterministic concurrency verification.
+	if s.testBeforeCreateHookGate.Load() && s.testBeforeCreateHook != nil {
+		s.testBeforeCreateHook(me)
 	}
 
 	// Create invite first with atomic cap check (#53)
@@ -529,10 +544,14 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	// If limit fails, delete the invite and return error
 	if to != "" {
 		rk := strings.ToLower(to)
-		// Check both limiters are ready before consuming from either (avoid partial spend)
-		if !s.lim.mailLim.Ready(me) || !s.lim.rcptLim.Ready(rk) {
+		// Lock around Ready/Allow to make them atomic across both limiters (#183)
+		s.limiterMu.Lock()
+		mailReady := s.lim.mailLim.Ready(me)
+		rcptReady := s.lim.rcptLim.Ready(rk)
+		if !mailReady || !rcptReady {
+			s.limiterMu.Unlock()
 			// Delete the invite we just created
-			if delErr := s.st.DeleteInvite(r.Context(), publicID, me); delErr != nil {
+			if delErr := s.rollbackInvite(r, publicID, me); delErr != nil {
 				s.log.Error("failed to delete invite after rate limit check", "public_id", publicID, "error", delErr)
 				s.internal(w, fmt.Errorf("rate limit check failed and invite cleanup failed: %w", delErr))
 				return
@@ -541,11 +560,26 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusTooManyRequests, "invite email rate limited; try later or create an invite without to_email and share the code yourself")
 			return
 		}
-		// Both ready, consume from both. Narrow race: two requests can both pass Ready,
-		// second Allow fails, spending one sender token. Compensating delete doesn't refund.
-		if !s.lim.mailLim.Allow(me) || !s.lim.rcptLim.Allow(rk) {
-			// Rare: Ready passed but Allow failed (concurrent race)
-			if delErr := s.st.DeleteInvite(r.Context(), publicID, me); delErr != nil {
+		// Both ready, consume atomically under lock. Check recipient first so a failed
+		// recipient check doesn't consume sender token (#183).
+		rcptOK := s.lim.rcptLim.Allow(rk)
+		if !rcptOK {
+			s.limiterMu.Unlock()
+			// Recipient exhausted between Ready and Allow
+			if delErr := s.rollbackInvite(r, publicID, me); delErr != nil {
+				s.log.Error("failed to delete invite after rate limit consume", "public_id", publicID, "error", delErr)
+				s.internal(w, fmt.Errorf("rate limit consume failed and invite cleanup failed: %w", delErr))
+				return
+			}
+			w.Header().Set("Retry-After", "600")
+			writeErr(w, http.StatusTooManyRequests, "invite email rate limited; try later or create an invite without to_email and share the code yourself")
+			return
+		}
+		mailOK := s.lim.mailLim.Allow(me)
+		s.limiterMu.Unlock()
+		if !mailOK {
+			// Sender exhausted between Ready and Allow (rare, recipient token already spent)
+			if delErr := s.rollbackInvite(r, publicID, me); delErr != nil {
 				s.log.Error("failed to delete invite after rate limit consume", "public_id", publicID, "error", delErr)
 				s.internal(w, fmt.Errorf("rate limit consume failed and invite cleanup failed: %w", delErr))
 				return
