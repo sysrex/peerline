@@ -950,7 +950,7 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 		s.internal(w, err)
 		return
 	}
-	s.log.Info("peer registered and paired", "peer_id", id, "inviter", g.Owner)
+	s.log.Info("unauthenticated pairing completed", "new_peer", id, "inviter", g.Owner)
 	resp := map[string]any{
 		"peer_id":        id,
 		"api_key":        key,
@@ -962,6 +962,5 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 	if len(sc) > 0 {
 		resp["granted_by_you"] = store.Grant{Owner: id, Grantee: g.Owner, Scopes: sc, Bags: bg}
 	}
-	s.log.Info("pairing accepted (unauthenticated)", "owner", g.Owner, "grantee", id)
 	writeJSON(w, http.StatusCreated, resp)
 }

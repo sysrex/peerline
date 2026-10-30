@@ -63,7 +63,6 @@ CREATE TABLE IF NOT EXISTS bags (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (owner, name)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS invites_pairing_token_hash ON invites(pairing_token_hash) WHERE pairing_token_hash IS NOT NULL;
 `
 
 // Open opens (and migrates) the database at path. Use ":memory:" for tests.
@@ -88,24 +87,27 @@ func Open(path string) (*Store, error) {
 }
 
 func buildDSN(path string) string {
+	pragmas := "_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
 	if path == ":memory:" {
-		return path
+		// Use file-based shared-cache for :memory: so pragmas apply
+		return "file::memory:?mode=memory&cache=shared&" + pragmas
 	}
 	sep := "?"
 	if strings.Contains(path, "?") {
 		sep = "&"
 	}
-	return path + sep + "_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	return path + sep + pragmas
 }
 
 // migrate applies ordered, idempotent schema upgrades tracked by PRAGMA user_version.
 func migrate(db *sql.DB) error {
+	// Read user_version outside tx to avoid holding connection
 	var version int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
 
-	migrations := []func(*sql.DB) error{
+	migrations := []func(*sql.Tx) error{
 		migrateV1NotifyEmail,
 		migrateV2PairingTokenHash,
 	}
@@ -121,7 +123,8 @@ func migrate(db *sql.DB) error {
 			return fmt.Errorf("begin migration v%d: %w", target, err)
 		}
 
-		if err := mig(db); err != nil {
+		// Run migration step on tx (not db) to avoid deadlock with MaxOpenConns=1
+		if err := mig(tx); err != nil {
 			tx.Rollback()
 			return fmt.Errorf("migration v%d: %w", target, err)
 		}
@@ -141,9 +144,9 @@ func migrate(db *sql.DB) error {
 }
 
 // migrateV1NotifyEmail adds the notify_email column to peers.
-func migrateV1NotifyEmail(db *sql.DB) error {
+func migrateV1NotifyEmail(tx *sql.Tx) error {
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name = 'notify_email'`).Scan(&n); err != nil {
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name = 'notify_email'`).Scan(&n); err != nil {
 		return err
 	}
 	if n > 0 {
@@ -151,22 +154,33 @@ func migrateV1NotifyEmail(db *sql.DB) error {
 	}
 	// Plaintext: Peerline has to address the wake-up mail later. The address
 	// is returned only to the peer who set it.
-	_, err := db.Exec(`ALTER TABLE peers ADD COLUMN notify_email TEXT NOT NULL DEFAULT ''`)
+	_, err := tx.Exec(`ALTER TABLE peers ADD COLUMN notify_email TEXT NOT NULL DEFAULT ''`)
 	return err
 }
 
 // migrateV2PairingTokenHash adds the pairing_token_hash column and unique index to invites.
-func migrateV2PairingTokenHash(db *sql.DB) error {
+// PR #11 already added both (without user_version tracking), so this checks before acting.
+func migrateV2PairingTokenHash(tx *sql.Tx) error {
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('invites') WHERE name = 'pairing_token_hash'`).Scan(&n); err != nil {
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('invites') WHERE name = 'pairing_token_hash'`).Scan(&n); err != nil {
 		return err
 	}
 	if n == 0 {
-		if _, err := db.Exec(`ALTER TABLE invites ADD COLUMN pairing_token_hash TEXT`); err != nil {
+		if _, err := tx.Exec(`ALTER TABLE invites ADD COLUMN pairing_token_hash TEXT`); err != nil {
 			return err
 		}
 	}
-	_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS invites_pairing_token_hash ON invites(pairing_token_hash) WHERE pairing_token_hash IS NOT NULL`)
+	// Check if the index already exists. PR #11 created a full unique index (no WHERE clause).
+	// We create a partial index (WHERE NOT NULL). IF NOT EXISTS won't error either way.
+	var hasIndex int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='invites_pairing_token_hash'`).Scan(&hasIndex); err != nil {
+		return err
+	}
+	if hasIndex > 0 {
+		// Index already exists (from PR #11 or a previous run). Keep it as-is.
+		return nil
+	}
+	_, err := tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS invites_pairing_token_hash ON invites(pairing_token_hash) WHERE pairing_token_hash IS NOT NULL`)
 	return err
 }
 
@@ -369,19 +383,13 @@ func (s *Store) AcceptInvite(ctx context.Context, codeHash, accepter string, bac
 }
 
 // RegisterAndAcceptByPairing atomically registers a new peer and accepts a pairing invite.
-// Returns the new peer's ID, key, and the grant from the inviter.
+// Returns the grant from the inviter.
 func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash, peerID, name, keyHash, notifyEmail string, backScopes, backBags []string) (grant *Grant, err error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	// N3: Guarded SELECT to fail early before peer insert
+	// #14 fix: Read-only check before BeginTx to avoid taking write lock for invalid tokens
 	var codeHash, fromPeer string
 	var exp int64
 	var used sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT code_hash,from_peer,expires_at,used_by FROM invites WHERE pairing_token_hash=?`, pairingTokenHash).
+	err = s.db.QueryRowContext(ctx, `SELECT code_hash,from_peer,expires_at,used_by FROM invites WHERE pairing_token_hash=?`, pairingTokenHash).
 		Scan(&codeHash, &fromPeer, &exp, &used)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -389,15 +397,23 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp < now() {
+	ts := now()
+	if used.Valid || exp < ts {
 		return nil, ErrNotFound
 	}
 	if fromPeer == peerID {
 		return nil, ErrConflict
 	}
 
+	// Now begin transaction for writes
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
 	_, err = tx.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email) VALUES(?,?,?,?,?)`,
-		peerID, name, keyHash, now(), notifyEmail)
+		peerID, name, keyHash, ts, notifyEmail)
 	if err != nil {
 		return nil, err
 	}
