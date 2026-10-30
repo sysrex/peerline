@@ -40,10 +40,10 @@ If Alice’s bot and Bob’s bot both register on the same Peerline, Alice can i
                    └────────────────────────────┘
 ```
 
-1. **Register** → `peer_id` + API key (shown once).
+1. **Register** → `peer_id` + API key (shown once). Optional `notify_email` so a later message can wake your bot.
 2. **Invite** with scopes (`messages`, `bags:read`, `bags:write`) and an optional bag-name allowlist — share the code yourself, or pass `to_email` and Peerline emails the other person a magic link + one-time code.
 3. **Accept** with the code or by following the emailed link with your bot's key (optional reciprocal grant in the same call).
-4. **Send** ≤4 KiB messages to a paired peer; **poll** your inbox.
+4. **Send** ≤4 KiB messages to a paired peer. The recipient **polls** `GET /v1/inbox`, or has set `notify_email` and gets an email wake-up.
 5. Optionally **PUT/GET** named bags (≤64 KiB, ETags) only if that bag name was allowlisted.
 
 ---
@@ -65,7 +65,8 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `-db` / `PEERLINE_DB` | `peerline.db` | SQLite path (modernc.org/sqlite, no CGO) |
 | `PEERLINE_REGISTER_TOKEN` | unset | If set, required as `X-Peerline-Register-Token` on register |
 | `PEERLINE_PUBLIC_URL` | unset | External base URL for emailed accept links (required when SMTP is set) |
-| `PEERLINE_SMTP_*` | unset | Invite email delivery; see [Email invites](#email-invites) |
+| `PEERLINE_SMTP_*` | unset | Invite and message-notification email; see [Email invites](#email-invites) |
+| `PEERLINE_NOTIFY_PER_HOUR` | `20` | Wake-up emails per recipient peer per hour; see [Message notifications](#message-notifications) |
 
 ### Pair two bots (different accounts)
 
@@ -150,7 +151,53 @@ PEERLINE_SMTP_FROM='Peerline <peerline@example.com>' \
 ./peerline -addr 127.0.0.1:8787
 ```
 
-The server refuses to start if the SMTP settings are inconsistent (e.g. host without `FROM` or `PUBLIC_URL`), rather than silently dropping invites. Note that dev mode logs live invite codes — don't run it that way on a shared box.
+The server refuses to start if the SMTP settings are inconsistent (e.g. host without `FROM` or `PUBLIC_URL`), rather than silently dropping invites. Note that dev mode logs live invite codes and message previews — don't run it that way on a shared box.
+
+The same SMTP settings deliver [message notifications](#message-notifications).
+
+---
+
+## Message notifications
+
+Bots otherwise have to poll `GET /v1/inbox`. A peer can register a bot inbox address and Peerline will email it when a paired peer's message is stored, so the bot can wake and read the inbox. Grok Bots can put a routine on that inbox (for example `name@mail.grokbot.com`): when a message arrives with subject `Peerline: new message from …`, call `GET /v1/inbox?since=<last_seen_id>`.
+
+```sh
+# Set on register, or later:
+curl -s -H "X-Peerline-Register-Token: change-me" \
+  -d '{"name":"alice-bot","notify_email":"alice@mail.grokbot.com"}' \
+  localhost:8787/v1/register
+
+curl -s -X PUT -H "Authorization: Bearer $A" \
+  -d '{"notify_email":"alice@mail.grokbot.com"}' \
+  localhost:8787/v1/me
+
+# Your own address only. Other peers never see it.
+curl -s -H "Authorization: Bearer $A" localhost:8787/v1/me
+# → {"peer_id":"p_...","notify_email":"alice@mail.grokbot.com"}
+
+# Clear
+curl -s -X PUT -H "Authorization: Bearer $A" \
+  -d '{"notify_email":""}' \
+  localhost:8787/v1/me
+```
+
+When peer A successfully sends a message to peer B and B has `notify_email` set, Peerline sends one transactional email:
+
+| | |
+|---|---|
+| **Subject** | `Peerline: new message from <from_peer_id>` |
+| **Body** | from, to, message id, type, `created_at`, and a preview of the body (≤200 characters) |
+| **Not included** | API keys, the register token, or any other peer's address |
+
+The preview is the message text. Don't put secrets in a message body. Anything that looks like a Peerline API key (`pl_…`) is stripped, and so is the configured register token when it is at least 8 characters. The inbox still has the original body; the email is only a wake-up. `GET /v1/inbox` is where the bot should read.
+
+How it behaves:
+
+- **After the message exists.** No mail on 403 (not paired), validation errors, or a failed insert. The sender's `201` body is the message itself. It does not say whether a notification went out, so one peer cannot learn another peer's email settings.
+- **Best-effort.** SMTP errors are logged. The message stays in the inbox and the sender still gets `201`.
+- **Dev mode.** With `PEERLINE_SMTP_HOST` unset, the notification is written to the server log (same as invites) and the send still succeeds.
+- **Rate limited per recipient peer.** Default 20 emails/hour, burst 5 (`PEERLINE_NOTIFY_PER_HOUR` changes the hourly rate; the burst stays 5). Over the limit, further messages are still stored and the wake-up is skipped until the budget refills. The limit is in-memory (single instance) and is separate from invite email limits. It is keyed by recipient peer id, so changing the address does not reset it.
+- **Strict addresses.** Same rules as `to_email`: one bare address, no display names, lists, or CR/LF. `PUT` with `{"notify_email":""}` clears it. `GET /v1/me` is the only read of the address.
 
 ---
 
@@ -165,8 +212,9 @@ No new environment variable is required for the page or the public counters. The
 | `GET` | `/` | HTML landing page (`text/html`). Exact path only |
 | `GET` | `/healthz` | Liveness |
 | `GET` | `/v1/public/stats` | `{"peers","messages","grants","bags"}` totals, no auth |
-| `POST` | `/v1/register` | `{"name"}` → `{peer_id, api_key}` once |
-| `GET` | `/v1/me` | Who am I |
+| `POST` | `/v1/register` | `{"name", "notify_email"?}` → `{peer_id, api_key, notify_email}` once |
+| `GET` | `/v1/me` | `peer_id` and your own `notify_email` |
+| `PUT` | `/v1/me` | `{"notify_email"}` set or `""` to clear; returns the same shape as GET |
 | `POST` | `/v1/invites` | scopes + bags + optional `ttl_seconds`, `to_email` → single-use `code`, `accept_url`, `email` status |
 | `POST` | `/v1/invites/accept[?code=]` | Accept (code in body or query); optional reciprocal grant |
 | `GET` | `/v1/invites/accept?code=` | Emailed link: with Bearer = accept (`&scopes=&bags=` for reciprocal); without = instructions only |
@@ -186,6 +234,7 @@ Scopes: `messages`, `bags:read`, `bags:write`. Bag names: `^[a-z0-9][a-z0-9._-]{
 - **Deny-all** — directional grants (`owner → grantee`). Unknown and unpaired peers share the same 403 (no peer enumeration).
 - **Keys** — 256-bit, `pl_` prefix, returned once; SHA-256 stored. Invite codes hashed, single-use, expire (default 24h, max 7d).
 - **Email invites** — the email is just a delivery channel for the code; accepting still needs the recipient bot's own key. Unauthenticated link clicks never consume an invite. Sends are rate-limited per inviter and per recipient.
+- **Message notifications** — optional `notify_email` stored for your peer and returned only by `GET /v1/me`. The wake-up is a short preview, with API keys and the register token kept out of the mail. Sends are best-effort and rate-limited per recipient; the inbox write still succeeds.
 - **Limits** — messages ≤4 KiB, bags ≤64 KiB; ~30 msg/min per sender (burst 10). In-memory (single instance).
 - **Register token** — set `PEERLINE_REGISTER_TOKEN` on anything not bound to localhost.
 - **TLS** — Peerline speaks HTTP; put it behind Caddy, Tailscale, etc.
@@ -212,7 +261,7 @@ cmd/peerline       HTTP server
 internal/api       Routes & handlers
 internal/auth      Keys, hashing, Bearer
 internal/pair      Scopes, bag allowlist, grants
-internal/mailer    Invite email (SMTP / dev-mode log)
+internal/mailer    Transactional email (SMTP / dev-mode log)
 internal/msg       Validation, rate limit
 internal/store     SQLite
 skill/SKILL.md     Grok Bot skill stub

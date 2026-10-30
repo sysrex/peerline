@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS peers (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   key_hash TEXT NOT NULL UNIQUE,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  notify_email TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS invites (
   code_hash TEXT PRIMARY KEY,
@@ -77,7 +78,27 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+// migrate adds columns that CREATE TABLE IF NOT EXISTS will not backfill on
+// databases created before they existed.
+func migrate(db *sql.DB) error {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name = 'notify_email'`).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	// Plaintext: Peerline has to address the wake-up mail later. The address
+	// is returned only to the peer who set it.
+	_, err := db.Exec(`ALTER TABLE peers ADD COLUMN notify_email TEXT NOT NULL DEFAULT ''`)
+	return err
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -92,9 +113,31 @@ type Peer struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-func (s *Store) CreatePeer(ctx context.Context, id, name, keyHash string) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at) VALUES(?,?,?,?)`, id, name, keyHash, now())
+func (s *Store) CreatePeer(ctx context.Context, id, name, keyHash, notifyEmail string) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email) VALUES(?,?,?,?,?)`, id, name, keyHash, now(), notifyEmail)
 	return err
+}
+
+// NotifyEmail returns the peer's wake-up address, or "" when unset.
+func (s *Store) NotifyEmail(ctx context.Context, id string) (string, error) {
+	var email string
+	err := s.db.QueryRowContext(ctx, `SELECT notify_email FROM peers WHERE id=?`, id).Scan(&email)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return email, err
+}
+
+// SetNotifyEmail sets or clears the wake-up address. email is "" to clear.
+func (s *Store) SetNotifyEmail(ctx context.Context, id, email string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE peers SET notify_email=? WHERE id=?`, email, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) PeerByKeyHash(ctx context.Context, keyHash string) (*Peer, error) {

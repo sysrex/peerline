@@ -1,4 +1,5 @@
-// Package mailer sends Peerline's transactional email (invite links).
+// Package mailer sends Peerline's transactional email (invite links and
+// new-message notifications).
 //
 // Two implementations: SMTP (configured via PEERLINE_SMTP_* env vars) and a
 // dev-mode Log sender that writes the message to the logger instead of

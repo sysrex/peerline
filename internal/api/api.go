@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sysrex/peerline/internal/auth"
 	"github.com/sysrex/peerline/internal/mailer"
@@ -37,7 +38,8 @@ type Config struct {
 	MsgBurst      int
 	Logger        *slog.Logger
 
-	// Mailer sends invite emails. Nil = dev mode (log the email, never fail).
+	// Mailer sends invite and message-notification emails. Nil = dev mode
+	// (log the email, never fail the request).
 	Mailer mailer.Sender
 	// PublicURL is the externally reachable base URL used in emailed accept
 	// links (e.g. https://peerline.example.com). If empty, it is derived from
@@ -47,6 +49,10 @@ type Config struct {
 	EmailPerHour     int
 	EmailBurst       int
 	EmailRcptPerHour int
+	// NotifyPerHour / NotifyBurst limit message-notification emails per
+	// recipient peer. Separate from the invite limiters.
+	NotifyPerHour int
+	NotifyBurst   int
 }
 
 type Server struct {
@@ -57,7 +63,9 @@ type Server struct {
 	// email send limits: by inviter peer id, and by recipient address
 	mailLim *msg.Limiter
 	rcptLim *msg.Limiter
-	log     *slog.Logger
+	// message-notification emails, by recipient peer id
+	notifyLim *msg.Limiter
+	log       *slog.Logger
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -82,12 +90,19 @@ func New(st *store.Store, cfg Config) *Server {
 	if cfg.EmailRcptPerHour <= 0 {
 		cfg.EmailRcptPerHour = 3
 	}
+	if cfg.NotifyPerHour <= 0 {
+		cfg.NotifyPerHour = 20
+	}
+	if cfg.NotifyBurst <= 0 {
+		cfg.NotifyBurst = 5
+	}
 	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
 	return &Server{st: st, cfg: cfg, log: cfg.Logger,
-		msgLim:  msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst),
-		regLim:  msg.NewLimiter(10, 5),
-		mailLim: msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst),
-		rcptLim: msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour)}
+		msgLim:    msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst),
+		regLim:    msg.NewLimiter(10, 5),
+		mailLim:   msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst),
+		rcptLim:   msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour),
+		notifyLim: msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst)}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -102,6 +117,7 @@ func (s *Server) Handler() http.Handler {
 
 	authed := http.NewServeMux()
 	authed.HandleFunc("GET /v1/me", s.me)
+	authed.HandleFunc("PUT /v1/me", s.updateMe)
 	authed.HandleFunc("POST /v1/invites", s.createInvite)
 	authed.HandleFunc("POST /v1/invites/accept", s.acceptInvite)
 	authed.HandleFunc("GET /v1/invites/accept", s.acceptInvite) // emailed magic link (Bearer required)
@@ -193,7 +209,8 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Name string `json:"name"`
+		Name        string `json:"name"`
+		NotifyEmail string `json:"notify_email"`
 	}
 	if !decode(w, r, &in) {
 		return
@@ -203,20 +220,73 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "name required (max 64 chars)")
 		return
 	}
+	notify, err := normalizeNotifyEmail(in.NotifyEmail)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "notify_email: invalid email address")
+		return
+	}
 	id, key := auth.NewID(), auth.NewKey()
-	if err := s.st.CreatePeer(r.Context(), id, in.Name, auth.Hash(key)); err != nil {
+	if err := s.st.CreatePeer(r.Context(), id, in.Name, auth.Hash(key), notify); err != nil {
 		s.internal(w, err)
 		return
 	}
-	s.log.Info("peer registered", "peer_id", id)
+	s.log.Info("peer registered", "peer_id", id, "notify_email_set", notify != "")
 	writeJSON(w, http.StatusCreated, map[string]string{
-		"peer_id": id, "name": in.Name, "api_key": key,
+		"peer_id": id, "name": in.Name, "api_key": key, "notify_email": notify,
 		"note": "api_key is shown once; store it securely",
 	})
 }
 
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]string{"peer_id": auth.PeerID(r.Context())})
+	id := auth.PeerID(r.Context())
+	email, err := s.st.NotifyEmail(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "peer not found")
+			return
+		}
+		s.internal(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"peer_id": id, "notify_email": email})
+}
+
+func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		NotifyEmail *string `json:"notify_email"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if in.NotifyEmail == nil {
+		writeErr(w, http.StatusBadRequest, "notify_email required")
+		return
+	}
+	email, err := normalizeNotifyEmail(*in.NotifyEmail)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "notify_email: invalid email address")
+		return
+	}
+	me := auth.PeerID(r.Context())
+	if err := s.st.SetNotifyEmail(r.Context(), me, email); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "peer not found")
+			return
+		}
+		s.internal(w, err)
+		return
+	}
+	s.log.Info("notify email updated", "peer_id", me, "set", email != "")
+	s.me(w, r)
+}
+
+// normalizeNotifyEmail returns "" to clear, or one bare address.
+func normalizeNotifyEmail(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	return mailer.ValidAddress(raw)
 }
 
 // ---- pairing ----
@@ -491,7 +561,87 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
+	// Only after the grant check and a successful insert. A denied, invalid,
+	// or unstored message must not wake the recipient. Mail failure and the
+	// notify rate limit do not change this 201: the inbox write already happened.
+	s.notifyNewMessage(r.Context(), m)
 	writeJSON(w, http.StatusCreated, m)
+}
+
+// apiKeyInBody matches Peerline API keys (pl_ + secret). Peer ids are p_ + hex
+// and do not match. Used to keep stored secrets out of notification previews.
+var apiKeyInBody = regexp.MustCompile(`pl_[A-Za-z0-9_-]{8,}`)
+
+const notifyPreviewMax = 200
+
+func (s *Server) notifyNewMessage(ctx context.Context, m *store.Message) {
+	// The message is already stored. Don't drop the wake-up if the client hangs up.
+	ctx = context.WithoutCancel(ctx)
+	email, err := s.st.NotifyEmail(ctx, m.To)
+	if err != nil {
+		s.log.Error("notify email lookup", "recipient", m.To, "message_id", m.ID, "err", err)
+		return
+	}
+	if email == "" {
+		return
+	}
+	if !s.notifyLim.Allow(m.To) {
+		s.log.Warn("notify email rate limited", "recipient", m.To, "message_id", m.ID)
+		return
+	}
+	status := "sent"
+	if s.cfg.Mailer.Mode() == "log" {
+		status = "logged"
+	}
+	if err := s.cfg.Mailer.Send(ctx, s.notifyEmail(m, email)); err != nil {
+		s.log.Error("notify email failed", "recipient", m.To, "message_id", m.ID, "err", err)
+		return
+	}
+	s.log.Info("notify email", "recipient", m.To, "message_id", m.ID, "status", status)
+}
+
+func (s *Server) notifyEmail(m *store.Message, to string) mailer.Message {
+	var b strings.Builder
+	fmt.Fprintf(&b, "From: %s\n", m.From)
+	fmt.Fprintf(&b, "To: %s\n", m.To)
+	fmt.Fprintf(&b, "Message id: %d\n", m.ID)
+	fmt.Fprintf(&b, "Type: %s\n", m.Type)
+	fmt.Fprintf(&b, "Created: %s\n\n", m.CreatedAt.UTC().Format(time.RFC3339))
+	fmt.Fprintf(&b, "Preview:\n%s\n", bodyPreview(m.Body, s.cfg.RegisterToken, notifyPreviewMax))
+	b.WriteString("\nRead the full message from your Peerline inbox (GET /v1/inbox).\n")
+	return mailer.Message{
+		To:      to,
+		Subject: "Peerline: new message from " + m.From,
+		Body:    b.String(),
+	}
+}
+
+// bodyPreview is an excerpt of the message body. It drops ASCII controls
+// (except tab and newline), redacts API keys and a register token of at least
+// 8 characters, and stays within max runes.
+func bodyPreview(body, registerToken string, max int) string {
+	if max < 1 {
+		return ""
+	}
+	clean := strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\t':
+			return r
+		case r < 0x20 || r == 0x7f:
+			return -1
+		default:
+			return r
+		}
+	}, body)
+	if len(registerToken) >= 8 {
+		clean = strings.ReplaceAll(clean, registerToken, "[redacted]")
+	}
+	clean = apiKeyInBody.ReplaceAllString(clean, "[redacted]")
+	if utf8.RuneCountInString(clean) <= max {
+		return clean
+	}
+	rs := []rune(clean)
+	return string(rs[:max-1]) + "…"
 }
 
 func (s *Server) inbox(w http.ResponseWriter, r *http.Request) {

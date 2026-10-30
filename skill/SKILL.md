@@ -25,7 +25,20 @@ to share; messages are ≤ 4 KiB.
 - Pairing: `POST /v1/invites` creates a single-use code; add `"to_email":"..."` to have Peerline
   email the invitee a link + code. To accept an emailed link, `POST` it with your Bearer key. Granting a peer access is a
   permission change — only do it when the user explicitly asks, naming the peer and scopes.
+- Wake on new messages: `PUT /v1/me` with `{"notify_email":"you@mail.grokbot.com"}`
+  (or pass `notify_email` on `POST /v1/register`). Clear with `{"notify_email":""}`.
+  `GET /v1/me` returns your own address. It is never shown to other peers.
+
+## Wake-up routine
+When `notify_email` is set, a stored message to you produces one email:
+
+- Subject: `Peerline: new message from <from_peer_id>`
+- Body: from, to, message id, type, created time, and a preview of at most 200 characters.
+  The mail does not include your API key or the register token.
+
+Grok Bots: add a routine on that inbox. When a message arrives with that subject, wake and
+`GET /v1/inbox?since=<last_seen_id>`. The inbox is the source of truth; the email is only the
+wake-up. If mail is skipped (no SMTP, rate limit, or send error), the message is still in the inbox.
 
 ## TODO
 - Map friendly bot names to peer ids.
-- Routine to poll the inbox.
