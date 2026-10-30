@@ -166,55 +166,97 @@ func rateLimitKey(ip string) string {
 }
 
 // ParseTrustedProxies parses a list of CIDR strings (or bare IPs) into IPNets.
-// IPv4-mapped entries are converted to their IPv4 form; mapped prefixes shorter
-// than /104 are rejected. Overly broad prefixes (/0, below /8 for IPv4, below /32
-// for IPv6) and zone-indexed addresses are rejected (#62, #164, #165).
+// Rejects overly broad prefixes (0.0.0.0/0, ::/0, and prefixes shorter than
+// /8 for IPv4 or /32 for IPv6) to prevent misconfiguration (#62).
+// IPv4-mapped IPv6 prefixes (e.g., ::ffff:10.0.0.0/104) are unmapped and
+// converted to IPv4 (10.0.0.0/8), with the IPv4 /8 floor applied.
+// Rejects zone identifiers (e.g., fe80::1%eth0).
 func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 	var nets []*net.IPNet
-	for _, s := range cidrs {
-		s = strings.TrimSpace(s)
-		if s == "" {
+	for _, cidr := range cidrs {
+		cidr = strings.TrimSpace(cidr)
+		if cidr == "" {
 			continue
 		}
 
-		var p netip.Prefix
-		if strings.Contains(s, "/") {
-			var err error
-			if p, err = netip.ParsePrefix(s); err != nil {
-				return nil, err
+		// Reject zone identifiers
+		if strings.Contains(cidr, "%") {
+			return nil, fmt.Errorf("parsing %q: zone identifiers are not allowed", cidr)
+		}
+
+		// Parse as prefix or bare IP
+		var prefix netip.Prefix
+		var err error
+		if strings.Contains(cidr, "/") {
+			// CIDR notation
+			prefix, err = netip.ParsePrefix(cidr)
+			if err != nil {
+				return nil, fmt.Errorf("parsing %q: %w", cidr, err)
 			}
 		} else {
-			addr, err := netip.ParseAddr(s)
+			// Bare IP - convert to /32 or /128
+			addr, err := netip.ParseAddr(cidr)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("parsing %q: %w", cidr, err)
 			}
-			if addr.Zone() != "" {
-				return nil, fmt.Errorf("parsing %q: zone-indexed addresses are not supported", s)
+			// Bare IPv4-mapped IPv6 addresses like ::ffff:10.0.0.1 should unmap to IPv4/32
+			if addr.Is4In6() {
+				addr = addr.Unmap()
 			}
-			p = netip.PrefixFrom(addr, addr.BitLen())
+			if addr.Is4() {
+				prefix = netip.PrefixFrom(addr, 32)
+			} else {
+				prefix = netip.PrefixFrom(addr, 128)
+			}
 		}
 
-		addr, bits := p.Addr(), p.Bits()
+		// Check for IPv4-mapped IPv6 prefixes BEFORE masking
+		addr := prefix.Addr()
 		if addr.Is4In6() {
-			if bits < 104 {
-				return nil, fmt.Errorf("parsing %q: IPv4-mapped prefix must be at least /104", s)
+			// This is an IPv4-mapped IPv6 prefix like ::ffff:10.0.0.0/104
+			bits := prefix.Bits()
+			if bits < 96 {
+				return nil, fmt.Errorf("parsing %q: IPv4-mapped IPv6 prefix must be at least /96", cidr)
 			}
-			addr, bits = addr.Unmap(), bits-96
-		}
-		if bits == 0 {
-			return nil, fmt.Errorf("parsing %q: prefix length /0 is too broad", s)
-		}
-		if addr.Is4() && bits < 8 {
-			return nil, fmt.Errorf("parsing %q: IPv4 prefix must be at least /8", s)
-		}
-		if addr.Is6() && bits < 32 {
-			return nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /32", s)
+			ipv4PrefixLen := bits - 96
+			// Apply IPv4 rules: reject /0, require at least /8
+			if ipv4PrefixLen == 0 {
+				return nil, fmt.Errorf("parsing %q: IPv4-mapped prefix covers all of IPv4 (equivalent to 0.0.0.0/0)", cidr)
+			}
+			if ipv4PrefixLen < 8 {
+				return nil, fmt.Errorf("parsing %q: IPv4-mapped prefix must map to at least /8 in IPv4 (need /%d or longer)", cidr, 96+8)
+			}
+			// Unmap to native IPv4 prefix
+			unmapped := addr.Unmap()
+			prefix = netip.PrefixFrom(unmapped, ipv4PrefixLen)
 		}
 
-		nets = append(nets, &net.IPNet{
-			IP:   netip.PrefixFrom(addr, bits).Masked().Addr().AsSlice(),
-			Mask: net.CIDRMask(bits, addr.BitLen()),
-		})
+		// Normalize the prefix (mask it)
+		prefix = prefix.Masked()
+
+		// Check prefix length
+		bits := prefix.Bits()
+		if bits == 0 {
+			return nil, fmt.Errorf("parsing %q: prefix length /0 is too broad", cidr)
+		}
+		if prefix.Addr().Is4() {
+			if bits < 8 {
+				return nil, fmt.Errorf("parsing %q: IPv4 prefix must be at least /8", cidr)
+			}
+		} else {
+			if bits < 32 {
+				return nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /32", cidr)
+			}
+		}
+
+		// Convert netip.Prefix to *net.IPNet
+		// We need to convert because clientIP uses []*net.IPNet
+		ipnetStr := prefix.String()
+		_, ipnet, err := net.ParseCIDR(ipnetStr)
+		if err != nil {
+			return nil, fmt.Errorf("converting %q to IPNet: %w", ipnetStr, err)
+		}
+		nets = append(nets, ipnet)
 	}
 	return nets, nil
 }

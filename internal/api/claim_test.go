@@ -110,7 +110,7 @@ func setupClaim(t *testing.T) *claimEnv {
 	}
 	t.Cleanup(func() { st.Close() })
 	logs := &bytes.Buffer{}
-	s := New(st, Config{CodePepper: []byte("p"), Logger: slog.New(slog.NewTextHandler(logs, nil))})
+	s := mustNew(t, st, Config{CodePepper: []byte("p"), Logger: slog.New(slog.NewTextHandler(logs, nil))})
 	s.lim.pairLim = msg.NewLimiter(1000, 1000)
 	f := &fakeClaims{byTok: map[string]*ClaimInvite{}, fails: map[string]int{}}
 	s.SetClaimStore(f)
@@ -237,7 +237,7 @@ func TestClaimLimiterIgnoresTokenValidity(t *testing.T) {
 	srv := httptest.NewServer(func() *Server {
 		st, _ := store.Open(t.TempDir() + "/l.db")
 		t.Cleanup(func() { st.Close() })
-		s := New(st, Config{CodePepper: []byte("p")})
+		s := mustNew(t, st, Config{CodePepper: []byte("p")})
 		s.SetClaimStore(e.fake)
 		return s
 	}().Handler())

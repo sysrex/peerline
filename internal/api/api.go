@@ -86,7 +86,7 @@ type Server struct {
 	testInviteCreatedHook func(peerID string)
 }
 
-func New(st *store.Store, cfg Config) *Server {
+func New(st *store.Store, cfg Config) (*Server, error) {
 	if cfg.MsgPerMinute <= 0 {
 		cfg.MsgPerMinute = 30
 	}
@@ -128,9 +128,18 @@ func New(st *store.Store, cfg Config) *Server {
 
 	trustedNets, err := ParseTrustedProxies(cfg.TrustedProxies)
 	if err != nil {
-		// This should have been caught at startup, log and continue with empty list
-		cfg.Logger.Warn("invalid trusted proxy CIDR, ignoring", "err", err)
-		trustedNets = nil
+		return nil, fmt.Errorf("invalid trusted proxy configuration: %w", err)
+	}
+
+	// Log parsed trusted networks at startup
+	if len(trustedNets) > 0 {
+		var prefixes []string
+		for _, n := range trustedNets {
+			prefixes = append(prefixes, n.String())
+		}
+		cfg.Logger.Info("trusted proxy networks configured", "prefixes", strings.Join(prefixes, ", "))
+	} else if len(cfg.TrustedProxies) == 0 {
+		cfg.Logger.Warn("no trusted proxies configured: X-Forwarded-For will be ignored")
 	}
 
 	s := &Server{
@@ -145,7 +154,7 @@ func New(st *store.Store, cfg Config) *Server {
 	// Start maintenance tasks
 	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, cfg.RetentionSeconds)
 
-	return s
+	return s, nil
 }
 
 // Stop gracefully stops background tasks.

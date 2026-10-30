@@ -21,7 +21,7 @@ func newLimitedServer(t *testing.T, trusted []string, clk *fakeClock) http.Handl
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	srv := New(st, Config{TrustedProxies: trusted, Now: clk.now})
+	srv := mustNew(t, st, Config{TrustedProxies: trusted, Now: clk.now})
 	t.Cleanup(srv.lim.Stop)
 	return srv.Handler()
 }
@@ -133,10 +133,13 @@ func TestLimiter429ContractAndRefill(t *testing.T) {
 	}
 }
 
-func TestZonedTrustedProxyDoesNotPanic(t *testing.T) {
-	clk := &fakeClock{time.Unix(1000, 0)}
-	h := newLimitedServer(t, []string{"fe80::1%eth0"}, clk)
-	if rr := do(h, "GET", "/", "[fe80::1]:1", "203.0.113.9"); rr.Code != 200 {
-		t.Fatalf("got %d, want 200", rr.Code)
+func TestZonedTrustedProxyRejectedAtStartup(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if _, err := New(st, Config{TrustedProxies: []string{"fe80::1%eth0"}}); err == nil {
+		t.Fatal("zone-indexed trusted proxy must be rejected before serving requests")
 	}
 }
