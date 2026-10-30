@@ -223,6 +223,16 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		return nil, fmt.Errorf("check if database is empty: %w", err)
 	}
 
+	var backupPath string
+	var reused bool
+	if currentVersion < SchemaVersion() && !opts.SkipMigrationBackup && !isEmpty {
+		backupPath, reused, err = backupBeforeMigration(db, path, currentVersion, SchemaVersion(), opts)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("migrate: %w", err)
+		}
+	}
+
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
@@ -233,7 +243,7 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		nowFunc = func() int64 { return time.Now().Unix() }
 	}
 
-	backupPath, reused, schemaInUse, err := migrateWithBackup(db, path, currentVersion, isEmpty, opts)
+	schemaInUse, err := runMigrations(db, currentVersion, opts)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -310,42 +320,22 @@ func setupBackupDir(dir string, logger *slog.Logger) error {
 	return nil
 }
 
-// migrateWithBackup applies migrations with pre-migration backup and returns (backupPath, reused, finalVersion, error).
-func migrateWithBackup(db *sql.DB, dbPath string, currentVersion int, wasEmpty bool, opts OpenOptions) (string, bool, int, error) {
+// runMigrations applies pending migrations and returns the resulting schema version.
+func runMigrations(db *sql.DB, currentVersion int, opts OpenOptions) (int, error) {
 	maxKnownVersion := SchemaVersion()
-
-	// If already at max, no migrations needed
 	if currentVersion >= maxKnownVersion {
-		return "", false, currentVersion, nil
+		return currentVersion, nil
 	}
-
-	// Take backup before migrations (unless skipped or database was empty)
-	var backupPath string
-	var reused bool
-	if !opts.SkipMigrationBackup && !wasEmpty {
-		var err error
-		backupPath, reused, err = backupBeforeMigration(db, dbPath, currentVersion, maxKnownVersion, opts)
-		if err != nil {
-			return "", false, 0, err
-		}
-	}
-
-	// Run migrations
 	for i, mig := range migrations {
-		target := i + 1
-		if err := runMigrationStep(db, target, mig, maxKnownVersion, opts); err != nil {
-			return backupPath, reused, 0, err
+		if err := runMigrationStep(db, i+1, mig, maxKnownVersion, opts); err != nil {
+			return 0, err
 		}
 	}
-
-	// Verify final version
-	finalVersion, err := checkSchemaVersion(db)
-	if err != nil {
-		return backupPath, reused, 0, err
-	}
-
-	return backupPath, reused, finalVersion, nil
+	return checkSchemaVersion(db)
 }
+
+// backupSuffixRE matches the timestamp (and optional PID) suffix of backups we create.
+const backupSuffixRE = `\.\d{8}-\d{6}\.\d{6}(\.\d+)?$`
 
 // backupBeforeMigration creates a VACUUM INTO backup of the database before applying migrations.
 // For :memory: databases or brand-new databases, no backup is taken.
@@ -380,7 +370,7 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 	dbBase := filepath.Base(dbPath)
 
 	// Check for existing backup matching this migration
-	pattern := regexp.MustCompile(`^` + regexp.QuoteMeta(dbBase) + `\.pre-v` + fmt.Sprintf("%d", targetVersion) + `-from-v` + fmt.Sprintf("%d", currentVersion) + `\..*`)
+	pattern := regexp.MustCompile(`^` + regexp.QuoteMeta(dbBase) + `\.pre-v` + fmt.Sprintf("%d", targetVersion) + `-from-v` + fmt.Sprintf("%d", currentVersion) + backupSuffixRE)
 	entries, err := os.ReadDir(backupDir)
 	if err != nil {
 		return "", false, fmt.Errorf("read backup directory: %w", err)
@@ -431,6 +421,9 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 	timestamp := time.Unix(nowFunc(), 0).UTC().Format("20060102-150405.000000")
 	backupName := fmt.Sprintf("%s.pre-v%d-from-v%d.%s", dbBase, targetVersion, currentVersion, timestamp)
 	backupPath := filepath.Join(backupDir, backupName)
+	if _, err := os.Lstat(backupPath); err == nil {
+		backupPath = fmt.Sprintf("%s.%d", backupPath, os.Getpid())
+	}
 
 	// Check available disk space
 	if err := checkDiskSpace(db, backupDir, opts.Logger); err != nil {
@@ -450,6 +443,11 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 		// Clean up partial backup
 		os.Remove(backupPath)
 		return "", false, fmt.Errorf("VACUUM INTO backup: %w", err)
+	}
+
+	if err := os.Chmod(backupPath, 0600); err != nil {
+		os.Remove(backupPath)
+		return "", false, fmt.Errorf("chmod backup: %w", err)
 	}
 
 	// Fsync the backup file
@@ -497,10 +495,16 @@ func verifyBackup(backupPath string, expectedVersion int) error {
 		return fmt.Errorf("backup user_version %d != expected %d", version, expectedVersion)
 	}
 
-	// Check peers table is queryable
-	var count int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM peers`).Scan(&count); err != nil {
-		return fmt.Errorf("query peers table: %w", err)
+	// Check peers table is queryable (absent in databases predating the schema)
+	var hasPeers int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='peers'`).Scan(&hasPeers); err != nil {
+		return fmt.Errorf("check peers table: %w", err)
+	}
+	if hasPeers > 0 {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM peers`).Scan(&count); err != nil {
+			return fmt.Errorf("query peers table: %w", err)
+		}
 	}
 
 	return nil
@@ -508,7 +512,7 @@ func verifyBackup(backupPath string, expectedVersion int) error {
 
 // enforceBackupRetention deletes old backups, keeping at most keepCount total (including excludePath).
 func enforceBackupRetention(backupDir, dbBase, excludePath string, keepCount int, logger *slog.Logger) error {
-	pattern := dbBase + ".pre-v"
+	pattern := regexp.MustCompile(`^` + regexp.QuoteMeta(dbBase) + `\.pre-v\d+-from-v\d+` + backupSuffixRE)
 
 	entries, err := os.ReadDir(backupDir)
 	if err != nil {
@@ -522,7 +526,7 @@ func enforceBackupRetention(backupDir, dbBase, excludePath string, keepCount int
 	var backups []backupInfo
 
 	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), pattern) {
+		if pattern.MatchString(entry.Name()) {
 			fullPath := filepath.Join(backupDir, entry.Name())
 			if fullPath == excludePath {
 				continue
