@@ -81,11 +81,11 @@ func TestEmailInviteDevMode(t *testing.T) {
 		t.Fatalf("expected 1 email, got %d", len(msgs))
 	}
 	if !strings.Contains(msgs[0].Body, inv.Code) {
-		t.Fatalf("email body should contain invite code %s, got: %s", inv.Code, msgs[0].Body)
+		t.Fatalf("email body should contain invite code %s", inv.Code)
 	}
-	// Email should contain the code in the accept URL and as a standalone one-time code
+	// Email should contain the code in the accept URL
 	if !strings.Contains(msgs[0].Body, "?code="+inv.Code) {
-		t.Fatalf("email body should contain code in URL, got: %s", msgs[0].Body)
+		t.Fatalf("email body should contain code in URL query string")
 	}
 
 	// Fix #26: invite code must NOT appear in logs
