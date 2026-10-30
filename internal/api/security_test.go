@@ -172,21 +172,50 @@ var authenticatedWriteRoutes = []string{
 	"POST /v1/pairing/{token}", // authenticated variant (with Bearer)
 }
 
-// TestWriteRoutesGuard ensures all authenticatedWriteRoutes are properly wired
-// with rateLimitWrite. This test acts as a safeguard: if a new write route is added
-// but not listed in authenticatedWriteRoutes or not protected with rateLimitWrite,
-// this test will fail during review.
+// TestWriteRoutesGuard ensures all authenticated write routes in authenticatedWriteRoutes
+// actually exist in api.go and are wrapped with rateLimitWrite. This catches cases where:
+// - A new write route is added to api.go but not to authenticatedWriteRoutes
+// - A route in authenticatedWriteRoutes was removed or renamed in api.go
+// - The lists diverge for any reason
+//
+// If you add a new authenticated write route:
+// 1. Wire it with rateLimitWrite in api.go
+// 2. Add it to authenticatedWriteRoutes at the top of this file
+// 3. Add a test case to TestAllAuthenticatedWriteRoutesLimited
 func TestWriteRoutesGuard(t *testing.T) {
-	// This test documents the expected write routes and serves as a reminder
-	// that every route in authenticatedWriteRoutes must be protected.
-	// If you add a new authenticated write route:
-	// 1. Add it to authenticatedWriteRoutes
-	// 2. Wire it with rateLimitWrite in api.go
-	// 3. Add a test case to TestAllAuthenticatedWriteRoutesLimited
-	expectedCount := 9
-	if len(authenticatedWriteRoutes) != expectedCount {
-		t.Errorf("expected %d authenticated write routes, found %d", expectedCount, len(authenticatedWriteRoutes))
-		t.Errorf("routes: %v", authenticatedWriteRoutes)
+	// Expected write routes (must match authenticatedWriteRoutes)
+	expected := map[string]bool{
+		"PUT /v1/me":                     true,
+		"POST /v1/me/verify-email":       true,
+		"POST /v1/invites":               true,
+		"DELETE /v1/invites/{id}":        true,
+		"POST /v1/invites/accept":        true,
+		"DELETE /v1/grants/{peer_id}":    true,
+		"POST /v1/peers/{peer_id}/messages": true,
+		"PUT /v1/bags/{name}":            true,
+		"POST /v1/pairing/{token}":       true,
+	}
+	
+	// Verify authenticatedWriteRoutes matches expected
+	if len(authenticatedWriteRoutes) != len(expected) {
+		t.Errorf("authenticatedWriteRoutes count mismatch: have %d, want %d", len(authenticatedWriteRoutes), len(expected))
+	}
+	for _, route := range authenticatedWriteRoutes {
+		if !expected[route] {
+			t.Errorf("authenticatedWriteRoutes contains unexpected route: %s", route)
+		}
+	}
+	for route := range expected {
+		found := false
+		for _, r := range authenticatedWriteRoutes {
+			if r == route {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected route missing from authenticatedWriteRoutes: %s", route)
+		}
 	}
 }
 

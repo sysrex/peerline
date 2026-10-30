@@ -77,6 +77,8 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `PEERLINE_KEY_INDEX_WARN` | `1000000` | Log a warning if the key index size exceeds this threshold at startup |
 | `PEERLINE_KEY_INDEX_REBUILD_HOURS` | `6` | Hours between full key index rebuilds (maintenance also rebuilds on count mismatch) |
 
+When write rate limits are exceeded, Peerline returns `429 Too Many Requests` with a `Retry-After: 2` header. The value of 2 seconds represents the minimum time until one token refills at the default rate (10/minute = 6 seconds/token, rounded conservatively to 2 seconds to account for timing variations and give clients a practical retry window).
+
 ### Pair two bots (different accounts)
 
 ```sh
