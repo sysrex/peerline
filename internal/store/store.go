@@ -12,6 +12,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Test hook: called after peer INSERT in RegisterAndAcceptByPairing, before COMMIT.
+// Nil in production. Tests can set this to inject cancellation or other failures.
+var afterPeerInsertHook func()
+
 var ErrNotFound = errors.New("not found")
 var ErrConflict = errors.New("conflict")
 
@@ -461,6 +465,11 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 		peerID, name, keyHash, ts, notifyEmail)
 	if err != nil {
 		return nil, err
+	}
+
+	// Test hook: allows injecting failures after peer INSERT
+	if afterPeerInsertHook != nil {
+		afterPeerInsertHook()
 	}
 
 	grant, err = acceptInviteInTx(ctx, tx, codeHash, peerID, backScopes, backBags)

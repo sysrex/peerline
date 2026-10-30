@@ -816,9 +816,9 @@ func TestRollbackAfterPeerInsert(t *testing.T) {
 	}
 }
 
-// TestContextCancellationMidAccept verifies the DB isn't wedged when context is cancelled mid-transaction.
-func TestContextCancellationMidAccept(t *testing.T) {
-	path := t.TempDir() + "/cancel.db"
+// TestContextCancellationBeforeTransaction verifies that cancelling before BeginTx doesn't wedge the DB.
+func TestContextCancellationBeforeTransaction(t *testing.T) {
+	path := t.TempDir() + "/cancel-before.db"
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -883,6 +883,87 @@ func TestContextCancellationMidAccept(t *testing.T) {
 	_, err = s.RegisterAndAcceptByPairing(normalCtx, pairingHash, "dave", "Dave", "hd", "", nil, nil)
 	if err != nil {
 		t.Fatalf("pairing redemption failed after cancel: %v", err)
+	}
+
+	var peerCount int
+	s.db.QueryRow(`SELECT COUNT(*) FROM peers`).Scan(&peerCount)
+	if peerCount != 3 {
+		t.Errorf("got %d peers, want 3 (alice, carol, dave)", peerCount)
+	}
+}
+
+// TestContextCancellationMidTransaction verifies that cancelling after BeginTx and after the peer INSERT
+// rolls back correctly, leaving no orphan peer and the invite unconsumed.
+func TestContextCancellationMidTransaction(t *testing.T) {
+	// Save original hook and restore after test
+	origHook := afterPeerInsertHook
+	defer func() { afterPeerInsertHook = origHook }()
+
+	path := t.TempDir() + "/cancel-mid-tx.db"
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	pairingHash := "cancel_hash"
+	exp := time.Now().Add(time.Hour)
+	if err := s.CreateInviteWithPairing(ctx, "code1", pairingHash, "alice", []string{"messages"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set up hook to cancel context after peer INSERT
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	afterPeerInsertHook = func() {
+		cancel()
+		// Give the cancellation a moment to propagate
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Try to register and accept - should fail due to cancellation after INSERT
+	_, err = s.RegisterAndAcceptByPairing(cancelCtx, pairingHash, "bob", "Bob", "hb", "", nil, nil)
+	if err == nil {
+		t.Fatal("expected error after mid-transaction cancel")
+	}
+	if !errors.Is(err, context.Canceled) && err != context.Canceled {
+		t.Logf("got error: %v (acceptable if transaction rolled back)", err)
+	}
+
+	// Clear the hook for subsequent operations
+	afterPeerInsertHook = nil
+
+	// Verify no orphan peer was created
+	var bobCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE id='bob'`).Scan(&bobCount); err != nil {
+		t.Fatal(err)
+	}
+	if bobCount != 0 {
+		t.Error("orphan peer 'bob' created after mid-transaction cancel")
+	}
+
+	// Verify the invite was not consumed
+	var used sql.NullString
+	if err := s.db.QueryRow(`SELECT used_by FROM invites WHERE pairing_token_hash=?`, pairingHash).Scan(&used); err != nil {
+		t.Fatal(err)
+	}
+	if used.Valid {
+		t.Error("invite was consumed after mid-transaction cancel")
+	}
+
+	// Verify DB isn't wedged: next accept should succeed
+	normalCtx := context.Background()
+	if _, err := s.RegisterAndAcceptByPairing(normalCtx, pairingHash, "carol", "Carol", "hc", "", nil, nil); err != nil {
+		t.Fatalf("DB wedged after mid-tx cancel: %v", err)
+	}
+
+	// Verify a plain write succeeds
+	if err := s.CreatePeer(normalCtx, "dave", "Dave", "hd", ""); err != nil {
+		t.Fatalf("plain write failed after mid-tx cancel: %v", err)
 	}
 
 	var peerCount int
@@ -1231,8 +1312,46 @@ func TestPragmasInEffect(t *testing.T) {
 				t.Errorf("foreign_keys = %d, want 1", fkEnabled)
 			}
 
-			// Verify _txlock=immediate behavior is tested in TestContextCancellationMidAccept
-			// which verifies that BeginTx takes the write lock immediately by blocking concurrent operations
+			// Verify _txlock=immediate: Begin() should take the write lock immediately,
+			// not defer it until the first write (which is DEFERRED behavior)
+			if tt.name == "file" {
+				// Only test with file DB (memory DB with single connection can't show this)
+				s2, err := Open(tt.path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer s2.Close()
+
+				// Start a transaction on first connection and do nothing
+				tx1, err := s.db.Begin()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx1.Rollback()
+
+				// Try to begin a transaction on second connection - should block or fail
+				// because the first connection already holds the write lock
+				done := make(chan error, 1)
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+					defer cancel()
+					tx2, err := s2.db.BeginTx(ctx, nil)
+					if err != nil {
+						done <- err
+						return
+					}
+					tx2.Rollback()
+					done <- nil
+				}()
+
+				err = <-done
+				if err == nil {
+					t.Error("second BeginTx succeeded, but first tx should hold write lock (_txlock=immediate not active)")
+				} else if !errors.Is(err, context.DeadlineExceeded) {
+					// Also accept SQLITE_BUSY or similar errors
+					t.Logf("second BeginTx blocked/failed as expected: %v", err)
+				}
+			}
 		})
 	}
 }
