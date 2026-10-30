@@ -3479,7 +3479,7 @@ func TestVersionEndpoint(t *testing.T) {
 						t.Errorf("unexpected key %q in response (expected only %v)", key, tt.wantKeys)
 					}
 				}
-				
+
 				// Check expected keys are present and non-empty
 				for _, key := range tt.wantKeys {
 					val, ok := info[key]
@@ -3510,7 +3510,7 @@ func TestVersionEndpoint(t *testing.T) {
 				if strings.Contains(version, "/") || strings.Contains(version, "merge") {
 					t.Errorf("version should not contain branch-like strings, got %q", version)
 				}
-				
+
 				// Assert security headers from securityHeaders wrapper
 				headers := map[string]string{
 					"Content-Security-Policy": "default-src 'none'",
@@ -3566,12 +3566,12 @@ func TestVersionEndpointRateLimit(t *testing.T) {
 
 		if resp.StatusCode == http.StatusTooManyRequests {
 			foundRateLimit = true
-			
+
 			// Check for Retry-After header
 			if ra := resp.Header.Get("Retry-After"); ra == "" {
 				t.Error("429 response should include Retry-After header")
 			}
-			
+
 			// Check uniform 429 body
 			var errResp map[string]string
 			if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
@@ -3579,12 +3579,12 @@ func TestVersionEndpointRateLimit(t *testing.T) {
 			} else if errMsg, ok := errResp["error"]; !ok || !strings.Contains(errMsg, "rate") {
 				t.Errorf("429 response should contain rate limit error, got: %v", errResp)
 			}
-			
+
 			// Verify security headers are present on 429
 			if csp := resp.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'none'") {
 				t.Errorf("429 missing strict CSP, got: %s", csp)
 			}
-			
+
 			resp.Body.Close()
 			break
 		}
