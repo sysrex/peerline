@@ -14,7 +14,7 @@ func TestLargerBurstRatePruneFloor(t *testing.T) {
 	// pruneAfter = max(2h, 2×5/(1/3600) = 36000s = 10h) = 10h
 	l := NewLimiterPerHour(1, 5)
 	clock := time.Unix(0, 0)
-	l.now = func() time.Time { return clock }
+	l.TestSetClock(func() time.Time { return clock })
 
 	// Use key "slow"
 	l.Allow("slow")

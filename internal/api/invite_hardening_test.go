@@ -274,7 +274,7 @@ func TestCapBeforeEmailBudget(t *testing.T) {
 // TestGETLimiterSeparateBuckets verifies that two clients behind a trusted
 // proxy with different X-Forwarded-For headers get separate getLim buckets,
 // and the same client shares one bucket. Uses frozen clock for deterministic
-// behavior. Closes issue #168.
+// behavior. Closes issue #168. Tests literal values: 60/min, burst 20, Retry-After "10".
 func TestGETLimiterSeparateBuckets(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/test.db")
 	if err != nil {
@@ -290,7 +290,7 @@ func TestGETLimiterSeparateBuckets(t *testing.T) {
 
 	// Freeze clock to avoid wall-clock refill
 	clock := time.Unix(1000, 0)
-	srv.lim.SetClock(func() time.Time { return clock })
+	srv.lim.testSetClock(func() time.Time { return clock })
 
 	handler := srv.Handler()
 
@@ -304,21 +304,25 @@ func TestGETLimiterSeparateBuckets(t *testing.T) {
 		return rr, rr.Body.Bytes()
 	}
 
-	// Exhaust client 1's bucket: GetBurst=20, so 20 requests succeed
-	for i := 0; i < GetBurst; i++ {
+	// Exhaust client 1's bucket: burst=20, so 20 requests succeed
+	const burst = 20 // Literal value per review
+	for i := 0; i < burst; i++ {
 		rr, body := makeRequest("1.2.3.4")
 		if rr.Code != 200 {
 			t.Fatalf("request %d from client 1: expected 200, got %d: %s", i+1, rr.Code, body)
 		}
 	}
 
-	// Request GetBurst+1 should be rate limited with Retry-After header
+	// Request 21 should be rate limited with Retry-After header
 	rr, body := makeRequest("1.2.3.4")
 	if rr.Code != 429 {
-		t.Errorf("request %d from client 1: expected 429 (rate limited), got %d", GetBurst+1, rr.Code)
+		t.Errorf("request %d from client 1: expected 429 (rate limited), got %d", burst+1, rr.Code)
 	}
-	if ra := rr.Header().Get("Retry-After"); ra != GetRetryAfter {
-		t.Errorf("expected Retry-After: %s, got %q", GetRetryAfter, ra)
+	if ra := rr.Header().Get("Retry-After"); ra != "10" {
+		t.Errorf("expected Retry-After: 10, got %q", ra)
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected Content-Type: application/json, got %q", ct)
 	}
 	var errResp map[string]string
 	if err := json.Unmarshal(body, &errResp); err != nil {
@@ -338,8 +342,58 @@ func TestGETLimiterSeparateBuckets(t *testing.T) {
 	if rr.Code != 429 {
 		t.Errorf("client 1 should still be rate limited, got %d", rr.Code)
 	}
-	if ra := rr.Header().Get("Retry-After"); ra != GetRetryAfter {
-		t.Errorf("client 1 retry: expected Retry-After: %s, got %q", GetRetryAfter, ra)
+	if ra := rr.Header().Get("Retry-After"); ra != "10" {
+		t.Errorf("client 1 retry: expected Retry-After: 10, got %q", ra)
+	}
+}
+
+// TestGETLimiterTokenRefill verifies that after exhausting the GET limiter,
+// advancing the clock refills tokens and allows new requests. Closes issue #178.
+func TestGETLimiterTokenRefill(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	cfg := Config{
+		Logger: slog.Default(),
+	}
+	srv := New(st, cfg)
+
+	// Freeze clock at epoch
+	clock := time.Unix(1000, 0)
+	srv.lim.testSetClock(func() time.Time { return clock })
+
+	handler := srv.Handler()
+
+	makeRequest := func() int {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = "203.0.113.10:12345"
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		return rr.Code
+	}
+
+	// Exhaust burst (20 tokens)
+	const burst = 20
+	for i := 0; i < burst; i++ {
+		if code := makeRequest(); code != 200 {
+			t.Fatalf("request %d: expected 200, got %d", i+1, code)
+		}
+	}
+
+	// Next request should be rate limited
+	if code := makeRequest(); code != 429 {
+		t.Errorf("request %d: expected 429, got %d", burst+1, code)
+	}
+
+	// Advance clock by 60 seconds (refills 60 tokens at 60/min = 1 token/sec)
+	clock = clock.Add(60 * time.Second)
+
+	// Now requests should succeed again (refilled at least 1 token)
+	if code := makeRequest(); code != 200 {
+		t.Errorf("after clock advance: expected 200, got %d", code)
 	}
 }
 
@@ -361,7 +415,7 @@ func TestUntrustedClientRotatingXFF(t *testing.T) {
 
 	// Freeze clock
 	clock := time.Unix(1000, 0)
-	srv.lim.SetClock(func() time.Time { return clock })
+	srv.lim.testSetClock(func() time.Time { return clock })
 
 	handler := srv.Handler()
 
@@ -377,8 +431,9 @@ func TestUntrustedClientRotatingXFF(t *testing.T) {
 		return rr, rr.Body.Bytes()
 	}
 
-	// Exhaust the bucket with GetBurst requests
-	for i := 0; i < GetBurst; i++ {
+	// Exhaust the bucket with burst requests (20 tokens)
+	const burst = 20
+	for i := 0; i < burst; i++ {
 		rr, body := makeRequest("1.1.1.1") // Spoofed XFF
 		if rr.Code != 200 {
 			t.Fatalf("request %d: expected 200, got %d: %s", i+1, rr.Code, body)
@@ -390,8 +445,11 @@ func TestUntrustedClientRotatingXFF(t *testing.T) {
 	if rr.Code != 429 {
 		t.Errorf("untrusted client rotating XFF: expected 429, got %d (bucket should not be fresh)", rr.Code)
 	}
-	if ra := rr.Header().Get("Retry-After"); ra != GetRetryAfter {
-		t.Errorf("expected Retry-After: %s, got %q", GetRetryAfter, ra)
+	if ra := rr.Header().Get("Retry-After"); ra != "10" {
+		t.Errorf("expected Retry-After: 10, got %q", ra)
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected Content-Type: application/json, got %q", ct)
 	}
 	var errResp map[string]string
 	if err := json.Unmarshal(body, &errResp); err != nil {
@@ -407,9 +465,57 @@ func TestUntrustedClientRotatingXFF(t *testing.T) {
 	}
 }
 
+// TestUntrustedClientRotatingXFFDefaultConfig verifies XFF spoofing protection
+// even when TrustedProxies is empty (default config). RemoteAddr is always used.
+func TestUntrustedClientRotatingXFFDefaultConfig(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	cfg := Config{
+		Logger: slog.Default(),
+		// TrustedProxies is empty (default)
+	}
+	srv := New(st, cfg)
+
+	// Freeze clock
+	clock := time.Unix(1000, 0)
+	srv.lim.testSetClock(func() time.Time { return clock })
+
+	handler := srv.Handler()
+
+	makeRequest := func(remoteAddr, spoofedXFF string) int {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = remoteAddr
+		if spoofedXFF != "" {
+			req.Header.Set("X-Forwarded-For", spoofedXFF)
+		}
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		return rr.Code
+	}
+
+	// Exhaust bucket from 203.0.113.100 with rotating XFF
+	const burst = 20
+	for i := 0; i < burst; i++ {
+		code := makeRequest("203.0.113.100:12345", "spoofed.example.com")
+		if code != 200 {
+			t.Fatalf("request %d: expected 200, got %d", i+1, code)
+		}
+	}
+
+	// Next request with different XFF should still be rate limited (same RemoteAddr)
+	code := makeRequest("203.0.113.100:12345", "different-spoof.example.com")
+	if code != 429 {
+		t.Errorf("same RemoteAddr with different XFF: expected 429, got %d", code)
+	}
+}
+
 // TestAnonymousGETDoesNotBlockAuthenticatedInbox verifies that an anonymous
 // client exhausting GET / does not cause 429 for authenticated peers polling
-// /v1/inbox. This closes the gap from issue #31/#129. Uses frozen clock.
+// /v1/inbox. This closes the gap from issue #31/#129.
 func TestAnonymousGETDoesNotBlockAuthenticatedInbox(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/test.db")
 	if err != nil {
@@ -424,7 +530,7 @@ func TestAnonymousGETDoesNotBlockAuthenticatedInbox(t *testing.T) {
 
 	// Freeze clock on the server's limiter manager
 	clock := time.Unix(1000, 0)
-	s.lim.SetClock(func() time.Time { return clock })
+	s.lim.testSetClock(func() time.Time { return clock })
 
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
@@ -436,13 +542,17 @@ func TestAnonymousGETDoesNotBlockAuthenticatedInbox(t *testing.T) {
 	// Anonymous client exhausts GET / (public GET limiter)
 	anon := &client{t: t, srv: srv}
 	gotRateLimited := false
-	for i := 0; i < GetBurst+5; i++ {
+	const burst = 20
+	for i := 0; i < burst+5; i++ {
 		resp, body := anon.do("GET", "/", nil, nil)
 		if resp.StatusCode == 429 {
 			gotRateLimited = true
 			// Assert Retry-After header and uniform body
-			if ra := resp.Header.Get("Retry-After"); ra != GetRetryAfter {
-				t.Errorf("anonymous GET: expected Retry-After: %s, got %q", GetRetryAfter, ra)
+			if ra := resp.Header.Get("Retry-After"); ra != "10" {
+				t.Errorf("anonymous GET: expected Retry-After: 10, got %q", ra)
+			}
+			if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+				t.Errorf("anonymous GET: expected Content-Type: application/json, got %q", ct)
 			}
 			var errResp map[string]string
 			if err := json.Unmarshal(body, &errResp); err != nil {
@@ -465,6 +575,103 @@ func TestAnonymousGETDoesNotBlockAuthenticatedInbox(t *testing.T) {
 
 	resp, body = bob.do("GET", "/v1/inbox", nil, nil)
 	want(t, resp, body, 200)
+}
+
+// TestAuthenticatedLimiterDoesNotBlockAnonymousGET verifies the reverse direction:
+// exhausting the authenticated inbox limiter does not block anonymous GET /.
+func TestAuthenticatedLimiterDoesNotBlockAnonymousGET(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	cfg := Config{
+		Logger: slog.Default(),
+	}
+	s := New(st, cfg)
+
+	// Freeze clock
+	clock := time.Unix(1000, 0)
+	s.lim.testSetClock(func() time.Time { return clock })
+
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	alice := register(t, srv, "alice")
+
+	// Exhaust alice's authenticated limiter (burst=40)
+	const authBurst = 40
+	for i := 0; i < authBurst; i++ {
+		resp, _ := alice.do("GET", "/v1/inbox", nil, nil)
+		if resp.StatusCode != 200 {
+			t.Fatalf("request %d: expected 200, got %d", i+1, resp.StatusCode)
+		}
+	}
+
+	// Next authenticated request should be rate limited
+	resp, _ := alice.do("GET", "/v1/inbox", nil, nil)
+	if resp.StatusCode != 429 {
+		t.Errorf("request %d: expected 429, got %d", authBurst+1, resp.StatusCode)
+	}
+
+	// Anonymous GET / should still succeed (different limiter)
+	anon := &client{t: t, srv: srv}
+	resp, body := anon.do("GET", "/", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Errorf("anonymous GET /: expected 200, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+// TestAuthenticatedGETLimiter verifies the authenticated GET endpoint limiter
+// with literal values: 120/min, burst 40, Retry-After "10". Closes issue #177.
+func TestAuthenticatedGETLimiter(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	cfg := Config{
+		Logger: slog.Default(),
+	}
+	s := New(st, cfg)
+
+	// Freeze clock
+	clock := time.Unix(1000, 0)
+	s.lim.testSetClock(func() time.Time { return clock })
+
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	alice := register(t, srv, "alice")
+
+	// Exhaust alice's authenticated limiter (burst=40)
+	const authBurst = 40 // Literal value per review
+	for i := 0; i < authBurst; i++ {
+		resp, body := alice.do("GET", "/v1/inbox", nil, nil)
+		if resp.StatusCode != 200 {
+			t.Fatalf("request %d: expected 200, got %d: %s", i+1, resp.StatusCode, body)
+		}
+	}
+
+	// Request 41 should be rate limited with Retry-After: 10 (not 2)
+	resp, body := alice.do("GET", "/v1/inbox", nil, nil)
+	if resp.StatusCode != 429 {
+		t.Errorf("request %d: expected 429, got %d", authBurst+1, resp.StatusCode)
+	}
+	if ra := resp.Header.Get("Retry-After"); ra != "10" {
+		t.Errorf("expected Retry-After: 10 (not 2), got %q", ra)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected Content-Type: application/json, got %q", ct)
+	}
+	var errResp map[string]string
+	if err := json.Unmarshal(body, &errResp); err != nil {
+		t.Errorf("unmarshal 429 body: %v", err)
+	} else if errResp["error"] != "rate limited" {
+		t.Errorf("expected uniform 429 body, got %v", errResp)
+	}
 }
 
 // TestAcceptByCodeAfterRevoke verifies that accepting an invite by code

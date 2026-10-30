@@ -240,12 +240,10 @@ type LimiterManager struct {
 
 // Rate limit constants for public GET endpoints and authenticated endpoints.
 const (
-	GetPerMinute      = 60
-	GetBurst          = 20
-	GetRetryAfter     = "10" // seconds, returned in Retry-After header
-	AuthGetPerMinute  = 120
-	AuthGetBurst      = 40
-	AuthGetRetryAfter = "2" // seconds
+	getPerMinute     = 60
+	getBurst         = 20
+	authGetPerMinute = 120
+	authGetBurst     = 40
 )
 
 // NewLimiterManager creates and starts a new limiter manager.
@@ -256,8 +254,8 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 		regLim:        msg.NewLimiter(10, 5),
 		pairLim:       msg.NewLimiter(10, 5),
 		failLim:       msg.NewLimiter(30, 10), // Failed pairing lookups: more lenient per-IP budget
-		getLim:        msg.NewLimiter(GetPerMinute, GetBurst),
-		authLim:       msg.NewLimiter(AuthGetPerMinute, AuthGetBurst),
+		getLim:        msg.NewLimiter(getPerMinute, getBurst),
+		authLim:       msg.NewLimiter(authGetPerMinute, authGetBurst),
 		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst),
 		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour),
 		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst),
@@ -272,18 +270,20 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 	return lm
 }
 
-// SetClock sets the clock function for all limiters (for testing).
-func (lm *LimiterManager) SetClock(clock func() time.Time) {
-	lm.msgLim.SetClock(clock)
-	lm.regLim.SetClock(clock)
-	lm.pairLim.SetClock(clock)
-	lm.failLim.SetClock(clock)
-	lm.getLim.SetClock(clock)
-	lm.authLim.SetClock(clock)
-	lm.mailLim.SetClock(clock)
-	lm.rcptLim.SetClock(clock)
-	lm.notifyLim.SetClock(clock)
-	lm.notifyAddrLim.SetClock(clock)
+// all returns all limiters in a single list for iteration.
+func (lm *LimiterManager) all() []*msg.Limiter {
+	return []*msg.Limiter{
+		lm.msgLim,
+		lm.regLim,
+		lm.pairLim,
+		lm.failLim,
+		lm.getLim,
+		lm.authLim,
+		lm.mailLim,
+		lm.rcptLim,
+		lm.notifyLim,
+		lm.notifyAddrLim,
+	}
 }
 
 // pruneLoop periodically prunes stale buckets from all limiters.
@@ -303,9 +303,10 @@ func (lm *LimiterManager) pruneLoop() {
 }
 
 func (lm *LimiterManager) prune() {
-	pruned := lm.msgLim.Prune() + lm.regLim.Prune() + lm.pairLim.Prune() + lm.failLim.Prune() +
-		lm.getLim.Prune() + lm.authLim.Prune() +
-		lm.mailLim.Prune() + lm.rcptLim.Prune() + lm.notifyLim.Prune() + lm.notifyAddrLim.Prune()
+	pruned := 0
+	for _, lim := range lm.all() {
+		pruned += lim.Prune()
+	}
 	_ = pruned // Could log if needed
 }
 

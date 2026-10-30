@@ -52,6 +52,7 @@ type Limiter struct {
 	shards     [shardCount]*shard
 	rate       float64 // tokens per second
 	burst      float64
+	clockMu    sync.RWMutex
 	now        func() time.Time
 	pruneAfter time.Duration
 	hashSeed   maphash.Seed // random seed for shard selection
@@ -115,9 +116,24 @@ func NewLimiterPerHour(perHour, burst int) *Limiter {
 	return l
 }
 
-// SetClock sets the clock function for testing. Must be called before any Allow/Ready calls.
-func (l *Limiter) SetClock(clock func() time.Time) {
+// TestSetClock sets the clock function for testing (race-safe, unexported hook).
+// Only use this in tests.
+func (l *Limiter) TestSetClock(clock func() time.Time) {
+	l.setClock(clock)
+}
+
+// setClock sets the clock function for testing (race-safe).
+func (l *Limiter) setClock(clock func() time.Time) {
+	l.clockMu.Lock()
 	l.now = clock
+	l.clockMu.Unlock()
+}
+
+// getClock returns the current clock function (race-safe).
+func (l *Limiter) getClock() func() time.Time {
+	l.clockMu.RLock()
+	defer l.clockMu.RUnlock()
+	return l.now
 }
 
 // Allow consumes one token for key; false means rate limited.
@@ -140,7 +156,7 @@ func (l *Limiter) Prune() int {
 func (l *Limiter) pruneShard(s *shard) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	t := l.now()
+	t := l.getClock()()
 	var pruned int
 	for key, b := range s.buckets {
 		if t.Sub(b.last) > l.pruneAfter {
@@ -155,7 +171,7 @@ func (l *Limiter) take(key string, consume bool) bool {
 	s := l.shards[l.shardIndex(key)]
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	t := l.now()
+	t := l.getClock()()
 	b, ok := s.buckets[key]
 	if !ok {
 		// Evict oldest idle bucket if at capacity

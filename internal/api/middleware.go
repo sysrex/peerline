@@ -26,7 +26,7 @@ func (s *Server) rateLimitGet(h http.HandlerFunc) http.HandlerFunc {
 		ip := clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets)
 		key := rateLimitKey(ip)
 		if !s.lim.getLim.Allow(key) {
-			w.Header().Set("Retry-After", GetRetryAfter)
+			w.Header().Set("Retry-After", "10")
 			writeErr(w, http.StatusTooManyRequests, "rate limited")
 			return
 		}
@@ -39,7 +39,7 @@ func (s *Server) rateLimitAuth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		peerID := auth.PeerID(r.Context())
 		if !s.lim.authLim.Allow(peerID) {
-			w.Header().Set("Retry-After", AuthGetRetryAfter)
+			w.Header().Set("Retry-After", "10")
 			writeErr(w, http.StatusTooManyRequests, "rate limited")
 			return
 		}
