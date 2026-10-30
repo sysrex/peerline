@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -12,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -2824,5 +2826,44 @@ func TestPairingLookupsBoundedPerIP(t *testing.T) {
 	}
 	if notFound > 5 || limited < 95 {
 		t.Fatalf("lookups not bounded: 404=%d 429=%d", notFound, limited)
+	}
+}
+
+func TestCSPNonceUniqueAndErrorResponsesStrict(t *testing.T) {
+	srv := newServer(t, Config{})
+	nonce := func() string {
+		resp, err := http.Get(srv.URL + "/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		v := resp.Header.Values("Content-Security-Policy")
+		if len(v) != 1 {
+			t.Fatalf("want one CSP header, got %v", v)
+		}
+		m := regexp.MustCompile(`script-src 'nonce-([^']+)'`).FindStringSubmatch(v[0])
+		if m == nil {
+			t.Fatalf("no nonce in %q", v[0])
+		}
+		raw, err := base64.StdEncoding.DecodeString(m[1])
+		if err != nil || len(raw) < 16 {
+			t.Fatalf("bad nonce %q: %v", m[1], err)
+		}
+		return m[1]
+	}
+	if nonce() == nonce() {
+		t.Fatal("nonce reused across requests")
+	}
+	const strict = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+	for _, c := range []struct{ method, path string }{{"GET", "/v1/me"}, {"GET", "/nope"}, {"POST", "/"}, {"POST", "/healthz"}} {
+		req, _ := http.NewRequest(c.method, srv.URL+c.path, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if got := resp.Header.Get("Content-Security-Policy"); got != strict {
+			t.Errorf("%s %s (%d): CSP %q", c.method, c.path, resp.StatusCode, got)
+		}
 	}
 }

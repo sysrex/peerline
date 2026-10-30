@@ -67,7 +67,10 @@ func main() {
 	publicURL := strings.TrimRight(os.Getenv("PEERLINE_PUBLIC_URL"), "/")
 	if ml.Mode() == "log" {
 		log.Warn("PEERLINE_SMTP_HOST unset: transactional emails (invites and message notifications) are logged, not sent (dev mode)")
-	} else if publicURL == "" {
+	} else if smtpCfg, ok := ml.(*mailer.SMTP); ok && smtpCfg.AllowPlaintext {
+		log.Warn("PEERLINE_SMTP_ALLOW_PLAINTEXT=1: mail may be sent without TLS; use only for a local dev relay")
+	}
+	if ml.Mode() != "log" && publicURL == "" {
 		// Emailed links must not be built from a client-supplied Host header.
 		log.Error("PEERLINE_PUBLIC_URL is required when SMTP is configured (used in emailed accept links)")
 		os.Exit(1)
