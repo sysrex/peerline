@@ -306,7 +306,7 @@ No new environment variable is required for the page or the public counters. The
 | `GET` | `/v1/me` | `peer_id` and your own `notify_email` |
 | `PUT` | `/v1/me` | `{"notify_email"}` set or `""` to clear; returns the same shape as GET |
 | `POST` | `/v1/invites` | scopes + bags + optional `ttl_seconds`, `to_email`, `generate_pairing` → single-use `code`, `public_id`, `accept_url`, optional `pairing_url`, `email` status |
-| `GET` | `/v1/invites` | List your active (non-expired, unused) invites; returns `{"invites":[{"public_id","scopes","bags","expires_at","to_email","pairing_url"}]}` |
+| `GET` | `/v1/invites` | List your non-expired invites (`?limit=` 1-200, default 50, `&offset=`); returns `{"invites":[{"public_id","scopes","bags","expires_at","used","is_pairing_link"}]}`. No codes, tokens or links are returned. |
 | `DELETE` | `/v1/invites/{public_id}` | Revoke an unused invite by its opaque `public_id` (owner-only); 404 if already used or doesn't exist |
 | `POST` | `/v1/invites/accept[?code=]` | Accept (code in body or query); optional reciprocal grant |
 | `GET` | `/v1/invites/accept?code=` | Emailed link: with Bearer = accept (`&scopes=&bags=` for reciprocal); without = instructions only |
