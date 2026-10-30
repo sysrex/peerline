@@ -400,6 +400,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	code := auth.NewSecret("inv_")
+	// API layer is not clock-injected yet; uses wall time directly
 	exp := time.Now().Add(ttl).UTC()
 	var pairingToken string
 	var publicID string

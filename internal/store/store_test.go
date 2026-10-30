@@ -1743,3 +1743,123 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 		t.Errorf("expected code2 and code4 to remain, got hashes: %v", codes)
 	}
 }
+
+// TestPairingTokenExpiryWithClock verifies that PairingTokenExists and the accept paths
+// respect s.now() for expiry checks.
+func TestPairingTokenExpiryWithClock(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// Create peers
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inject fake clock
+	origNow := s.now
+	defer func() { s.now = origNow }()
+
+	currentTime := int64(1000000)
+	s.now = func() int64 { return currentTime }
+
+	// Create a pairing invite that expires at currentTime + 100
+	codeHash := "code_test"
+	pairingHash := "pair_test"
+	expiresAt := time.Unix(currentTime+100, 0)
+	if err := s.CreateInviteWithPairing(ctx, codeHash, pairingHash, "alice", []string{"messages"}, nil, expiresAt); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Token is valid 10 seconds before expiry
+	s.now = func() int64 { return currentTime + 90 }
+	exists, err := s.PairingTokenExists(ctx, pairingHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Error("token should exist 10 seconds before expiry")
+	}
+
+	// 2. Token is still valid 1 second before expiry
+	s.now = func() int64 { return currentTime + 99 }
+	exists, err = s.PairingTokenExists(ctx, pairingHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Error("token should exist 1 second before expiry")
+	}
+
+	// 3. Token is invalid 1 second after expiry
+	s.now = func() int64 { return currentTime + 101 }
+	exists, err = s.PairingTokenExists(ctx, pairingHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Error("token should not exist 1 second after expiry")
+	}
+
+	// Reset clock to before expiry for accept path tests
+	s.now = func() int64 { return currentTime + 50 }
+
+	// Create a second invite for accept tests
+	codeHash2 := "code_test2"
+	pairingHash2 := "pair_test2"
+	expiresAt2 := time.Unix(currentTime+200, 0)
+	if err := s.CreateInviteWithPairing(ctx, codeHash2, pairingHash2, "alice", []string{"messages"}, nil, expiresAt2); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. GetInviteByPairingToken rejects expired token
+	s.now = func() int64 { return currentTime + 201 }
+	_, err = s.GetInviteByPairingToken(ctx, pairingHash2)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetInviteByPairingToken should return ErrNotFound for expired token, got %v", err)
+	}
+
+	// 5. AcceptInviteByPairingToken rejects expired token
+	s.now = func() int64 { return currentTime + 202 }
+	_, err = s.AcceptInviteByPairingToken(ctx, pairingHash2, "bob", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("AcceptInviteByPairingToken should return ErrNotFound for expired token, got %v", err)
+	}
+
+	// 6. RegisterAndAcceptByPairing rejects expired token (pre-check)
+	s.now = func() int64 { return currentTime + 203 }
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash2, "charlie", "Charlie", "hc", "", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("RegisterAndAcceptByPairing should return ErrNotFound for expired token in pre-check, got %v", err)
+	}
+
+	// 7. RegisterAndAcceptByPairing: token expires between pre-check and tx
+	// Create a third invite
+	codeHash3 := "code_test3"
+	pairingHash3 := "pair_test3"
+	expiresAt3 := time.Unix(currentTime+300, 0)
+	if err := s.CreateInviteWithPairing(ctx, codeHash3, pairingHash3, "alice", []string{"messages"}, nil, expiresAt3); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set clock so pre-check passes (before expiry) but tx-time check fails (after expiry)
+	callCount := 0
+	s.now = func() int64 {
+		callCount++
+		if callCount == 1 {
+			// First call: pre-check time (before expiry)
+			return currentTime + 299
+		}
+		// Second call: tx time (after expiry)
+		return currentTime + 301
+	}
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash3, "dave", "Dave", "hd", "", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("RegisterAndAcceptByPairing should return ErrNotFound when token expires between pre-check and tx, got %v", err)
+	}
+}

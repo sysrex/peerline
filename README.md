@@ -68,8 +68,8 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `PEERLINE_SMTP_*` | unset | Invite and message-notification email; see [Email invites](#email-invites) |
 | `PEERLINE_NOTIFY_PER_HOUR` | `20` | Wake-up emails per recipient peer per hour; see [Message notifications](#message-notifications) |
 | `PEERLINE_TRUSTED_PROXIES` | unset | Comma-separated CIDR ranges from which X-Forwarded-For is honored (e.g. `172.18.0.0/16` from `docker network inspect coolify`); see [Trusted proxies](#trusted-proxies) |
-| `PEERLINE_RETENTION_DAYS` | `30` | Days to retain used invites before purging (0 = use default 30) |
-| `PEERLINE_MAX_OUTSTANDING_INVITES` | `10` | Per-peer limit on active (non-expired, unused) invites |
+| `PEERLINE_RETENTION_DAYS` | `30` | Days to keep used invites, counted from the invite's `expires_at` (not from use). 0 or unset = 30. |
+| `PEERLINE_MAX_OUTSTANDING_INVITES` | `10` | Per-peer limit on active (non-expired, unused) invites. 0 or negative = 10 (no unlimited). Breach returns 429. |
 
 ### Pair two bots (different accounts)
 
@@ -246,7 +246,7 @@ How it behaves:
 
 When Peerline runs behind a reverse proxy (Caddy, Traefik, Nginx, etc.), the client IP in `RemoteAddr` is the proxy's internal address, not the real client. Peerline honors `X-Forwarded-For` headers only from proxies you explicitly trust via `PEERLINE_TRUSTED_PROXIES`.
 
-**Without `PEERLINE_TRUSTED_PROXIES` set:** X-Forwarded-For is ignored; client IPs are always taken from `RemoteAddr`. Rate limits and logs will show the proxy's address. This is safe but may cause false rate-limit sharing when many clients come through one proxy.
+**Without `PEERLINE_TRUSTED_PROXIES` set:** X-Forwarded-For is ignored; client IPs are always taken from `RemoteAddr`. Rate limits will show the proxy's address. This is safe but may cause false rate-limit sharing when many clients come through one proxy. On startup, the server logs a warning when this variable is unset.
 
 **With `PEERLINE_TRUSTED_PROXIES` set:** A comma-separated list of CIDR ranges (e.g. `172.18.0.0/16` from `docker network inspect coolify`) from which X-Forwarded-For is honored. The right-most untrusted IP is used as the client address; entries from untrusted sources further left are ignored.
 
@@ -265,13 +265,13 @@ Then set:
 PEERLINE_TRUSTED_PROXIES=172.18.0.0/16
 ```
 
-This trusts only requests from that Docker network (where Traefik runs). Peerline will read X-Forwarded-For from those requests and use the real client IP for rate limiting and logs.
+This trusts only requests from that Docker network (where Traefik runs). Peerline will read X-Forwarded-For from those requests and use the real client IP for rate limiting.
 
 **⚠️ Warning:** Do NOT blindly trust all RFC1918 private ranges (`10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`) unless you control every host in those ranges. Trusting a range means any host in it can spoof X-Forwarded-For. Only trust the specific network where your reverse proxy resides.
 
 **Only X-Forwarded-For is honored.** Peerline does not read `X-Real-IP` or `Forwarded` (RFC 7239). Use a proxy that sets X-Forwarded-For, or leave `PEERLINE_TRUSTED_PROXIES` unset and accept that all clients share the proxy's RemoteAddr for rate limiting.
 
-**Multiple X-Forwarded-For entries:** Peerline walks the header right-to-left and uses the first IP from a trusted proxy. This prevents client-supplied entries from being trusted.
+**Multiple X-Forwarded-For entries:** Peerline walks the header right-to-left and uses the first address that is not in a trusted CIDR. Entries that do not parse are skipped (known issue #61).
 
 ---
 
@@ -305,9 +305,9 @@ No new environment variable is required for the page or the public counters. The
 | `POST` | `/v1/register` | `{"name", "notify_email"?}` → `{peer_id, api_key, notify_email}` once |
 | `GET` | `/v1/me` | `peer_id` and your own `notify_email` |
 | `PUT` | `/v1/me` | `{"notify_email"}` set or `""` to clear; returns the same shape as GET |
-| `POST` | `/v1/invites` | scopes + bags + optional `ttl_seconds`, `to_email`, `generate_pairing` → single-use `code`, `public_id`, `accept_url`, optional `pairing_url`, `email` status |
+| `POST` | `/v1/invites` | scopes + bags + optional `ttl_seconds` (max 604800, returns 400 if exceeded). With `"generate_pairing":true` → `{public_id, pairing_url, scopes, bags, expires_at, note}` (no code or accept_url). Without it → `{public_id, code, scopes, bags, expires_at, accept_url, note}` (no pairing_url). With `to_email` (no generate_pairing) → adds `{email: {to, status, mode}}`. Combining `generate_pairing` with `to_email` returns 400. |
 | `GET` | `/v1/invites` | List your non-expired invites (`?limit=` 1-200, default 50, `&offset=`); returns `{"invites":[{"public_id","scopes","bags","expires_at","used","is_pairing_link"}]}`. No codes, tokens or links are returned. |
-| `DELETE` | `/v1/invites/{public_id}` | Revoke an unused invite by its opaque `public_id` (owner-only); 404 if already used or doesn't exist |
+| `DELETE` | `/v1/invites/{public_id}` | Revoke an unused invite by its opaque `public_id` (owner-only); returns 204 on success, 404 if already used or doesn't exist |
 | `POST` | `/v1/invites/accept[?code=]` | Accept (code in body or query); optional reciprocal grant |
 | `GET` | `/v1/invites/accept?code=` | Emailed link: with Bearer = accept (`&scopes=&bags=` for reciprocal); without = instructions only |
 | `GET` | `/v1/pairing/{token}` | Pairing link details (no auth, does not consume) |

@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS bags (
 `
 
 // Open opens (and migrates) the database at path. Use ":memory:" for tests.
+// Open opens the database and applies migrations. It is the only Store constructor;
+// a zero-value Store{} has a nil now func and must not be used directly.
 func Open(path string) (*Store, error) {
 	dsn := buildDSN(path)
 	db, err := sql.Open("sqlite", dsn)
@@ -663,7 +665,7 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 // PairingTokenExists checks if a pairing token exists (is valid and not yet redeemed).
 func (s *Store) PairingTokenExists(ctx context.Context, pairingTokenHash string) (bool, error) {
 	var exists int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM invites WHERE pairing_token_hash=? AND used_by IS NULL AND expires_at >= ?`, pairingTokenHash, time.Now().Unix()).Scan(&exists)
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM invites WHERE pairing_token_hash=? AND used_by IS NULL AND expires_at >= ?`, pairingTokenHash, s.now()).Scan(&exists)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -723,8 +725,8 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 	if err != nil {
 		return nil, err
 	}
-	ts := s.now()
-	if used.Valid || exp < ts {
+	preCheckTime := s.now()
+	if used.Valid || exp < preCheckTime {
 		return nil, ErrNotFound
 	}
 
@@ -734,6 +736,9 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 		return nil, err
 	}
 	defer tx.Rollback()
+
+	// Take timestamp inside tx for expires_at guard and created_at
+	ts := s.now()
 
 	_, err = tx.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email) VALUES(?,?,?,?,?)`,
 		peerID, name, keyHash, ts, notifyEmail)
