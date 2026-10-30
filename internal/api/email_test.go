@@ -54,6 +54,21 @@ func (c *captureMailer) messages() []mailer.Message {
 	return c.all()
 }
 
+// captureAndLog wraps a capture mailer and also forwards to Log for dev-mode testing
+type captureAndLog struct {
+	capture *captureMailer
+	log     mailer.Log
+}
+
+func (c *captureAndLog) Mode() string { return "smtp" }
+
+func (c *captureAndLog) Send(ctx context.Context, m mailer.Message) error {
+	if err := c.capture.Send(ctx, m); err != nil {
+		return err
+	}
+	return c.log.Send(ctx, m)
+}
+
 // Dev mode: no SMTP configured -> email is logged, invite still created and usable.
 func TestEmailInviteDevMode(t *testing.T) {
 	var logs syncBuf
