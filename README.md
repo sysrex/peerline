@@ -232,6 +232,8 @@ How it behaves:
 | `PEERLINE_PUBLIC_URL` | — | Required with a host, e.g. `https://peerline.example.com`. Links are never built from the request's `Host` header when real email is sent. In dev mode it falls back to the request host. |
 | `PEERLINE_EMAIL_PER_HOUR` | `20` | Invite emails per inviting peer per hour. |
 
+**TLS verification.** "Plaintext allowed" only means a relay that does not offer STARTTLS is used in cleartext. If STARTTLS is offered, the certificate is always verified, so a self-signed or internal-CA relay certificate fails the probe and every send. With credentials, a non-loopback relay must offer STARTTLS.
+
 **Startup probe.** With a host set, Peerline connects to the relay at boot (3 s bound). A provable TLS misconfiguration (STARTTLS required but not offered, bad certificate) exits 1; an unreachable relay only logs a warning and sends retry at runtime.
 
 ```sh
