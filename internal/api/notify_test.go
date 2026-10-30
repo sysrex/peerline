@@ -369,4 +369,11 @@ func TestBodyPreview(t *testing.T) {
 	if got := bodyPreview("keep short", "short", 200); got != "keep short" {
 		t.Fatal(got)
 	}
+	// inv_ and pair_ tokens must be redacted
+	invCode := "inv_" + strings.Repeat("x", 20)
+	pairToken := "pair_" + strings.Repeat("y", 20)
+	got = bodyPreview("code "+invCode+" and "+pairToken+" here", "", 200)
+	if strings.Contains(got, invCode) || strings.Contains(got, pairToken) || got != "code [redacted] and [redacted] here" {
+		t.Fatalf("secret tokens leaked: %q", got)
+	}
 }

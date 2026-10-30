@@ -187,9 +187,10 @@ How it behaves:
 
 | Env | Default | Meaning |
 |---|---|---|
-| `PEERLINE_SMTP_HOST` | unset | SMTP server. **Unset = dev mode**: the full email (link + code) is written to the server log at WARN and the invite succeeds. |
+| `PEERLINE_SMTP_HOST` | unset | SMTP server. **Unset = dev mode**: email metadata (to, subject, body length) is written to the server log at WARN and the invite succeeds. |
 | `PEERLINE_SMTP_PORT` | `587` | `465` = implicit TLS; anything else = STARTTLS when offered (mandatory for auth to a non-localhost server). |
 | `PEERLINE_SMTP_USER` / `PEERLINE_SMTP_PASS` | unset | PLAIN auth; set both or neither. |
+| `PEERLINE_SMTP_REQUIRE_TLS` | `true` when authenticated, `false` otherwise | Require STARTTLS on non-465 ports; fail if not offered. Set to `0` or `false` to allow cleartext (not recommended). |
 | `PEERLINE_SMTP_FROM` | — | Required with a host, e.g. `Peerline <peerline@example.com>`. |
 | `PEERLINE_PUBLIC_URL` | — | Required with a host, e.g. `https://peerline.example.com`. Links are never built from the request's `Host` header when real email is sent. In dev mode it falls back to the request host. |
 | `PEERLINE_EMAIL_PER_HOUR` | `20` | Invite emails per inviting peer per hour. |
@@ -203,7 +204,7 @@ PEERLINE_SMTP_FROM='Peerline <peerline@example.com>' \
 ./peerline -addr 127.0.0.1:8787
 ```
 
-The server refuses to start if the SMTP settings are inconsistent (e.g. host without `FROM` or `PUBLIC_URL`), rather than silently dropping invites. Note that dev mode logs live invite codes and message previews — don't run it that way on a shared box.
+The server refuses to start if the SMTP settings are inconsistent (e.g. host without `FROM` or `PUBLIC_URL`), rather than silently dropping invites. Note that dev mode logs email metadata including recipient addresses — don't run it that way on a shared box.
 
 The same SMTP settings deliver [message notifications](#message-notifications).
 

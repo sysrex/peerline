@@ -63,7 +63,7 @@ func (l Log) Send(_ context.Context, m Message) error {
 		lg = slog.Default()
 	}
 	lg.Warn("SMTP not configured; email logged instead of sent (dev mode)",
-		"to", m.To, "subject", m.Subject, "body", m.Body)
+		"to", m.To, "subject", m.Subject, "body_len", len(m.Body))
 	return nil
 }
 
@@ -76,6 +76,9 @@ type SMTP struct {
 	Host, User, Pass, From string
 	Port                   int
 	Timeout                time.Duration
+	// RequireTLS fails the send if STARTTLS is not available (non-465 ports only).
+	// Defaults to true when User is set, false otherwise.
+	RequireTLS bool
 	// TLSConfig is optional (tests); defaults to ServerName=Host.
 	TLSConfig *tls.Config
 }
@@ -108,7 +111,11 @@ func FromEnv(lg *slog.Logger) (Sender, error) {
 	if (user == "") != (pass == "") {
 		return nil, errors.New("PEERLINE_SMTP_USER and PEERLINE_SMTP_PASS must be set together")
 	}
-	return &SMTP{Host: host, Port: port, User: user, Pass: pass, From: from, Timeout: 10 * time.Second}, nil
+	requireTLS := user != "" // default: require TLS when authenticated
+	if v := os.Getenv("PEERLINE_SMTP_REQUIRE_TLS"); v != "" {
+		requireTLS = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+	}
+	return &SMTP{Host: host, Port: port, User: user, Pass: pass, From: from, Timeout: 10 * time.Second, RequireTLS: requireTLS}, nil
 }
 
 func (s *SMTP) Send(ctx context.Context, m Message) error {
@@ -156,6 +163,8 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 			if err := c.StartTLS(tlsCfg); err != nil {
 				return fmt.Errorf("smtp starttls: %w", err)
 			}
+		} else if s.RequireTLS {
+			return errors.New("smtp: STARTTLS required but not offered by server")
 		}
 	}
 	if s.User != "" {

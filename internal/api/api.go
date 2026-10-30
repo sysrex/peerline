@@ -984,6 +984,9 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 // and do not match. Used to keep stored secrets out of notification previews.
 var apiKeyInBody = regexp.MustCompile(`pl_[A-Za-z0-9_-]{8,}`)
 
+// secretTokenInBody matches invite codes (inv_) and pairing tokens (pair_).
+var secretTokenInBody = regexp.MustCompile(`(?:inv|pair)_[A-Za-z0-9_-]{16,}`)
+
 const notifyPreviewMax = 200
 
 func (s *Server) notifyNewMessage(ctx context.Context, m *store.Message) {
@@ -1061,6 +1064,7 @@ func bodyPreview(body, registerToken string, max int) string {
 		clean = strings.ReplaceAll(clean, registerToken, "[redacted]")
 	}
 	clean = apiKeyInBody.ReplaceAllString(clean, "[redacted]")
+	clean = secretTokenInBody.ReplaceAllString(clean, "[redacted]")
 	if utf8.RuneCountInString(clean) <= max {
 		return clean
 	}

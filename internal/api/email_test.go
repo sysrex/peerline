@@ -45,8 +45,12 @@ func TestEmailInviteDevMode(t *testing.T) {
 		t.Fatalf("accept_url: %s", inv.AcceptURL)
 	}
 	l := logs.String()
-	if !strings.Contains(l, "bob@example.com") || !strings.Contains(l, inv.Code) || !strings.Contains(l, "dev mode") {
-		t.Fatalf("email body not logged: %s", l)
+	if !strings.Contains(l, "bob@example.com") || !strings.Contains(l, "dev mode") || !strings.Contains(l, "body_len=") {
+		t.Fatalf("email metadata not logged: %s", l)
+	}
+	// Fix #26: invite code must NOT appear in logs
+	if strings.Contains(l, inv.Code) {
+		t.Fatalf("invite code leaked in dev mode log: %s", l)
 	}
 
 	// Unauthenticated click (human / mail scanner) shows instructions and does not consume.
