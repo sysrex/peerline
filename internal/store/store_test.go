@@ -1623,12 +1623,12 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 	}
 
 	// Mock time
-	origNow := now
-	defer func() { now = origNow }()
+	origNow := s.now
+	defer func() { s.now = origNow }()
 
 	// Start at a base time
 	currentTime := int64(2000000)
-	now = func() int64 { return currentTime }
+	s.now = func() int64 { return currentTime }
 
 	// Create and immediately accept invites at different points in time
 
@@ -1643,7 +1643,7 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 	tenDaysAgo := currentTime - 10*24*60*60
 	exp2 := time.Unix(tenDaysAgo-100, 0) // expired 10 days + 100s ago
 	// Temporarily go back in time to create and accept it
-	now = func() int64 { return tenDaysAgo - 200 } // before exp2
+	s.now = func() int64 { return tenDaysAgo - 200 } // before exp2
 	if err := s.CreateInvite(ctx, "code2", "alice", []string{"messages"}, nil, exp2); err != nil {
 		t.Fatal(err)
 	}
@@ -1651,13 +1651,13 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Return to current time
-	now = func() int64 { return currentTime }
+	s.now = func() int64 { return currentTime }
 
 	// 3. Used invite that expired 40 days ago - should be PURGED (beyond 30-day retention)
 	fortyDaysAgo := currentTime - 40*24*60*60
 	exp3 := time.Unix(fortyDaysAgo-100, 0) // expired 40 days + 100s ago
 	// Temporarily go back in time to create and accept it
-	now = func() int64 { return fortyDaysAgo - 200 } // before exp3
+	s.now = func() int64 { return fortyDaysAgo - 200 } // before exp3
 	if err := s.CreateInvite(ctx, "code3", "alice", []string{"messages"}, nil, exp3); err != nil {
 		t.Fatal(err)
 	}
@@ -1668,7 +1668,7 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Return to current time
-	now = func() int64 { return currentTime }
+	s.now = func() int64 { return currentTime }
 
 	// 4. Used invite not yet expired - should be KEPT
 	exp4 := time.Unix(currentTime+24*60*60, 0) // expires in 1 day

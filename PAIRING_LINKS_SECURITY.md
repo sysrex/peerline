@@ -33,9 +33,9 @@ What it **DOES** contain:
 
 **Lifecycle:**
 - Single-use (consumed on first successful accept)
-- Expires with the underlying invite (default 24h, max 7d)
+- Expires with the underlying invite (default 1h, 24h for emailed invites, max 7d)
 - Cannot be reused after acceptance
-- Automatically cleaned up when expired
+- Cleaned up by hourly maintenance sweep after expiry
 
 ### 3. What GET /v1/pairing/{token} Exposes
 

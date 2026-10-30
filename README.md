@@ -248,7 +248,7 @@ When Peerline runs behind a reverse proxy (Caddy, Traefik, Nginx, etc.), the cli
 
 **Without `PEERLINE_TRUSTED_PROXIES` set:** X-Forwarded-For is ignored; client IPs are always taken from `RemoteAddr`. Rate limits and logs will show the proxy's address. This is safe but may cause false rate-limit sharing when many clients come through one proxy.
 
-**With `PEERLINE_TRUSTED_PROXIES` set:** A comma-separated list of CIDR ranges (e.g. `172.18.0.0/16` from `docker network inspect coolify`) from which X-Forwarded-For is honored. Only the right-most entry from a trusted proxy is used; entries from untrusted sources are ignored.
+**With `PEERLINE_TRUSTED_PROXIES` set:** A comma-separated list of CIDR ranges (e.g. `172.18.0.0/16` from `docker network inspect coolify`) from which X-Forwarded-For is honored. The right-most untrusted IP is used as the client address; entries from untrusted sources further left are ignored.
 
 ### Coolify / Traefik setup
 
@@ -277,10 +277,10 @@ This trusts only requests from that Docker network (where Traefik runs). Peerlin
 
 ## Maintenance and cleanup
 
-Peerline runs a background maintenance task every hour that purges:
+Peerline runs a background maintenance task hourly (and once at startup) that purges:
 
-- **Unused expired invites:** Deleted immediately when `expires_at < now`.
-- **Used invites:** Retained for audit, then deleted after the retention window (default 30 days). An invite is purged when `used_by IS NOT NULL AND expires_at < now - retention_window`.
+- **Unused expired invites:** Deleted when `expires_at < now` during the hourly sweep.
+- **Used invites:** Kept for the retention window (default 30 days) counted from the invite's `expires_at` (not from when it was used), then deleted. An invite is purged when `used_by IS NOT NULL AND expires_at < now - retention_window`.
 
 The retention window is configured via `PEERLINE_RETENTION_DAYS` (default `30`). Set it to `0` to use the default. Examples:
 
@@ -305,7 +305,9 @@ No new environment variable is required for the page or the public counters. The
 | `POST` | `/v1/register` | `{"name", "notify_email"?}` → `{peer_id, api_key, notify_email}` once |
 | `GET` | `/v1/me` | `peer_id` and your own `notify_email` |
 | `PUT` | `/v1/me` | `{"notify_email"}` set or `""` to clear; returns the same shape as GET |
-| `POST` | `/v1/invites` | scopes + bags + optional `ttl_seconds`, `to_email` → single-use `code`, `accept_url`, `email` status |
+| `POST` | `/v1/invites` | scopes + bags + optional `ttl_seconds`, `to_email`, `generate_pairing` → single-use `code`, `public_id`, `accept_url`, optional `pairing_url`, `email` status |
+| `GET` | `/v1/invites` | List your active (non-expired, unused) invites; returns `{"invites":[{"public_id","scopes","bags","expires_at","to_email","pairing_url"}]}` |
+| `DELETE` | `/v1/invites/{public_id}` | Revoke an unused invite by its opaque `public_id` (owner-only); 404 if already used or doesn't exist |
 | `POST` | `/v1/invites/accept[?code=]` | Accept (code in body or query); optional reciprocal grant |
 | `GET` | `/v1/invites/accept?code=` | Emailed link: with Bearer = accept (`&scopes=&bags=` for reciprocal); without = instructions only |
 | `GET` | `/v1/pairing/{token}` | Pairing link details (no auth, does not consume) |
