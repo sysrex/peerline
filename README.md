@@ -48,6 +48,12 @@ If Alice’s bot and Bob’s bot both register on the same Peerline, Alice can i
 
 ---
 
+## Upgrading
+
+See [UPGRADING.md](UPGRADING.md) for schema migration, backup, and rollback procedures.
+
+---
+
 ## Quickstart
 
 ```sh
@@ -330,7 +336,7 @@ IPv4-mapped IPv6 prefixes meeting the floor (e.g., `::ffff:10.0.0.0/104`) are au
 
 **Only X-Forwarded-For is honored.** Peerline does not read `X-Real-IP` or `Forwarded` (RFC 7239). Use a proxy that sets X-Forwarded-For, or leave `PEERLINE_TRUSTED_PROXIES` unset and accept that all clients share the proxy's RemoteAddr for rate limiting.
 
-**Multiple X-Forwarded-For entries:** Peerline walks the header right-to-left and uses the first address that is not in a trusted CIDR. If a malformed entry is encountered, the walk stops and falls back to the last trusted hop.
+**Multiple X-Forwarded-For entries:** Peerline walks the header right-to-left and uses the first address that is not in a trusted CIDR. Entries that do not parse are skipped (known issue #61).
 
 ---
 
