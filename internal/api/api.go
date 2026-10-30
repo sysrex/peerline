@@ -154,6 +154,7 @@ func (s *Server) Handler() http.Handler {
 	authed := http.NewServeMux()
 	authed.HandleFunc("GET /v1/me", s.rateLimitAuth(s.me))
 	authed.HandleFunc("PUT /v1/me", s.updateMe)
+	authed.HandleFunc("POST /v1/me/verify-email", s.verifyEmail)
 	authed.HandleFunc("POST /v1/invites", s.createInvite)
 	authed.HandleFunc("GET /v1/invites", s.rateLimitAuth(s.listInvites))
 	authed.HandleFunc("DELETE /v1/invites/{id}", s.deleteInvite)
@@ -261,21 +262,50 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "notify_email: invalid email address")
 		return
 	}
+	
+	// Generate verification token if email is set
+	token := ""
+	if notify != "" {
+		token = auth.NewSecret("eml_")
+	}
+	
 	id, key := auth.NewID(), auth.NewKey()
-	if err := s.st.CreatePeer(r.Context(), id, in.Name, auth.Hash(key), notify); err != nil {
+	if err := s.st.CreatePeer(r.Context(), id, in.Name, auth.Hash(key), notify, token); err != nil {
 		s.internal(w, err)
 		return
 	}
+	
+	// Send verification email if address is set
+	if notify != "" && token != "" {
+		verifyURL := s.publicBase(r) + "/v1/me/verify-email?token=" + url.QueryEscape(token)
+		msg := s.verificationEmail(id, notify, verifyURL)
+		ctx := context.WithoutCancel(r.Context())
+		if err := s.cfg.Mailer.Send(ctx, msg); err != nil {
+			s.log.Error("verification email failed", "peer", id, "err", err)
+			// Continue - verification can be resent
+		} else {
+			s.log.Info("verification email sent", "peer", id)
+		}
+	}
+	
 	s.log.Info("peer registered", "peer_id", id, "notify_email_set", notify != "")
-	writeJSON(w, http.StatusCreated, map[string]string{
-		"peer_id": id, "name": in.Name, "api_key": key, "notify_email": notify,
-		"note": "api_key is shown once; store it securely",
-	})
+	resp := map[string]any{
+		"peer_id":      id,
+		"name":         in.Name,
+		"api_key":      key,
+		"notify_email": notify,
+		"verified":     false,
+		"note":         "api_key is shown once; store it securely",
+	}
+	if notify != "" {
+		resp["note"] = "api_key is shown once; store it securely. Check your email for a verification link to enable notifications."
+	}
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	id := auth.PeerID(r.Context())
-	email, err := s.st.NotifyEmail(r.Context(), id)
+	email, verified, _, err := s.st.GetNotifyEmailWithStatus(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "peer not found")
@@ -284,7 +314,11 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"peer_id": id, "notify_email": email})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"peer_id":      id,
+		"notify_email": email,
+		"verified":     verified,
+	})
 }
 
 func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
@@ -304,7 +338,14 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	me := auth.PeerID(r.Context())
-	if err := s.st.SetNotifyEmail(r.Context(), me, email); err != nil {
+	
+	// Generate verification token if setting email
+	token := ""
+	if email != "" {
+		token = auth.NewSecret("eml_")
+	}
+	
+	if err := s.st.SetNotifyEmail(r.Context(), me, email, token); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "peer not found")
 			return
@@ -312,8 +353,35 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
-	s.log.Info("notify email updated", "peer_id", me, "set", email != "")
-	s.me(w, r)
+	
+	// Send verification email if address is set
+	if email != "" && token != "" {
+		verifyURL := s.publicBase(r) + "/v1/me/verify-email?token=" + url.QueryEscape(token)
+		msg := s.verificationEmail(me, email, verifyURL)
+		// Detach from client cancellation
+		ctx := context.WithoutCancel(r.Context())
+		if err := s.cfg.Mailer.Send(ctx, msg); err != nil {
+			s.log.Error("verification email failed", "peer", me, "err", err)
+			// Continue - verification can be resent
+		} else {
+			s.log.Info("verification email sent", "peer", me)
+		}
+	}
+	
+	s.log.Info("notify email updated", "peer_id", me, "set", email != "", "verified", false)
+	
+	// Return current status
+	currentEmail, verified, _, err := s.st.GetNotifyEmailWithStatus(r.Context(), me)
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"peer_id":      me,
+		"notify_email": currentEmail,
+		"verified":     verified,
+		"note":         "Check your email for a verification link to enable notifications",
+	})
 }
 
 // normalizeNotifyEmail returns "" to clear, or one bare address.
@@ -323,6 +391,45 @@ func normalizeNotifyEmail(raw string) (string, error) {
 		return "", nil
 	}
 	return mailer.ValidAddress(raw)
+}
+
+// verificationEmail creates the email body for email address verification.
+func (s *Server) verificationEmail(peerID, to, verifyURL string) mailer.Message {
+	var b strings.Builder
+	b.WriteString("Verify your email address to enable Peerline message notifications.\n\n")
+	fmt.Fprintf(&b, "Peer: %s\n\n", peerID)
+	b.WriteString("Click the link below or open it in your bot's HTTP client:\n\n")
+	fmt.Fprintf(&b, "  %s\n\n", verifyURL)
+	fmt.Fprintf(&b, "  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" \\\n    '%s'\n\n", verifyURL)
+	b.WriteString("If you didn't set this address, ignore this email.\n")
+	return mailer.Message{
+		To:      to,
+		Subject: "Peerline: Verify your email address",
+		Body:    b.String(),
+	}
+}
+
+// verifyEmail handles email verification via token.
+func (s *Server) verifyEmail(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		writeErr(w, http.StatusBadRequest, "token required")
+		return
+	}
+	me := auth.PeerID(r.Context())
+	if err := s.st.VerifyNotifyEmail(r.Context(), me, token); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusBadRequest, "invalid or expired token")
+			return
+		}
+		s.internal(w, err)
+		return
+	}
+	s.log.Info("email verified", "peer_id", me)
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status": "verified",
+		"note":   "Email verified successfully. You will now receive message notifications.",
+	})
 }
 
 // ---- pairing ----
@@ -804,18 +911,28 @@ const notifyPreviewMax = 200
 func (s *Server) notifyNewMessage(ctx context.Context, m *store.Message) {
 	// The message is already stored. Don't drop the wake-up if the client hangs up.
 	ctx = context.WithoutCancel(ctx)
-	email, err := s.st.NotifyEmail(ctx, m.To)
+	
+	// Only send to verified emails
+	email, err := s.st.GetVerifiedNotifyEmail(ctx, m.To)
 	if err != nil {
 		s.log.Error("notify email lookup", "recipient", m.To, "message_id", m.ID, "err", err)
 		return
 	}
 	if email == "" {
-		return
+		return // No verified email set
 	}
+	
+	// Check both per-peer and per-address rate limits
+	normalizedAddr := strings.ToLower(email)
 	if !s.lim.notifyLim.Allow(m.To) {
-		s.log.Warn("notify email rate limited", "recipient", m.To, "message_id", m.ID)
+		s.log.Warn("notify email rate limited (per-peer)", "recipient", m.To, "message_id", m.ID)
 		return
 	}
+	if !s.lim.notifyAddrLim.Allow(normalizedAddr) {
+		s.log.Warn("notify email rate limited (per-address)", "address", normalizedAddr, "recipient", m.To, "message_id", m.ID)
+		return
+	}
+	
 	status := "sent"
 	if s.cfg.Mailer.Mode() == "log" {
 		status = "logged"
@@ -835,7 +952,9 @@ func (s *Server) notifyEmail(m *store.Message, to string) mailer.Message {
 	fmt.Fprintf(&b, "Type: %s\n", m.Type)
 	fmt.Fprintf(&b, "Created: %s\n\n", m.CreatedAt.UTC().Format(time.RFC3339))
 	fmt.Fprintf(&b, "Preview:\n%s\n", bodyPreview(m.Body, s.cfg.RegisterToken, notifyPreviewMax))
-	b.WriteString("\nRead the full message from your Peerline inbox (GET /v1/inbox).\n")
+	b.WriteString("\nRead the full message from your Peerline inbox (GET /v1/inbox).\n\n")
+	b.WriteString("---\n")
+	fmt.Fprintf(&b, "You received this notification because peer %s sent a message to peer %s, and %s has this email set as their verified notification address. To stop receiving these notifications, clear your notify_email via PUT /v1/me.\n", m.From, m.To, m.To)
 	return mailer.Message{
 		To:      to,
 		Subject: "Peerline: new message from " + m.From,
@@ -1187,7 +1306,7 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 	}
 	// Atomically register and accept the pairing in one transaction
 	id, key := auth.NewID(), auth.NewKey()
-	g, err := s.st.RegisterAndAcceptByPairing(r.Context(), tokenHash, id, in.Name, auth.Hash(key), "", sc, bg)
+	g, err := s.st.RegisterAndAcceptByPairing(r.Context(), tokenHash, id, in.Name, auth.Hash(key), "", "", sc, bg)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")

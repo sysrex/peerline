@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS peers (
   name TEXT NOT NULL,
   key_hash TEXT NOT NULL UNIQUE,
   created_at INTEGER NOT NULL,
-  notify_email TEXT NOT NULL DEFAULT ''
+  notify_email TEXT NOT NULL DEFAULT '',
+  notify_email_verified INTEGER NOT NULL DEFAULT 0,
+  notify_email_token TEXT
 );
 CREATE TABLE IF NOT EXISTS invites (
   code_hash TEXT PRIMARY KEY,
@@ -118,6 +120,7 @@ func migrate(db *sql.DB) error {
 		migrateV1NotifyEmail,
 		migrateV2PairingTokenHash,
 		migrateV3InvitePublicID,
+		migrateV4EmailVerification,
 	}
 
 	for i, mig := range migrations {
@@ -289,6 +292,33 @@ func migrateV3InvitePublicID(tx *sql.Tx) error {
 	return nil
 }
 
+// migrateV4EmailVerification adds notify_email_verified and notify_email_token columns to peers.
+func migrateV4EmailVerification(tx *sql.Tx) error {
+	// Check if notify_email_verified column exists
+	var hasVerified int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name = 'notify_email_verified'`).Scan(&hasVerified); err != nil {
+		return err
+	}
+	if hasVerified == 0 {
+		if _, err := tx.Exec(`ALTER TABLE peers ADD COLUMN notify_email_verified INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+
+	// Check if notify_email_token column exists
+	var hasToken int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name = 'notify_email_token'`).Scan(&hasToken); err != nil {
+		return err
+	}
+	if hasToken == 0 {
+		if _, err := tx.Exec(`ALTER TABLE peers ADD COLUMN notify_email_token TEXT`); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (s *Store) Close() error { return s.db.Close() }
 
 // generatePublicID returns a random 16-byte hex string for invite public_id.
@@ -308,8 +338,10 @@ type Peer struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-func (s *Store) CreatePeer(ctx context.Context, id, name, keyHash, notifyEmail string) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email) VALUES(?,?,?,?,?)`, id, name, keyHash, s.now(), notifyEmail)
+func (s *Store) CreatePeer(ctx context.Context, id, name, keyHash, notifyEmail, notifyToken string) error {
+	verified := 0
+	_, err := s.db.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email,notify_email_verified,notify_email_token) VALUES(?,?,?,?,?,?,?)`, 
+		id, name, keyHash, s.now(), notifyEmail, verified, notifyToken)
 	return err
 }
 
@@ -324,8 +356,22 @@ func (s *Store) NotifyEmail(ctx context.Context, id string) (string, error) {
 }
 
 // SetNotifyEmail sets or clears the wake-up address. email is "" to clear.
-func (s *Store) SetNotifyEmail(ctx context.Context, id, email string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE peers SET notify_email=? WHERE id=?`, email, id)
+// When setting a new email, it marks it as unverified and generates a confirmation token.
+func (s *Store) SetNotifyEmail(ctx context.Context, id, email, token string) error {
+	verified := 0
+	if email == "" {
+		// Clearing email
+		res, err := s.db.ExecContext(ctx, `UPDATE peers SET notify_email=?, notify_email_verified=0, notify_email_token=NULL WHERE id=?`, email, id)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	}
+	// Setting new email: unverified with token
+	res, err := s.db.ExecContext(ctx, `UPDATE peers SET notify_email=?, notify_email_verified=?, notify_email_token=? WHERE id=?`, email, verified, token, id)
 	if err != nil {
 		return err
 	}
@@ -333,6 +379,46 @@ func (s *Store) SetNotifyEmail(ctx context.Context, id, email string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// GetNotifyEmailWithStatus returns the email, whether it's verified, and the verification token.
+func (s *Store) GetNotifyEmailWithStatus(ctx context.Context, id string) (email string, verified bool, token string, err error) {
+	var verifiedInt int
+	var tokenNull sql.NullString
+	err = s.db.QueryRowContext(ctx, `SELECT notify_email, notify_email_verified, notify_email_token FROM peers WHERE id=?`, id).Scan(&email, &verifiedInt, &tokenNull)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, "", ErrNotFound
+	}
+	if err != nil {
+		return "", false, "", err
+	}
+	verified = verifiedInt != 0
+	if tokenNull.Valid {
+		token = tokenNull.String
+	}
+	return email, verified, token, nil
+}
+
+// VerifyNotifyEmail marks the email as verified if the token matches.
+func (s *Store) VerifyNotifyEmail(ctx context.Context, id, token string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE peers SET notify_email_verified=1, notify_email_token=NULL WHERE id=? AND notify_email_token=?`, id, token)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// GetVerifiedNotifyEmail returns the email only if it's verified, or "" if unset/unverified.
+func (s *Store) GetVerifiedNotifyEmail(ctx context.Context, id string) (string, error) {
+	var email string
+	err := s.db.QueryRowContext(ctx, `SELECT notify_email FROM peers WHERE id=? AND notify_email_verified=1 AND notify_email != ''`, id).Scan(&email)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return email, err
 }
 
 func (s *Store) PeerByKeyHash(ctx context.Context, keyHash string) (*Peer, error) {
@@ -711,7 +797,7 @@ func (s *Store) AcceptInvite(ctx context.Context, codeHash, accepter string, bac
 
 // RegisterAndAcceptByPairing atomically registers a new peer and accepts a pairing invite.
 // Returns the grant from the inviter.
-func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash, peerID, name, keyHash, notifyEmail string, backScopes, backBags []string) (grant *Grant, err error) {
+func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash, peerID, name, keyHash, notifyEmail, notifyToken string, backScopes, backBags []string) (grant *Grant, err error) {
 	// #14 fix: Read-only check before BeginTx to avoid taking write lock for invalid tokens
 	var codeHash, fromPeer string
 	var exp int64
@@ -739,8 +825,9 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 	// Take timestamp inside tx for expires_at guard and created_at
 	ts := s.now()
 
-	_, err = tx.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email) VALUES(?,?,?,?,?)`,
-		peerID, name, keyHash, ts, notifyEmail)
+	verified := 0
+	_, err = tx.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email,notify_email_verified,notify_email_token) VALUES(?,?,?,?,?,?,?)`,
+		peerID, name, keyHash, ts, notifyEmail, verified, notifyToken)
 	if err != nil {
 		return nil, err
 	}

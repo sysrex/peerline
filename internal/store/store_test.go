@@ -35,17 +35,17 @@ func TestStoreBasics(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err := s.CreatePeer(ctx, "a", "alice", "ha", "alice@example.com"); err != nil {
+	if err := s.CreatePeer(ctx, "a", "alice", "ha", "alice@example.com", ""); err != nil {
 		t.Fatal(err)
 	}
-	s.CreatePeer(ctx, "b", "bob", "hb", "")
+	s.CreatePeer(ctx, "b", "bob", "hb", "", "")
 	if email, err := s.NotifyEmail(ctx, "a"); err != nil || email != "alice@example.com" {
 		t.Fatal(email, err)
 	}
 	if email, err := s.NotifyEmail(ctx, "b"); err != nil || email != "" {
 		t.Fatal(email, err)
 	}
-	if err := s.SetNotifyEmail(ctx, "a", ""); err != nil {
+	if err := s.SetNotifyEmail(ctx, "a", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if email, err := s.NotifyEmail(ctx, "a"); err != nil || email != "" {
@@ -80,10 +80,10 @@ func TestStats(t *testing.T) {
 	if err != nil || st != (Stats{}) {
 		t.Fatalf("empty: %+v %v", st, err)
 	}
-	if err := s.CreatePeer(ctx, "a", "alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "a", "alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "b", "bob", "hb", ""); err != nil {
+	if err := s.CreatePeer(ctx, "b", "bob", "hb", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.CreateInvite(ctx, "c2", "a", []string{"messages"}, nil, time.Now().Add(time.Hour)); err != nil {
@@ -137,10 +137,10 @@ func TestNotifyEmailMigration(t *testing.T) {
 	if err != nil || email != "" {
 		t.Fatalf("migrated email %q %v", email, err)
 	}
-	if err := s.SetNotifyEmail(ctx, "p_old", "old@example.com"); err != nil {
+	if err := s.SetNotifyEmail(ctx, "p_old", "old@example.com", "tok1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetNotifyEmail(ctx, "missing", "a@b.co"); !errors.Is(err, ErrNotFound) {
+	if err := s.SetNotifyEmail(ctx, "missing", "a@b.co", "tok2"); !errors.Is(err, ErrNotFound) {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -210,8 +210,8 @@ func TestV0SchemaMigration(t *testing.T) {
 
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 3 {
-		t.Fatalf("user_version = %d, want 3", version)
+	if version != 4 {
+		t.Fatalf("user_version = %d, want 4", version)
 	}
 
 	email, err := s.NotifyEmail(ctx, "alice")
@@ -278,8 +278,8 @@ func TestV1SchemaMigration(t *testing.T) {
 
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 3 {
-		t.Fatalf("user_version = %d, want 3", version)
+	if version != 4 {
+		t.Fatalf("user_version = %d, want 4", version)
 	}
 
 	email, err := s.NotifyEmail(ctx, "alice")
@@ -497,8 +497,8 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 			// Verify user_version is 2
 			var version int
 			migratedStore.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-			if version != 3 {
-				t.Fatalf("user_version = %d, want 3", version)
+			if version != 4 {
+				t.Fatalf("user_version = %d, want 4", version)
 			}
 
 			// Compare full schema
@@ -545,7 +545,7 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 			}
 
 			// Verify uniqueness behavior: duplicate pairing_token_hash rejected, multiple NULLs allowed
-			if err := migratedStore.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+			if err := migratedStore.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 				t.Fatal(err)
 			}
 			exp := time.Now().Add(time.Hour)
@@ -577,7 +577,7 @@ func TestConcurrentPairingRedemption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s1.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s1.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	pairingHash := "pairing_hash_123"
@@ -601,7 +601,7 @@ func TestConcurrentPairingRedemption(t *testing.T) {
 				return
 			}
 			defer s.Close()
-			_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash, id, name, kh, "", nil, nil)
+			_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash, id, name, kh, "", "", nil, nil)
 			results <- err
 		}(peerID, peerName, keyHash)
 	}
@@ -655,7 +655,7 @@ func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 	}
 	defer s.Close()
 
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -666,7 +666,7 @@ func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = s.RegisterAndAcceptByPairing(ctx, expiredHash, "bob", "Bob", "hb", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(ctx, expiredHash, "bob", "Bob", "hb", "", "", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for expired, got %v", err)
 	}
@@ -681,7 +681,7 @@ func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 
 	// Test 2: Already-used pairing token
 	usedHash := "used_hash"
-	if err := s.CreatePeer(ctx, "carol", "Carol", "hc", ""); err != nil {
+	if err := s.CreatePeer(ctx, "carol", "Carol", "hc", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.CreateInviteWithPairing(ctx, "code_used", usedHash, "alice", []string{"messages"}, nil, time.Now().Add(time.Hour)); err != nil {
@@ -692,7 +692,7 @@ func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = s.RegisterAndAcceptByPairing(ctx, usedHash, "dave", "Dave", "hd", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(ctx, usedHash, "dave", "Dave", "hd", "", "", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for used invite, got %v", err)
 	}
@@ -705,7 +705,7 @@ func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 	}
 
 	// Test 3: Invalid token (doesn't exist)
-	_, err = s.RegisterAndAcceptByPairing(ctx, "nonexistent_hash", "eve", "Eve", "he", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(ctx, "nonexistent_hash", "eve", "Eve", "he", "", "", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for nonexistent, got %v", err)
 	}
@@ -727,10 +727,10 @@ func TestExpiredInviteRejection(t *testing.T) {
 	}
 	defer s.Close()
 
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", ""); err != nil {
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -773,7 +773,7 @@ func TestRollbackAfterPeerInsert(t *testing.T) {
 	}
 	defer s.Close()
 
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -789,7 +789,7 @@ func TestRollbackAfterPeerInsert(t *testing.T) {
 	defer s.db.Exec(`DROP TRIGGER IF EXISTS rollback_test_trigger`)
 
 	// Try to register - peer INSERT will succeed but grant INSERT will fail due to trigger
-	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash, "bob", "Bob", "hb", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash, "bob", "Bob", "hb", "", "", nil, nil)
 	if err == nil {
 		t.Fatal("expected error due to injected failure")
 	}
@@ -816,7 +816,7 @@ func TestRollbackAfterPeerInsert(t *testing.T) {
 	if _, err := s.db.Exec(`DROP TRIGGER rollback_test_trigger`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.RegisterAndAcceptByPairing(ctx, pairingHash, "carol", "Carol", "hc", "", nil, nil); err != nil {
+	if _, err := s.RegisterAndAcceptByPairing(ctx, pairingHash, "carol", "Carol", "hc", "", "", nil, nil); err != nil {
 		t.Fatalf("invite should still be redeemable after trigger removed: %v", err)
 	}
 }
@@ -831,7 +831,7 @@ func TestContextCancellationBeforeTransaction(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -860,7 +860,7 @@ func TestContextCancellationBeforeTransaction(t *testing.T) {
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := s.RegisterAndAcceptByPairing(cancelCtx, pairingHash, "bob", "Bob", "hb", "", nil, nil)
+		_, err := s.RegisterAndAcceptByPairing(cancelCtx, pairingHash, "bob", "Bob", "hb", "", "", nil, nil)
 		done <- err
 	}()
 
@@ -880,12 +880,12 @@ func TestContextCancellationBeforeTransaction(t *testing.T) {
 
 	// DB should not be wedged - normal operations should work
 	normalCtx := context.Background()
-	if err := s.CreatePeer(normalCtx, "carol", "Carol", "hc", ""); err != nil {
+	if err := s.CreatePeer(normalCtx, "carol", "Carol", "hc", "", ""); err != nil {
 		t.Fatalf("DB wedged after cancel: %v", err)
 	}
 
 	// Original pairing token should still be redeemable
-	_, err = s.RegisterAndAcceptByPairing(normalCtx, pairingHash, "dave", "Dave", "hd", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(normalCtx, pairingHash, "dave", "Dave", "hd", "", "", nil, nil)
 	if err != nil {
 		t.Fatalf("pairing redemption failed after cancel: %v", err)
 	}
@@ -908,7 +908,7 @@ func TestContextCancellationMidTransaction(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -930,7 +930,7 @@ func TestContextCancellationMidTransaction(t *testing.T) {
 	defer s.db.Exec(`DROP TRIGGER IF EXISTS cancel_test_trigger`)
 
 	// Try to register and accept - should fail due to cancellation after peer INSERT
-	_, err = s.RegisterAndAcceptByPairing(cancelCtx, pairingHash, "bob", "Bob", "hb", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(cancelCtx, pairingHash, "bob", "Bob", "hb", "", "", nil, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got: %v", err)
 	}
@@ -961,12 +961,12 @@ func TestContextCancellationMidTransaction(t *testing.T) {
 
 	// Verify DB isn't wedged: next accept should succeed
 	normalCtx := context.Background()
-	if _, err := s.RegisterAndAcceptByPairing(normalCtx, pairingHash, "carol", "Carol", "hc", "", nil, nil); err != nil {
+	if _, err := s.RegisterAndAcceptByPairing(normalCtx, pairingHash, "carol", "Carol", "hc", "", "", nil, nil); err != nil {
 		t.Fatalf("DB wedged after mid-tx cancel: %v", err)
 	}
 
 	// Verify a plain write succeeds
-	if err := s.CreatePeer(normalCtx, "dave", "Dave", "hd", ""); err != nil {
+	if err := s.CreatePeer(normalCtx, "dave", "Dave", "hd", "", ""); err != nil {
 		t.Fatalf("plain write failed after mid-tx cancel: %v", err)
 	}
 
@@ -1052,7 +1052,7 @@ func TestPairingTokenHashMigration(t *testing.T) {
 	if err := s.CreateInviteWithPairing(ctx, "c-dup", "tok-hash", "p_old", []string{"messages"}, nil, until); err == nil {
 		t.Fatal("expected unique pairing token hash")
 	}
-	if err := s.CreatePeer(ctx, "p_new", "new", "hn", ""); err != nil {
+	if err := s.CreatePeer(ctx, "p_new", "new", "hn", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	g, err := s.AcceptInvite(ctx, "legacy", "p_new", nil, nil)
@@ -1199,8 +1199,8 @@ func TestPR11AlreadyMigrated(t *testing.T) {
 
 	// Verify user_version advanced to 2
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 3 {
-		t.Fatalf("user_version = %d, want 3", version)
+	if version != 4 {
+		t.Fatalf("user_version = %d, want 4", version)
 	}
 
 	// Verify columns still exist
@@ -1248,8 +1248,8 @@ func TestPR11AlreadyMigrated(t *testing.T) {
 
 	// Verify user_version unchanged
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 3 {
-		t.Fatalf("user_version after second migrate = %d, want 3", version)
+	if version != 4 {
+		t.Fatalf("user_version after second migrate = %d, want 4", version)
 	}
 
 	// Verify columns still present
@@ -1418,7 +1418,7 @@ func TestV3MigrationFreshDB(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a peer and invite
-	if err := s.CreatePeer(ctx, "alice", "Alice", "hash1", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "hash1", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1514,8 +1514,8 @@ func TestV2ToV3Migration(t *testing.T) {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 {
-		t.Errorf("user_version = %d, want 3", version)
+	if version != 4 {
+		t.Errorf("user_version = %d, want 4", version)
 	}
 
 	// Verify all rows have public_id
@@ -1599,8 +1599,8 @@ func TestV3MigrationIdempotent(t *testing.T) {
 	// Verify user_version is still 3
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 3 {
-		t.Errorf("user_version = %d, want 3", version)
+	if version != 4 {
+		t.Errorf("user_version = %d, want 4", version)
 	}
 }
 
@@ -1615,10 +1615,10 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 	defer s.Close()
 
 	// Create peers
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", ""); err != nil {
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1661,7 +1661,7 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 	if err := s.CreateInvite(ctx, "code3", "alice", []string{"messages"}, nil, exp3); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "charlie", "Charlie", "hc", ""); err != nil {
+	if err := s.CreatePeer(ctx, "charlie", "Charlie", "hc", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.AcceptInvite(ctx, "code3", "charlie", nil, nil); err != nil {
@@ -1675,7 +1675,7 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 	if err := s.CreateInvite(ctx, "code4", "alice", []string{"messages"}, nil, exp4); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "dave", "Dave", "hd", ""); err != nil {
+	if err := s.CreatePeer(ctx, "dave", "Dave", "hd", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.AcceptInvite(ctx, "code4", "dave", nil, nil); err != nil {
@@ -1755,10 +1755,10 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 	ctx := context.Background()
 
 	// Create peers
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", ""); err != nil {
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1830,7 +1830,7 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 
 	// 6. RegisterAndAcceptByPairing rejects expired token (pre-check)
 	s.now = func() int64 { return currentTime + 203 }
-	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash2, "charlie", "Charlie", "hc", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash2, "charlie", "Charlie", "hc", "", "", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("RegisterAndAcceptByPairing should return ErrNotFound for expired token in pre-check, got %v", err)
 	}
@@ -1854,7 +1854,7 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 		}
 		return currentTime + 301 // After expiry: tx fails
 	}
-	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash3, "dave", "Dave", "hd", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash3, "dave", "Dave", "hd", "", "", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("RegisterAndAcceptByPairing should return ErrNotFound when token expires between pre-check and tx, got %v", err)
 	}
@@ -1935,7 +1935,7 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 
 	// At exact expiry time: should be accepted
 	s.now = func() int64 { return currentTime + 600 }
-	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash6, "carol", "Carol", "hc", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash6, "carol", "Carol", "hc", "", "", nil, nil)
 	if err != nil {
 		t.Errorf("RegisterAndAcceptByPairing at exact expiry (now == expires_at) should succeed, got %v", err)
 	}
@@ -1951,7 +1951,7 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 
 	// One second after expiry: should be rejected
 	s.now = func() int64 { return currentTime + 701 }
-	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash7, "dan", "Dan", "hdan", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash7, "dan", "Dan", "hdan", "", "", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("RegisterAndAcceptByPairing at expires_at+1 should return ErrNotFound, got %v", err)
 	}
