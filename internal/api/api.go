@@ -545,6 +545,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		TTLSeconds      int      `json:"ttl_seconds"`
 		ToEmail         string   `json:"to_email"`         // optional: email the accept link + code
 		GeneratePairing bool     `json:"generate_pairing"` // optional: generate shareable pairing link
+		RequireConfirm  bool     `json:"require_confirm"`  // optional: pairing link must be claimed, then confirmed by you with a code
 	}
 	if !decode(w, r, &in) {
 		return
@@ -591,6 +592,11 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if in.RequireConfirm && (!in.GeneratePairing || s.claims == nil) {
+		writeErr(w, http.StatusBadRequest, "require_confirm needs generate_pairing and a server with claim support")
+		return
+	}
+
 	code := auth.NewSecret("inv_")
 	exp := s.now().Add(ttl).UTC()
 	var pairingToken string
@@ -605,7 +611,11 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	// Create invite first with atomic cap check (#53)
 	if in.GeneratePairing {
 		pairingToken = auth.NewPairingToken()
-		publicID, err = s.st.CreateInviteWithPairingAtomic(r.Context(), auth.Hash(code), auth.Hash(pairingToken), me, sc, bg, exp, s.cfg.MaxOutstandingInvites)
+		create := s.st.CreateInviteWithPairingAtomic
+		if in.RequireConfirm {
+			create = s.st.CreateConfirmInviteAtomic
+		}
+		publicID, err = create(r.Context(), auth.Hash(code), auth.Hash(pairingToken), me, sc, bg, exp, s.cfg.MaxOutstandingInvites)
 		if errors.Is(err, store.ErrTooManyInvites) {
 			writeErr(w, http.StatusTooManyRequests, fmt.Sprintf("too many outstanding invites (limit %d); revoke or wait for expiry", s.cfg.MaxOutstandingInvites))
 			return

@@ -103,6 +103,10 @@ func main() {
 	}
 	retentionSeconds := int64(retentionDays * 24 * 60 * 60)
 
+	if os.Getenv("PEERLINE_CODE_PEPPER") == "" {
+		log.Warn("PEERLINE_CODE_PEPPER unset: confirm-mode short codes use a per-process secret, so pending claims cannot be confirmed across a restart")
+	}
+
 	apiServer, err := api.New(st, api.Config{
 		RegisterToken:         regTok,
 		CodePepper:            []byte(os.Getenv("PEERLINE_CODE_PEPPER")),
@@ -121,6 +125,8 @@ func main() {
 		log.Error("failed to create API server", "err", err)
 		os.Exit(1)
 	}
+
+	apiServer.SetClaimStore(st)
 
 	maxBags, maxBytes := apiServer.BagLimits()
 	log.Info("bag storage caps", "max_bags_per_peer", maxBags, "max_bag_bytes_per_peer", maxBytes)

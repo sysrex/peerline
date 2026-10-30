@@ -212,8 +212,8 @@ func TestV0SchemaMigration(t *testing.T) {
 
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 5 {
-		t.Fatalf("user_version = %d, want 5", version)
+	if version != len(migrations) {
+		t.Fatalf("user_version = %d, want %d", version, len(migrations))
 	}
 
 	email, err := s.NotifyEmail(ctx, "alice")
@@ -280,8 +280,8 @@ func TestV1SchemaMigration(t *testing.T) {
 
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 5 {
-		t.Fatalf("user_version = %d, want 5", version)
+	if version != len(migrations) {
+		t.Fatalf("user_version = %d, want %d", version, len(migrations))
 	}
 
 	email, err := s.NotifyEmail(ctx, "alice")
@@ -499,8 +499,8 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 			// Verify user_version is 2
 			var version int
 			migratedStore.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-			if version != 5 {
-				t.Fatalf("user_version = %d, want 5", version)
+			if version != len(migrations) {
+				t.Fatalf("user_version = %d, want %d", version, len(migrations))
 			}
 
 			// Compare full schema
@@ -1202,8 +1202,8 @@ func TestPR11AlreadyMigrated(t *testing.T) {
 
 	// Verify user_version advanced to 2
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 5 {
-		t.Fatalf("user_version = %d, want 5", version)
+	if version != len(migrations) {
+		t.Fatalf("user_version = %d, want %d", version, len(migrations))
 	}
 
 	// Verify columns still exist
@@ -1251,8 +1251,8 @@ func TestPR11AlreadyMigrated(t *testing.T) {
 
 	// Verify user_version unchanged
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 5 {
-		t.Fatalf("user_version after second migrate = %d, want 5", version)
+	if version != len(migrations) {
+		t.Fatalf("user_version after second migrate = %d, want %d", version, len(migrations))
 	}
 
 	// Verify columns still present
@@ -1516,8 +1516,8 @@ func TestV2ToV3Migration(t *testing.T) {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 5 {
-		t.Errorf("user_version = %d, want 5", version)
+	if version != len(migrations) {
+		t.Errorf("user_version = %d, want %d", version, len(migrations))
 	}
 
 	// Verify all rows have public_id
@@ -1601,8 +1601,8 @@ func TestV3MigrationIdempotent(t *testing.T) {
 	// Verify user_version is still 3
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 5 {
-		t.Errorf("user_version = %d, want 5", version)
+	if version != len(migrations) {
+		t.Errorf("user_version = %d, want %d", version, len(migrations))
 	}
 }
 
@@ -2512,5 +2512,18 @@ func TestBagLimitsByteCapFileDBRace(t *testing.T) {
 	}
 	if totalBytes > byteCap {
 		t.Errorf("mixed race: total bytes %d exceeds cap %d", totalBytes, byteCap)
+	}
+}
+
+func TestOpenRefusesDamagedSchema(t *testing.T) {
+	path := t.TempDir() + "/t.db"
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mustExec(t, `DROP INDEX invites_public_id`)
+	s.Close()
+	if _, err := Open(path); err == nil || !strings.Contains(err.Error(), "invites_public_id") {
+		t.Fatalf("want damaged-schema error, got %v", err)
 	}
 }

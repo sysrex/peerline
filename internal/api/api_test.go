@@ -35,15 +35,6 @@ type client struct {
 	id  string
 }
 
-func mustNew(t *testing.T, st *store.Store, cfg Config) *Server {
-	t.Helper()
-	s, err := New(st, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return s
-}
-
 func newServer(t *testing.T, cfg Config) *httptest.Server {
 	t.Helper()
 	st, err := store.Open(t.TempDir() + "/t.db")
