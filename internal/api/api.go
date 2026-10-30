@@ -267,6 +267,8 @@ func (s *Server) Handler() http.Handler {
 	authed := http.NewServeMux()
 	authed.HandleFunc("GET /v1/me", s.rateLimitAuth(s.me))
 	authed.HandleFunc("PUT /v1/me", s.rateLimitWrite(s.updateMe))
+	authed.HandleFunc("POST /v1/me/rotate-key", s.rateLimitWrite(s.rotateKey))
+	authed.HandleFunc("DELETE /v1/me", s.rateLimitWrite(s.deleteMe))
 	authed.HandleFunc("POST /v1/me/verify-email", s.rateLimitWrite(s.verifyEmail))
 	authed.HandleFunc("POST /v1/invites", s.rateLimitWrite(s.createInvite))
 	authed.HandleFunc("GET /v1/invites", s.rateLimitAuth(s.listInvites))
@@ -486,6 +488,39 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 		"notify_email": email,
 		"verified":     verified,
 	})
+}
+
+func (s *Server) rotateKey(w http.ResponseWriter, r *http.Request) {
+	me := auth.PeerID(r.Context())
+	key := auth.NewKey()
+	if err := s.st.RotateKey(r.Context(), me, auth.Hash(key)); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "peer not found")
+			return
+		}
+		s.internal(w, err)
+		return
+	}
+	s.log.Info("api key rotated", "peer_id", me)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"peer_id": me,
+		"api_key": key,
+		"note":    "api_key is shown once; the previous key no longer works",
+	})
+}
+
+func (s *Server) deleteMe(w http.ResponseWriter, r *http.Request) {
+	me := auth.PeerID(r.Context())
+	if err := s.st.DeletePeer(r.Context(), me); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "peer not found")
+			return
+		}
+		s.internal(w, err)
+		return
+	}
+	s.log.Info("peer deleted", "peer_id", me)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
