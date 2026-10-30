@@ -52,7 +52,7 @@ Backups are **verified** after creation:
 - Created with **0600 permissions** (owner-only access) to prevent world-readable windows
 - **Contain sensitive data**: Backups contain API key hashes (unsalted SHA-256), invite/pairing-token hashes, notify email addresses, full message bodies, and bag contents. No passwords are stored anywhere in Peerline.
 - Should be stored on encrypted volumes in production
-- Backup directory must not be group- or world-writable (checked on startup)
+- Backup directory (including the default, the database directory) must be a real directory (not a symlink), owned by the user running Peerline, with no group or world access (mode 0700); checked on startup
 - Excluded from Git via `.gitignore` (`*.db.pre-v*`)
 
 ## Backup Files
@@ -88,6 +88,7 @@ To adjust retention:
 - Set `PEERLINE_BACKUP_KEEP=5` to keep at most 5 backup files in total
 - Minimum value is 1; invalid values log a warning and use the default (3)
 - The just-created or reused backup counts toward this limit but is never deleted
+- Only regular files named exactly like Peerline backups (`<db>.pre-vN-from-vM.<timestamp>[.<pid>]`) are managed and deleted; to keep a backup, copy it elsewhere or rename it so it no longer matches
 
 ### Storage Location
 
@@ -98,7 +99,7 @@ export PEERLINE_BACKUP_DIR=/var/backups/peerline
 ```
 
 The directory will be created if it doesn't exist (with **0700 permissions** for security).  
-Peerline will **refuse to start** if the backup directory has group- or world-writable permissions.
+Peerline will **refuse to start** if the backup directory is a symlink, is owned by another user, or allows any group or world access (mode other than 0700). This applies to the default location (the database directory) too.
 
 ### Disk Space Requirements
 
