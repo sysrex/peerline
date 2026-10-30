@@ -1101,6 +1101,34 @@ func (s *Store) GetVerifiedNotifyEmail(ctx context.Context, id string) (string, 
 	return email, err
 }
 
+// RotateKey replaces the peer's API key hash. The old key stops authenticating
+// immediately; grants, bags and identity are untouched.
+func (s *Store) RotateKey(ctx context.Context, id, newKeyHash string) error {
+	s.keyIndexRemove(id)
+	res, err := s.db.ExecContext(ctx, `UPDATE peers SET key_hash=? WHERE id=?`, newKeyHash, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	s.keyIndex.add(newKeyHash, id)
+	return nil
+}
+
+// DeletePeer removes the peer and, via foreign keys, its grants, invites, messages and bags.
+func (s *Store) DeletePeer(ctx context.Context, id string) error {
+	s.keyIndexRemove(id)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM peers WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) PeerByKeyHash(ctx context.Context, keyHash string) (*Peer, error) {
 	var p Peer
 	var ts int64
