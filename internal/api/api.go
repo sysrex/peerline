@@ -276,7 +276,7 @@ func (s *Server) Handler() http.Handler {
 	authed.HandleFunc("POST /v1/invites/accept", s.rateLimitWrite(s.acceptInvite))
 	authed.HandleFunc("GET /v1/grants", s.rateLimitAuth(s.listGrants))
 	authed.HandleFunc("DELETE /v1/grants/{peer_id}", s.rateLimitWrite(s.revokeGrant))
-	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.rateLimitAuth(s.sendMessage)) // budgeted by msgLim, not writeLim
+	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.rateLimitAuth(s.sendMessage))
 	authed.HandleFunc("GET /v1/inbox", s.rateLimitAuth(s.inbox)) // polling-friendly rate limit
 	authed.HandleFunc("GET /v1/bags/{name}", s.rateLimitAuth(s.getBag))
 	authed.HandleFunc("PUT /v1/bags/{name}", s.rateLimitBagWrite(s.putBag))
