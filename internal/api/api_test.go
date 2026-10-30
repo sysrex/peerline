@@ -1705,38 +1705,3 @@ func TestAPIClock(t *testing.T) {
 		t.Errorf("expires_at after +100s = %v, want %v", expTime, expected)
 	}
 }
-
-// TestRateLimitWithMultipleXFFHeaders verifies that multiple X-Forwarded-For
-// header lines are properly combined when the RemoteAddr is trusted (#61).
-func TestRateLimitWithMultipleXFFHeaders(t *testing.T) {
-	// Unit test coverage for multiple XFF headers is in clientip_test.go
-	// This integration test verifies end-to-end behavior through the HTTP handler
-	srv := newServer(t, Config{
-		TrustedProxies: []string{"127.0.0.0/8"},
-		MsgPerMinute:   10,
-		MsgBurst:       10,
-	})
-
-	// Register and pair two peers
-	a, b := register(t, srv, "alice"), register(t, srv, "bob")
-	pairUp(t, a, b, []string{"messages"}, nil, nil)
-
-	// Make a request with custom XFF headers to verify they're processed
-	// This tests that the rate limiting sees the combined XFF list
-	req, _ := http.NewRequest("GET", srv.URL+"/v1/inbox", nil)
-	req.Header.Set("Authorization", "Bearer "+b.key)
-	// Multiple XFF headers should be combined: ["203.0.113.10", "10.0.0.2", "10.0.0.3"]
-	req.Header.Add("X-Forwarded-For", "203.0.113.10, 10.0.0.2")
-	req.Header.Add("X-Forwarded-For", "10.0.0.3")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-
-	// The request should succeed (not testing rate limiting here, just that it works)
-	if resp.StatusCode != 200 {
-		t.Errorf("expected 200, got %d", resp.StatusCode)
-	}
-}

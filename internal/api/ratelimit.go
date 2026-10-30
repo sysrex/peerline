@@ -168,6 +168,8 @@ func rateLimitKey(ip string) string {
 // ParseTrustedProxies parses a list of CIDR strings (or bare IPs) into IPNets.
 // Rejects overly broad prefixes (0.0.0.0/0, ::/0, and prefixes shorter than
 // /8 for IPv4 or /32 for IPv6) to prevent misconfiguration (#62).
+// IPv4-mapped IPv6 prefixes (e.g., ::ffff:10.0.0.0/104) are unmapped and
+// converted to IPv4 (10.0.0.0/8), with the IPv4 /8 floor applied.
 func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 	var nets []*net.IPNet
 	for _, cidr := range cidrs {
@@ -201,6 +203,42 @@ func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 		// Check prefix length to prevent overly broad trust (#62)
 		ones, bits := ipnet.Mask.Size()
 		isIPv4 := bits == 32
+
+		// Check for IPv4-mapped IPv6 prefixes (::ffff:0:0/96+)
+		// net.ParseCIDR unmaps the IP but keeps the /128 mask size and IPv6 prefix length
+		if !isIPv4 && bits == 128 && len(ipnet.IP) == 16 {
+			// Check if this is an IPv4-mapped prefix by looking at the IP bytes
+			// IPv4-mapped addresses have the pattern ::ffff:a.b.c.d (first 10 bytes zero, next 2 bytes 0xff)
+			isIPv4Mapped := true
+			for i := 0; i < 10; i++ {
+				if ipnet.IP[i] != 0 {
+					isIPv4Mapped = false
+					break
+				}
+			}
+			if isIPv4Mapped && ipnet.IP[10] == 0xff && ipnet.IP[11] == 0xff {
+				// This is an IPv4-mapped IPv6 prefix like ::ffff:10.0.0.0/104
+				// The IPv4 portion is in the last 4 bytes
+				if ones < 96 {
+					return nil, fmt.Errorf("parsing %q: IPv4-mapped IPv6 prefix must be at least /96", cidr)
+				}
+				ipv4PrefixLen := ones - 96
+				// Apply IPv4 rules: reject /0, require at least /8
+				if ipv4PrefixLen == 0 {
+					return nil, fmt.Errorf("parsing %q: IPv4-mapped prefix covers all of IPv4 (equivalent to 0.0.0.0/0)", cidr)
+				}
+				if ipv4PrefixLen < 8 {
+					return nil, fmt.Errorf("parsing %q: IPv4-mapped prefix must map to at least /8 in IPv4 (need /%d or longer)", cidr, 96+8)
+				}
+				// Convert to native IPv4 CIDR using the last 4 bytes
+				ipv4Bytes := ipnet.IP[12:16]
+				ipv4Addr := net.IPv4(ipv4Bytes[0], ipv4Bytes[1], ipv4Bytes[2], ipv4Bytes[3])
+				ipv4Str := ipv4Addr.String() + "/" + fmt.Sprintf("%d", ipv4PrefixLen)
+				_, ipnet, _ = net.ParseCIDR(ipv4Str)
+				nets = append(nets, ipnet)
+				continue
+			}
+		}
 
 		// Reject /0 for both IPv4 and IPv6
 		if ones == 0 {
