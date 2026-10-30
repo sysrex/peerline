@@ -288,8 +288,6 @@ This trusts only requests from that Docker network (where Traefik runs). Peerlin
 
 **⚠️ Warning:** Do NOT blindly trust all RFC1918 private ranges (`10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`) unless you control every host in those ranges. Trusting a range means any host in it can spoof X-Forwarded-For. Only trust the specific network where your reverse proxy resides.
 
-<<<<<<< HEAD
-=======
 **Prefix length restrictions:** To prevent misconfiguration, Peerline enforces minimum prefix lengths: `/8` for IPv4 and `/32` for IPv6. The following are rejected at startup:
 - Overly broad prefixes: `0.0.0.0/0`, `::/0`, and any prefix shorter than the floor
 - IPv4-mapped IPv6 prefixes shorter than `/96` (e.g., `::ffff:0:0/80` would also trust `::1`)
@@ -298,7 +296,6 @@ This trusts only requests from that Docker network (where Traefik runs). Peerlin
 
 IPv4-mapped IPv6 prefixes meeting the floor (e.g., `::ffff:10.0.0.0/104`) are automatically unmapped to their native IPv4 equivalent (`10.0.0.0/8`) and treated as IPv4. A bare IPv4-mapped address like `::ffff:10.0.0.1` becomes `10.0.0.1/32`.
 
->>>>>>> origin/main
 **Only X-Forwarded-For is honored.** Peerline does not read `X-Real-IP` or `Forwarded` (RFC 7239). Use a proxy that sets X-Forwarded-For, or leave `PEERLINE_TRUSTED_PROXIES` unset and accept that all clients share the proxy's RemoteAddr for rate limiting.
 
 **Multiple X-Forwarded-For entries:** Peerline walks the header right-to-left and uses the first address that is not in a trusted CIDR. Entries that do not parse are skipped (known issue #61).
