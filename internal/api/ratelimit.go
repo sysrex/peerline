@@ -279,6 +279,14 @@ type LimiterManager struct {
 	wg     sync.WaitGroup
 }
 
+// Rate limit constants for public GET endpoints and authenticated endpoints.
+const (
+	getPerMinute     = 60
+	getBurst         = 20
+	authGetPerMinute = 120
+	authGetBurst     = 40
+)
+
 // NewLimiterManager creates and starts a new limiter manager.
 func NewLimiterManager(cfg Config) *LimiterManager {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -287,8 +295,8 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 		regLim:        msg.NewLimiter(10, 5),
 		pairLim:       msg.NewLimiter(10, 5),
 		failLim:       msg.NewLimiter(30, 10), // Failed pairing lookups: more lenient per-IP budget
-		getLim:        msg.NewLimiter(60, 20),
-		authLim:       msg.NewLimiter(120, 40), // Higher limit for authenticated polling
+		getLim:        msg.NewLimiter(getPerMinute, getBurst),
+		authLim:       msg.NewLimiter(authGetPerMinute, authGetBurst),
 		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst),
 		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour),
 		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst),
@@ -301,6 +309,22 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 	go lm.pruneLoop()
 
 	return lm
+}
+
+// all returns all limiters in a single list for iteration.
+func (lm *LimiterManager) all() []*msg.Limiter {
+	return []*msg.Limiter{
+		lm.msgLim,
+		lm.regLim,
+		lm.pairLim,
+		lm.failLim,
+		lm.getLim,
+		lm.authLim,
+		lm.mailLim,
+		lm.rcptLim,
+		lm.notifyLim,
+		lm.notifyAddrLim,
+	}
 }
 
 // pruneLoop periodically prunes stale buckets from all limiters.
@@ -320,9 +344,10 @@ func (lm *LimiterManager) pruneLoop() {
 }
 
 func (lm *LimiterManager) prune() {
-	pruned := lm.msgLim.Prune() + lm.regLim.Prune() + lm.pairLim.Prune() + lm.failLim.Prune() +
-		lm.getLim.Prune() + lm.authLim.Prune() +
-		lm.mailLim.Prune() + lm.rcptLim.Prune() + lm.notifyLim.Prune() + lm.notifyAddrLim.Prune()
+	pruned := 0
+	for _, lim := range lm.all() {
+		pruned += lim.Prune()
+	}
 	_ = pruned // Could log if needed
 }
 

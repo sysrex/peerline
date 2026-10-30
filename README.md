@@ -339,6 +339,8 @@ No new environment variable is required for the page or the public counters. The
 | `GET` | `/v1/inbox?since=&limit=` | Returns `next_since` |
 | `GET`/`PUT` | `/v1/bags/{name}[?owner=]` | Raw bytes, `ETag: "vN"` |
 
+> **Note:** As of v3, invite API responses use `public_id` (a random 128-bit opaque identifier) instead of the previous `invite_id` (ROWID). This prevents id reuse and improves security for revocation endpoints.
+
 Scopes: `messages`, `bags:read`, `bags:write`. Bag names: `^[a-z0-9][a-z0-9._-]{0,63}$`.
 
 ---
