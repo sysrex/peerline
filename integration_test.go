@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,6 +38,9 @@ func (c *testClient) do(method, path string, body interface{}, headers map[strin
 	req, err := http.NewRequest(method, c.baseURL+path, r)
 	if err != nil {
 		c.t.Fatal(err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	if c.key != "" {
 		req.Header.Set("Authorization", "Bearer "+c.key)
@@ -250,11 +254,27 @@ func TestIntegration_ExpiredInvite(t *testing.T) {
 
 	code := alice.createInvite([]string{"messages"}, []string{}, 1)
 
+	// The store clock is unexported, so the TTL really has to elapse.
 	time.Sleep(2 * time.Second)
 
-	resp, _ := bob.do("POST", "/api/accept", map[string]string{"code": code}, nil)
-	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected 404/400 for expired invite, got %d", resp.StatusCode)
+	resp, _ := bob.do("POST", "/v1/invites/accept", map[string]string{"code": code}, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for expired invite, got %d", resp.StatusCode)
+	}
+}
+
+func TestIntegration_ValidInviteAccepted(t *testing.T) {
+	srv := setupTestServer(t)
+
+	alice := &testClient{t: t, baseURL: srv.URL}
+	bob := &testClient{t: t, baseURL: srv.URL}
+	alice.register("alice")
+	bob.register("bob")
+
+	code := alice.createInvite([]string{"messages"}, []string{}, 60)
+	resp, body := bob.do("POST", "/v1/invites/accept", map[string]string{"code": code}, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for unexpired invite, got %d %s", resp.StatusCode, body)
 	}
 }
 
@@ -287,8 +307,8 @@ func TestIntegration_BadInviteCode(t *testing.T) {
 	bob.register("bob")
 
 	resp, _ := bob.do("POST", "/v1/invites/accept", map[string]string{"code": "invalid-code-12345"}, nil)
-	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected 404/400 for bad invite code, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for bad invite code, got %d", resp.StatusCode)
 	}
 }
 
@@ -345,9 +365,19 @@ func setupTestServer(t *testing.T) *httptest.Server {
 		NotifyPerHour:    20,
 		TrustedProxies:   []string{},
 		RetentionSeconds: 86400,
+		MsgPerMinute:     600,
+		MsgBurst:         100,
+		WritePerMinute:   600,
+		WriteBurst:       100,
 	}
 
-	apiServer := api.New(st, cfg)
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	apiServer, err := api.New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := httptest.NewServer(apiServer.Handler())
 	t.Cleanup(srv.Close)
 

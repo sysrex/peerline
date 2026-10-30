@@ -8,6 +8,8 @@ import (
 
 // deprecateQueryCodeOnAccept adds RFC 9745 deprecation headers to /v1/invites/accept responses
 // when ?code= is in the URL. Runs outside auth and body decoding so 401, 400, 413 also carry them.
+const retryAfterSeconds = "10"
+
 func deprecateQueryCodeOnAccept(deprecationDate, linkURL string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -40,7 +42,7 @@ func (s *Server) rateLimitGet(h http.HandlerFunc) http.HandlerFunc {
 		ip := clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets)
 		key := rateLimitKey(ip)
 		if !s.lim.getLim.Allow(key) {
-			w.Header().Set("Retry-After", "10")
+			w.Header().Set("Retry-After", retryAfterSeconds)
 			writeErr(w, http.StatusTooManyRequests, "rate limited")
 			return
 		}
@@ -53,7 +55,7 @@ func (s *Server) rateLimitAuth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		peerID := auth.PeerID(r.Context())
 		if !s.lim.authLim.Allow(peerID) {
-			w.Header().Set("Retry-After", "10")
+			w.Header().Set("Retry-After", retryAfterSeconds)
 			writeErr(w, http.StatusTooManyRequests, "rate limited")
 			return
 		}
@@ -81,7 +83,7 @@ func (s *Server) rateLimitVersion(h http.HandlerFunc) http.HandlerFunc {
 		ip := clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets)
 		key := rateLimitKey(ip)
 		if !s.lim.versionLim.Allow(key) {
-			w.Header().Set("Retry-After", "10")
+			w.Header().Set("Retry-After", retryAfterSeconds)
 			writeErr(w, http.StatusTooManyRequests, "rate limited")
 			return
 		}
@@ -94,7 +96,7 @@ func (s *Server) rateLimitVersion(h http.HandlerFunc) http.HandlerFunc {
 func (s *Server) rateLimitBagWrite(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.lim.bagWriteLim.Allow(auth.PeerID(r.Context())) {
-			w.Header().Set("Retry-After", "10")
+			w.Header().Set("Retry-After", retryAfterSeconds)
 			writeErr(w, http.StatusTooManyRequests, "rate limited")
 			return
 		}

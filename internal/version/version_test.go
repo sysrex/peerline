@@ -289,9 +289,9 @@ func TestInfoValidatesInjectedValues(t *testing.T) {
 }
 
 func TestShortCommitKeepsDirtyMarker(t *testing.T) {
-	defer func() { once = sync.Once{}; infoOnce = nil }()
+	defer func() { once = sync.Once{}; infoOnce, infoDirty = nil, false }()
 	once = sync.Once{}
-	infoOnce = map[string]string{"commit": strings.Repeat("a", 40), "dirty": "true"}
+	infoOnce, infoDirty = map[string]string{"commit": strings.Repeat("a", 40)}, true
 	once.Do(func() {})
 	if got, want := ShortCommit(), strings.Repeat("a", 12)+"-dirty"; got != want {
 		t.Errorf("ShortCommit() = %q, want %q", got, want)

@@ -193,8 +193,8 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 			prefixes = append(prefixes, n.String())
 		}
 		cfg.Logger.Info("trusted proxy networks configured", "prefixes", strings.Join(prefixes, ", "))
-	} else if len(cfg.TrustedProxies) == 0 {
-		cfg.Logger.Warn("no trusted proxies configured: X-Forwarded-For will be ignored")
+	} else {
+		cfg.Logger.Warn("no trusted proxies configured: X-Forwarded-For will be ignored", "entries", len(cfg.TrustedProxies))
 	}
 
 	s := &Server{

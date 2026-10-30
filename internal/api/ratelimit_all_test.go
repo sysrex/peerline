@@ -1,7 +1,12 @@
 package api
 
 import (
+	"bytes"
+	"context"
+	"github.com/sysrex/peerline/internal/store"
+	"log/slog"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -41,5 +46,26 @@ func TestVersionLimiterPruned(t *testing.T) {
 	lm.prune()
 	if n := lm.versionLim.Prune(); n != 0 {
 		t.Errorf("prune() left %d stale /version buckets", n)
+	}
+}
+
+func TestBlankTrustedProxyEntriesWarn(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	srv, err := New(st, Config{TrustedProxies: []string{" ", " "}, Logger: log})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+	if !strings.Contains(buf.String(), "no trusted proxies configured") {
+		t.Errorf("expected warning for blank entries, got %q", buf.String())
 	}
 }

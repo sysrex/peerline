@@ -24,8 +24,9 @@ var (
 )
 
 var (
-	once     sync.Once
-	infoOnce map[string]string
+	once      sync.Once
+	infoOnce  map[string]string
+	infoDirty bool
 )
 
 // releaseVersionRE matches strict semver releases: vX.Y.Z or X.Y.Z with no build metadata or git describe suffix.
@@ -74,16 +75,12 @@ func Info() map[string]string {
 		if _, err := time.Parse(time.RFC3339, buildTime); err != nil || len(buildTime) > maxBuildTimeLen {
 			buildTime = "unknown"
 		}
-		dirtyStr := "false"
-		if dirty && commit != "unknown" {
-			dirtyStr = "true"
-		}
+		infoDirty = dirty && commit != "unknown"
 
 		infoOnce = map[string]string{
 			"version":    version,
 			"commit":     commit,
 			"build_time": buildTime,
-			"dirty":      dirtyStr,
 		}
 	})
 	return infoOnce
@@ -104,15 +101,14 @@ func normalizeVersion(v string) string {
 
 // ShortCommit returns the first 12 characters of the commit SHA, plus "-dirty" for a modified tree.
 func ShortCommit() string {
-	info := Info()
-	commit := info["commit"]
+	commit := Info()["commit"]
 	if commit == "unknown" {
 		return commit
 	}
 	if len(commit) > 12 {
 		commit = commit[:12]
 	}
-	if info["dirty"] == "true" {
+	if infoDirty {
 		commit += "-dirty"
 	}
 	return commit
