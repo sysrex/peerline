@@ -1956,3 +1956,63 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 		t.Errorf("RegisterAndAcceptByPairing at expires_at+1 should return ErrNotFound, got %v", err)
 	}
 }
+
+func TestBagStats(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.CreatePeer(ctx, "alice", "Alice", "halice", "alice@example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initially no bags
+	stats, err := s.GetBagStats(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Count != 0 || stats.TotalBytes != 0 {
+		t.Errorf("got %+v, want Count=0 TotalBytes=0", stats)
+	}
+
+	// Add a bag
+	_, err = s.PutBag(ctx, "alice", "notes", []byte("hello world"), "alice", -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, err = s.GetBagStats(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Count != 1 || stats.TotalBytes != 11 {
+		t.Errorf("got %+v, want Count=1 TotalBytes=11", stats)
+	}
+
+	// Add another bag
+	_, err = s.PutBag(ctx, "alice", "tasks", []byte("do stuff"), "alice", -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, err = s.GetBagStats(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Count != 2 || stats.TotalBytes != 19 {
+		t.Errorf("got %+v, want Count=2 TotalBytes=19", stats)
+	}
+
+	// Update a bag (should not change count, only bytes)
+	_, err = s.PutBag(ctx, "alice", "notes", []byte("goodbye"), "alice", -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, err = s.GetBagStats(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Count != 2 || stats.TotalBytes != 15 {
+		t.Errorf("got %+v, want Count=2 TotalBytes=15", stats)
+	}
+}

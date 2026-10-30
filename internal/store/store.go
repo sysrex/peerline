@@ -1040,6 +1040,21 @@ func (s *Store) GetBag(ctx context.Context, owner, name string) (*Bag, error) {
 	return &b, nil
 }
 
+// BagStats holds storage statistics for a peer's bags.
+type BagStats struct {
+	Count      int
+	TotalBytes int64
+}
+
+// GetBagStats returns the number of bags and total bytes for a peer's bags.
+func (s *Store) GetBagStats(ctx context.Context, owner string) (BagStats, error) {
+	var stats BagStats
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(LENGTH(content)), 0) FROM bags WHERE owner=?`,
+		owner).Scan(&stats.Count, &stats.TotalBytes)
+	return stats, err
+}
+
 // PutBag writes a bag. If ifVersion >= 0 it must match the current version
 // (0 = must not exist yet); otherwise ErrConflict. ifVersion < 0 = unconditional.
 func (s *Store) PutBag(ctx context.Context, owner, name string, content []byte, by string, ifVersion int64) (int64, error) {

@@ -64,6 +64,13 @@ type Config struct {
 	// RetentionSeconds is how long (in seconds) to keep used invites before purging.
 	// Default is 30 days (2592000 seconds). Set to 0 for the default.
 	RetentionSeconds int64
+	// BagPerMinute / BagBurst limit PUT /v1/bags writes per peer.
+	BagPerMinute int
+	BagBurst     int
+	// MaxBagsPerPeer is the maximum number of bags a peer can own (0 = unlimited).
+	MaxBagsPerPeer int
+	// MaxBagBytesPerPeer is the maximum total bytes across all bags for a peer (0 = unlimited).
+	MaxBagBytesPerPeer int64
 }
 
 type Server struct {
@@ -1170,6 +1177,11 @@ func (s *Server) putBag(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Rate limit bag writes per owner (only if configured)
+	if s.cfg.BagPerMinute > 0 && !s.lim.bagLim.Allow(owner) {
+		writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return
+	}
 	ifVersion := int64(-1)
 	if im := r.Header.Get("If-Match"); im != "" {
 		v, ok := parseETag(im)
@@ -1185,6 +1197,37 @@ func (s *Server) putBag(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, http.StatusRequestEntityTooLarge, "bag exceeds 64KiB")
 		return
+	}
+	// Check storage limits before creating a new bag (only if configured)
+	if s.cfg.MaxBagsPerPeer > 0 || s.cfg.MaxBagBytesPerPeer > 0 {
+		if ifVersion == 0 || ifVersion < 0 {
+			stats, err := s.st.GetBagStats(r.Context(), owner)
+			if err != nil {
+				s.internal(w, err)
+				return
+			}
+			// For conditional creates (If-None-Match: *), only check if bag doesn't exist
+			// For unconditional writes, check if creating vs updating by checking existence
+			checkLimits := ifVersion == 0 // explicit create
+			if ifVersion < 0 {
+				// Unconditional write: need to check if bag exists
+				_, err := s.st.GetBag(r.Context(), owner, name)
+				checkLimits = errors.Is(err, store.ErrNotFound)
+			}
+			if checkLimits {
+				// Check bag count limit
+				if s.cfg.MaxBagsPerPeer > 0 && stats.Count >= s.cfg.MaxBagsPerPeer {
+					writeErr(w, http.StatusForbidden, "bag limit exceeded")
+					return
+				}
+				// Check total bytes limit
+				newTotal := stats.TotalBytes + int64(len(body))
+				if s.cfg.MaxBagBytesPerPeer > 0 && newTotal > s.cfg.MaxBagBytesPerPeer {
+					writeErr(w, http.StatusForbidden, "storage quota exceeded")
+					return
+				}
+			}
+		}
 	}
 	v, err := s.st.PutBag(r.Context(), owner, name, body, auth.PeerID(r.Context()), ifVersion)
 	if errors.Is(err, store.ErrConflict) {

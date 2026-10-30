@@ -258,6 +258,49 @@ func TestReadOnlyBagScope(t *testing.T) {
 	want(t, resp, body, 201)
 }
 
+func TestBagRateLimit(t *testing.T) {
+	srv := newServer(t, Config{BagPerMinute: 2, BagBurst: 2})
+	a := register(t, srv, "alice")
+	// burst allows 2 writes
+	resp, body := a.do("PUT", "/v1/bags/a", []byte("x"), nil)
+	want(t, resp, body, 201)
+	resp, body = a.do("PUT", "/v1/bags/b", []byte("y"), nil)
+	want(t, resp, body, 201)
+	// third write is rate limited
+	resp, body = a.do("PUT", "/v1/bags/c", []byte("z"), nil)
+	want(t, resp, body, 429)
+}
+
+func TestBagStorageLimits(t *testing.T) {
+	// limit to 3 bags and 100 bytes total
+	srv := newServer(t, Config{MaxBagsPerPeer: 3, MaxBagBytesPerPeer: 100})
+	a := register(t, srv, "alice")
+
+	// create 3 bags under the limits
+	resp, body := a.do("PUT", "/v1/bags/a", bytes.Repeat([]byte("x"), 30), nil)
+	want(t, resp, body, 201)
+	resp, body = a.do("PUT", "/v1/bags/b", bytes.Repeat([]byte("y"), 30), nil)
+	want(t, resp, body, 201)
+	resp, body = a.do("PUT", "/v1/bags/c", bytes.Repeat([]byte("z"), 30), nil)
+	want(t, resp, body, 201)
+
+	// 4th bag exceeds count limit
+	resp, body = a.do("PUT", "/v1/bags/d", []byte("w"), nil)
+	want(t, resp, body, 403)
+
+	// updating existing bag should still work
+	resp, body = a.do("PUT", "/v1/bags/a", bytes.Repeat([]byte("x"), 35), nil)
+	want(t, resp, body, 200)
+
+	// new bag that would exceed byte limit
+	srv2 := newServer(t, Config{MaxBagBytesPerPeer: 50})
+	b := register(t, srv2, "bob")
+	resp, body = b.do("PUT", "/v1/bags/small", bytes.Repeat([]byte("x"), 40), nil)
+	want(t, resp, body, 201)
+	resp, body = b.do("PUT", "/v1/bags/big", bytes.Repeat([]byte("y"), 20), nil)
+	want(t, resp, body, 403)
+}
+
 func TestInviteValidation(t *testing.T) {
 	srv := newServer(t, Config{})
 	a := register(t, srv, "alice")
