@@ -21,7 +21,7 @@ func securityHeaders(next http.Handler) http.Handler {
 // rateLimitGet wraps a handler with light GET endpoint rate limiting (per-IP).
 func (s *Server) rateLimitGet(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ip := clientIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"), s.trustedNets)
+		ip := clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets)
 		key := rateLimitKey(ip)
 		if !s.lim.getLim.Allow(key) {
 			w.Header().Set("Retry-After", "10")

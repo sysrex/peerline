@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/sysrex/peerline/internal/auth"
@@ -192,14 +193,28 @@ func (s *Server) Handler() http.Handler {
 // ---- helpers ----
 
 // sanitizeInviterName strips characters that can be used for prompt injection.
-// Uses an allowlist of Unicode categories: letters, digits, marks, spaces, and limited punctuation.
+// Allows Unicode letters, digits, marks, spaces, and limited punctuation.
+// Explicitly filters bidi controls (U+202A-U+202E, U+2066-U+2069, U+200E/F) and tag characters (U+E0000-U+E007F).
 func sanitizeInviterName(name string) string {
 	const maxLen = 64
 	var out strings.Builder
 	for _, r := range name {
-		// Allow letters (L*), digits (Nd), marks (M*), spaces, and limited punctuation
-		if utf8.ValidRune(r) && (r == ' ' || r == '.' || r == '-' || r == '_' || r == ',' || r == '\'' ||
-			('A' <= r && r <= 'Z') || ('a' <= r && r <= 'z') || ('0' <= r && r <= '9')) {
+		// Filter bidi controls: U+202A-U+202E (embedding/override), U+2066-U+2069 (isolates), U+200E/F (marks)
+		if (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) || r == 0x200E || r == 0x200F {
+			continue
+		}
+		// Filter tag characters: U+E0000-U+E007F
+		if r >= 0xE0000 && r <= 0xE007F {
+			continue
+		}
+		// Filter zero-width and format characters that were in the old allowlist implicitly excluded
+		if r == 0x200B || r == 0x200C || r == 0x200D || r == 0xFEFF {
+			continue
+		}
+
+		// Allow: Unicode letters, digits, marks, spaces, and limited punctuation
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsMark(r) || r == ' ' ||
+			r == '.' || r == '-' || r == '_' || r == ',' || r == '\'' {
 			out.WriteRune(r)
 		}
 		// Stop if we exceed max length
@@ -251,7 +266,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Now charge the rate limiter after token validation
-	if !s.lim.regLim.Allow(rateLimitKey(clientIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"), s.trustedNets))) {
+	if !s.lim.regLim.Allow(rateLimitKey(clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets))) {
 		writeErr(w, http.StatusTooManyRequests, "rate limited")
 		return
 	}
@@ -370,7 +385,11 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate TTL before any multiplication to prevent overflow
+	// Default: 1h for regular invites, 24h for email invites
 	ttl := defaultInviteTTL
+	if to != "" {
+		ttl = 24 * time.Hour
+	}
 	if in.TTLSeconds > 0 {
 		if in.TTLSeconds > maxInviteTTLSec {
 			writeErr(w, http.StatusBadRequest, fmt.Sprintf("ttl_seconds must not exceed %d (7 days)", maxInviteTTLSec))
@@ -388,7 +407,18 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Email rate limit check (before creating invite or spending budget)
+	// Check per-owner invite cap BEFORE spending email budget (#53)
+	count, err := s.st.CountOutstandingInvites(r.Context(), me)
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	if count >= s.cfg.MaxOutstandingInvites {
+		writeErr(w, http.StatusTooManyRequests, fmt.Sprintf("too many outstanding invites (limit %d); revoke or wait for expiry", s.cfg.MaxOutstandingInvites))
+		return
+	}
+
+	// Email rate limit check (after cap check, before creating invite)
 	if to != "" {
 		rk := strings.ToLower(to)
 		if !s.lim.mailLim.Ready(me) || !s.lim.rcptLim.Ready(rk) || !s.lim.mailLim.Allow(me) || !s.lim.rcptLim.Allow(rk) {
@@ -401,12 +431,12 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	code := auth.NewSecret("inv_")
 	exp := time.Now().Add(ttl).UTC()
 	var pairingToken string
-	var inviteID int64
+	var publicID string
 
 	// Atomically check invite cap and create invite
 	if in.GeneratePairing {
 		pairingToken = auth.NewPairingToken()
-		inviteID, err = s.st.CreateInviteWithPairingAtomic(r.Context(), auth.Hash(code), auth.Hash(pairingToken), me, sc, bg, exp, s.cfg.MaxOutstandingInvites)
+		publicID, err = s.st.CreateInviteWithPairingAtomic(r.Context(), auth.Hash(code), auth.Hash(pairingToken), me, sc, bg, exp, s.cfg.MaxOutstandingInvites)
 		if errors.Is(err, store.ErrTooManyInvites) {
 			writeErr(w, http.StatusTooManyRequests, fmt.Sprintf("too many outstanding invites (limit %d); revoke or wait for expiry", s.cfg.MaxOutstandingInvites))
 			return
@@ -416,7 +446,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		inviteID, err = s.st.CreateInviteAtomic(r.Context(), auth.Hash(code), me, sc, bg, exp, s.cfg.MaxOutstandingInvites)
+		publicID, err = s.st.CreateInviteAtomic(r.Context(), auth.Hash(code), me, sc, bg, exp, s.cfg.MaxOutstandingInvites)
 		if errors.Is(err, store.ErrTooManyInvites) {
 			writeErr(w, http.StatusTooManyRequests, fmt.Sprintf("too many outstanding invites (limit %d); revoke or wait for expiry", s.cfg.MaxOutstandingInvites))
 			return
@@ -429,10 +459,10 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 
 	// Response shape depends on generate_pairing
 	if pairingToken != "" {
-		// Pairing-only response: only pairing_url and invite_id, no code or accept_url
+		// Pairing-only response: only pairing_url and public_id, no code or accept_url
 		pairingURL := s.publicBase(r) + "/v1/pairing/" + url.PathEscape(pairingToken)
 		resp := map[string]any{
-			"invite_id":   inviteID,
+			"public_id":   publicID,
 			"pairing_url": pairingURL,
 			"scopes":      sc,
 			"bags":        bg,
@@ -443,10 +473,10 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Standard invite response with code, accept_url, and invite_id
+	// Standard invite response with code, accept_url, and public_id
 	acceptURL := s.publicBase(r) + "/v1/invites/accept?code=" + url.QueryEscape(code)
 	resp := map[string]any{
-		"invite_id":  inviteID,
+		"public_id":  publicID,
 		"code":       code,
 		"scopes":     sc,
 		"bags":       bg,
@@ -613,15 +643,14 @@ func (s *Server) listInvites(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteInvite(w http.ResponseWriter, r *http.Request) {
-	idStr := r.PathValue("id")
-	inviteID, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid invite id")
+	publicID := r.PathValue("id")
+	if publicID == "" {
+		writeErr(w, http.StatusBadRequest, "missing public_id")
 		return
 	}
 
 	me := auth.PeerID(r.Context())
-	err = s.st.DeleteInvite(r.Context(), inviteID, me)
+	err := s.st.DeleteInvite(r.Context(), publicID, me)
 	if errors.Is(err, store.ErrNotFound) {
 		writeErr(w, http.StatusNotFound, "invite not found or already used")
 		return
@@ -630,7 +659,7 @@ func (s *Server) deleteInvite(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
-	s.log.Info("invite revoked", "peer", me, "invite_id", inviteID)
+	s.log.Info("invite revoked", "peer", me, "public_id", publicID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -995,7 +1024,7 @@ func (s *Server) acceptPairing(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Rate limit pairing redemptions after token validation
-	if !s.lim.pairLim.Allow(rateLimitKey(clientIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"), s.trustedNets))) {
+	if !s.lim.pairLim.Allow(rateLimitKey(clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets))) {
 		writeErr(w, http.StatusTooManyRequests, "rate limited")
 		return
 	}
@@ -1051,7 +1080,7 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 	}
 
 	// Rate limit pairing redemptions after register token check passes
-	if !s.lim.pairLim.Allow(rateLimitKey(clientIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"), s.trustedNets))) {
+	if !s.lim.pairLim.Allow(rateLimitKey(clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets))) {
 		writeErr(w, http.StatusTooManyRequests, "rate limited")
 		return
 	}
@@ -1100,6 +1129,5 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 	if len(sc) > 0 {
 		resp["granted_by_you"] = store.Grant{Owner: id, Grantee: g.Owner, Scopes: sc, Bags: bg}
 	}
-	s.log.Info("pairing accepted (unauthenticated)", "owner", g.Owner, "grantee", id)
 	writeJSON(w, http.StatusCreated, resp)
 }

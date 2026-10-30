@@ -11,17 +11,12 @@ import (
 	"github.com/sysrex/peerline/internal/msg"
 )
 
-// httpRequest is the minimal interface we need from *http.Request for clientIP.
-type httpRequest interface {
-	RemoteAddr() string
-	Header(key string) string
-}
-
 // clientIP returns the client IP, honoring X-Forwarded-For only from trusted proxies.
 // It walks X-Forwarded-For right-to-left, skipping entries in trustedNets, and returns
 // the first untrusted IP. Only consults XFF when RemoteAddr itself is trusted.
 // IPs are normalized (IPv4-mapped IPv6 → IPv4, canonical form, no zone/port).
-func clientIP(remoteAddr, xffHeader string, trustedNets []*net.IPNet) string {
+// Combines all X-Forwarded-For header lines (clients may send multiple headers).
+func clientIP(remoteAddr string, xffHeaders []string, trustedNets []*net.IPNet) string {
 	// Parse and normalize RemoteAddr
 	remoteIP := parseAndNormalizeIP(remoteAddr)
 	if remoteIP == "" {
@@ -52,18 +47,26 @@ func clientIP(remoteAddr, xffHeader string, trustedNets []*net.IPNet) string {
 		return remoteIP
 	}
 
-	// Parse X-Forwarded-For and walk right-to-left
-	if xffHeader == "" {
+	// Parse all X-Forwarded-For headers and combine them
+	// Each header value may contain comma-separated IPs
+	if len(xffHeaders) == 0 {
 		return remoteIP
 	}
 
-	// Split by comma and walk backwards
-	parts := strings.Split(xffHeader, ",")
-	for i := len(parts) - 1; i >= 0; i-- {
-		candidate := strings.TrimSpace(parts[i])
-		if candidate == "" {
-			continue
+	var allIPs []string
+	for _, header := range xffHeaders {
+		parts := strings.Split(header, ",")
+		for _, part := range parts {
+			trimmed := strings.TrimSpace(part)
+			if trimmed != "" {
+				allIPs = append(allIPs, trimmed)
+			}
 		}
+	}
+
+	// Walk right-to-left through all IPs
+	for i := len(allIPs) - 1; i >= 0; i-- {
+		candidate := allIPs[i]
 
 		// Normalize the candidate
 		normalized := parseAndNormalizeIP(candidate)

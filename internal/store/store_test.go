@@ -1757,3 +1757,195 @@ func TestDeleteInviteOwnership(t *testing.T) {
 		t.Errorf("expected ErrNotFound on repeat delete, got %v", err)
 	}
 }
+func TestV3MigrationFreshDB(t *testing.T) {
+	s, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Create a peer and invite
+	if err := s.CreatePeer(ctx, "alice", "Alice", "hash1", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	publicID, err := s.CreateInviteAtomic(ctx, "code1", "alice", []string{"messages"}, nil, time.Now().Add(time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify public_id is not empty
+	if publicID == "" {
+		t.Error("public_id should not be empty")
+	}
+
+	// Verify it's 32 hex chars
+	if len(publicID) != 32 {
+		t.Errorf("public_id length = %d, want 32", len(publicID))
+	}
+
+	// Query back and verify
+	var checkID string
+	err = s.db.QueryRowContext(ctx, `SELECT public_id FROM invites WHERE code_hash=?`, "code1").Scan(&checkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkID != publicID {
+		t.Errorf("public_id mismatch: got %q, want %q", checkID, publicID)
+	}
+}
+
+// Test v2 to v3 migration with backfill
+func TestV2ToV3Migration(t *testing.T) {
+	dbPath := t.TempDir() + "/test.db"
+
+	// Create a v2 database manually
+	db, err := sql.Open("sqlite", dbPath+"?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create schema without public_id
+	_, err = db.Exec(`
+		PRAGMA journal_mode=WAL;
+		CREATE TABLE peers (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			key_hash TEXT NOT NULL UNIQUE,
+			created_at INTEGER NOT NULL,
+			notify_email TEXT NOT NULL DEFAULT ''
+		);
+		CREATE TABLE invites (
+			code_hash TEXT PRIMARY KEY,
+			from_peer TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
+			scopes TEXT NOT NULL,
+			bags TEXT NOT NULL,
+			expires_at INTEGER NOT NULL,
+			used_by TEXT,
+			pairing_token_hash TEXT
+		);
+		CREATE UNIQUE INDEX invites_pairing_token_hash ON invites(pairing_token_hash) WHERE pairing_token_hash IS NOT NULL;
+		PRAGMA user_version = 2;
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert test data
+	_, err = db.Exec(`INSERT INTO peers (id, name, key_hash, created_at) VALUES ('alice', 'Alice', 'hash1', ?)`, time.Now().Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.Exec(`INSERT INTO invites (code_hash, from_peer, scopes, bags, expires_at) VALUES ('code1', 'alice', 'messages', '', ?)`, time.Now().Add(time.Hour).Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.Exec(`INSERT INTO invites (code_hash, from_peer, scopes, bags, expires_at) VALUES ('code2', 'alice', 'messages', '', ?)`, time.Now().Add(time.Hour).Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db.Close()
+
+	// Open with migration
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Verify user_version is now 3
+	var version int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 3 {
+		t.Errorf("user_version = %d, want 3", version)
+	}
+
+	// Verify all rows have public_id
+	rows, err := s.db.Query(`SELECT code_hash, public_id FROM invites ORDER BY code_hash`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	count := 0
+	seen := make(map[string]bool)
+	for rows.Next() {
+		var codeHash, publicID string
+		if err := rows.Scan(&codeHash, &publicID); err != nil {
+			t.Fatal(err)
+		}
+		count++
+		if publicID == "" {
+			t.Errorf("code_hash %q has empty public_id", codeHash)
+		}
+		if len(publicID) != 32 {
+			t.Errorf("code_hash %q public_id length = %d, want 32", codeHash, len(publicID))
+		}
+		if seen[publicID] {
+			t.Errorf("duplicate public_id %q", publicID)
+		}
+		seen[publicID] = true
+	}
+	if count != 2 {
+		t.Errorf("expected 2 backfilled rows, got %d", count)
+	}
+}
+
+// Test v3 migration idempotence
+func TestV3MigrationIdempotent(t *testing.T) {
+	dbPath := t.TempDir() + "/test.db"
+
+	// Create v2 DB
+	db, err := sql.Open("sqlite", dbPath+"?_txlock=immediate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		PRAGMA journal_mode=WAL;
+		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+		CREATE TABLE invites (code_hash TEXT PRIMARY KEY, from_peer TEXT, scopes TEXT, bags TEXT, expires_at INTEGER, used_by TEXT, pairing_token_hash TEXT);
+		PRAGMA user_version = 2;
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Exec(`INSERT INTO peers VALUES ('alice', 'Alice', 'hash1', ?, '')`, time.Now().Unix())
+	db.Exec(`INSERT INTO invites VALUES ('code1', 'alice', 'messages', '', ?, NULL, NULL)`, time.Now().Add(time.Hour).Unix())
+	db.Close()
+
+	// Run migration once
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var publicID1 string
+	s.db.QueryRow(`SELECT public_id FROM invites WHERE code_hash='code1'`).Scan(&publicID1)
+	s.Close()
+
+	// Run migration again (should be idempotent)
+	s, err = Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	var publicID2 string
+	s.db.QueryRow(`SELECT public_id FROM invites WHERE code_hash='code1'`).Scan(&publicID2)
+
+	// public_id should be unchanged
+	if publicID1 != publicID2 {
+		t.Errorf("public_id changed after re-migration: %q -> %q", publicID1, publicID2)
+	}
+
+	// Verify user_version is still 3
+	var version int
+	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
+	if version != 3 {

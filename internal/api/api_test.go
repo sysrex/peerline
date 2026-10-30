@@ -691,51 +691,58 @@ func TestXFFParsing(t *testing.T) {
 	tests := []struct {
 		name        string
 		remoteAddr  string
-		xff         string
+		xff         []string
 		trustedNets []*net.IPNet
 		want        string
 	}{
 		{
 			name:        "client-forged leftmost entry",
 			remoteAddr:  "10.0.0.1:1234",
-			xff:         "1.2.3.4, 203.0.113.5",
+			xff:         []string{"1.2.3.4, 203.0.113.5"},
 			trustedNets: trustedNets,
 			want:        "203.0.113.5", // rightmost untrusted
 		},
 		{
 			name:        "untrusted RemoteAddr ignores XFF",
 			remoteAddr:  "203.0.113.1:5678",
-			xff:         "1.2.3.4, 10.0.0.5",
+			xff:         []string{"1.2.3.4, 10.0.0.5"},
 			trustedNets: trustedNets,
 			want:        "203.0.113.1",
 		},
 		{
 			name:        "chain of trusted proxies",
 			remoteAddr:  "10.0.0.1:1234",
-			xff:         "203.0.113.99, 10.0.0.2, 10.0.0.3",
+			xff:         []string{"203.0.113.99, 10.0.0.2, 10.0.0.3"},
 			trustedNets: trustedNets,
 			want:        "203.0.113.99",
 		},
 		{
 			name:        "IPv4-mapped IPv6 normalization",
 			remoteAddr:  "[::ffff:203.0.113.5]:1234",
-			xff:         "",
+			xff:         nil,
 			trustedNets: nil,
 			want:        "203.0.113.5",
 		},
 		{
 			name:        "IPv6 canonical form",
 			remoteAddr:  "[2001:0db8:0000:0000:0000:0000:0000:0001]:1234",
-			xff:         "",
+			xff:         nil,
 			trustedNets: nil,
 			want:        "2001:db8::1",
 		},
 		{
 			name:        "bare IP trusted proxy",
 			remoteAddr:  "192.168.1.1:1234",
-			xff:         "203.0.113.10",
+			xff:         []string{"203.0.113.10"},
 			trustedNets: trustedNets,
 			want:        "203.0.113.10",
+		},
+		{
+			name:        "multiple XFF headers combined",
+			remoteAddr:  "10.0.0.1:1234",
+			xff:         []string{"1.2.3.4, 203.0.113.20", "10.0.0.5"},
+			trustedNets: trustedNets,
+			want:        "203.0.113.20", // attacker in first header, proxy in second
 		},
 	}
 
@@ -989,20 +996,20 @@ func TestDeleteInviteByID(t *testing.T) {
 	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv struct {
-		InviteID int64 `json:"invite_id"`
+		PublicID string `json:"public_id"`
 	}
 	json.Unmarshal(body, &inv)
 
 	// Bob can't delete Alice's invite
-	resp, body = b.do("DELETE", fmt.Sprintf("/v1/invites/%d", inv.InviteID), nil, nil)
+	resp, body = b.do("DELETE", fmt.Sprintf("/v1/invites/%s", inv.PublicID), nil, nil)
 	want(t, resp, body, 404)
 
 	// Alice can delete her own invite
-	resp, body = a.do("DELETE", fmt.Sprintf("/v1/invites/%d", inv.InviteID), nil, nil)
+	resp, body = a.do("DELETE", fmt.Sprintf("/v1/invites/%s", inv.PublicID), nil, nil)
 	want(t, resp, body, 204)
 
 	// Repeat delete returns 404
-	resp, body = a.do("DELETE", fmt.Sprintf("/v1/invites/%d", inv.InviteID), nil, nil)
+	resp, body = a.do("DELETE", fmt.Sprintf("/v1/invites/%s", inv.PublicID), nil, nil)
 	want(t, resp, body, 404)
 }
 
@@ -1018,12 +1025,12 @@ func TestInviteCodeNeverLogged(t *testing.T) {
 	want(t, resp, body, 201)
 	var inv struct {
 		Code     string `json:"code"`
-		InviteID int64  `json:"invite_id"`
+		PublicID string `json:"public_id"`
 	}
 	json.Unmarshal(body, &inv)
 
 	// Delete the invite (triggers log)
-	a.do("DELETE", fmt.Sprintf("/v1/invites/%d", inv.InviteID), nil, nil)
+	a.do("DELETE", fmt.Sprintf("/v1/invites/%s", inv.PublicID), nil, nil)
 
 	// Check logs don't contain the code or any prefix
 	logs := logBuf.String()
@@ -1034,9 +1041,9 @@ func TestInviteCodeNeverLogged(t *testing.T) {
 	if strings.Contains(logs, codePrefix) {
 		t.Error("invite code prefix found in logs")
 	}
-	// Should contain invite_id
-	if !strings.Contains(logs, fmt.Sprintf("%d", inv.InviteID)) {
-		t.Error("invite_id not found in logs")
+	// Should contain public_id
+	if !strings.Contains(logs, inv.PublicID) {
+		t.Error("public_id not found in logs")
 	}
 }
 
@@ -1098,12 +1105,12 @@ func TestGeneratePairingReturnsOnlyURL(t *testing.T) {
 	var result map[string]any
 	json.Unmarshal(body, &result)
 
-	// Should have pairing_url and invite_id
+	// Should have pairing_url and public_id
 	if _, ok := result["pairing_url"]; !ok {
 		t.Error("missing pairing_url")
 	}
-	if _, ok := result["invite_id"]; !ok {
-		t.Error("missing invite_id")
+	if _, ok := result["public_id"]; !ok {
+		t.Error("missing public_id")
 	}
 
 	// Should NOT have code or accept_url

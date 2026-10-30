@@ -3,7 +3,7 @@ package msg
 
 import (
 	"errors"
-	"hash/fnv"
+	"hash/maphash"
 	"regexp"
 	"sync"
 	"time"
@@ -54,6 +54,7 @@ type Limiter struct {
 	burst      float64
 	now        func() time.Time
 	pruneAfter time.Duration
+	hashSeed   maphash.Seed // random seed for shard selection
 }
 
 type shard struct {
@@ -82,6 +83,7 @@ func NewLimiter(perMinute, burst int) *Limiter {
 		burst:      float64(burst),
 		now:        time.Now,
 		pruneAfter: pruneAfter,
+		hashSeed:   maphash.MakeSeed(),
 	}
 	for i := range l.shards {
 		l.shards[i] = &shard{buckets: make(map[string]*bucket)}
@@ -105,6 +107,7 @@ func NewLimiterPerHour(perHour, burst int) *Limiter {
 		burst:      float64(burst),
 		now:        time.Now,
 		pruneAfter: pruneAfter,
+		hashSeed:   maphash.MakeSeed(),
 	}
 	for i := range l.shards {
 		l.shards[i] = &shard{buckets: make(map[string]*bucket)}
@@ -172,8 +175,10 @@ func (l *Limiter) take(key string, consume bool) bool {
 // Must be called with s.mu held.
 // Samples evictionSamples random buckets and picks the oldest idle one (tokens == burst).
 // If none are idle, picks the oldest overall.
-// Tradeoff: an attacker spraying IPv6 /128s can still evict hot buckets, but requires
-// sustained traffic to fill the shard. Consider keying IPv6 by /64 in the API layer.
+// Tradeoff: The limiter fails open on eviction (an evicted key restarts with full burst).
+// Idleness is judged without applying refill, so recently active buckets survive.
+// An attacker can still evict hot buckets by spraying unique keys to fill a shard,
+// but IPv6 clients are keyed by /64 prefix in the API layer, making this much harder.
 func (l *Limiter) evictOneLocked(s *shard, now time.Time) {
 	if len(s.buckets) == 0 {
 		return
@@ -212,7 +217,8 @@ func (l *Limiter) evictOneLocked(s *shard, now time.Time) {
 }
 
 func (l *Limiter) shardIndex(key string) uint32 {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return h.Sum32() % shardCount
+	var h maphash.Hash
+	h.SetSeed(l.hashSeed)
+	h.WriteString(key)
+	return uint32(h.Sum64() % shardCount)
 }
