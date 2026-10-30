@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sysrex/peerline/internal/auth"
 	_ "modernc.org/sqlite"
 )
 
@@ -20,7 +19,6 @@ type Store struct{ db *sql.DB }
 
 const schema = `
 PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS peers (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -35,7 +33,7 @@ CREATE TABLE IF NOT EXISTS invites (
   bags TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
   used_by TEXT,
-  pairing_token_hash TEXT UNIQUE
+  pairing_token_hash TEXT
 );
 -- grants are directional: grantee may act on owner's resources within scopes/bags.
 CREATE TABLE IF NOT EXISTS grants (
@@ -65,11 +63,13 @@ CREATE TABLE IF NOT EXISTS bags (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (owner, name)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS invites_pairing_token_hash ON invites(pairing_token_hash) WHERE pairing_token_hash IS NOT NULL;
 `
 
 // Open opens (and migrates) the database at path. Use ":memory:" for tests.
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	dsn := buildDSN(path)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -78,13 +78,24 @@ func Open(path string) (*Store, error) {
 	db.SetConnMaxLifetime(0)
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("migrate: %w", err)
+		return nil, fmt.Errorf("schema: %w", err)
 	}
 	if err := migrate(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	return &Store{db: db}, nil
+}
+
+func buildDSN(path string) string {
+	if path == ":memory:" {
+		return path
+	}
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return path + sep + "_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
 }
 
 // migrate applies ordered, idempotent schema upgrades tracked by PRAGMA user_version.
@@ -311,12 +322,12 @@ func (s *Store) GetInviteByPairingToken(ctx context.Context, pairingTokenHash st
 
 // AcceptInviteByPairingToken atomically consumes an invite via pairing token and creates grants.
 func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash, accepter string, backScopes, backBags []string) (*Grant, error) {
-	tx, err := s.beginImmediate(ctx)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	
+
 	var codeHash string
 	err = tx.QueryRowContext(ctx, `SELECT code_hash FROM invites WHERE pairing_token_hash=?`, pairingTokenHash).Scan(&codeHash)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -325,12 +336,12 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 	if err != nil {
 		return nil, err
 	}
-	
+
 	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -340,17 +351,17 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 // AcceptInvite atomically consumes an invite and creates the inviter->accepter grant
 // plus, optionally, a reciprocal accepter->inviter grant. Returns the inviter's grant.
 func (s *Store) AcceptInvite(ctx context.Context, codeHash, accepter string, backScopes, backBags []string) (*Grant, error) {
-	tx, err := s.beginImmediate(ctx)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	
+
 	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -359,91 +370,52 @@ func (s *Store) AcceptInvite(ctx context.Context, codeHash, accepter string, bac
 
 // RegisterAndAcceptByPairing atomically registers a new peer and accepts a pairing invite.
 // Returns the new peer's ID, key, and the grant from the inviter.
-func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash, name, notifyEmail string, backScopes, backBags []string) (peerID, key string, grant *Grant, err error) {
-	tx, err := s.beginImmediate(ctx)
+func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash, peerID, name, keyHash, notifyEmail string, backScopes, backBags []string) (grant *Grant, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return "", "", nil, err
+		return nil, err
 	}
 	defer tx.Rollback()
-	
-	var codeHash string
-	err = tx.QueryRowContext(ctx, `SELECT code_hash FROM invites WHERE pairing_token_hash=?`, pairingTokenHash).Scan(&codeHash)
+
+	// N3: Guarded SELECT to fail early before peer insert
+	var codeHash, fromPeer string
+	var exp int64
+	var used sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT code_hash,from_peer,expires_at,used_by FROM invites WHERE pairing_token_hash=?`, pairingTokenHash).
+		Scan(&codeHash, &fromPeer, &exp, &used)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", "", nil, ErrNotFound
+		return nil, ErrNotFound
 	}
 	if err != nil {
-		return "", "", nil, err
+		return nil, err
 	}
-	
-	peerID, key = auth.NewID(), auth.NewKey()
-	keyHash := auth.Hash(key)
+	if used.Valid || exp < now() {
+		return nil, ErrNotFound
+	}
+	if fromPeer == peerID {
+		return nil, ErrConflict
+	}
+
 	_, err = tx.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email) VALUES(?,?,?,?,?)`,
 		peerID, name, keyHash, now(), notifyEmail)
 	if err != nil {
-		return "", "", nil, err
+		return nil, err
 	}
-	
+
 	grant, err = acceptInviteInTx(ctx, tx, codeHash, peerID, backScopes, backBags)
 	if err != nil {
-		return "", "", nil, err
+		return nil, err
 	}
-	
+
 	if err := tx.Commit(); err != nil {
-		return "", "", nil, err
-	}
-	return peerID, key, grant, nil
-}
-
-// txLike is an interface covering the methods we need from sql.Tx.
-type txLike interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-	Commit() error
-	Rollback() error
-}
-
-// beginImmediate starts a transaction with BEGIN IMMEDIATE.
-func (s *Store) beginImmediate(ctx context.Context) (txLike, error) {
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
 		return nil, err
 	}
-	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
-		conn.Close()
-		return nil, err
-	}
-	return &immediateTx{conn: conn, ctx: ctx}, nil
-}
-
-// immediateTx wraps a connection with a manually-started IMMEDIATE transaction.
-type immediateTx struct {
-	conn *sql.Conn
-	ctx  context.Context
-}
-
-func (tx *immediateTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	return tx.conn.ExecContext(ctx, query, args...)
-}
-
-func (tx *immediateTx) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
-	return tx.conn.QueryRowContext(ctx, query, args...)
-}
-
-func (tx *immediateTx) Commit() error {
-	_, err := tx.conn.ExecContext(tx.ctx, `COMMIT`)
-	tx.conn.Close()
-	return err
-}
-
-func (tx *immediateTx) Rollback() error {
-	tx.conn.ExecContext(tx.ctx, `ROLLBACK`)
-	tx.conn.Close()
-	return nil
+	return grant, nil
 }
 
 // acceptInviteInTx is the shared helper that atomically consumes an invite using a guarded
 // update and creates grants. Must be called within a transaction.
-func acceptInviteInTx(ctx context.Context, tx txLike, codeHash, accepter string, backScopes, backBags []string) (*Grant, error) {
+func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string, backScopes, backBags []string) (*Grant, error) {
 	var from, scopes, bags string
 	err := tx.QueryRowContext(ctx, `SELECT from_peer,scopes,bags FROM invites WHERE code_hash=?`, codeHash).
 		Scan(&from, &scopes, &bags)
@@ -453,13 +425,13 @@ func acceptInviteInTx(ctx context.Context, tx txLike, codeHash, accepter string,
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if from == accepter {
 		return nil, ErrConflict
 	}
-	
+
 	ts := now()
-	res, err := tx.ExecContext(ctx, 
+	res, err := tx.ExecContext(ctx,
 		`UPDATE invites SET used_by=? WHERE code_hash=? AND used_by IS NULL AND expires_at>=?`,
 		accepter, codeHash, ts)
 	if err != nil {
@@ -472,7 +444,7 @@ func acceptInviteInTx(ctx context.Context, tx txLike, codeHash, accepter string,
 	if n != 1 {
 		return nil, ErrNotFound
 	}
-	
+
 	up := `INSERT INTO grants(owner,grantee,scopes,bags,created_at) VALUES(?,?,?,?,?)
 	       ON CONFLICT(owner,grantee) DO UPDATE SET scopes=excluded.scopes, bags=excluded.bags, created_at=excluded.created_at`
 	if _, err := tx.ExecContext(ctx, up, from, accepter, scopes, bags, ts); err != nil {
@@ -483,7 +455,7 @@ func acceptInviteInTx(ctx context.Context, tx txLike, codeHash, accepter string,
 			return nil, err
 		}
 	}
-	
+
 	return &Grant{Owner: from, Grantee: accepter, Scopes: split(scopes), Bags: split(bags)}, nil
 }
 

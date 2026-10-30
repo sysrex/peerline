@@ -419,10 +419,10 @@ func mustHome(t *testing.T, c *client) []byte {
 func TestPairingLink(t *testing.T) {
 	srv := newServer(t, Config{RegisterToken: "test-reg-token"})
 	a := registerAs(t, srv, "alice", map[string]string{"X-Peerline-Register-Token": "test-reg-token"})
-	
+
 	// Create invite with pairing link
 	resp, body := a.do("POST", "/v1/invites", map[string]any{
-		"scopes": []string{"messages"},
+		"scopes":           []string{"messages"},
 		"generate_pairing": true,
 	}, nil)
 	want(t, resp, body, 201)
@@ -439,14 +439,14 @@ func TestPairingLink(t *testing.T) {
 	if !strings.Contains(inv.PairingURL, "/v1/pairing/pair_") {
 		t.Fatalf("unexpected pairing_url: %s", inv.PairingURL)
 	}
-	
+
 	// Extract token from URL
 	parts := strings.Split(inv.PairingURL, "/v1/pairing/")
 	if len(parts) != 2 {
 		t.Fatalf("malformed pairing_url: %s", inv.PairingURL)
 	}
 	token := parts[1]
-	
+
 	// GET pairing details (no auth)
 	anon := &client{t: t, srv: srv}
 	resp, body = anon.do("GET", "/v1/pairing/"+token, nil, nil)
@@ -462,16 +462,16 @@ func TestPairingLink(t *testing.T) {
 	if !ok || len(scopes) != 1 || scopes[0] != "messages" {
 		t.Fatalf("scopes: %v", details["scopes"])
 	}
-	
+
 	// Accept pairing without auth (register + accept)
 	resp, body = anon.do("POST", "/v1/pairing/"+token, map[string]any{
-		"name": "bob",
+		"name":   "bob",
 		"scopes": []string{"messages"},
 	}, map[string]string{"X-Peerline-Register-Token": "test-reg-token"})
 	want(t, resp, body, 201)
 	var result struct {
-		PeerID  string `json:"peer_id"`
-		APIKey  string `json:"api_key"`
+		PeerID       string      `json:"peer_id"`
+		APIKey       string      `json:"api_key"`
 		GrantedToYou store.Grant `json:"granted_to_you"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
@@ -483,7 +483,7 @@ func TestPairingLink(t *testing.T) {
 	if result.GrantedToYou.Owner != a.id {
 		t.Fatalf("grant owner: want %s got %s", a.id, result.GrantedToYou.Owner)
 	}
-	
+
 	// Verify pairing worked - bob can message alice
 	b := &client{t: t, srv: srv, id: result.PeerID, key: result.APIKey}
 	resp, body = b.do("POST", "/v1/peers/"+a.id+"/messages", map[string]any{
@@ -491,14 +491,14 @@ func TestPairingLink(t *testing.T) {
 		"body": "hello from bob",
 	}, nil)
 	want(t, resp, body, 201)
-	
+
 	// Alice can message bob
 	resp, body = a.do("POST", "/v1/peers/"+b.id+"/messages", map[string]any{
 		"type": "note",
 		"body": "hello from alice",
 	}, nil)
 	want(t, resp, body, 201)
-	
+
 	// Pairing token is single-use
 	resp, body = anon.do("POST", "/v1/pairing/"+token, map[string]any{
 		"name": "charlie",
@@ -510,10 +510,10 @@ func TestPairingLinkAuthenticated(t *testing.T) {
 	srv := newServer(t, Config{RegisterToken: "test-reg-token"})
 	a := registerAs(t, srv, "alice", map[string]string{"X-Peerline-Register-Token": "test-reg-token"})
 	b := registerAs(t, srv, "bob", map[string]string{"X-Peerline-Register-Token": "test-reg-token"})
-	
+
 	// Alice creates pairing link
 	resp, body := a.do("POST", "/v1/invites", map[string]any{
-		"scopes": []string{"messages"},
+		"scopes":           []string{"messages"},
 		"generate_pairing": true,
 	}, nil)
 	want(t, resp, body, 201)
@@ -524,7 +524,7 @@ func TestPairingLinkAuthenticated(t *testing.T) {
 		t.Fatal(err)
 	}
 	token := strings.Split(inv.PairingURL, "/v1/pairing/")[1]
-	
+
 	// Bob accepts with existing credentials (authenticated)
 	resp, body = b.do("POST", "/v1/pairing/"+token, map[string]any{
 		"scopes": []string{"messages"},
@@ -539,7 +539,7 @@ func TestPairingLinkAuthenticated(t *testing.T) {
 	if result.GrantedToYou.Owner != a.id || result.GrantedToYou.Grantee != b.id {
 		t.Fatalf("grant: %+v", result.GrantedToYou)
 	}
-	
+
 	// Verify messaging works
 	resp, body = b.do("POST", "/v1/peers/"+a.id+"/messages", map[string]any{
 		"type": "note",
@@ -551,11 +551,11 @@ func TestPairingLinkAuthenticated(t *testing.T) {
 func TestPairingLinkInvalid(t *testing.T) {
 	srv := newServer(t, Config{})
 	anon := &client{t: t, srv: srv}
-	
+
 	// Invalid token format
 	resp, body := anon.do("GET", "/v1/pairing/invalid", nil, nil)
 	want(t, resp, body, 400)
-	
+
 	// Non-existent token
 	resp, body = anon.do("GET", "/v1/pairing/pair_aGVsbG8gd29ybGQgaXMgaGVyZQ", nil, nil)
 	want(t, resp, body, 404)
@@ -564,10 +564,10 @@ func TestPairingLinkInvalid(t *testing.T) {
 func TestPairingLinkSelfAccept(t *testing.T) {
 	srv := newServer(t, Config{})
 	a := register(t, srv, "alice")
-	
+
 	// Create pairing link
 	resp, body := a.do("POST", "/v1/invites", map[string]any{
-		"scopes": []string{"messages"},
+		"scopes":           []string{"messages"},
 		"generate_pairing": true,
 	}, nil)
 	want(t, resp, body, 201)
@@ -578,7 +578,7 @@ func TestPairingLinkSelfAccept(t *testing.T) {
 		t.Fatal(err)
 	}
 	token := strings.Split(inv.PairingURL, "/v1/pairing/")[1]
-	
+
 	// Alice cannot accept her own pairing link
 	resp, body = a.do("POST", "/v1/pairing/"+token, nil, nil)
 	want(t, resp, body, 400)
@@ -590,7 +590,7 @@ func TestPairingLinkSelfAccept(t *testing.T) {
 func TestPairingLinkWithoutGenerateFlag(t *testing.T) {
 	srv := newServer(t, Config{})
 	a := register(t, srv, "alice")
-	
+
 	// Create normal invite without generate_pairing
 	resp, body := a.do("POST", "/v1/invites", map[string]any{
 		"scopes": []string{"messages"},
@@ -600,14 +600,79 @@ func TestPairingLinkWithoutGenerateFlag(t *testing.T) {
 	if err := json.Unmarshal(body, &inv); err != nil {
 		t.Fatal(err)
 	}
-	
+
 	// Should not have pairing_url
 	if _, exists := inv["pairing_url"]; exists {
 		t.Fatal("pairing_url should not exist without generate_pairing flag")
 	}
-	
+
 	// Should still have code and accept_url
 	if inv["code"] == nil || inv["accept_url"] == nil {
 		t.Fatal("missing code or accept_url")
+	}
+}
+
+func TestPairingAcceptStatusCodes(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+
+	// Create pairing link
+	resp, body := a.do("POST", "/v1/invites", map[string]any{
+		"scopes":           []string{"messages"},
+		"generate_pairing": true,
+	}, nil)
+	want(t, resp, body, 201)
+	var inv struct {
+		PairingURL string `json:"pairing_url"`
+	}
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
+	}
+	token := strings.Split(inv.PairingURL, "/v1/pairing/")[1]
+
+	// Test 404: Invalid/nonexistent token
+	resp, body = noAuth.do("POST", "/v1/pairing/invalid_token", map[string]any{
+		"name": "Bob",
+	}, nil)
+	want(t, resp, body, 404)
+	if !strings.Contains(string(body), "invalid, used, or expired") {
+		t.Errorf("unexpected 404 body: %s", body)
+	}
+
+	// Test 400: Self-accept (alice created the invite, bob tries with alice's id - simulated by bad name logic)
+	// Actually, we'll test missing name for 400
+	resp, body = noAuth.do("POST", "/v1/pairing/"+token, map[string]any{}, nil)
+	want(t, resp, body, 400)
+	if !strings.Contains(string(body), "name required") {
+		t.Errorf("unexpected 400 body: %s", body)
+	}
+
+	// Test 201: Successful unauthenticated pairing
+	resp, body = noAuth.do("POST", "/v1/pairing/"+token, map[string]any{
+		"name": "Bob",
+	}, nil)
+	want(t, resp, body, 201)
+	var result struct {
+		PeerID     string `json:"peer_id"`
+		APIKey     string `json:"api_key"`
+		PairedWith string `json:"paired_with"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.PeerID == "" || result.APIKey == "" || result.PairedWith == "" {
+		t.Fatalf("missing fields in 201 response: %+v", result)
+	}
+	if result.PairedWith != a.id {
+		t.Errorf("paired_with = %s, want %s", result.PairedWith, a.id)
+	}
+
+	// Test 404: Token already used
+	resp, body = noAuth.do("POST", "/v1/pairing/"+token, map[string]any{
+		"name": "Carol",
+	}, nil)
+	want(t, resp, body, 404)
+	if !strings.Contains(string(body), "invalid, used, or expired") {
+		t.Errorf("unexpected 404 for used token: %s", body)
 	}
 }

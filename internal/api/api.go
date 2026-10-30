@@ -303,11 +303,11 @@ func normalizeNotifyEmail(raw string) (string, error) {
 
 func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Scopes        []string `json:"scopes"`
-		Bags          []string `json:"bags"`
-		TTLSeconds    int      `json:"ttl_seconds"`
-		ToEmail       string   `json:"to_email"`       // optional: email the accept link + code
-		GeneratePairing bool   `json:"generate_pairing"` // optional: generate shareable pairing link
+		Scopes          []string `json:"scopes"`
+		Bags            []string `json:"bags"`
+		TTLSeconds      int      `json:"ttl_seconds"`
+		ToEmail         string   `json:"to_email"`         // optional: email the accept link + code
+		GeneratePairing bool     `json:"generate_pairing"` // optional: generate shareable pairing link
 	}
 	if !decode(w, r, &in) {
 		return
@@ -937,7 +937,8 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 		return
 	}
 	// Atomically register and accept the pairing in one transaction
-	id, key, g, err := s.st.RegisterAndAcceptByPairing(r.Context(), auth.Hash(token), in.Name, "", sc, bg)
+	id, key := auth.NewID(), auth.NewKey()
+	g, err := s.st.RegisterAndAcceptByPairing(r.Context(), auth.Hash(token), id, in.Name, auth.Hash(key), "", sc, bg)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
@@ -951,12 +952,12 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 	}
 	s.log.Info("peer registered and paired", "peer_id", id, "inviter", g.Owner)
 	resp := map[string]any{
-		"peer_id":         id,
-		"api_key":         key,
-		"name":            in.Name,
-		"paired_with":     g.Owner,
-		"granted_to_you":  g,
-		"note":            "api_key is shown once; store it securely",
+		"peer_id":        id,
+		"api_key":        key,
+		"name":           in.Name,
+		"paired_with":    g.Owner,
+		"granted_to_you": g,
+		"note":           "api_key is shown once; store it securely",
 	}
 	if len(sc) > 0 {
 		resp["granted_by_you"] = store.Grant{Owner: id, Grantee: g.Owner, Scopes: sc, Bags: bg}
