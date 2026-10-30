@@ -75,6 +75,7 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `PEERLINE_WRITE_PER_MINUTE` | `10` | Per-peer rate limit for authenticated write operations, per minute |
 | `PEERLINE_WRITE_BURST` | `3` | Burst allowance for write operations |
 | `PEERLINE_KEY_INDEX_WARN` | `1000000` | Log a warning if the key index size exceeds this threshold at startup |
+| `PEERLINE_KEY_INDEX_REBUILD_HOURS` | `6` | Hours between full key index rebuilds (maintenance also rebuilds on count mismatch) |
 
 ### Pair two bots (different accounts)
 

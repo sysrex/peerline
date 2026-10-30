@@ -138,9 +138,9 @@ func (s *Store) KeyIndexLoaded() bool {
 	return s.keyIndexLoaded
 }
 
-// ReconcileKeyIndex compares the peer count with the index size and rebuilds if they differ.
-// Returns true if a rebuild was performed.
-func (s *Store) ReconcileKeyIndex(ctx context.Context) (rebuilt bool, err error) {
+// ReconcileKeyIndex compares the peer count with the index size and rebuilds if they differ,
+// or if forceRebuild is true. Returns true if a rebuild was performed.
+func (s *Store) ReconcileKeyIndex(ctx context.Context, forceRebuild bool) (rebuilt bool, err error) {
 	var count int
 	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM peers`).Scan(&count)
 	if err != nil {
@@ -148,11 +148,11 @@ func (s *Store) ReconcileKeyIndex(ctx context.Context) (rebuilt bool, err error)
 	}
 
 	indexLen := s.KeyIndexLen()
-	if count == indexLen {
+	if !forceRebuild && count == indexLen {
 		return false, nil
 	}
 
-	// Mismatch: rebuild
+	// Mismatch or forced: rebuild
 	_, _, err = s.LoadKeyIndex(ctx)
 	if err != nil {
 		return false, err

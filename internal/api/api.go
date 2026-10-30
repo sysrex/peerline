@@ -72,6 +72,8 @@ type Config struct {
 	// authenticated write operations. Default: 10/min, burst 3.
 	WritePerMinute int
 	WriteBurst     int
+	// KeyIndexRebuildHours is how often to do a full key index rebuild (default: 6).
+	KeyIndexRebuildHours int
 }
 
 type Server struct {
@@ -132,6 +134,9 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 	if cfg.WriteBurst <= 0 {
 		cfg.WriteBurst = 3
 	}
+	if cfg.KeyIndexRebuildHours <= 0 {
+		cfg.KeyIndexRebuildHours = 6
+	}
 	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
 
 	trustedNets, err := ParseTrustedProxies(cfg.TrustedProxies)
@@ -151,7 +156,7 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 	}
 
 	// Start maintenance tasks
-	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, cfg.RetentionSeconds)
+	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, cfg.RetentionSeconds, cfg.KeyIndexRebuildHours)
 
 	return s, nil
 }

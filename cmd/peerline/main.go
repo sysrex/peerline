@@ -109,6 +109,11 @@ func main() {
 	}
 	retentionSeconds := int64(retentionDays * 24 * 60 * 60)
 
+	keyIndexRebuildHours, _ := strconv.Atoi(os.Getenv("PEERLINE_KEY_INDEX_REBUILD_HOURS"))
+	if keyIndexRebuildHours <= 0 {
+		keyIndexRebuildHours = 6 // default
+	}
+
 	// Parse rate limiter config (#96: validate at startup)
 	authFailPerMinute, err := parseInt(os.Getenv("PEERLINE_AUTH_FAIL_PER_MINUTE"), "PEERLINE_AUTH_FAIL_PER_MINUTE")
 	if err != nil {
@@ -138,19 +143,20 @@ func main() {
 		"write_burst", writeBurst)
 
 	apiServer, err := api.New(st, api.Config{
-		RegisterToken:         regTok,
-		Logger:                log,
-		Mailer:                ml,
-		PublicURL:             publicURL,
-		EmailPerHour:          emailPerHour,
-		NotifyPerHour:         notifyPerHour,
-		TrustedProxies:        trustedProxies,
-		MaxOutstandingInvites: maxOutstandingInvites,
-		RetentionSeconds:      retentionSeconds,
-		AuthFailPerMinute:     authFailPerMinute,
-		AuthFailBurst:         authFailBurst,
-		WritePerMinute:        writePerMinute,
-		WriteBurst:            writeBurst,
+		RegisterToken:            regTok,
+		Logger:                   log,
+		Mailer:                   ml,
+		PublicURL:                publicURL,
+		EmailPerHour:             emailPerHour,
+		NotifyPerHour:            notifyPerHour,
+		TrustedProxies:           trustedProxies,
+		MaxOutstandingInvites:    maxOutstandingInvites,
+		RetentionSeconds:         retentionSeconds,
+		AuthFailPerMinute:        authFailPerMinute,
+		AuthFailBurst:            authFailBurst,
+		WritePerMinute:           writePerMinute,
+		WriteBurst:               writeBurst,
+		KeyIndexRebuildHours:     keyIndexRebuildHours,
 	})
 	if err != nil {
 		log.Error("api.New failed", "err", err)
