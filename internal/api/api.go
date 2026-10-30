@@ -10,11 +10,14 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/sysrex/peerline/internal/auth"
+	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/msg"
 	"github.com/sysrex/peerline/internal/pair"
 	"github.com/sysrex/peerline/internal/store"
@@ -33,6 +36,17 @@ type Config struct {
 	MsgPerMinute  int
 	MsgBurst      int
 	Logger        *slog.Logger
+
+	// Mailer sends invite emails. Nil = dev mode (log the email, never fail).
+	Mailer mailer.Sender
+	// PublicURL is the externally reachable base URL used in emailed accept
+	// links (e.g. https://peerline.example.com). If empty, it is derived from
+	// the request (fine for local dev; set it in production).
+	PublicURL string
+	// Email send limits: per inviting peer and per recipient address, per hour.
+	EmailPerHour     int
+	EmailBurst       int
+	EmailRcptPerHour int
 }
 
 type Server struct {
@@ -40,7 +54,10 @@ type Server struct {
 	cfg    Config
 	msgLim *msg.Limiter
 	regLim *msg.Limiter
-	log    *slog.Logger
+	// email send limits: by inviter peer id, and by recipient address
+	mailLim *msg.Limiter
+	rcptLim *msg.Limiter
+	log     *slog.Logger
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -53,9 +70,24 @@ func New(st *store.Store, cfg Config) *Server {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	if cfg.Mailer == nil {
+		cfg.Mailer = mailer.Log{Logger: cfg.Logger}
+	}
+	if cfg.EmailPerHour <= 0 {
+		cfg.EmailPerHour = 20
+	}
+	if cfg.EmailBurst <= 0 {
+		cfg.EmailBurst = 5
+	}
+	if cfg.EmailRcptPerHour <= 0 {
+		cfg.EmailRcptPerHour = 3
+	}
+	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
 	return &Server{st: st, cfg: cfg, log: cfg.Logger,
-		msgLim: msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst),
-		regLim: msg.NewLimiter(10, 5)}
+		msgLim:  msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst),
+		regLim:  msg.NewLimiter(10, 5),
+		mailLim: msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst),
+		rcptLim: msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour)}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -67,19 +99,31 @@ func (s *Server) Handler() http.Handler {
 	authed.HandleFunc("GET /v1/me", s.me)
 	authed.HandleFunc("POST /v1/invites", s.createInvite)
 	authed.HandleFunc("POST /v1/invites/accept", s.acceptInvite)
+	authed.HandleFunc("GET /v1/invites/accept", s.acceptInvite) // emailed magic link (Bearer required)
 	authed.HandleFunc("GET /v1/grants", s.listGrants)
 	authed.HandleFunc("DELETE /v1/grants/{peer_id}", s.revokeGrant)
 	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.sendMessage)
 	authed.HandleFunc("GET /v1/inbox", s.inbox)
 	authed.HandleFunc("GET /v1/bags/{name}", s.getBag)
 	authed.HandleFunc("PUT /v1/bags/{name}", s.putBag)
-	mux.Handle("/v1/", auth.Middleware(func(ctx context.Context, h string) (string, error) {
+	authMW := auth.Middleware(func(ctx context.Context, h string) (string, error) {
 		p, err := s.st.PeerByKeyHash(ctx, h)
 		if err != nil {
 			return "", err
 		}
 		return p.ID, nil
-	}, authed))
+	}, authed)
+	mux.Handle("/v1/", authMW)
+	// The emailed accept link: with a Bearer key it accepts (same flow as
+	// POST); without one (a human clicking, or a link scanner) it only shows
+	// instructions and never consumes the invite.
+	mux.HandleFunc("GET /v1/invites/accept", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			authMW.ServeHTTP(w, r)
+			return
+		}
+		s.acceptLanding(w, r)
+	})
 	return securityHeaders(mux)
 }
 
@@ -177,9 +221,19 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		Scopes     []string `json:"scopes"`
 		Bags       []string `json:"bags"`
 		TTLSeconds int      `json:"ttl_seconds"`
+		ToEmail    string   `json:"to_email"` // optional: email the accept link + code
 	}
 	if !decode(w, r, &in) {
 		return
+	}
+	var to string
+	if in.ToEmail != "" {
+		a, err := mailer.ValidAddress(in.ToEmail)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "to_email: invalid email address")
+			return
+		}
+		to = a
 	}
 	sc, bg, err := pair.Normalize(in.Scopes, in.Bags)
 	if err != nil {
@@ -194,16 +248,110 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	if in.TTLSeconds > 0 {
 		ttl = min(time.Duration(in.TTLSeconds)*time.Second, maxInviteTTL)
 	}
+	me := auth.PeerID(r.Context())
+	if to != "" {
+		// Check both limits (without consuming) before taking from either, and before
+		// creating anything, so a 429 leaves no stray invite and burns no budget.
+		rk := strings.ToLower(to)
+		if !s.mailLim.Ready(me) || !s.rcptLim.Ready(rk) || !s.mailLim.Allow(me) || !s.rcptLim.Allow(rk) {
+			w.Header().Set("Retry-After", "600")
+			writeErr(w, http.StatusTooManyRequests, "invite email rate limited; try later or create an invite without to_email and share the code yourself")
+			return
+		}
+	}
 	code := auth.NewSecret("inv_")
 	exp := time.Now().Add(ttl).UTC()
-	if err := s.st.CreateInvite(r.Context(), auth.Hash(code), auth.PeerID(r.Context()), sc, bg, exp); err != nil {
+	if err := s.st.CreateInvite(r.Context(), auth.Hash(code), me, sc, bg, exp); err != nil {
 		s.internal(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{
+	acceptURL := s.publicBase(r) + "/v1/invites/accept?code=" + url.QueryEscape(code)
+	resp := map[string]any{
 		"code": code, "scopes": sc, "bags": bg, "expires_at": exp.Format(time.RFC3339),
-		"note": "single use; share out of band with the peer you want to pair with",
-	})
+		"accept_url": acceptURL,
+		"note":       "single use; share out of band with the peer you want to pair with",
+	}
+	if to != "" {
+		status := "sent"
+		if s.cfg.Mailer.Mode() == "log" {
+			status = "logged"
+		}
+		m := inviteEmail(s.inviterName(r.Context(), me), me, to, code, acceptURL, sc, bg, exp)
+		// Detach from client cancellation; the SMTP sender has its own timeout.
+		if err := s.cfg.Mailer.Send(context.WithoutCancel(r.Context()), m); err != nil {
+			s.log.Error("invite email failed", "inviter", me, "err", err)
+			status = "failed"
+		} else {
+			s.log.Info("invite email", "inviter", me, "status", status)
+		}
+		resp["email"] = map[string]string{"to": to, "status": status, "mode": s.cfg.Mailer.Mode()}
+		resp["note"] = "single use; emailed to " + to + " (code also returned here as a fallback/debug aid)"
+		if status == "failed" {
+			resp["note"] = "invite created but the email could not be sent; share the code out of band"
+		}
+	}
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+func (s *Server) publicBase(r *http.Request) string {
+	if s.cfg.PublicURL != "" {
+		return s.cfg.PublicURL
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
+}
+
+func (s *Server) inviterName(ctx context.Context, id string) string {
+	n, err := s.st.PeerName(ctx, id)
+	if err != nil {
+		return "A Peerline peer"
+	}
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, n)
+}
+
+func inviteEmail(inviter, inviterID, to, code, acceptURL string, scopes, bags []string, exp time.Time) mailer.Message {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s (Peerline peer %s) invited one of your bots to pair on Peerline,\n", inviter, inviterID)
+	b.WriteString("a deny-all relay that lets bots on different accounts exchange short messages.\n\n")
+	fmt.Fprintf(&b, "Scopes granted to you: %s\n", strings.Join(scopes, ", "))
+	if len(bags) > 0 {
+		fmt.Fprintf(&b, "Bags: %s\n", strings.Join(bags, ", "))
+	}
+	fmt.Fprintf(&b, "Expires: %s (single use)\n\n", exp.Format(time.RFC3339))
+	b.WriteString("Accept with your bot's own Peerline API key (opening the link in a browser\nonly shows instructions; it does not accept):\n\n")
+	fmt.Fprintf(&b, "  %s\n\n", acceptURL)
+	fmt.Fprintf(&b, "  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" \\\n    '%s'\n\n", acceptURL)
+	fmt.Fprintf(&b, "Or give your bot this one-time code:\n\n  %s\n\n", code)
+	b.WriteString("Accepting only lets your bot act within the scopes above on the inviter's side;\nnothing of yours is shared unless you grant scopes back.\n")
+	b.WriteString("If you don't recognise the inviter, ignore this email. The code expires on its own.\n")
+	return mailer.Message{To: to, Subject: "Peerline: " + inviter + " invited your bot to pair", Body: b.String()}
+}
+
+var inviteCodeRE = regexp.MustCompile(`^inv_[A-Za-z0-9_-]{16,64}$`)
+
+// acceptLanding answers an unauthenticated GET of the emailed link. It never
+// touches the invite (so mail scanners and previews cannot burn it).
+func (s *Server) acceptLanding(w http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if !inviteCodeRE.MatchString(code) {
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, "Peerline: missing or malformed invite code.\n")
+		return
+	}
+	u := s.publicBase(r) + "/v1/invites/accept?code=" + url.QueryEscape(code)
+	fmt.Fprintf(w, "Peerline invite\n\nThis link must be opened by your bot with its Peerline API key:\n\n"+
+		"  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" '%s'\n\n"+
+		"Optionally grant scopes back in the same call with a JSON body, e.g. {\"scopes\":[\"messages\"]}.\n"+
+		"Or paste the one-time code into your bot: %s\n\nNothing has been accepted yet.\n", u, code)
 }
 
 func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
@@ -212,7 +360,25 @@ func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 		Scopes []string `json:"scopes"` // optional reciprocal grant to the inviter
 		Bags   []string `json:"bags"`
 	}
-	if !decode(w, r, &in) {
+	// Body is optional when the code comes from the emailed link (?code=).
+	if r.Method == http.MethodPost && r.ContentLength != 0 {
+		if !decode(w, r, &in) {
+			return
+		}
+	}
+	q := r.URL.Query()
+	if qc := q.Get("code"); qc != "" {
+		if in.Code != "" && in.Code != qc {
+			writeErr(w, http.StatusBadRequest, "code in body and query differ")
+			return
+		}
+		in.Code = qc
+	}
+	if r.Method == http.MethodGet {
+		in.Scopes, in.Bags = splitCSV(q.Get("scopes")), splitCSV(q.Get("bags"))
+	}
+	if in.Code == "" {
+		writeErr(w, http.StatusBadRequest, "code required (JSON body or ?code=)")
 		return
 	}
 	sc, bg, err := pair.Normalize(in.Scopes, in.Bags)
@@ -239,6 +405,16 @@ func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log.Info("pairing accepted", "owner", g.Owner, "grantee", me)
 	writeJSON(w, 200, resp)
+}
+
+func splitCSV(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (s *Server) listGrants(w http.ResponseWriter, r *http.Request) {

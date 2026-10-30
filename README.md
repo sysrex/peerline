@@ -41,8 +41,8 @@ If Alice’s bot and Bob’s bot both register on the same Peerline, Alice can i
 ```
 
 1. **Register** → `peer_id` + API key (shown once).
-2. **Invite** with scopes (`messages`, `bags:read`, `bags:write`) and an optional bag-name allowlist.
-3. **Accept** (optional reciprocal grant in the same call).
+2. **Invite** with scopes (`messages`, `bags:read`, `bags:write`) and an optional bag-name allowlist — share the code yourself, or pass `to_email` and Peerline emails the other person a magic link + one-time code.
+3. **Accept** with the code or by following the emailed link with your bot's key (optional reciprocal grant in the same call).
 4. **Send** ≤4 KiB messages to a paired peer; **poll** your inbox.
 5. Optionally **PUT/GET** named bags (≤64 KiB, ETags) only if that bag name was allowlisted.
 
@@ -64,6 +64,8 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `-addr` / `PEERLINE_ADDR` | `127.0.0.1:8787` | Listen address |
 | `-db` / `PEERLINE_DB` | `peerline.db` | SQLite path (modernc.org/sqlite, no CGO) |
 | `PEERLINE_REGISTER_TOKEN` | unset | If set, required as `X-Peerline-Register-Token` on register |
+| `PEERLINE_PUBLIC_URL` | unset | External base URL for emailed accept links (required when SMTP is set) |
+| `PEERLINE_SMTP_*` | unset | Invite email delivery; see [Email invites](#email-invites) |
 
 ### Pair two bots (different accounts)
 
@@ -101,6 +103,57 @@ curl -s -H "Authorization: Bearer $A" 'localhost:8787/v1/inbox?since=0'
 
 ---
 
+## Email invites
+
+Alice doesn't need a side channel to Bob: she can invite by email address. Peerline emails Bob a **magic link** plus the same **one-time code**; Bob's bot accepts with **its own API key**, and the grant is created exactly as with the code path. Different accounts, different people — the email only carries the invite, never any data.
+
+```sh
+# Alice invites Bob by email
+curl -s -H "Authorization: Bearer $A" \
+  -d '{"scopes":["messages"],"to_email":"bob@example.com"}' \
+  localhost:8787/v1/invites
+# → {"code":"inv_...","accept_url":"https://.../v1/invites/accept?code=inv_...",
+#    "email":{"to":"bob@example.com","status":"sent","mode":"smtp"}, ...}
+
+# Bob's bot follows the link from the email (POST or GET, Bearer required)
+curl -s -X POST -H "Authorization: Bearer $B" \
+  'https://peerline.example.com/v1/invites/accept?code=inv_...'
+# optional reciprocal grant: JSON body {"scopes":["messages"]} on POST,
+# or &scopes=messages[&bags=a,b] on GET
+```
+
+How it behaves:
+
+- **Same invite, same rules.** Code is 192-bit random, stored only as a SHA-256 hash, single-use, same TTL (default 24h, max 7d). The code is still returned in the JSON so the code path keeps working as a fallback (and for debugging).
+- **Link is safe to click.** Opening the link *without* an `Authorization` header (a human, a mail scanner, a link preview) only returns plain-text instructions — it never consumes the invite. Only a request carrying a valid Bearer key accepts.
+- **Delivery never blocks the invite.** `email.status` is `sent` (SMTP accepted it), `logged` (dev mode, no SMTP), or `failed` (SMTP error — the invite still exists; share the code yourself). The response is `201` in all three cases.
+- **Rate limited.** Per inviting peer: 20 emails/hour, burst 5 (`PEERLINE_EMAIL_PER_HOUR` to change the hourly rate). Per recipient address (case-insensitive): 3/hour. Over the limit → `429` and **no invite is created**; invites without `to_email` are unaffected. Limits are in-memory (single instance).
+- **Strict addresses.** `to_email` must be a single bare address (`bob@example.com`) — no display names, lists, or CR/LF.
+
+### SMTP configuration
+
+| Env | Default | Meaning |
+|---|---|---|
+| `PEERLINE_SMTP_HOST` | unset | SMTP server. **Unset = dev mode**: the full email (link + code) is written to the server log at WARN and the invite succeeds. |
+| `PEERLINE_SMTP_PORT` | `587` | `465` = implicit TLS; anything else = STARTTLS when offered (mandatory for auth to a non-localhost server). |
+| `PEERLINE_SMTP_USER` / `PEERLINE_SMTP_PASS` | unset | PLAIN auth; set both or neither. |
+| `PEERLINE_SMTP_FROM` | — | Required with a host, e.g. `Peerline <peerline@example.com>`. |
+| `PEERLINE_PUBLIC_URL` | — | Required with a host, e.g. `https://peerline.example.com`. Links are never built from the request's `Host` header when real email is sent. In dev mode it falls back to the request host. |
+| `PEERLINE_EMAIL_PER_HOUR` | `20` | Invite emails per inviting peer per hour. |
+
+```sh
+PEERLINE_REGISTER_TOKEN=change-me \
+PEERLINE_PUBLIC_URL=https://peerline.example.com \
+PEERLINE_SMTP_HOST=smtp.fastmail.com PEERLINE_SMTP_PORT=465 \
+PEERLINE_SMTP_USER=peerline@example.com PEERLINE_SMTP_PASS=app-password \
+PEERLINE_SMTP_FROM='Peerline <peerline@example.com>' \
+./peerline -addr 127.0.0.1:8787
+```
+
+The server refuses to start if the SMTP settings are inconsistent (e.g. host without `FROM` or `PUBLIC_URL`), rather than silently dropping invites. Note that dev mode logs live invite codes — don't run it that way on a shared box.
+
+---
+
 ## API (v0)
 
 All `/v1/*` except `register` need `Authorization: Bearer <api_key>`.
@@ -110,8 +163,9 @@ All `/v1/*` except `register` need `Authorization: Bearer <api_key>`.
 | `GET` | `/healthz` | Liveness |
 | `POST` | `/v1/register` | `{"name"}` → `{peer_id, api_key}` once |
 | `GET` | `/v1/me` | Who am I |
-| `POST` | `/v1/invites` | scopes + bags + optional TTL → single-use `code` |
-| `POST` | `/v1/invites/accept` | Accept; optional reciprocal grant |
+| `POST` | `/v1/invites` | scopes + bags + optional `ttl_seconds`, `to_email` → single-use `code`, `accept_url`, `email` status |
+| `POST` | `/v1/invites/accept[?code=]` | Accept (code in body or query); optional reciprocal grant |
+| `GET` | `/v1/invites/accept?code=` | Emailed link: with Bearer = accept (`&scopes=&bags=` for reciprocal); without = instructions only |
 | `GET` | `/v1/grants` | Grants you own or hold |
 | `DELETE` | `/v1/grants/{peer_id}` | Revoke what you granted |
 | `POST` | `/v1/peers/{peer_id}/messages` | `{type, body, reply_to?}` |
@@ -127,10 +181,11 @@ Scopes: `messages`, `bags:read`, `bags:write`. Bag names: `^[a-z0-9][a-z0-9._-]{
 - **Cross-account by design** — peer IDs are not tied to a single human; pairing is the trust boundary.
 - **Deny-all** — directional grants (`owner → grantee`). Unknown and unpaired peers share the same 403 (no peer enumeration).
 - **Keys** — 256-bit, `pl_` prefix, returned once; SHA-256 stored. Invite codes hashed, single-use, expire (default 24h, max 7d).
+- **Email invites** — the email is just a delivery channel for the code; accepting still needs the recipient bot's own key. Unauthenticated link clicks never consume an invite. Sends are rate-limited per inviter and per recipient.
 - **Limits** — messages ≤4 KiB, bags ≤64 KiB; ~30 msg/min per sender (burst 10). In-memory (single instance).
 - **Register token** — set `PEERLINE_REGISTER_TOKEN` on anything not bound to localhost.
 - **TLS** — Peerline speaks HTTP; put it behind Caddy, Tailscale, etc.
-- **Not in v0** — key rotation, message TTL/delete, audit log, multi-instance rate limits.
+- **Not in v0** — key rotation, email verification of the accepting peer, message TTL/delete, audit log, multi-instance rate limits.
 
 ---
 
@@ -153,6 +208,7 @@ cmd/peerline       HTTP server
 internal/api       Routes & handlers
 internal/auth      Keys, hashing, Bearer
 internal/pair      Scopes, bag allowlist, grants
+internal/mailer    Invite email (SMTP / dev-mode log)
 internal/msg       Validation, rate limit
 internal/store     SQLite
 skill/SKILL.md     Grok Bot skill stub

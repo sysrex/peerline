@@ -33,3 +33,13 @@ func TestLimiterRefill(t *testing.T) {
 		t.Fatal("refill")
 	}
 }
+
+func TestLimiterReady(t *testing.T) {
+	l := NewLimiterPerHour(1, 1)
+	if !l.Ready("a") || !l.Ready("a") {
+		t.Fatal("Ready must not consume")
+	}
+	if !l.Allow("a") || l.Ready("a") || l.Allow("a") {
+		t.Fatal("bucket should be empty after one Allow")
+	}
+}

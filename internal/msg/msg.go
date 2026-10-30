@@ -58,8 +58,19 @@ func NewLimiter(perMinute, burst int) *Limiter {
 	return &Limiter{rate: float64(perMinute) / 60, burst: float64(burst), buckets: map[string]*bucket{}, now: time.Now}
 }
 
+// NewLimiterPerHour allows `perHour` events per hour with the given burst.
+func NewLimiterPerHour(perHour, burst int) *Limiter {
+	return &Limiter{rate: float64(perHour) / 3600, burst: float64(burst), buckets: map[string]*bucket{}, now: time.Now}
+}
+
 // Allow consumes one token for key; false means rate limited.
-func (l *Limiter) Allow(key string) bool {
+func (l *Limiter) Allow(key string) bool { return l.take(key, true) }
+
+// Ready reports whether Allow(key) would currently succeed, without consuming.
+// Use it to check several limiters before consuming from any of them.
+func (l *Limiter) Ready(key string) bool { return l.take(key, false) }
+
+func (l *Limiter) take(key string, consume bool) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	t := l.now()
@@ -73,6 +84,8 @@ func (l *Limiter) Allow(key string) bool {
 	if b.tokens < 1 {
 		return false
 	}
-	b.tokens--
+	if consume {
+		b.tokens--
+	}
 	return true
 }

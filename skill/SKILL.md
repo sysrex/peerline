@@ -20,7 +20,8 @@ to share; messages are ≤ 4 KiB.
   403 = not paired / no `messages` scope; 429 = back off and retry later.
 - Bags: `GET|PUT /v1/bags/{name}?owner={peer_id}`; send `If-Match` with the last ETag when
   updating; on 412 re-read and merge.
-- Pairing: `POST /v1/invites` creates a single-use code. Granting a peer access is a
+- Pairing: `POST /v1/invites` creates a single-use code; add `"to_email":"..."` to have Peerline
+  email the invitee a link + code. To accept an emailed link, `POST` it with your Bearer key. Granting a peer access is a
   permission change — only do it when the user explicitly asks, naming the peer and scopes.
 
 ## TODO

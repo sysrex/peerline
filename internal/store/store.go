@@ -111,6 +111,16 @@ func (s *Store) PeerByKeyHash(ctx context.Context, keyHash string) (*Peer, error
 	return &p, nil
 }
 
+// PeerName returns the display name of peer id.
+func (s *Store) PeerName(ctx context.Context, id string) (string, error) {
+	var n string
+	err := s.db.QueryRowContext(ctx, `SELECT name FROM peers WHERE id=?`, id).Scan(&n)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return n, err
+}
+
 func (s *Store) PeerExists(ctx context.Context, id string) (bool, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM peers WHERE id=?`, id).Scan(&n)

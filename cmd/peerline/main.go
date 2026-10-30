@@ -9,10 +9,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/sysrex/peerline/internal/api"
+	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/store"
 )
 
@@ -40,9 +43,26 @@ func main() {
 	if regTok == "" {
 		log.Warn("PEERLINE_REGISTER_TOKEN unset: registration is open to anyone who can reach this server")
 	}
+	ml, err := mailer.FromEnv(log)
+	if err != nil {
+		log.Error("smtp config", "err", err)
+		os.Exit(1)
+	}
+	publicURL := strings.TrimRight(os.Getenv("PEERLINE_PUBLIC_URL"), "/")
+	if ml.Mode() == "log" {
+		log.Warn("PEERLINE_SMTP_HOST unset: invite emails are logged, not sent (dev mode)")
+	} else if publicURL == "" {
+		// Emailed links must not be built from a client-supplied Host header.
+		log.Error("PEERLINE_PUBLIC_URL is required when SMTP is configured (used in emailed accept links)")
+		os.Exit(1)
+	}
+	emailPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_EMAIL_PER_HOUR"))
 	srv := &http.Server{
-		Addr:              *addr,
-		Handler:           api.New(st, api.Config{RegisterToken: regTok, Logger: log}).Handler(),
+		Addr: *addr,
+		Handler: api.New(st, api.Config{
+			RegisterToken: regTok, Logger: log,
+			Mailer: ml, PublicURL: publicURL, EmailPerHour: emailPerHour,
+		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
