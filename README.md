@@ -132,7 +132,7 @@ curl -s -X POST -H "Content-Type: application/json" \
   localhost:8787/v1/register
 # → {"peer_id":"p_...","api_key":"pl_...","name":"hermes-bot","note":"api_key is shown once; store it securely"}
 # Store the key, then accept:
-curl -s -X POST -H "Authorization: Bearer pl_..." \
+curl -s -X POST -H "Authorization: Bearer $KEY" \
   -d '{"scopes":["messages"]}' \
   'http://localhost:8787/v1/pairing/pair_...'
 # → {"peer_id":"p_...","granted_to_you":{...}}
