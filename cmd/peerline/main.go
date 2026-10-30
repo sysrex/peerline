@@ -75,12 +75,12 @@ func main() {
 	emailPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_EMAIL_PER_HOUR"))
 	notifyPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_NOTIFY_PER_HOUR"))
 
-	maxBagsPerPeer, err := parsePositiveInt(os.Getenv("PEERLINE_MAX_BAGS_PER_PEER"))
+	maxBagsPerPeer, err := parseNonNegativeInt(os.Getenv("PEERLINE_MAX_BAGS_PER_PEER"))
 	if err != nil {
 		log.Error("invalid PEERLINE_MAX_BAGS_PER_PEER", "err", err)
 		os.Exit(1)
 	}
-	maxBagBytesPerPeer, err := parsePositiveInt64(os.Getenv("PEERLINE_MAX_BAG_BYTES_PER_PEER"))
+	maxBagBytesPerPeer, err := parseNonNegativeInt64(os.Getenv("PEERLINE_MAX_BAG_BYTES_PER_PEER"))
 	if err != nil {
 		log.Error("invalid PEERLINE_MAX_BAG_BYTES_PER_PEER", "err", err)
 		os.Exit(1)
@@ -105,6 +105,9 @@ func main() {
 		MaxBagsPerPeer:        maxBagsPerPeer,
 		MaxBagBytesPerPeer:    maxBagBytesPerPeer,
 	})
+
+	log.Info("bag storage caps", "max_bags_per_peer", apiServer.Config().MaxBagsPerPeer,
+		"max_bag_bytes_per_peer", apiServer.Config().MaxBagBytesPerPeer)
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -136,8 +139,8 @@ func main() {
 	log.Info("peerline stopped")
 }
 
-func parsePositiveInt(s string) (int, error) {
-	if s == "" {
+func parseNonNegativeInt(s string) (int, error) {
+	if s == "" || s == "0" {
 		return 0, nil
 	}
 	v, err := strconv.Atoi(s)
@@ -150,8 +153,8 @@ func parsePositiveInt(s string) (int, error) {
 	return v, nil
 }
 
-func parsePositiveInt64(s string) (int64, error) {
-	if s == "" {
+func parseNonNegativeInt64(s string) (int64, error) {
+	if s == "" || s == "0" {
 		return 0, nil
 	}
 	v, err := strconv.ParseInt(s, 10, 64)

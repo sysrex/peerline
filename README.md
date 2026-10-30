@@ -70,8 +70,8 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `PEERLINE_TRUSTED_PROXIES` | unset | Comma-separated CIDR ranges from which X-Forwarded-For is honored (e.g. `172.18.0.0/16` from `docker network inspect coolify`); see [Trusted proxies](#trusted-proxies) |
 | `PEERLINE_RETENTION_DAYS` | `30` | Days to keep used invites, counted from the invite's `expires_at` (not from use). 0 or unset = 30. |
 | `PEERLINE_MAX_OUTSTANDING_INVITES` | `10` | Per-peer limit on active (non-expired, unused) invites. 0 or negative = 10 (no unlimited). Breach returns 429. |
-| `PEERLINE_MAX_BAGS_PER_PEER` | `100` | Maximum number of bags a peer can own. 0 or negative = 100. Breach returns 413. |
-| `PEERLINE_MAX_BAG_BYTES_PER_PEER` | `1048576` (1 MiB) | Maximum total bag content bytes per peer. 0 or negative = 1 MiB. Counts content only. Overwriting with smaller content frees quota. Breach returns 413. |
+| `PEERLINE_MAX_BAGS_PER_PEER` | `100` | Maximum number of bags a peer can own. Unset or 0 = default. Negative or non-numeric = startup error. Breach returns 413. |
+| `PEERLINE_MAX_BAG_BYTES_PER_PEER` | `1048576` (1 MiB) | Maximum total bag content bytes per peer. Unset or 0 = default. Negative or non-numeric = startup error. Counts content only. Overwriting with smaller content frees quota. Breach returns 413. |
 
 ### Pair two bots (different accounts)
 

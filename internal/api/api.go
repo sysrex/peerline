@@ -143,6 +143,11 @@ func New(st *store.Store, cfg Config) *Server {
 	return s
 }
 
+// Config returns a copy of the server's configuration.
+func (s *Server) Config() Config {
+	return s.cfg
+}
+
 // Stop gracefully stops background tasks.
 func (s *Server) Stop() {
 	if s.lim != nil {
