@@ -36,7 +36,10 @@ func newTestLimiterManager(cfg Config, clock func() time.Time) *LimiterManager {
 
 // newTestServer creates a Server with a custom clock for rate limiters (testing only).
 func newTestServer(st *store.Store, cfg Config, clock func() time.Time) *Server {
-	srv := New(st, cfg)
+	srv, err := New(st, cfg)
+	if err != nil {
+		panic(err)
+	}
 	srv.lim.Stop()
 	srv.lim = newTestLimiterManager(cfg, clock)
 	return srv
