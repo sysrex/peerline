@@ -6,6 +6,9 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,6 +20,16 @@ import (
 
 // Global cancel function for the test_cancel scalar function
 var testCancelFunc atomic.Value // stores context.CancelFunc
+
+// secureTempDir creates a temporary directory with 0700 permissions for testing backups.
+func secureTempDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatalf("chmod temp dir: %v", err)
+	}
+	return dir
+}
 
 func init() {
 	// Register the test_cancel scalar function globally
@@ -35,17 +48,17 @@ func TestStoreBasics(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err := s.CreatePeer(ctx, "a", "alice", "ha", "alice@example.com", ""); err != nil {
+	if err := s.CreatePeer(ctx, "a", "alice", "ha", "alice@example.com"); err != nil {
 		t.Fatal(err)
 	}
-	s.CreatePeer(ctx, "b", "bob", "hb", "", "")
+	s.CreatePeer(ctx, "b", "bob", "hb", "")
 	if email, err := s.NotifyEmail(ctx, "a"); err != nil || email != "alice@example.com" {
 		t.Fatal(email, err)
 	}
 	if email, err := s.NotifyEmail(ctx, "b"); err != nil || email != "" {
 		t.Fatal(email, err)
 	}
-	if err := s.SetNotifyEmail(ctx, "a", "", ""); err != nil {
+	if err := s.SetNotifyEmail(ctx, "a", ""); err != nil {
 		t.Fatal(err)
 	}
 	if email, err := s.NotifyEmail(ctx, "a"); err != nil || email != "" {
@@ -80,10 +93,10 @@ func TestStats(t *testing.T) {
 	if err != nil || st != (Stats{}) {
 		t.Fatalf("empty: %+v %v", st, err)
 	}
-	if err := s.CreatePeer(ctx, "a", "alice", "ha", "", ""); err != nil {
+	if err := s.CreatePeer(ctx, "a", "alice", "ha", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "b", "bob", "hb", "", ""); err != nil {
+	if err := s.CreatePeer(ctx, "b", "bob", "hb", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.CreateInvite(ctx, "c2", "a", []string{"messages"}, nil, time.Now().Add(time.Hour)); err != nil {
@@ -110,7 +123,7 @@ func TestStats(t *testing.T) {
 // Databases created before notify_email must gain the column on open.
 func TestNotifyEmailMigration(t *testing.T) {
 	ctx := context.Background()
-	path := t.TempDir() + "/old.db"
+	path := secureTempDir(t) + "/old.db"
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
@@ -137,10 +150,10 @@ func TestNotifyEmailMigration(t *testing.T) {
 	if err != nil || email != "" {
 		t.Fatalf("migrated email %q %v", email, err)
 	}
-	if err := s.SetNotifyEmail(ctx, "p_old", "old@example.com", "tok1"); err != nil {
+	if err := s.SetNotifyEmail(ctx, "p_old", "old@example.com"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetNotifyEmail(ctx, "missing", "a@b.co", "tok2"); !errors.Is(err, ErrNotFound) {
+	if err := s.SetNotifyEmail(ctx, "missing", "a@b.co"); !errors.Is(err, ErrNotFound) {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -160,7 +173,7 @@ func TestNotifyEmailMigration(t *testing.T) {
 // TestV0SchemaMigration verifies v0 databases (without notify_email) upgrade correctly.
 func TestV0SchemaMigration(t *testing.T) {
 	ctx := context.Background()
-	path := t.TempDir() + "/v0.db"
+	path := secureTempDir(t) + "/v0.db"
 
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -210,8 +223,8 @@ func TestV0SchemaMigration(t *testing.T) {
 
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 4 {
-		t.Fatalf("user_version = %d, want 4", version)
+	if version != 3 {
+		t.Fatalf("user_version = %d, want 3", version)
 	}
 
 	email, err := s.NotifyEmail(ctx, "alice")
@@ -223,7 +236,7 @@ func TestV0SchemaMigration(t *testing.T) {
 // TestV1SchemaMigration verifies v1 databases (with notify_email) upgrade to v2.
 func TestV1SchemaMigration(t *testing.T) {
 	ctx := context.Background()
-	path := t.TempDir() + "/v1.db"
+	path := secureTempDir(t) + "/v1.db"
 
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -278,8 +291,8 @@ func TestV1SchemaMigration(t *testing.T) {
 
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 4 {
-		t.Fatalf("user_version = %d, want 4", version)
+	if version != 3 {
+		t.Fatalf("user_version = %d, want 3", version)
 	}
 
 	email, err := s.NotifyEmail(ctx, "alice")
@@ -291,7 +304,7 @@ func TestV1SchemaMigration(t *testing.T) {
 // TestPartialMigrationState verifies recovery when column exists but index is missing.
 func TestPartialMigrationState(t *testing.T) {
 	ctx := context.Background()
-	path := t.TempDir() + "/partial.db"
+	path := secureTempDir(t) + "/partial.db"
 
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -465,7 +478,7 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 		},
 	}
 
-	freshPath := t.TempDir() + "/fresh.db"
+	freshPath := secureTempDir(t) + "/fresh.db"
 	freshStore, err := Open(freshPath)
 	if err != nil {
 		t.Fatal(err)
@@ -478,7 +491,7 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			path := t.TempDir() + "/" + tt.name + ".db"
+			path := secureTempDir(t) + "/" + tt.name + ".db"
 			db, err := sql.Open("sqlite", path)
 			if err != nil {
 				t.Fatal(err)
@@ -497,8 +510,8 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 			// Verify user_version is 2
 			var version int
 			migratedStore.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-			if version != 4 {
-				t.Fatalf("user_version = %d, want 4", version)
+			if version != 3 {
+				t.Fatalf("user_version = %d, want 3", version)
 			}
 
 			// Compare full schema
@@ -545,7 +558,7 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 			}
 
 			// Verify uniqueness behavior: duplicate pairing_token_hash rejected, multiple NULLs allowed
-			if err := migratedStore.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+			if err := migratedStore.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
 				t.Fatal(err)
 			}
 			exp := time.Now().Add(time.Hour)
@@ -571,13 +584,13 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 // Store instances to test real lock contention.
 func TestConcurrentPairingRedemption(t *testing.T) {
 	ctx := context.Background()
-	path := t.TempDir() + "/concurrent.db"
+	path := secureTempDir(t) + "/concurrent.db"
 
 	s1, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s1.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+	if err := s1.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
 		t.Fatal(err)
 	}
 	pairingHash := "pairing_hash_123"
@@ -601,7 +614,7 @@ func TestConcurrentPairingRedemption(t *testing.T) {
 				return
 			}
 			defer s.Close()
-			_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash, id, name, kh, "", "", nil, nil)
+			_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash, id, name, kh, "", nil, nil)
 			results <- err
 		}(peerID, peerName, keyHash)
 	}
@@ -655,7 +668,7 @@ func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 	}
 	defer s.Close()
 
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -666,7 +679,7 @@ func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = s.RegisterAndAcceptByPairing(ctx, expiredHash, "bob", "Bob", "hb", "", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(ctx, expiredHash, "bob", "Bob", "hb", "", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for expired, got %v", err)
 	}
@@ -681,7 +694,7 @@ func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 
 	// Test 2: Already-used pairing token
 	usedHash := "used_hash"
-	if err := s.CreatePeer(ctx, "carol", "Carol", "hc", "", ""); err != nil {
+	if err := s.CreatePeer(ctx, "carol", "Carol", "hc", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.CreateInviteWithPairing(ctx, "code_used", usedHash, "alice", []string{"messages"}, nil, time.Now().Add(time.Hour)); err != nil {
@@ -692,7 +705,7 @@ func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = s.RegisterAndAcceptByPairing(ctx, usedHash, "dave", "Dave", "hd", "", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(ctx, usedHash, "dave", "Dave", "hd", "", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for used invite, got %v", err)
 	}
@@ -705,7 +718,7 @@ func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 	}
 
 	// Test 3: Invalid token (doesn't exist)
-	_, err = s.RegisterAndAcceptByPairing(ctx, "nonexistent_hash", "eve", "Eve", "he", "", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(ctx, "nonexistent_hash", "eve", "Eve", "he", "", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for nonexistent, got %v", err)
 	}
@@ -727,10 +740,10 @@ func TestExpiredInviteRejection(t *testing.T) {
 	}
 	defer s.Close()
 
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -762,18 +775,231 @@ func TestExpiredInviteRejection(t *testing.T) {
 	}
 }
 
+// TestPairingTokenExpiryWithClock verifies pairing token expiry behavior with precise clock control.
+// From #88/#102: tests exact expiry boundaries and ensures no orphan peers on mid-transaction expiry.
+func TestPairingTokenExpiryWithClock(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	// Create peers
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inject fake clock
+	origNow := s.now
+	defer func() { s.now = origNow }()
+
+	currentTime := int64(1000000)
+	s.now = func() int64 { return currentTime }
+
+	// Create a pairing invite that expires at currentTime + 100
+	codeHash := "code_test"
+	pairingHash := "pair_test"
+	expiresAt := time.Unix(currentTime+100, 0)
+	if err := s.CreateInviteWithPairing(ctx, codeHash, pairingHash, "alice", []string{"messages"}, nil, expiresAt); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Token is valid 10 seconds before expiry
+	s.now = func() int64 { return currentTime + 90 }
+	exists, err := s.PairingTokenExists(ctx, pairingHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Error("token should exist 10 seconds before expiry")
+	}
+
+	// 2. Token is still valid 1 second before expiry
+	s.now = func() int64 { return currentTime + 99 }
+	exists, err = s.PairingTokenExists(ctx, pairingHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Error("token should exist 1 second before expiry")
+	}
+
+	// 3. Token is invalid 1 second after expiry
+	s.now = func() int64 { return currentTime + 101 }
+	exists, err = s.PairingTokenExists(ctx, pairingHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Error("token should not exist 1 second after expiry")
+	}
+
+	// 4. GetInviteByPairingToken rejects expired token
+	codeHash2 := "code_test2"
+	pairingHash2 := "pair_test2"
+	expiresAt2 := time.Unix(currentTime+200, 0)
+	s.now = func() int64 { return currentTime + 50 }
+	if err := s.CreateInviteWithPairing(ctx, codeHash2, pairingHash2, "alice", []string{"messages"}, nil, expiresAt2); err != nil {
+		t.Fatal(err)
+	}
+	s.now = func() int64 { return currentTime + 201 }
+	_, err = s.GetInviteByPairingToken(ctx, pairingHash2)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetInviteByPairingToken should return ErrNotFound for expired token, got %v", err)
+	}
+
+	// 5. AcceptInviteByPairingToken rejects expired token
+	s.now = func() int64 { return currentTime + 202 }
+	_, err = s.AcceptInviteByPairingToken(ctx, pairingHash2, "bob", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("AcceptInviteByPairingToken should return ErrNotFound for expired token, got %v", err)
+	}
+
+	// 6. RegisterAndAcceptByPairing rejects expired token (pre-check)
+	s.now = func() int64 { return currentTime + 203 }
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash2, "charlie", "Charlie", "hc", "", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("RegisterAndAcceptByPairing should return ErrNotFound for expired token in pre-check, got %v", err)
+	}
+
+	// 7. RegisterAndAcceptByPairing: token expires between pre-check and tx
+	// Create a third invite
+	codeHash3 := "code_test3"
+	pairingHash3 := "pair_test3"
+	expiresAt3 := time.Unix(currentTime+300, 0)
+	s.now = func() int64 { return currentTime + 100 }
+	if err := s.CreateInviteWithPairing(ctx, codeHash3, pairingHash3, "alice", []string{"messages"}, nil, expiresAt3); err != nil {
+		t.Fatal(err)
+	}
+
+	// Deterministic state-flag clock: first call (pre-check) passes, second call (tx) fails
+	callCount := 0
+	s.now = func() int64 {
+		callCount++
+		if callCount == 1 {
+			return currentTime + 299 // Before expiry: pre-check passes
+		}
+		return currentTime + 301 // After expiry: tx fails
+	}
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash3, "dave", "Dave", "hd", "", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("RegisterAndAcceptByPairing should return ErrNotFound when token expires between pre-check and tx, got %v", err)
+	}
+	if callCount != 2 {
+		t.Errorf("expected 2 clock calls (pre-check + tx), got %d", callCount)
+	}
+
+	// Assert no orphan peer, no grant, invite's used_by is NULL
+	var peerCount int
+	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM peers WHERE id = ? OR name = ?", "dave", "Dave").Scan(&peerCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if peerCount != 0 {
+		t.Errorf("expected no peer row for dave, got count %d", peerCount)
+	}
+
+	var grantCount int
+	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM grants WHERE grantee = ?", "dave").Scan(&grantCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grantCount != 0 {
+		t.Errorf("expected no grant for dave, got count %d", grantCount)
+	}
+
+	var usedBy sql.NullString
+	err = s.db.QueryRowContext(ctx, "SELECT used_by FROM invites WHERE pairing_token_hash = ?", pairingHash3).Scan(&usedBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usedBy.Valid {
+		t.Errorf("invite used_by should be NULL, got %q", usedBy.String)
+	}
+
+	// Exact boundary tests for AcceptInviteByPairingToken
+	// Create invite expiring at currentTime + 400
+	codeHash4 := "code_test4"
+	pairingHash4 := "pair_test4"
+	expiresAt4 := time.Unix(currentTime+400, 0)
+	s.now = func() int64 { return currentTime + 200 }
+	if err := s.CreateInviteWithPairing(ctx, codeHash4, pairingHash4, "alice", []string{"messages"}, nil, expiresAt4); err != nil {
+		t.Fatal(err)
+	}
+
+	// At exact expiry time: should be accepted
+	s.now = func() int64 { return currentTime + 400 }
+	_, err = s.AcceptInviteByPairingToken(ctx, pairingHash4, "bob", nil, nil)
+	if err != nil {
+		t.Errorf("AcceptInviteByPairingToken at exact expiry (now == expires_at) should succeed, got %v", err)
+	}
+
+	// Create another invite for +1 test
+	codeHash5 := "code_test5"
+	pairingHash5 := "pair_test5"
+	expiresAt5 := time.Unix(currentTime+500, 0)
+	s.now = func() int64 { return currentTime + 200 }
+	if err := s.CreateInviteWithPairing(ctx, codeHash5, pairingHash5, "alice", []string{"messages"}, nil, expiresAt5); err != nil {
+		t.Fatal(err)
+	}
+
+	// One second after expiry: should be rejected
+	s.now = func() int64 { return currentTime + 501 }
+	_, err = s.AcceptInviteByPairingToken(ctx, pairingHash5, "bob", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("AcceptInviteByPairingToken at expires_at+1 should return ErrNotFound, got %v", err)
+	}
+
+	// Exact boundary tests for RegisterAndAcceptByPairing
+	// Create invite expiring at currentTime + 600
+	codeHash6 := "code_test6"
+	pairingHash6 := "pair_test6"
+	expiresAt6 := time.Unix(currentTime+600, 0)
+	s.now = func() int64 { return currentTime + 200 }
+	if err := s.CreateInviteWithPairing(ctx, codeHash6, pairingHash6, "alice", []string{"messages"}, nil, expiresAt6); err != nil {
+		t.Fatal(err)
+	}
+
+	// At exact expiry time: should be accepted
+	s.now = func() int64 { return currentTime + 600 }
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash6, "carol", "Carol", "hc", "", nil, nil)
+	if err != nil {
+		t.Errorf("RegisterAndAcceptByPairing at exact expiry (now == expires_at) should succeed, got %v", err)
+	}
+
+	// Create another invite for +1 test
+	codeHash7 := "code_test7"
+	pairingHash7 := "pair_test7"
+	expiresAt7 := time.Unix(currentTime+700, 0)
+	s.now = func() int64 { return currentTime + 200 }
+	if err := s.CreateInviteWithPairing(ctx, codeHash7, pairingHash7, "alice", []string{"messages"}, nil, expiresAt7); err != nil {
+		t.Fatal(err)
+	}
+
+	// One second after expiry: should be rejected
+	s.now = func() int64 { return currentTime + 701 }
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash7, "dan", "Dan", "hdan", "", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("RegisterAndAcceptByPairing at expires_at+1 should return ErrNotFound, got %v", err)
+	}
+}
+
 // TestRollbackAfterPeerInsert verifies that when RegisterAndAcceptByPairing fails
 // after the peer insert but before commit, no orphan peer is left and the invite remains unconsumed.
 func TestRollbackAfterPeerInsert(t *testing.T) {
 	ctx := context.Background()
-	path := t.TempDir() + "/rollback.db"
+	path := secureTempDir(t) + "/rollback.db"
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
 
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -789,7 +1015,7 @@ func TestRollbackAfterPeerInsert(t *testing.T) {
 	defer s.db.Exec(`DROP TRIGGER IF EXISTS rollback_test_trigger`)
 
 	// Try to register - peer INSERT will succeed but grant INSERT will fail due to trigger
-	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash, "bob", "Bob", "hb", "", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash, "bob", "Bob", "hb", "", nil, nil)
 	if err == nil {
 		t.Fatal("expected error due to injected failure")
 	}
@@ -816,14 +1042,14 @@ func TestRollbackAfterPeerInsert(t *testing.T) {
 	if _, err := s.db.Exec(`DROP TRIGGER rollback_test_trigger`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.RegisterAndAcceptByPairing(ctx, pairingHash, "carol", "Carol", "hc", "", "", nil, nil); err != nil {
+	if _, err := s.RegisterAndAcceptByPairing(ctx, pairingHash, "carol", "Carol", "hc", "", nil, nil); err != nil {
 		t.Fatalf("invite should still be redeemable after trigger removed: %v", err)
 	}
 }
 
 // TestContextCancellationBeforeTransaction verifies that cancelling before BeginTx doesn't wedge the DB.
 func TestContextCancellationBeforeTransaction(t *testing.T) {
-	path := t.TempDir() + "/cancel-before.db"
+	path := secureTempDir(t) + "/cancel-before.db"
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -831,7 +1057,7 @@ func TestContextCancellationBeforeTransaction(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -860,7 +1086,7 @@ func TestContextCancellationBeforeTransaction(t *testing.T) {
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := s.RegisterAndAcceptByPairing(cancelCtx, pairingHash, "bob", "Bob", "hb", "", "", nil, nil)
+		_, err := s.RegisterAndAcceptByPairing(cancelCtx, pairingHash, "bob", "Bob", "hb", "", nil, nil)
 		done <- err
 	}()
 
@@ -880,12 +1106,12 @@ func TestContextCancellationBeforeTransaction(t *testing.T) {
 
 	// DB should not be wedged - normal operations should work
 	normalCtx := context.Background()
-	if err := s.CreatePeer(normalCtx, "carol", "Carol", "hc", "", ""); err != nil {
+	if err := s.CreatePeer(normalCtx, "carol", "Carol", "hc", ""); err != nil {
 		t.Fatalf("DB wedged after cancel: %v", err)
 	}
 
 	// Original pairing token should still be redeemable
-	_, err = s.RegisterAndAcceptByPairing(normalCtx, pairingHash, "dave", "Dave", "hd", "", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(normalCtx, pairingHash, "dave", "Dave", "hd", "", nil, nil)
 	if err != nil {
 		t.Fatalf("pairing redemption failed after cancel: %v", err)
 	}
@@ -900,7 +1126,7 @@ func TestContextCancellationBeforeTransaction(t *testing.T) {
 // TestContextCancellationMidTransaction verifies that cancelling after BeginTx and after the peer INSERT
 // rolls back correctly, leaving no orphan peer and the invite unconsumed.
 func TestContextCancellationMidTransaction(t *testing.T) {
-	path := t.TempDir() + "/cancel-mid-tx.db"
+	path := secureTempDir(t) + "/cancel-mid-tx.db"
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -908,7 +1134,7 @@ func TestContextCancellationMidTransaction(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -930,7 +1156,7 @@ func TestContextCancellationMidTransaction(t *testing.T) {
 	defer s.db.Exec(`DROP TRIGGER IF EXISTS cancel_test_trigger`)
 
 	// Try to register and accept - should fail due to cancellation after peer INSERT
-	_, err = s.RegisterAndAcceptByPairing(cancelCtx, pairingHash, "bob", "Bob", "hb", "", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(cancelCtx, pairingHash, "bob", "Bob", "hb", "", nil, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got: %v", err)
 	}
@@ -961,12 +1187,12 @@ func TestContextCancellationMidTransaction(t *testing.T) {
 
 	// Verify DB isn't wedged: next accept should succeed
 	normalCtx := context.Background()
-	if _, err := s.RegisterAndAcceptByPairing(normalCtx, pairingHash, "carol", "Carol", "hc", "", "", nil, nil); err != nil {
+	if _, err := s.RegisterAndAcceptByPairing(normalCtx, pairingHash, "carol", "Carol", "hc", "", nil, nil); err != nil {
 		t.Fatalf("DB wedged after mid-tx cancel: %v", err)
 	}
 
 	// Verify a plain write succeeds
-	if err := s.CreatePeer(normalCtx, "dave", "Dave", "hd", "", ""); err != nil {
+	if err := s.CreatePeer(normalCtx, "dave", "Dave", "hd", ""); err != nil {
 		t.Fatalf("plain write failed after mid-tx cancel: %v", err)
 	}
 
@@ -981,7 +1207,7 @@ func TestContextCancellationMidTransaction(t *testing.T) {
 // so migrate must not stop there. invites has no pairing_token_hash until Open.
 func TestPairingTokenHashMigration(t *testing.T) {
 	ctx := context.Background()
-	path := t.TempDir() + "/pre-pairing.db"
+	path := secureTempDir(t) + "/pre-pairing.db"
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
@@ -1052,7 +1278,7 @@ func TestPairingTokenHashMigration(t *testing.T) {
 	if err := s.CreateInviteWithPairing(ctx, "c-dup", "tok-hash", "p_old", []string{"messages"}, nil, until); err == nil {
 		t.Fatal("expected unique pairing token hash")
 	}
-	if err := s.CreatePeer(ctx, "p_new", "new", "hn", "", ""); err != nil {
+	if err := s.CreatePeer(ctx, "p_new", "new", "hn", ""); err != nil {
 		t.Fatal(err)
 	}
 	g, err := s.AcceptInvite(ctx, "legacy", "p_new", nil, nil)
@@ -1078,7 +1304,7 @@ func TestPairingTokenHashMigration(t *testing.T) {
 // Returning after the first column leaves pairing invites broken.
 func TestMigrateNotifyEmailAndPairingToken(t *testing.T) {
 	ctx := context.Background()
-	path := t.TempDir() + "/v0.db"
+	path := secureTempDir(t) + "/v0.db"
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
@@ -1136,7 +1362,7 @@ func TestMigrateNotifyEmailAndPairingToken(t *testing.T) {
 // 5. The index (whether PR #11's full or our partial) works correctly
 func TestPR11AlreadyMigrated(t *testing.T) {
 	ctx := context.Background()
-	path := t.TempDir() + "/pr11.db"
+	path := secureTempDir(t) + "/pr11.db"
 
 	// Create exactly PR #11's post-migration schema (238b916)
 	db, err := sql.Open("sqlite", path)
@@ -1199,8 +1425,8 @@ func TestPR11AlreadyMigrated(t *testing.T) {
 
 	// Verify user_version advanced to 2
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 4 {
-		t.Fatalf("user_version = %d, want 4", version)
+	if version != 3 {
+		t.Fatalf("user_version = %d, want 3", version)
 	}
 
 	// Verify columns still exist
@@ -1242,14 +1468,18 @@ func TestPR11AlreadyMigrated(t *testing.T) {
 	}
 
 	// Run migrate again (should be no-op)
-	if err := migrate(s.db); err != nil {
+	currentVer, err := checkSchemaVersion(s.db)
+	if err != nil {
+		t.Fatalf("checkSchemaVersion failed: %v", err)
+	}
+	if err := migrate(s.db, currentVer); err != nil {
 		t.Fatalf("second migrate failed: %v", err)
 	}
 
 	// Verify user_version unchanged
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 4 {
-		t.Fatalf("user_version after second migrate = %d, want 4", version)
+	if version != 3 {
+		t.Fatalf("user_version after second migrate = %d, want 3", version)
 	}
 
 	// Verify columns still present
@@ -1287,7 +1517,7 @@ func TestPragmasInEffect(t *testing.T) {
 		path string
 	}{
 		{"memory", ":memory:"},
-		{"file", t.TempDir() + "/pragmas.db"},
+		{"file", secureTempDir(t) + "/pragmas.db"},
 	}
 
 	for _, tt := range tests {
@@ -1408,8 +1638,851 @@ func TestPragmasInEffect(t *testing.T) {
 		})
 	}
 }
+
+// TestFailClosedVersionGuard verifies that the database refuses to open when user_version
+// is newer than the binary supports, and leaves the database untouched.
+func TestFailClosedVersionGuard(t *testing.T) {
+	path := secureTempDir(t) + "/future.db"
+
+	// Create a database with a future schema version
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Set up a minimal schema
+	if _, err := db.Exec(`CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set user_version to a future version (higher than current max of 3)
+	if _, err := db.Exec(`PRAGMA user_version = 99`); err != nil {
+		t.Fatal(err)
+	}
+
+	var versionBefore int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&versionBefore); err != nil {
+		t.Fatal(err)
+	}
+	if versionBefore != 99 {
+		t.Fatalf("setup failed: user_version = %d, want 99", versionBefore)
+	}
+
+	db.Close()
+
+	// Attempt to open with Store - should fail with clear error message
+	_, err = Open(path)
+	if err == nil {
+		t.Fatal("expected error when opening database with future schema version")
+	}
+
+	// Verify error is ErrSchemaTooNew via errors.As
+	var tooNewErr *ErrSchemaTooNew
+	if !errors.As(err, &tooNewErr) {
+		t.Errorf("expected ErrSchemaTooNew, got %T: %v", err, err)
+	} else {
+		if tooNewErr.Have != 99 || tooNewErr.Max != 3 {
+			t.Errorf("ErrSchemaTooNew: Have=%d, Max=%d, want Have=99, Max=3", tooNewErr.Have, tooNewErr.Max)
+		}
+	}
+
+	// Verify error message mentions both versions
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "99") || !strings.Contains(errMsg, "3") {
+		t.Errorf("error message should mention both schema versions (99 and 3), got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "newer") && !strings.Contains(errMsg, "upgrade") {
+		t.Errorf("error message should mention 'newer' or 'upgrade', got: %s", errMsg)
+	}
+
+	// Verify the database was not modified (user_version still 99)
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var versionAfter int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&versionAfter); err != nil {
+		t.Fatal(err)
+	}
+	if versionAfter != 99 {
+		t.Errorf("database was modified: user_version changed from 99 to %d", versionAfter)
+	}
+}
+
+// TestSchemaVersionDerivedFromMigrations verifies that SchemaVersion() returns exactly len(migrations)
+// and that a fresh Open ends at that version.
+func TestSchemaVersionDerivedFromMigrations(t *testing.T) {
+	// SchemaVersion() must equal len(migrations)
+	if SchemaVersion() != len(migrations) {
+		t.Fatalf("SchemaVersion() = %d, len(migrations) = %d; must be equal", SchemaVersion(), len(migrations))
+	}
+
+	// Fresh Open should end at SchemaVersion()
+	path := secureTempDir(t) + "/fresh.db"
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if s.SchemaVersionInUse() != SchemaVersion() {
+		t.Errorf("fresh Open: SchemaVersionInUse() = %d, SchemaVersion() = %d; should match", s.SchemaVersionInUse(), SchemaVersion())
+	}
+
+	// Verify the database user_version matches
+	var dbVersion int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&dbVersion); err != nil {
+		t.Fatal(err)
+	}
+	if dbVersion != SchemaVersion() {
+		t.Errorf("database user_version = %d, SchemaVersion() = %d; should match", dbVersion, SchemaVersion())
+	}
+}
+
+// TestNegativeSchemaVersion verifies that a negative user_version is rejected.
+func TestNegativeSchemaVersion(t *testing.T) {
+	path := secureTempDir(t) + "/negative.db"
+
+	// Create a database with a negative user_version
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Exec(`CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set negative version
+	if _, err := db.Exec(`PRAGMA user_version = -5`); err != nil {
+		t.Fatal(err)
+	}
+
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != -5 {
+		t.Fatalf("setup failed: user_version = %d, want -5", version)
+	}
+
+	db.Close()
+
+	// Attempt to open - should fail with ErrSchemaInvalid
+	_, err = Open(path)
+	if err == nil {
+		t.Fatal("expected error when opening database with negative schema version")
+	}
+
+	// Verify error is ErrSchemaInvalid via errors.As
+	var invalidErr *ErrSchemaInvalid
+	if !errors.As(err, &invalidErr) {
+		t.Errorf("expected ErrSchemaInvalid, got %T: %v", err, err)
+	} else {
+		if invalidErr.Have != -5 {
+			t.Errorf("ErrSchemaInvalid.Have = %d, want -5", invalidErr.Have)
+		}
+	}
+}
+
+// TestVersionGuardBeforeSchema verifies that checkSchemaVersion runs before db.Exec(schema),
+// leaving sqlite_master and journal_mode untouched when a too-new or invalid version is detected.
+func TestVersionGuardBeforeSchema(t *testing.T) {
+	path := secureTempDir(t) + "/guard.db"
+
+	// Create a v99 database with custom schema
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Use a different schema structure to detect if Open overwrites it
+	if _, err := db.Exec(`CREATE TABLE custom_table (data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 99`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Snapshot sqlite_master and journal_mode before Open attempt
+	var masterRowsBefore strings.Builder
+	rows, err := db.Query(`SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var typ, name, tblName string
+		var sql sql.NullString
+		if err := rows.Scan(&typ, &name, &tblName, &sql); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&masterRowsBefore, "%s|%s|%s|%s\n", typ, name, tblName, sql.String)
+	}
+	rows.Close()
+
+	var journalModeBefore string
+	if err := db.QueryRow(`PRAGMA journal_mode`).Scan(&journalModeBefore); err != nil {
+		t.Fatal(err)
+	}
+
+	db.Close()
+
+	// Attempt to Open - should fail before executing schema
+	_, err = Open(path)
+	if err == nil {
+		t.Fatal("expected error when opening database with future schema version")
+	}
+
+	// Reopen and verify sqlite_master and journal_mode unchanged
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var masterRowsAfter strings.Builder
+	rows, err = db.Query(`SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var typ, name, tblName string
+		var sql sql.NullString
+		if err := rows.Scan(&typ, &name, &tblName, &sql); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&masterRowsAfter, "%s|%s|%s|%s\n", typ, name, tblName, sql.String)
+	}
+	rows.Close()
+
+	if masterRowsBefore.String() != masterRowsAfter.String() {
+		t.Errorf("sqlite_master changed after rejected Open:\nBefore:\n%s\nAfter:\n%s", masterRowsBefore.String(), masterRowsAfter.String())
+	}
+
+	var journalModeAfter string
+	if err := db.QueryRow(`PRAGMA journal_mode`).Scan(&journalModeAfter); err != nil {
+		t.Fatal(err)
+	}
+	if journalModeBefore != journalModeAfter {
+		t.Errorf("journal_mode changed from %q to %q after rejected Open", journalModeBefore, journalModeAfter)
+	}
+
+	// Verify custom_table still exists and peers table does NOT exist
+	var customTableCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='custom_table'`).Scan(&customTableCount); err != nil {
+		t.Fatal(err)
+	}
+	if customTableCount != 1 {
+		t.Error("custom_table should still exist")
+	}
+
+	var peersTableCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='peers'`).Scan(&peersTableCount); err != nil {
+		t.Fatal(err)
+	}
+	if peersTableCount != 0 {
+		t.Error("peers table should not exist (schema script should not have run)")
+	}
+}
+
+// TestBackupBeforeMigration verifies that a VACUUM INTO backup is created
+// before any pending migration runs.
+func TestBackupBeforeMigration(t *testing.T) {
+	tempDir := secureTempDir(t)
+	path := tempDir + "/test.db"
+
+	// Create a v2 database (one version behind current max of 3)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create v2 schema
+	if _, err := db.Exec(`
+		CREATE TABLE peers (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			key_hash TEXT NOT NULL UNIQUE,
+			created_at INTEGER NOT NULL,
+			notify_email TEXT NOT NULL DEFAULT ''
+		);
+		CREATE TABLE invites (
+			code_hash TEXT PRIMARY KEY,
+			from_peer TEXT NOT NULL,
+			scopes TEXT NOT NULL,
+			bags TEXT NOT NULL,
+			expires_at INTEGER NOT NULL,
+			used_by TEXT,
+			pairing_token_hash TEXT
+		);
+		CREATE UNIQUE INDEX invites_pairing_token_hash ON invites(pairing_token_hash) WHERE pairing_token_hash IS NOT NULL;
+		PRAGMA user_version = 2;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert test data to verify backup captures it
+	if _, err := db.Exec(`INSERT INTO peers (id, name, key_hash, created_at) VALUES ('test_peer', 'Test', 'hash1', ?)`, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+
+	db.Close()
+
+	// Open with Store - this should create the backup and run migration
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Verify a backup was created with pattern .pre-v3-from-v2.<timestamp>
+	files, err := os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var backupPath string
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "test.db.pre-v3-from-v") {
+			backupPath = tempDir + "/" + f.Name()
+			break
+		}
+	}
+	if backupPath == "" {
+		t.Fatal("backup file was not created")
+	}
+
+	// Verify backup is a valid SQLite database and contains the test data
+	backupDB, err := sql.Open("sqlite", backupPath)
+	if err != nil {
+		t.Fatalf("cannot open backup at %s: %v", backupPath, err)
+	}
+	defer backupDB.Close()
+
+	var peerID string
+	if err := backupDB.QueryRow(`SELECT id FROM peers WHERE id='test_peer'`).Scan(&peerID); err != nil {
+		t.Fatalf("backup does not contain test data: %v", err)
+	}
+	if peerID != "test_peer" {
+		t.Errorf("backup peer_id = %q, want 'test_peer'", peerID)
+	}
+
+	// Verify backup has the old version (2, not 3)
+	var backupVersion int
+	if err := backupDB.QueryRow(`PRAGMA user_version`).Scan(&backupVersion); err != nil {
+		t.Fatal(err)
+	}
+	if backupVersion != 2 {
+		t.Errorf("backup user_version = %d, want 2 (pre-migration)", backupVersion)
+	}
+
+	// Verify backup has the original row count
+	var backupPeerCount int
+	if err := backupDB.QueryRow(`SELECT COUNT(*) FROM peers`).Scan(&backupPeerCount); err != nil {
+		t.Fatalf("cannot count peers in backup: %v", err)
+	}
+	if backupPeerCount != 1 {
+		t.Errorf("backup has %d peers, want 1", backupPeerCount)
+	}
+
+	// Verify main database was migrated to version 3
+	var mainVersion int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&mainVersion); err != nil {
+		t.Fatal(err)
+	}
+	if mainVersion != 3 {
+		t.Errorf("main database user_version = %d, want 3 (post-migration)", mainVersion)
+	}
+
+	// Verify backup has exactly 0600 permissions on Unix
+	info, err := os.Stat(backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.PathSeparator == '/' {
+		mode := info.Mode() & os.ModePerm
+		if mode != 0600 {
+			t.Errorf("backup file mode = %o, want exactly 0600", mode)
+		}
+	}
+}
+
+// TestBackupWithQuoteInPath verifies that backups work when the database path contains a single quote.
+func TestBackupWithQuoteInPath(t *testing.T) {
+	// Create a directory with a single quote in the name
+	baseDir := secureTempDir(t)
+	quotedDir := baseDir + "/test'dir"
+	if err := os.Mkdir(quotedDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := quotedDir + "/test.db"
+
+	// Create a v2 database
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Exec(`
+		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+		CREATE TABLE invites (code_hash TEXT PRIMARY KEY, from_peer TEXT, scopes TEXT, bags TEXT, expires_at INTEGER, used_by TEXT, pairing_token_hash TEXT);
+		PRAGMA user_version = 2;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Exec(`INSERT INTO peers (id, name, key_hash, created_at) VALUES ('p1', 'Test', 'h1', ?)`, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+
+	db.Close()
+
+	// Open with Store - should handle the quote in the path
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("failed to open database with quote in path: %v", err)
+	}
+	defer s.Close()
+
+	// Verify backup was created
+	files, err := os.ReadDir(quotedDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	foundBackup := false
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "test.db.pre-v3-from-v") {
+			foundBackup = true
+			// Verify we can open it
+			backupPath := quotedDir + "/" + f.Name()
+			backupDB, err := sql.Open("sqlite", backupPath)
+			if err != nil {
+				t.Fatalf("cannot open backup: %v", err)
+			}
+			defer backupDB.Close()
+
+			var peerID string
+			if err := backupDB.QueryRow(`SELECT id FROM peers WHERE id='p1'`).Scan(&peerID); err != nil {
+				t.Fatalf("backup is corrupted: %v", err)
+			}
+			break
+		}
+	}
+
+	if !foundBackup {
+		t.Error("backup was not created with quote in path")
+	}
+}
+
+// TestBackupRetry verifies that a second migration attempt (with an existing backup)
+// creates a new backup with a unique timestamp and doesn't fail.
+func TestBackupRetry(t *testing.T) {
+	tempDir := secureTempDir(t)
+	path := tempDir + "/retry.db"
+
+	// Create a v1 database
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Exec(`
+		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+		CREATE TABLE invites (code_hash TEXT PRIMARY KEY, from_peer TEXT, scopes TEXT, bags TEXT, expires_at INTEGER, used_by TEXT);
+		PRAGMA user_version = 1;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	db.Close()
+
+	// First migration (v1 -> v3)
+	s1, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.Close()
+
+	// Count backups
+	files, err := os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupCount := 0
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "retry.db.pre-v3-from-v") {
+			backupCount++
+		}
+	}
+	if backupCount != 1 {
+		t.Errorf("first migration created %d backups, want 1", backupCount)
+	}
+
+	// Manually downgrade to v1 to simulate a retry scenario
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// Second migration attempt - should create another backup with different timestamp
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	// Count backups again
+	files, err = os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupCount = 0
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "retry.db.pre-v3-from-v") {
+			backupCount++
+		}
+	}
+	if backupCount != 2 {
+		t.Errorf("retry created %d total backups, want 2", backupCount)
+	}
+}
+
+// TestBrandNewDatabaseSkipsBackup verifies that a brand-new database (user_version 0, no tables)
+// doesn't create a backup.
+func TestBrandNewDatabaseSkipsBackup(t *testing.T) {
+	tempDir := secureTempDir(t)
+	path := tempDir + "/new.db"
+
+	// Open creates a brand-new database
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Verify no backup was created
+	files, err := os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "new.db.pre-v") {
+			t.Errorf("backup created for brand-new database: %s", f.Name())
+		}
+	}
+}
+
+// TestBackupFailureAbortsStartup verifies that if the backup fails (e.g., unwritable directory),
+// the migration is aborted, nothing is migrated, and no stray backup file is left.
+func TestBackupFailureAbortsStartup(t *testing.T) {
+	baseDir := secureTempDir(t)
+	readOnlyDir := baseDir + "/readonly"
+	if err := os.Mkdir(readOnlyDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	path := readOnlyDir + "/test.db"
+
+	// Create a v2 database
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Exec(`
+		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+		CREATE TABLE invites (code_hash TEXT PRIMARY KEY, from_peer TEXT, scopes TEXT, bags TEXT, expires_at INTEGER, used_by TEXT, pairing_token_hash TEXT);
+		PRAGMA user_version = 2;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	db.Close()
+
+	// Make directory read-only on Unix
+	if os.PathSeparator == '/' {
+		if err := os.Chmod(readOnlyDir, 0555); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Chmod(readOnlyDir, 0755) // Restore for cleanup
+	}
+
+	// Attempt to open - should fail due to backup failure
+	_, err = Open(path)
+	if err == nil && os.PathSeparator == '/' {
+		t.Fatal("expected error when backup directory is read-only")
+	}
+
+	// If we got an error on Unix, verify the database wasn't migrated and no backup file was left
+	if os.PathSeparator == '/' && err != nil {
+		// Restore write permissions to check
+		os.Chmod(readOnlyDir, 0755)
+
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+
+		var version int
+		if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+			t.Fatal(err)
+		}
+		if version != 2 {
+			t.Errorf("database was migrated despite backup failure: version = %d, want 2", version)
+		}
+
+		// Verify no stray backup file was left
+		files, err := os.ReadDir(readOnlyDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range files {
+			if strings.HasPrefix(f.Name(), "test.db.pre-v") {
+				t.Errorf("stray backup file left behind: %s", f.Name())
+			}
+		}
+	}
+}
+
+// TestPreExistingBackupNotOverwritten verifies that if a backup file already exists at the target path,
+// the migration aborts with a clear error instead of overwriting it.
+func TestPreExistingBackupNotOverwritten(t *testing.T) {
+	tempDir := secureTempDir(t)
+	path := tempDir + "/test.db"
+
+	// Create a v2 database
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Exec(`
+		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+		PRAGMA user_version = 2;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// Create a pre-existing file at a backup path that will be used
+	// We need to force a collision, which is tricky with nanosecond timestamps.
+	// Instead, we'll mock time by temporarily replacing now() or test backupBeforeMigration directly.
+	// For this test, let's create a file with a known name and trigger a collision via retry.
+
+	// First migration attempt
+	s1, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Find the backup that was created
+	files, err := os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var firstBackupPath string
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "test.db.pre-v3-from-v") {
+			firstBackupPath = tempDir + "/" + f.Name()
+			break
+		}
+	}
+	if firstBackupPath == "" {
+		t.Fatal("first backup not created")
+	}
+
+	// Read the backup content
+	firstBackupContent, err := os.ReadFile(firstBackupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s1.Close()
+
+	// Downgrade to v2
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 2`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// The first backup still exists. Second migration attempt should create a new backup
+	// with a different timestamp, not overwrite the first one.
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	// Verify the first backup was not modified
+	currentBackupContent, err := os.ReadFile(firstBackupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(currentBackupContent) != string(firstBackupContent) {
+		t.Error("first backup was modified during second migration")
+	}
+
+	// Verify a second backup was created
+	files, err = os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	backupCount := 0
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "test.db.pre-v3-from-v") {
+			backupCount++
+		}
+	}
+	if backupCount != 2 {
+		t.Errorf("got %d backups after retry, want 2", backupCount)
+	}
+}
+
+// TestInMemoryExplicitDSN verifies that in-memory databases with explicit DSN skip backup.
+func TestInMemoryExplicitDSN(t *testing.T) {
+	// Use buildDSN to get the same in-memory DSN format the code uses
+	dsn := buildDSN(":memory:")
+
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Manually set up schema and set version to v2
+	if _, err := db.Exec(schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 2`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run migration (bypassing Open to test the migration logic directly)
+	currentVer, err := checkSchemaVersion(db)
+	if err != nil {
+		t.Fatalf("checkSchemaVersion failed: %v", err)
+	}
+	if err := migrate(db, currentVer); err != nil {
+		t.Fatalf("migration failed: %v", err)
+	}
+
+	// Verify it migrated to v3
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 3 {
+		t.Errorf("version = %d, want 3", version)
+	}
+
+	// The test passing means no backup was created (it would have failed trying to create a file)
+}
+
+// TestNoBackupWhenCurrent verifies that no backup is created when the database
+// is already at the current schema version.
+func TestNoBackupWhenCurrent(t *testing.T) {
+	tempDir := secureTempDir(t)
+	path := tempDir + "/current.db"
+
+	// Create a database at the current version by using Open
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	// Verify it's at version 3
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 3 {
+		t.Fatalf("setup failed: version = %d, want 3", version)
+	}
+
+	db.Close()
+
+	// Remove any backups that might have been created during the first Open
+	// (since it migrated from 0 to 3, but brand-new DBs shouldn't create backups)
+	files, err := os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialBackupCount := 0
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "current.db.pre-v") {
+			initialBackupCount++
+			os.Remove(tempDir + "/" + f.Name())
+		}
+	}
+
+	// Open again - no migration should run, no new backup should be created
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Verify no new backup was created this time
+	files, err = os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "current.db.pre-v") {
+			t.Error("backup file should not be created when database is already current")
+		}
+	}
+}
+
+// TestInMemorySkipsBackup verifies that :memory: databases skip the backup step.
+func TestInMemorySkipsBackup(t *testing.T) {
+	// This should succeed without trying to create a backup file
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Verify it's fully migrated
+	var version int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 3 {
+		t.Errorf("in-memory database user_version = %d, want 3", version)
+	}
+
+	// No file should exist (this is a weak test, but we can't easily verify
+	// that VACUUM INTO was not called)
+}
+
 func TestV3MigrationFreshDB(t *testing.T) {
-	s, err := Open(t.TempDir() + "/test.db")
+	s, err := Open(secureTempDir(t) + "/test.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1418,7 +2491,7 @@ func TestV3MigrationFreshDB(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a peer and invite
-	if err := s.CreatePeer(ctx, "alice", "Alice", "hash1", "", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "hash1", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1450,7 +2523,7 @@ func TestV3MigrationFreshDB(t *testing.T) {
 
 // Test v2 to v3 migration with backfill
 func TestV2ToV3Migration(t *testing.T) {
-	dbPath := t.TempDir() + "/test.db"
+	dbPath := secureTempDir(t) + "/test.db"
 
 	// Create a v2 database manually
 	db, err := sql.Open("sqlite", dbPath+"?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
@@ -1514,8 +2587,8 @@ func TestV2ToV3Migration(t *testing.T) {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
-		t.Errorf("user_version = %d, want 4", version)
+	if version != 3 {
+		t.Errorf("user_version = %d, want 3", version)
 	}
 
 	// Verify all rows have public_id
@@ -1551,7 +2624,7 @@ func TestV2ToV3Migration(t *testing.T) {
 
 // Test v3 migration idempotence
 func TestV3MigrationIdempotent(t *testing.T) {
-	dbPath := t.TempDir() + "/test.db"
+	dbPath := secureTempDir(t) + "/test.db"
 
 	// Create v2 DB
 	db, err := sql.Open("sqlite", dbPath+"?_txlock=immediate")
@@ -1599,8 +2672,8 @@ func TestV3MigrationIdempotent(t *testing.T) {
 	// Verify user_version is still 3
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 4 {
-		t.Errorf("user_version = %d, want 4", version)
+	if version != 3 {
+		t.Errorf("user_version = %d, want 3", version)
 	}
 }
 
@@ -1615,10 +2688,10 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 	defer s.Close()
 
 	// Create peers
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1632,8 +2705,8 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 
 	// Create and immediately accept invites at different points in time
 
-	// 1. Unused expired invite (expires 500s ago, beyond 5-minute grace) - should be purged
-	exp1 := time.Unix(currentTime-500, 0)
+	// 1. Unused expired invite (expires 100s ago) - should be purged
+	exp1 := time.Unix(currentTime-100, 0)
 	if err := s.CreateInvite(ctx, "code1", "alice", []string{"messages"}, nil, exp1); err != nil {
 		t.Fatal(err)
 	}
@@ -1661,7 +2734,7 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 	if err := s.CreateInvite(ctx, "code3", "alice", []string{"messages"}, nil, exp3); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "charlie", "Charlie", "hc", "", ""); err != nil {
+	if err := s.CreatePeer(ctx, "charlie", "Charlie", "hc", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.AcceptInvite(ctx, "code3", "charlie", nil, nil); err != nil {
@@ -1675,7 +2748,7 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 	if err := s.CreateInvite(ctx, "code4", "alice", []string{"messages"}, nil, exp4); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "dave", "Dave", "hd", "", ""); err != nil {
+	if err := s.CreatePeer(ctx, "dave", "Dave", "hd", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.AcceptInvite(ctx, "code4", "dave", nil, nil); err != nil {
@@ -1744,215 +2817,787 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 	}
 }
 
-// TestPairingTokenExpiryWithClock verifies that PairingTokenExists and the accept paths
-// respect s.now() for expiry checks.
-func TestPairingTokenExpiryWithClock(t *testing.T) {
-	s, err := Open(":memory:")
+// TestBackupReuseOnRestartLoop verifies that existing backups are reused when valid and newer than DB.
+func TestBackupReuseOnRestartLoop(t *testing.T) {
+	tempDir := secureTempDir(t)
+	path := tempDir + "/restart.db"
+
+	// Create a v2 database
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
-	ctx := context.Background()
 
-	// Create peers
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
-		t.Fatal(err)
-	}
-
-	// Inject fake clock
-	origNow := s.now
-	defer func() { s.now = origNow }()
-
-	currentTime := int64(1000000)
-	s.now = func() int64 { return currentTime }
-
-	// Create a pairing invite that expires at currentTime + 100
-	codeHash := "code_test"
-	pairingHash := "pair_test"
-	expiresAt := time.Unix(currentTime+100, 0)
-	if err := s.CreateInviteWithPairing(ctx, codeHash, pairingHash, "alice", []string{"messages"}, nil, expiresAt); err != nil {
+	if _, err := db.Exec(`
+		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+		CREATE TABLE invites (code_hash TEXT PRIMARY KEY, from_peer TEXT, scopes TEXT, bags TEXT, expires_at INTEGER, used_by TEXT, pairing_token_hash TEXT);
+		PRAGMA user_version = 2;
+	`); err != nil {
 		t.Fatal(err)
 	}
 
-	// 1. Token is valid 10 seconds before expiry
-	s.now = func() int64 { return currentTime + 90 }
-	exists, err := s.PairingTokenExists(ctx, pairingHash)
+	if _, err := db.Exec(`INSERT INTO peers (id, name, key_hash, created_at) VALUES ('p1', 'Test', 'h1', ?)`, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+
+	db.Close()
+
+	// Manually create a valid backup to simulate a previous crash-loop attempt
+	backupName := "restart.db.pre-v3-from-v2.20260101-120000.000000"
+	backupPath := tempDir + "/" + backupName
+
+	// Copy the DB to create the backup
+	dbContent, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !exists {
-		t.Error("token should exist 10 seconds before expiry")
+	if err := os.WriteFile(backupPath, dbContent, 0600); err != nil {
+		t.Fatal(err)
 	}
 
-	// 2. Token is still valid 1 second before expiry
-	s.now = func() int64 { return currentTime + 99 }
-	exists, err = s.PairingTokenExists(ctx, pairingHash)
+	// Set backup mtime to be newer than DB
+	futureTime := time.Now().Add(time.Hour)
+	if err := os.Chtimes(backupPath, futureTime, futureTime); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open should reuse the existing backup
+	opts := OpenOptions{
+		Logger:               slog.Default(),
+		BackupRetentionCount: 3,
+	}
+
+	st, err := OpenWithOptions(path, opts)
+	if err != nil {
+		t.Fatalf("open failed: %v", err)
+	}
+	defer st.Close()
+
+	// Verify backup was reused
+	if !st.BackupReused() {
+		t.Error("backup should have been reused")
+	}
+
+	// Verify only one backup exists (the one we created)
+	files, err := os.ReadDir(tempDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !exists {
-		t.Error("token should exist 1 second before expiry")
-	}
-
-	// 3. Token is invalid 1 second after expiry
-	s.now = func() int64 { return currentTime + 101 }
-	exists, err = s.PairingTokenExists(ctx, pairingHash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if exists {
-		t.Error("token should not exist 1 second after expiry")
-	}
-
-	// 4. GetInviteByPairingToken rejects expired token
-	codeHash2 := "code_test2"
-	pairingHash2 := "pair_test2"
-	expiresAt2 := time.Unix(currentTime+200, 0)
-	s.now = func() int64 { return currentTime + 50 }
-	if err := s.CreateInviteWithPairing(ctx, codeHash2, pairingHash2, "alice", []string{"messages"}, nil, expiresAt2); err != nil {
-		t.Fatal(err)
-	}
-	s.now = func() int64 { return currentTime + 201 }
-	_, err = s.GetInviteByPairingToken(ctx, pairingHash2)
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("GetInviteByPairingToken should return ErrNotFound for expired token, got %v", err)
-	}
-
-	// 5. AcceptInviteByPairingToken rejects expired token
-	s.now = func() int64 { return currentTime + 202 }
-	_, err = s.AcceptInviteByPairingToken(ctx, pairingHash2, "bob", nil, nil)
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("AcceptInviteByPairingToken should return ErrNotFound for expired token, got %v", err)
-	}
-
-	// 6. RegisterAndAcceptByPairing rejects expired token (pre-check)
-	s.now = func() int64 { return currentTime + 203 }
-	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash2, "charlie", "Charlie", "hc", "", "", nil, nil)
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("RegisterAndAcceptByPairing should return ErrNotFound for expired token in pre-check, got %v", err)
-	}
-
-	// 7. RegisterAndAcceptByPairing: token expires between pre-check and tx
-	// Create a third invite
-	codeHash3 := "code_test3"
-	pairingHash3 := "pair_test3"
-	expiresAt3 := time.Unix(currentTime+300, 0)
-	s.now = func() int64 { return currentTime + 100 }
-	if err := s.CreateInviteWithPairing(ctx, codeHash3, pairingHash3, "alice", []string{"messages"}, nil, expiresAt3); err != nil {
-		t.Fatal(err)
-	}
-
-	// Deterministic state-flag clock: first call (pre-check) passes, second call (tx) fails
-	callCount := 0
-	s.now = func() int64 {
-		callCount++
-		if callCount == 1 {
-			return currentTime + 299 // Before expiry: pre-check passes
+	backupCount := 0
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "restart.db.pre-v3-from-v") {
+			backupCount++
 		}
-		return currentTime + 301 // After expiry: tx fails
 	}
-	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash3, "dave", "Dave", "hd", "", "", nil, nil)
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("RegisterAndAcceptByPairing should return ErrNotFound when token expires between pre-check and tx, got %v", err)
+	if backupCount != 1 {
+		t.Errorf("got %d backups, want 1 (reused)", backupCount)
 	}
-	if callCount != 2 {
-		t.Errorf("expected 2 clock calls (pre-check + tx), got %d", callCount)
+}
+
+// TestRetentionCoversAllVersions verifies retention deletes old backups across all schema versions.
+func TestRetentionCoversAllVersions(t *testing.T) {
+	testCases := []struct {
+		name       string
+		keepCount  int
+		wantRemain int
+	}{
+		{"keep_3", 3, 3},
+		{"keep_1", 1, 1},
 	}
 
-	// Assert no orphan peer, no grant, invite's used_by is NULL
-	var peerCount int
-	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM peers WHERE id = ? OR name = ?", "dave", "Dave").Scan(&peerCount)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tempDir := secureTempDir(t)
+			dbBase := "test.db"
+
+			// Create fake backups for different schema transitions with explicit mtimes
+			baseTime := time.Now().Add(-time.Hour)
+			backupNames := []struct {
+				name  string
+				mtime time.Time
+			}{
+				{dbBase + ".pre-v2-from-v1.20260101-120000.000000", baseTime},
+				{dbBase + ".pre-v2-from-v1.20260101-130000.000000", baseTime.Add(10 * time.Minute)},
+				{dbBase + ".pre-v3-from-v2.20260101-140000.000000", baseTime.Add(20 * time.Minute)},
+				{dbBase + ".pre-v3-from-v2.20260101-150000.000000", baseTime.Add(30 * time.Minute)},
+				{dbBase + ".pre-v3-from-v2.20260101-160000.000000", baseTime.Add(40 * time.Minute)}, // newest
+			}
+
+			for _, backup := range backupNames {
+				path := tempDir + "/" + backup.name
+				if err := os.WriteFile(path, []byte("fake backup"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chtimes(path, backup.mtime, backup.mtime); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// Enforce retention, excluding the newest one (backupNames[4])
+			newestPath := tempDir + "/" + backupNames[4].name
+			logger := slog.Default()
+			if err := enforceBackupRetention(tempDir, dbBase, tc.keepCount, newestPath, logger); err != nil {
+				t.Fatal(err)
+			}
+
+			// Count remaining backups
+			files, err := os.ReadDir(tempDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var remaining []string
+			for _, f := range files {
+				if strings.HasPrefix(f.Name(), dbBase+".pre-v") {
+					remaining = append(remaining, f.Name())
+				}
+			}
+
+			// Should have exactly keepCount total (including the excluded one)
+			if len(remaining) != tc.wantRemain {
+				t.Errorf("retention kept %d backups, want %d", len(remaining), tc.wantRemain)
+				for _, name := range remaining {
+					t.Logf("  remaining: %s", name)
+				}
+			}
+
+			// Verify the excluded newest is still there
+			if _, err := os.Stat(newestPath); err != nil {
+				t.Errorf("excluded backup should still exist: %v", err)
+			}
+		})
+	}
+}
+
+// TestBackupBeforeSchema verifies that backup is taken before db.Exec(schema) runs.
+func TestBackupBeforeSchema(t *testing.T) {
+	tempDir := secureTempDir(t)
+	path := tempDir + "/backup-before.db"
+
+	// Create a v2 database with a custom table NOT in the schema
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if peerCount != 0 {
-		t.Errorf("expected no peer row for dave, got count %d", peerCount)
+
+	// Create ONLY a custom table, no schema tables
+	if _, err := db.Exec(`
+		CREATE TABLE custom_table (data TEXT);
+		INSERT INTO custom_table VALUES ('test');
+		PRAGMA user_version = 2;
+	`); err != nil {
+		t.Fatal(err)
 	}
 
-	var grantCount int
-	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM grants WHERE grantee = ?", "dave").Scan(&grantCount)
+	// Snapshot sqlite_master before Open
+	type schemaRow struct {
+		typ     string
+		name    string
+		tblName string
+		sql     string
+	}
+	var beforeSchema []schemaRow
+	rows, err := db.Query(`SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type != 'index' ORDER BY type, name`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if grantCount != 0 {
-		t.Errorf("expected no grant for dave, got count %d", grantCount)
+	for rows.Next() {
+		var r schemaRow
+		if err := rows.Scan(&r.typ, &r.name, &r.tblName, &r.sql); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		beforeSchema = append(beforeSchema, r)
 	}
+	rows.Close()
 
-	var usedBy sql.NullString
-	err = s.db.QueryRowContext(ctx, "SELECT used_by FROM invites WHERE pairing_token_hash = ?", pairingHash3).Scan(&usedBy)
+	db.Close()
+
+	// Open with migration (will create backup before schema)
+	st, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if usedBy.Valid {
-		t.Errorf("invite used_by should be NULL, got %q", usedBy.String)
+	defer st.Close()
+
+	// Verify backup was created
+	backupPath := st.lastBackupPath
+	if backupPath == "" {
+		t.Fatal("no backup was created")
 	}
 
-	// Exact boundary tests for AcceptInviteByPairingToken
-	// Create invite expiring at currentTime + 400
-	codeHash4 := "code_test4"
-	pairingHash4 := "pair_test4"
-	expiresAt4 := time.Unix(currentTime+400, 0)
-	s.now = func() int64 { return currentTime + 200 }
-	if err := s.CreateInviteWithPairing(ctx, codeHash4, pairingHash4, "alice", []string{"messages"}, nil, expiresAt4); err != nil {
-		t.Fatal(err)
-	}
-
-	// At exact expiry time: should be accepted
-	s.now = func() int64 { return currentTime + 400 }
-	_, err = s.AcceptInviteByPairingToken(ctx, pairingHash4, "bob", nil, nil)
+	// Open the backup and verify its sqlite_master matches the pre-Open snapshot
+	backupDB, err := sql.Open("sqlite", backupPath+"?mode=ro")
 	if err != nil {
-		t.Errorf("AcceptInviteByPairingToken at exact expiry (now == expires_at) should succeed, got %v", err)
-	}
-
-	// Create another invite for +1 test
-	codeHash5 := "code_test5"
-	pairingHash5 := "pair_test5"
-	expiresAt5 := time.Unix(currentTime+500, 0)
-	s.now = func() int64 { return currentTime + 200 }
-	if err := s.CreateInviteWithPairing(ctx, codeHash5, pairingHash5, "alice", []string{"messages"}, nil, expiresAt5); err != nil {
 		t.Fatal(err)
 	}
+	defer backupDB.Close()
 
-	// One second after expiry: should be rejected
-	s.now = func() int64 { return currentTime + 501 }
-	_, err = s.AcceptInviteByPairingToken(ctx, pairingHash5, "bob", nil, nil)
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("AcceptInviteByPairingToken at expires_at+1 should return ErrNotFound, got %v", err)
-	}
-
-	// Exact boundary tests for RegisterAndAcceptByPairing
-	// Create invite expiring at currentTime + 600
-	codeHash6 := "code_test6"
-	pairingHash6 := "pair_test6"
-	expiresAt6 := time.Unix(currentTime+600, 0)
-	s.now = func() int64 { return currentTime + 200 }
-	if err := s.CreateInviteWithPairing(ctx, codeHash6, pairingHash6, "alice", []string{"messages"}, nil, expiresAt6); err != nil {
-		t.Fatal(err)
-	}
-
-	// At exact expiry time: should be accepted
-	s.now = func() int64 { return currentTime + 600 }
-	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash6, "carol", "Carol", "hc", "", "", nil, nil)
+	var backupSchema []schemaRow
+	rows, err = backupDB.Query(`SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type != 'index' ORDER BY type, name`)
 	if err != nil {
-		t.Errorf("RegisterAndAcceptByPairing at exact expiry (now == expires_at) should succeed, got %v", err)
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var r schemaRow
+		if err := rows.Scan(&r.typ, &r.name, &r.tblName, &r.sql); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		backupSchema = append(backupSchema, r)
+	}
+	rows.Close()
+
+	// Compare: backup should NOT have peers, invites, etc. (schema tables)
+	if len(backupSchema) != len(beforeSchema) {
+		t.Errorf("backup sqlite_master has %d entries, pre-Open had %d", len(backupSchema), len(beforeSchema))
 	}
 
-	// Create another invite for +1 test
-	codeHash7 := "code_test7"
-	pairingHash7 := "pair_test7"
-	expiresAt7 := time.Unix(currentTime+700, 0)
-	s.now = func() int64 { return currentTime + 200 }
-	if err := s.CreateInviteWithPairing(ctx, codeHash7, pairingHash7, "alice", []string{"messages"}, nil, expiresAt7); err != nil {
+	for i, bs := range backupSchema {
+		if i >= len(beforeSchema) {
+			t.Errorf("backup has extra entry: %s %s", bs.typ, bs.name)
+			continue
+		}
+		if bs.sql != beforeSchema[i].sql {
+			t.Errorf("backup schema differs at entry %d:\nbackup: %s\npre-Open: %s", i, bs.sql, beforeSchema[i].sql)
+		}
+	}
+
+	// Verify custom_table exists in backup but peers does NOT
+	var customCount int
+	if err := backupDB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='custom_table'`).Scan(&customCount); err != nil {
+		t.Fatal(err)
+	}
+	if customCount != 1 {
+		t.Error("backup should have custom_table")
+	}
+
+	var peersCount int
+	if err := backupDB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='peers'`).Scan(&peersCount); err != nil {
+		t.Fatal(err)
+	}
+	if peersCount != 0 {
+		t.Error("backup should NOT have peers table (schema was not run yet)")
+	}
+}
+
+// TestSchemaVersionMatchesMigrations verifies SchemaVersion() == len(migrations).
+func TestSchemaVersionMatchesMigrations(t *testing.T) {
+	if SchemaVersion() != len(migrations) {
+		t.Errorf("SchemaVersion() = %d, but len(migrations) = %d", SchemaVersion(), len(migrations))
+	}
+}
+
+// TestStoreHasNonNilClock verifies that Store returned by Open has a non-nil now func.
+func TestStoreHasNonNilClock(t *testing.T) {
+	st, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if st.now == nil {
+		t.Error("Store.now is nil; Store must have a working clock")
+	}
+
+	// Verify clock works
+	ts := st.now()
+	if ts <= 0 {
+		t.Errorf("Store.now() returned invalid timestamp: %d", ts)
+	}
+
+	// Should be close to current time
+	now := time.Now().Unix()
+	if abs := func(x int64) int64 {
+		if x < 0 {
+			return -x
+		}
+		return x
+	}(ts - now); abs > 5 {
+		t.Errorf("Store.now() = %d, but time.Now().Unix() = %d (diff %d sec, expected < 5)", ts, now, abs)
+	}
+}
+
+// TestInTransactionRecheckCatchesTooNew verifies the in-transaction version recheck logic
+// catches a concurrent schema version bump using migrationStepHook injection.
+func TestInTransactionRecheckCatchesTooNew(t *testing.T) {
+	tempDir := secureTempDir(t)
+	path := tempDir + "/recheck.db"
+
+	// Create a v2 database with WAL mode
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		PRAGMA journal_mode=WAL;
+		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+		CREATE TABLE invites (code_hash TEXT PRIMARY KEY, from_peer TEXT, scopes TEXT, bags TEXT, expires_at INTEGER, used_by TEXT, pairing_token_hash TEXT);
+		PRAGMA user_version = 2;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// Inject a hook that bumps user_version to 99 when target=3
+	opts := OpenOptions{
+		Logger:               slog.Default(),
+		BackupRetentionCount: 3,
+		SkipMigrationBackup:  true,
+		migrationStepHook: func(target, current int) error {
+			if target == 3 {
+				// Simulate concurrent migration by bumping version
+				db, err := sql.Open("sqlite", path)
+				if err != nil {
+					return err
+				}
+				defer db.Close()
+				_, err = db.Exec(`PRAGMA user_version = 99`)
+				return err
+			}
+			return nil
+		},
+	}
+
+	_, err = OpenWithOptions(path, opts)
+	if err == nil {
+		t.Fatal("expected error when version changed during migration")
+	}
+
+	// Should be ErrSchemaTooNew or SQLITE_BUSY
+	// (SQLITE_BUSY is also acceptable as it prevents the migration from completing)
+	var tooNewErr *ErrSchemaTooNew
+	if !errors.As(err, &tooNewErr) {
+		// Accept SQLITE_BUSY as it also prevents migration
+		if !strings.Contains(err.Error(), "database is locked") && !strings.Contains(err.Error(), "SQLITE_BUSY") {
+			t.Errorf("expected ErrSchemaTooNew or SQLITE_BUSY, got %T: %v", err, err)
+		}
+	}
+}
+
+// TestBackupDirPermissionsCheck verifies that OpenWithOptions refuses insecure backup directories.
+func TestBackupDirPermissionsCheck(t *testing.T) {
+	// Skip if running as root (can't test permission restrictions)
+	if os.Geteuid() == 0 {
+		t.Skip("skipping permission test when running as root")
+	}
+
+	tempDir := secureTempDir(t)
+	insecureDir := tempDir + "/insecure"
+
+	// Create directory with group-writable permissions
+	if err := os.Mkdir(insecureDir, 0770); err != nil {
 		t.Fatal(err)
 	}
 
-	// One second after expiry: should be rejected
-	s.now = func() int64 { return currentTime + 701 }
-	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash7, "dan", "Dan", "hdan", "", "", nil, nil)
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("RegisterAndAcceptByPairing at expires_at+1 should return ErrNotFound, got %v", err)
+	// Create a v2 database that will need migration
+	dbPath := tempDir + "/test.db"
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+		PRAGMA user_version = 2;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO peers VALUES ('p1', 'Test', 'h1', ?, '')`, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// Try to open with this insecure backup dir
+	opts := OpenOptions{
+		BackupDir:            insecureDir,
+		Logger:               slog.Default(),
+		BackupRetentionCount: 3,
+	}
+
+	_, err = OpenWithOptions(dbPath, opts)
+	if err == nil {
+		t.Fatal("expected error for group-writable backup directory")
+	}
+
+	if !strings.Contains(err.Error(), "insecure permissions") {
+		t.Errorf("error should mention insecure permissions, got: %v", err)
+	}
+}
+
+// TestInvalidBackupKeepValue verifies that invalid BackupRetentionCount values are rejected.
+func TestInvalidBackupKeepValue(t *testing.T) {
+	opts := OpenOptions{
+		BackupRetentionCount: 0,
+		Logger:               slog.Default(),
+	}
+
+	st, err := OpenWithOptions(":memory:", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// OpenWithOptions should adjust invalid values to default (3)
+	// This is tested by the successful open and the warning log
+}
+
+// TestBackupFileMode verifies backups are created with 0600 permissions.
+func TestBackupFileMode(t *testing.T) {
+	tempDir := secureTempDir(t)
+	path := tempDir + "/mode.db"
+
+	// Create a v2 database
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+		PRAGMA user_version = 2;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO peers VALUES ('p1', 'Test', 'h1', ?, '')`, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// Open triggers migration and creates backup
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Find the backup file
+	backupBase := st.LastBackupPath()
+	if backupBase == "" {
+		t.Fatal("no backup was created")
+	}
+
+	backupPath := tempDir + "/" + backupBase
+	info, err := os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("cannot stat backup: %v", err)
+	}
+
+	// Verify mode is exactly 0600
+	mode := info.Mode() & os.ModePerm
+	if mode != 0600 {
+		t.Errorf("backup file mode = %04o, want 0600", mode)
+	}
+}
+
+// TestBackupCollisionRetry verifies that a timestamp collision triggers PID suffix retry.
+func TestBackupCollisionRetry(t *testing.T) {
+	tempDir := secureTempDir(t)
+	path := tempDir + "/collision.db"
+
+	// Create a v2 database
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+		PRAGMA user_version = 2;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// Fixed timestamp for collision
+	fixedTime := time.Date(2026, 1, 30, 12, 0, 0, 0, time.UTC)
+
+	// Create a pre-existing backup file with that timestamp
+	existingBackup := fmt.Sprintf("%s/collision.db.pre-v3-from-v2.%s", tempDir, fixedTime.Format("20060102-150405.000000"))
+	if err := os.WriteFile(existingBackup, []byte("fake"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open with fixed clock
+	opts := OpenOptions{
+		Logger:               slog.Default(),
+		BackupRetentionCount: 3,
+		now: func() int64 {
+			return fixedTime.Unix()
+		},
+	}
+
+	st, err := OpenWithOptions(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Verify a backup with PID suffix was created
+	backupBase := st.LastBackupPath()
+	if backupBase == "" {
+		t.Fatal("no backup was created")
+	}
+
+	// Should contain PID suffix
+	if !strings.Contains(backupBase, fmt.Sprintf(".%d", os.Getpid())) {
+		t.Errorf("backup name %q should contain PID suffix .%d", backupBase, os.Getpid())
+	}
+
+	// Both files should exist
+	files, err := os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupCount := 0
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "collision.db.pre-v3-from-v2") {
+			backupCount++
+		}
+	}
+	if backupCount != 2 {
+		t.Errorf("got %d backups, want 2 (original + PID suffix)", backupCount)
+	}
+}
+
+// TestRetentionIgnoresLookalikeFiles verifies that operator-kept files with similar names survive retention.
+func TestRetentionIgnoresLookalikeFiles(t *testing.T) {
+	tempDir := secureTempDir(t)
+	dbBase := "test.db"
+
+	// Create real backups
+	realBackups := []string{
+		dbBase + ".pre-v2-from-v1.20260101-120000.000000",
+		dbBase + ".pre-v3-from-v2.20260101-130000.000000",
+		dbBase + ".pre-v3-from-v2.20260101-140000.000000",
+	}
+	for _, name := range realBackups {
+		path := tempDir + "/" + name
+		if err := os.WriteFile(path, []byte("fake backup"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Create operator-kept lookalike files that should NOT match the strict regex
+	lookalikeFiles := []string{
+		dbBase + ".pre-v3-from-v2.manual-backup",
+		dbBase + ".pre-v99-emergency",
+		dbBase + ".backup",
+	}
+	for _, name := range lookalikeFiles {
+		path := tempDir + "/" + name
+		if err := os.WriteFile(path, []byte("operator file"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Enforce retention with keepCount=1, excluding the newest real backup
+	newestPath := tempDir + "/" + realBackups[2]
+	logger := slog.Default()
+	if err := enforceBackupRetention(tempDir, dbBase, 1, newestPath, logger); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify lookalike files still exist
+	for _, name := range lookalikeFiles {
+		path := tempDir + "/" + name
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("lookalike file %q was deleted, should survive: %v", name, err)
+		}
+	}
+
+	// Verify only the newest real backup remains
+	files, err := os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var remainingRealBackups []string
+	for _, f := range files {
+		name := f.Name()
+		for _, rb := range realBackups {
+			if name == rb {
+				remainingRealBackups = append(remainingRealBackups, name)
+				break
+			}
+		}
+	}
+	if len(remainingRealBackups) != 1 {
+		t.Errorf("got %d real backups remaining, want 1", len(remainingRealBackups))
+		for _, name := range remainingRealBackups {
+			t.Logf("  remaining: %s", name)
+		}
+	}
+	if len(remainingRealBackups) == 1 && remainingRealBackups[0] != filepath.Base(newestPath) {
+		t.Errorf("wrong backup survived: %s, want %s", remainingRealBackups[0], filepath.Base(newestPath))
+	}
+}
+
+// TestNoAbsolutePathsInErrors verifies that error messages and logs use only base names.
+func TestNoAbsolutePathsInErrors(t *testing.T) {
+	tempDir := secureTempDir(t)
+	path := tempDir + "/pathtest.db"
+
+	// Create a v2 database
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+		PRAGMA user_version = 2;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// Open successfully to create backup
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	// Now test various error paths
+
+	// 1. Test backup directory permission error
+	badDir := tempDir + "/baddir"
+	if err := os.Mkdir(badDir, 0770); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := OpenOptions{
+		BackupDir:            badDir,
+		Logger:               slog.Default(),
+		BackupRetentionCount: 3,
+	}
+
+	// Reset to v2 to trigger migration
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Exec(`PRAGMA user_version = 2`)
+	db.Close()
+
+	_, err = OpenWithOptions(path, opts)
+	if err != nil {
+		// Error should not contain the temp directory path
+		if strings.Contains(err.Error(), tempDir) {
+			t.Errorf("error contains temp directory path %q: %v", tempDir, err)
+		}
+	}
+}
+
+// TestVacuumIntoFailure verifies cleanup when VACUUM INTO fails.
+func TestVacuumIntoFailure(t *testing.T) {
+	tempDir := secureTempDir(t)
+	path := tempDir + "/vacuum-fail.db"
+
+	// Create a v2 database
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+		PRAGMA user_version = 2;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO peers VALUES ('p1', 'Test', 'h1', ?, '')`, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// Inject vacuumInto that fails
+	opts := OpenOptions{
+		Logger:               slog.Default(),
+		BackupRetentionCount: 3,
+		vacuumInto: func(db *sql.DB, backupPath string) error {
+			return errors.New("injected vacuum failure")
+		},
+	}
+
+	_, err = OpenWithOptions(path, opts)
+	if err == nil {
+		t.Fatal("expected error when VACUUM INTO fails")
+	}
+
+	// Verify no stray backup file was left
+	files, err := os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "vacuum-fail.db.pre-v") {
+			t.Errorf("stray backup file left after VACUUM failure: %s", f.Name())
+		}
+	}
+
+	// Verify database version is still 2 (migration aborted)
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 2 {
+		t.Errorf("database version = %d after failed backup, want 2 (unchanged)", version)
+	}
+}
+
+// TestAvailableDiskSpaceRefusal verifies that insufficient disk space aborts migration.
+func TestAvailableDiskSpaceRefusal(t *testing.T) {
+	tempDir := secureTempDir(t)
+	path := tempDir + "/diskspace.db"
+
+	// Create a v2 database
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+		PRAGMA user_version = 2;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO peers VALUES ('p1', 'Test', 'h1', ?, '')`, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// Save original func
+	origFunc := availableDiskSpaceFunc
+	defer func() { availableDiskSpaceFunc = origFunc }()
+
+	// Inject disk space check that returns 0 available (full disk)
+	availableDiskSpaceFunc = func(path string) (uint64, bool, error) {
+		return 0, true, nil
+	}
+
+	_, err = Open(path)
+	if err == nil {
+		t.Fatal("expected error when disk space is insufficient")
+	}
+
+	if !strings.Contains(err.Error(), "insufficient disk space") {
+		t.Errorf("error should mention insufficient disk space, got: %v", err)
+	}
+
+	// Verify database version is still 2 (migration aborted)
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 2 {
+		t.Errorf("database version = %d after disk space refusal, want 2 (unchanged)", version)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -32,12 +33,72 @@ func main() {
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	st, err := store.Open(*dbPath)
+
+	// Parse backup environment variables
+	skipBackup := os.Getenv("PEERLINE_SKIP_MIGRATION_BACKUP") == "1"
+	backupDir := os.Getenv("PEERLINE_BACKUP_DIR")
+	backupKeep := 3
+
+	if keepEnv := os.Getenv("PEERLINE_BACKUP_KEEP"); keepEnv != "" {
+		if n, err := strconv.Atoi(keepEnv); err == nil {
+			if n >= 1 {
+				backupKeep = n
+			} else {
+				log.Warn("PEERLINE_BACKUP_KEEP must be >= 1, using default", "invalid_value", keepEnv, "default", 3)
+			}
+		} else {
+			log.Warn("PEERLINE_BACKUP_KEEP must be a number, using default", "invalid_value", keepEnv, "default", 3)
+		}
+	}
+
+	if skipBackup {
+		log.Warn("PEERLINE_SKIP_MIGRATION_BACKUP is enabled, pre-migration backups are disabled")
+	}
+
+	// Open database with explicit options
+	opts := store.OpenOptions{
+		SkipMigrationBackup:  skipBackup,
+		BackupDir:            backupDir,
+		BackupRetentionCount: backupKeep,
+		Logger:               log,
+	}
+
+	st, err := store.OpenWithOptions(*dbPath, opts)
 	if err != nil {
+		// Check for schema-too-new error and exit with distinct code
+		var tooNewErr *store.ErrSchemaTooNew
+		if errors.As(err, &tooNewErr) {
+			log.Error("database schema version is too new for this binary", "err", err)
+			os.Exit(2)
+		}
+		// Check for schema-invalid error
+		var invalidErr *store.ErrSchemaInvalid
+		if errors.As(err, &invalidErr) {
+			log.Error("database schema version is invalid", "err", err)
+			os.Exit(1)
+		}
 		log.Error("open store", "err", err)
 		os.Exit(1)
 	}
 	defer st.Close()
+
+	// Log schema version, max supported, and backup info on startup
+	backupInfo := "none needed"
+	if bp := st.LastBackupPath(); bp != "" {
+		if st.BackupReused() {
+			backupInfo = "reused " + bp
+		} else {
+			backupInfo = bp
+		}
+	} else if skipBackup {
+		backupInfo = "skipped (opt-out)"
+	}
+	dbBase := filepath.Base(*dbPath)
+	log.Info("database opened",
+		"db", dbBase,
+		"schema_version", st.SchemaVersionInUse(),
+		"max_supported", store.SchemaVersion(),
+		"backup", backupInfo)
 
 	regTok := os.Getenv("PEERLINE_REGISTER_TOKEN")
 	if regTok == "" {
