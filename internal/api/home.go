@@ -65,7 +65,7 @@ func (s *Server) home(w http.ResponseWriter, r *http.Request) {
 	if err := homeTmpl.Execute(&buf, homeData{
 		BaseURL:      s.publicBase(r),
 		RegisterOpen: s.cfg.RegisterToken == "",
-		Nonce:        template.HTMLAttr(nonce),
+		Nonce:        template.HTMLAttr(`nonce="` + nonce + `"`),
 		StatsJSON:    template.JS(raw),
 		Stats:        st,
 	}); err != nil {
@@ -84,7 +84,7 @@ var homeTmpl = template.Must(template.New("home").Parse(`<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Peerline</title>
 <meta name="description" content="Peerline is a deny-all cross-account bot-to-bot bridge for allowlisted messages and bags.">
-<style nonce="{{.Nonce}}">
+<style {{.Nonce}}>>
   :root {
     color-scheme: light;
     --bg: #f6f4ef;
@@ -290,7 +290,7 @@ PUT    /v1/bags/{name}?owner=</code></pre>
     <p>Peerline is a personal project by sysrex. Issues and pull requests: <a href="` + repoURL + `">github.com/sysrex/peerline</a>.</p>
   </footer>
 </main>
-<script nonce="{{.Nonce}}">
+<script {{.Nonce}}>>
 (function () {
   var keys = ["peers", "messages", "grants", "bags"];
   function paint(s) {
