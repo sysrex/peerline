@@ -644,8 +644,15 @@ func (s *Server) inviterName(ctx context.Context, id string) string {
 //   - Tab, newline, and all unicode.IsSpace chars become a single space
 //   - Repeated spaces are collapsed
 //
+// Length limit:
+//   - Maximum 64 runes counted on the final NFC (composed) output
+//   - Precomposed characters (e.g., é = U+00E9) count as 1 rune
+//   - Hangul syllables (e.g., 한 = U+D55C) count as 1 rune each
+//   - Truncation respects grapheme cluster boundaries: if cutting at 64 runes
+//     would split a base from non-composing marks, backs off to exclude the
+//     entire trailing cluster
+//
 // Returns "A Peerline peer" if the result is empty after filtering.
-// Max length 64 runes (not bytes).
 //
 // Note: Cross-script homoglyphs (e.g., Cyrillic а vs Latin a) are not fully solvable here
 // and require application-level awareness or visual similarity detection.
@@ -654,7 +661,18 @@ func sanitizeInviterName(name string) string {
 		maxRunes        = 64
 		maxMarksPerBase = 3 // Issue #84 specifies 3 marks per base (issue #63 asked for 2 but #84 is the live tracker)
 		fallbackName    = "A Peerline peer"
+		maxInputBytes   = 1024 // Guard against unbounded normalization work
 	)
+
+	// Guard: truncate raw input to maxInputBytes on a UTF-8 rune boundary
+	// to prevent huge stored names from causing unbounded NFKC/NFD work
+	if len(name) > maxInputBytes {
+		name = name[:maxInputBytes]
+		// Back off to a rune boundary: step back while the last byte is not a rune start
+		for len(name) > 0 && !utf8.RuneStart(name[len(name)-1]) {
+			name = name[:len(name)-1]
+		}
+	}
 
 	// Apply NFKC normalization first (compatibility decomposition + canonical composition)
 	// This normalizes fullwidth/halfwidth chars, ligatures, compatibility forms
@@ -666,7 +684,6 @@ func sanitizeInviterName(name string) string {
 
 	var out strings.Builder
 	lastWasSpace := false
-	runeCount := 0
 	marksAfterBase := 0
 	lastWasBaseChar := false // tracks if last was letter/number (valid base for marks)
 
@@ -717,7 +734,6 @@ func sanitizeInviterName(name string) string {
 			if lastWasBaseChar && marksAfterBase < maxMarksPerBase {
 				out.WriteRune(r)
 				marksAfterBase++
-				runeCount++
 				// Keep lastWasBaseChar true so we stay in this mark sequence
 			}
 			// Otherwise drop the mark
@@ -727,7 +743,6 @@ func sanitizeInviterName(name string) string {
 			lastWasSpace = false
 			lastWasBaseChar = true
 			marksAfterBase = 0 // Reset mark counter for new base
-			runeCount++
 		} else if unicode.IsSpace(r) || r == '\t' || r == '\n' || r == '\r' {
 			// Map all whitespace (including tab/newline) to single space
 			if !lastWasSpace && out.Len() > 0 {
@@ -735,7 +750,6 @@ func sanitizeInviterName(name string) string {
 				lastWasSpace = true
 				lastWasBaseChar = false
 				marksAfterBase = 0
-				runeCount++
 			}
 		} else if r == '.' || r == ',' || r == '-' || r == '_' || r == '\'' {
 			// Basic ASCII punctuation
@@ -743,16 +757,10 @@ func sanitizeInviterName(name string) string {
 			lastWasSpace = false
 			lastWasBaseChar = false // punctuation is not a valid base for marks
 			marksAfterBase = 0
-			runeCount++
 		} else {
 			// Other characters: reset state but don't write
 			lastWasBaseChar = false
 			marksAfterBase = 0
-		}
-
-		// Stop if we exceed max runes
-		if runeCount >= maxRunes {
-			break
 		}
 	}
 
@@ -764,6 +772,37 @@ func sanitizeInviterName(name string) string {
 	if result == "" {
 		return fallbackName
 	}
+
+	// Apply length cap to NFC output (64 runes of final composed form)
+	// This ensures precomposed characters (é), Hangul syllables (한), etc. count as 1 rune each
+	runes := []rune(result)
+	if len(runes) > maxRunes {
+		// Truncate at maxRunes, but check if this splits a grapheme cluster.
+		// NFC does not guarantee boundaries: e.g., e+grave+combining-mark-below doesn't compose,
+		// so cutting after 'e' leaves dangling marks.
+		// If the next rune (at position maxRunes) is a combining mark, back off to drop
+		// the entire trailing base+marks cluster.
+		truncated := runes[:maxRunes]
+		if len(runes) > maxRunes {
+			nextRune := runes[maxRunes]
+			if unicode.Is(unicode.Mn, nextRune) || unicode.Is(unicode.Mc, nextRune) || unicode.Is(unicode.Me, nextRune) {
+				// Backed-off: scan backwards to find the base character and drop it too
+				for i := len(truncated) - 1; i >= 0; i-- {
+					r := truncated[i]
+					isMark := unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) || unicode.Is(unicode.Me, r)
+					if !isMark {
+						// Found the base, truncate before it
+						truncated = truncated[:i]
+						break
+					}
+				}
+			}
+		}
+		result = string(truncated)
+	}
+
+	// Trim trailing spaces that may have been left by the 64-rune truncation
+	result = strings.TrimRight(result, " ")
 
 	return result
 }

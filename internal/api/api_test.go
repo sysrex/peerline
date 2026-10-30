@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/sysrex/peerline/internal/store"
 	"golang.org/x/text/unicode/norm"
@@ -2101,11 +2102,17 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Empty string", "", "A Peerline peer"},
 		{"Only spaces", "   ", "A Peerline peer"},
 
-		// Issue #68: Length tests (64 runes max)
+		// Issue #68: Length tests (64 runes max, counted on final NFC output)
 		{"70 ASCII letters", strings.Repeat("a", 70), strings.Repeat("a", 64)},
 		{"30 CJK chars under byte limit", strings.Repeat("日", 30), strings.Repeat("日", 30)},
 		// 64 runes (not bytes): "日" is 3 bytes, 64 copies = 192 bytes, should keep exactly 64 runes
 		{"Long multibyte truncated at 64 runes", strings.Repeat("日", 70), strings.Repeat("日", 64)},
+		// Precomposed characters: é (U+00E9) is 1 rune in NFC
+		{"70 precomposed é gives 64", strings.Repeat("é", 70), strings.Repeat("é", 64)},
+		// Hangul syllables: 한 (U+D55C) is 1 rune in NFC, decomposes to 3 jamo in NFD
+		{"70 Hangul syllables gives 64", strings.Repeat("한", 70), strings.Repeat("한", 64)},
+		// a+acute recomposes to á in NFC, 70 gives 64
+		{"70 a+acute recomposes to 64 á", strings.Repeat("a\u0301", 70), strings.Repeat("á", 64)},
 	}
 
 	for _, tt := range tests {
@@ -2138,6 +2145,95 @@ func TestSanitizerUnicode(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestSanitizerSplitCluster verifies that truncation respects grapheme cluster boundaries
+func TestSanitizerSplitCluster(t *testing.T) {
+	// 63 'a' + e+grave+combining-mark-below (doesn't compose in NFC) + "zzz"
+	// Should give 63 'a' without the partial cluster
+	input := strings.Repeat("a", 63) + "e\u0300\u0316" + "zzz"
+	got := sanitizeInviterName(input)
+	want := strings.Repeat("a", 63)
+
+	if got != want {
+		t.Errorf("sanitizeInviterName split cluster = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
+
+	// Verify UTF-8 validity
+	if !utf8.ValidString(got) {
+		t.Errorf("sanitizeInviterName returned invalid UTF-8")
+	}
+
+	// Verify result is NFC
+	if !norm.NFC.IsNormalString(got) {
+		t.Errorf("sanitizeInviterName result is not NFC normalized")
+	}
+
+	// Verify no trailing combining marks
+	runes := []rune(got)
+	if len(runes) > 0 {
+		lastRune := runes[len(runes)-1]
+		if unicode.Is(unicode.Mn, lastRune) || unicode.Is(unicode.Mc, lastRune) || unicode.Is(unicode.Me, lastRune) {
+			t.Errorf("sanitizeInviterName has trailing combining mark U+%04X", lastRune)
+		}
+	}
+}
+
+// TestSanitizerHugeInput verifies the input guard prevents unbounded normalization work
+func TestSanitizerHugeInput(t *testing.T) {
+	// 100 KB of 'a' characters
+	input := strings.Repeat("a", 100*1024)
+	got := sanitizeInviterName(input)
+
+	// Should return 64 'a' characters (truncated at input guard, then at 64 runes)
+	want := strings.Repeat("a", 64)
+	if got != want {
+		t.Errorf("sanitizeInviterName(100KB input) = %q (len %d), want %q (len %d)", got[:20]+"...", len([]rune(got)), want, len([]rune(want)))
+	}
+}
+
+// TestSanitizerInputGuardInvalidUTF8 verifies the input guard doesn't trim back past invalid bytes elsewhere
+func TestSanitizerInputGuardInvalidUTF8(t *testing.T) {
+	// 2000 bytes of 'a' with 0xff (invalid UTF-8) at byte 10
+	// Should give 64 'a' (not fallback), proving we don't trim back to empty
+	input := strings.Repeat("a", 10) + "\xff" + strings.Repeat("a", 1989)
+	got := sanitizeInviterName(input)
+	want := strings.Repeat("a", 64)
+
+	if got != want {
+		t.Errorf("sanitizeInviterName(2000 bytes with invalid at byte 10) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
+}
+
+// TestSanitizerInputGuardRuneBoundary verifies the input guard respects rune boundaries
+func TestSanitizerInputGuardRuneBoundary(t *testing.T) {
+	// Create input that has a 3-byte UTF-8 character (日) right at the 1024-byte cut
+	// Fill up to 1022 bytes with 'a', then add 日 (3 bytes) so it straddles the boundary
+	base := strings.Repeat("a", 1022)
+	input := base + "日" + strings.Repeat("b", 100)
+
+	got := sanitizeInviterName(input)
+
+	// The guard should cut before 日 (not in the middle), then cap at 64 runes
+	// So we should get 64 'a' characters (first 64 of the 1022)
+	want := strings.Repeat("a", 64)
+	if got != want {
+		t.Errorf("sanitizeInviterName(input with 3-byte rune at boundary) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
+}
+
+// TestSanitizerTrailingSpaceTrim verifies trailing spaces are trimmed after 64-rune cut
+func TestSanitizerTrailingSpaceTrim(t *testing.T) {
+	// 64 'a' followed by space and more text
+	// The 64-rune cut will include the space; it should be trimmed
+	input := strings.Repeat("a", 63) + " b" + strings.Repeat("c", 100)
+	got := sanitizeInviterName(input)
+
+	// Should get 63 'a' (no trailing space)
+	want := strings.Repeat("a", 63)
+	if got != want {
+		t.Errorf("sanitizeInviterName(63a + space + text) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
 	}
 }
 
