@@ -23,7 +23,7 @@ func TestNullPublicIDRowSkipped(t *testing.T) {
 	// Register a peer
 	peerID := "p_testpeer123"
 	keyHash := auth.Hash("test-key")
-	if err := st.CreatePeer(ctx, peerID, "TestPeer", keyHash, ""); err != nil {
+	if err := st.CreatePeer(ctx, peerID, "TestPeer", keyHash, "", ""); err != nil {
 		t.Fatal(err)
 	}
 
