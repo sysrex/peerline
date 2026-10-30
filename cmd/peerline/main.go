@@ -43,6 +43,20 @@ func main() {
 	if regTok == "" {
 		log.Warn("PEERLINE_REGISTER_TOKEN unset: registration is open to anyone who can reach this server")
 	}
+
+	// Parse trusted proxy CIDRs
+	var trustedProxies []string
+	if tp := os.Getenv("PEERLINE_TRUSTED_PROXIES"); tp != "" {
+		trustedProxies = strings.Split(tp, ",")
+		// Validate at startup
+		if _, err := api.ParseTrustedProxies(trustedProxies); err != nil {
+			log.Error("invalid PEERLINE_TRUSTED_PROXIES CIDR", "err", err)
+			os.Exit(1)
+		}
+	}
+
+	maxOutstandingInvites, _ := strconv.Atoi(os.Getenv("PEERLINE_MAX_OUTSTANDING_INVITES"))
+
 	ml, err := mailer.FromEnv(log)
 	if err != nil {
 		log.Error("smtp config", "err", err)
@@ -58,13 +72,21 @@ func main() {
 	}
 	emailPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_EMAIL_PER_HOUR"))
 	notifyPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_NOTIFY_PER_HOUR"))
+
+	apiServer := api.New(st, api.Config{
+		RegisterToken:         regTok,
+		Logger:                log,
+		Mailer:                ml,
+		PublicURL:             publicURL,
+		EmailPerHour:          emailPerHour,
+		NotifyPerHour:         notifyPerHour,
+		TrustedProxies:        trustedProxies,
+		MaxOutstandingInvites: maxOutstandingInvites,
+	})
+
 	srv := &http.Server{
-		Addr: *addr,
-		Handler: api.New(st, api.Config{
-			RegisterToken: regTok, Logger: log,
-			Mailer: ml, PublicURL: publicURL, EmailPerHour: emailPerHour,
-			NotifyPerHour: notifyPerHour,
-		}).Handler(),
+		Addr:              *addr,
+		Handler:           apiServer.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -82,6 +104,10 @@ func main() {
 		}
 	}()
 	<-ctx.Done()
+
+	// Stop background tasks before shutting down server
+	apiServer.Stop()
+
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutCtx)

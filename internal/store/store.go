@@ -15,6 +15,7 @@ import (
 
 var ErrNotFound = errors.New("not found")
 var ErrConflict = errors.New("conflict")
+var ErrTooManyInvites = errors.New("too many outstanding invites")
 
 var memDBCounter uint64
 
@@ -340,6 +341,152 @@ func (s *Store) CreateInviteWithPairing(ctx context.Context, codeHash, pairingTo
 	_, err := s.db.ExecContext(ctx, `INSERT INTO invites(code_hash,from_peer,scopes,bags,expires_at,pairing_token_hash) VALUES(?,?,?,?,?,?)`,
 		codeHash, from, join(scopes), join(bags), expires.Unix(), pairingTokenHash)
 	return err
+}
+
+// CreateInviteAtomic checks the per-peer invite cap and creates an invite atomically within one transaction.
+// Returns ErrTooManyInvites if the cap would be exceeded. Returns the invite's ROWID on success.
+func (s *Store) CreateInviteAtomic(ctx context.Context, codeHash, from string, scopes, bags []string, expires time.Time, cap int) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	var count int
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`, from, now()).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	if count >= cap {
+		return 0, ErrTooManyInvites
+	}
+
+	res, err := tx.ExecContext(ctx, `INSERT INTO invites(code_hash,from_peer,scopes,bags,expires_at) VALUES(?,?,?,?,?)`,
+		codeHash, from, join(scopes), join(bags), expires.Unix())
+	if err != nil {
+		return 0, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+
+	return res.LastInsertId()
+}
+
+// CreateInviteWithPairingAtomic checks the per-peer invite cap and creates a pairing invite atomically within one transaction.
+// Returns ErrTooManyInvites if the cap would be exceeded. Returns the invite's ROWID on success.
+func (s *Store) CreateInviteWithPairingAtomic(ctx context.Context, codeHash, pairingTokenHash, from string, scopes, bags []string, expires time.Time, cap int) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	var count int
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`, from, now()).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	if count >= cap {
+		return 0, ErrTooManyInvites
+	}
+
+	res, err := tx.ExecContext(ctx, `INSERT INTO invites(code_hash,from_peer,scopes,bags,expires_at,pairing_token_hash) VALUES(?,?,?,?,?,?)`,
+		codeHash, from, join(scopes), join(bags), expires.Unix(), pairingTokenHash)
+	if err != nil {
+		return 0, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+
+	return res.LastInsertId()
+}
+
+// InviteMetadata holds non-secret information about an invite for listing.
+type InviteMetadata struct {
+	InviteID      int64     `json:"invite_id"`
+	Scopes        []string  `json:"scopes"`
+	Bags          []string  `json:"bags"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	Used          bool      `json:"used"`
+	IsPairingLink bool      `json:"is_pairing_link"`
+}
+
+// CountOutstandingInvites returns the number of active (non-expired, unused) invites created by the peer.
+func (s *Store) CountOutstandingInvites(ctx context.Context, peerID string) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`,
+		peerID, now()).Scan(&count)
+	return count, err
+}
+
+// ListInvitesByPeer returns non-secret metadata for active invites created by the peer.
+// Results are ordered by creation (ROWID) and support pagination.
+func (s *Store) ListInvitesByPeer(ctx context.Context, peerID string, limit, offset int) ([]InviteMetadata, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT ROWID, scopes, bags, expires_at, used_by IS NOT NULL, 
+		        pairing_token_hash IS NOT NULL
+		 FROM invites 
+		 WHERE from_peer=? AND expires_at>=?
+		 ORDER BY ROWID
+		 LIMIT ? OFFSET ?`,
+		peerID, now(), limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var invites []InviteMetadata
+	for rows.Next() {
+		var im InviteMetadata
+		var scopes, bags string
+		var exp int64
+		var used, hasPairingToken bool
+		if err := rows.Scan(&im.InviteID, &scopes, &bags, &exp, &used, &hasPairingToken); err != nil {
+			return nil, err
+		}
+		im.Scopes = split(scopes)
+		im.Bags = split(bags)
+		im.ExpiresAt = time.Unix(exp, 0).UTC()
+		im.Used = used
+		im.IsPairingLink = hasPairingToken
+		invites = append(invites, im)
+	}
+	return invites, rows.Err()
+}
+
+// DeleteInvite removes an invite by ID if it belongs to the specified peer and is unused.
+func (s *Store) DeleteInvite(ctx context.Context, inviteID int64, ownerID string) error {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM invites WHERE ROWID=? AND from_peer=? AND used_by IS NULL`,
+		inviteID, ownerID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// PurgeExpiredInvites removes expired and unused invite rows.
+// It does NOT delete used invites, since those may be useful for audit.
+func (s *Store) PurgeExpiredInvites(ctx context.Context) (int, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM invites WHERE expires_at<? AND used_by IS NULL`,
+		now())
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 type InviteInfo struct {

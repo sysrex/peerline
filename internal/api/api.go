@@ -27,8 +27,9 @@ import (
 const (
 	MaxBagBytes      = 64 << 10
 	maxJSONBytes     = 16 << 10
-	defaultInviteTTL = 24 * time.Hour
+	defaultInviteTTL = 1 * time.Hour
 	maxInviteTTL     = 7 * 24 * time.Hour
+	maxInviteTTLSec  = 604800 // 7 days in seconds, checked before multiplication
 )
 
 type Config struct {
@@ -53,19 +54,20 @@ type Config struct {
 	// recipient peer. Separate from the invite limiters.
 	NotifyPerHour int
 	NotifyBurst   int
+	// TrustedProxies is a list of CIDR ranges (e.g. "10.0.0.0/8") from which
+	// X-Forwarded-For headers are honored. If empty, X-Forwarded-For is ignored.
+	TrustedProxies []string
+	// MaxOutstandingInvites is the per-peer limit on active (non-expired, unused) invites.
+	MaxOutstandingInvites int
 }
 
 type Server struct {
-	st     *store.Store
-	cfg    Config
-	msgLim *msg.Limiter
-	regLim *msg.Limiter
-	// email send limits: by inviter peer id, and by recipient address
-	mailLim *msg.Limiter
-	rcptLim *msg.Limiter
-	// message-notification emails, by recipient peer id
-	notifyLim *msg.Limiter
-	log       *slog.Logger
+	st          *store.Store
+	cfg         Config
+	lim         *LimiterManager
+	maint       *MaintenanceManager
+	log         *slog.Logger
+	trustedNets []*net.IPNet
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -96,36 +98,65 @@ func New(st *store.Store, cfg Config) *Server {
 	if cfg.NotifyBurst <= 0 {
 		cfg.NotifyBurst = 5
 	}
+	if cfg.MaxOutstandingInvites <= 0 {
+		cfg.MaxOutstandingInvites = 10
+	}
 	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
-	return &Server{st: st, cfg: cfg, log: cfg.Logger,
-		msgLim:    msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst),
-		regLim:    msg.NewLimiter(10, 5),
-		mailLim:   msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst),
-		rcptLim:   msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour),
-		notifyLim: msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst)}
+
+	trustedNets, err := ParseTrustedProxies(cfg.TrustedProxies)
+	if err != nil {
+		// This should have been caught at startup, log and continue with empty list
+		cfg.Logger.Warn("invalid trusted proxy CIDR, ignoring", "err", err)
+		trustedNets = nil
+	}
+
+	s := &Server{
+		st:          st,
+		cfg:         cfg,
+		log:         cfg.Logger,
+		lim:         NewLimiterManager(cfg),
+		trustedNets: trustedNets,
+	}
+
+	// Start maintenance tasks
+	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger)
+
+	return s
+}
+
+// Stop gracefully stops background tasks.
+func (s *Server) Stop() {
+	if s.lim != nil {
+		s.lim.Stop()
+	}
+	if s.maint != nil {
+		s.maint.Stop()
+	}
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	// {$} is an exact match for "/". A bare "GET /" would swallow every other path.
-	mux.HandleFunc("GET /{$}", s.home)
+	mux.HandleFunc("GET /{$}", s.rateLimitGet(s.home))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
 	mux.HandleFunc("POST /v1/register", s.register)
 	// Registered on the outer mux so it is not behind Bearer auth. The more
 	// specific pattern wins over the /v1/ subtree below.
-	mux.HandleFunc("GET /v1/public/stats", s.publicStats)
+	mux.HandleFunc("GET /v1/public/stats", s.rateLimitGet(s.publicStats))
 
 	authed := http.NewServeMux()
-	authed.HandleFunc("GET /v1/me", s.me)
+	authed.HandleFunc("GET /v1/me", s.rateLimitAuth(s.me))
 	authed.HandleFunc("PUT /v1/me", s.updateMe)
 	authed.HandleFunc("POST /v1/invites", s.createInvite)
+	authed.HandleFunc("GET /v1/invites", s.rateLimitAuth(s.listInvites))
+	authed.HandleFunc("DELETE /v1/invites/{id}", s.deleteInvite)
 	authed.HandleFunc("POST /v1/invites/accept", s.acceptInvite)
 	authed.HandleFunc("GET /v1/invites/accept", s.acceptInvite) // emailed magic link (Bearer required)
-	authed.HandleFunc("GET /v1/grants", s.listGrants)
+	authed.HandleFunc("GET /v1/grants", s.rateLimitAuth(s.listGrants))
 	authed.HandleFunc("DELETE /v1/grants/{peer_id}", s.revokeGrant)
 	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.sendMessage)
-	authed.HandleFunc("GET /v1/inbox", s.inbox)
-	authed.HandleFunc("GET /v1/bags/{name}", s.getBag)
+	authed.HandleFunc("GET /v1/inbox", s.rateLimitAuth(s.inbox)) // polling-friendly rate limit
+	authed.HandleFunc("GET /v1/bags/{name}", s.rateLimitAuth(s.getBag))
 	authed.HandleFunc("PUT /v1/bags/{name}", s.putBag)
 	authed.HandleFunc("POST /v1/pairing/{token}", s.acceptPairing) // authenticated pairing acceptance
 	authMW := auth.Middleware(func(ctx context.Context, h string) (string, error) {
@@ -147,7 +178,7 @@ func (s *Server) Handler() http.Handler {
 		s.acceptLanding(w, r)
 	})
 	// Pairing endpoints: GET shows details, POST accepts (optionally creating a new peer)
-	mux.HandleFunc("GET /v1/pairing/{token}", s.getPairing)
+	mux.HandleFunc("GET /v1/pairing/{token}", s.rateLimitGet(s.getPairing))
 	mux.HandleFunc("POST /v1/pairing/{token}", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "" {
 			authMW.ServeHTTP(w, r)
@@ -158,15 +189,26 @@ func (s *Server) Handler() http.Handler {
 	return securityHeaders(mux)
 }
 
-func securityHeaders(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Cache-Control", "no-store")
-		next.ServeHTTP(w, r)
-	})
-}
-
 // ---- helpers ----
+
+// sanitizeInviterName strips characters that can be used for prompt injection.
+// Uses an allowlist of Unicode categories: letters, digits, marks, spaces, and limited punctuation.
+func sanitizeInviterName(name string) string {
+	const maxLen = 64
+	var out strings.Builder
+	for _, r := range name {
+		// Allow letters (L*), digits (Nd), marks (M*), spaces, and limited punctuation
+		if utf8.ValidRune(r) && (r == ' ' || r == '.' || r == '-' || r == '_' || r == ',' || r == '\'' ||
+			('A' <= r && r <= 'Z') || ('a' <= r && r <= 'z') || ('0' <= r && r <= '9')) {
+			out.WriteRune(r)
+		}
+		// Stop if we exceed max length
+		if out.Len() >= maxLen {
+			break
+		}
+	}
+	return strings.TrimSpace(out.String())
+}
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -199,25 +241,21 @@ func (s *Server) internal(w http.ResponseWriter, err error) {
 	writeErr(w, http.StatusInternalServerError, "internal error")
 }
 
-func clientIP(r *http.Request) string {
-	h, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return h
-}
-
 // ---- auth ----
 
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
-	if !s.regLim.Allow(clientIP(r)) {
-		writeErr(w, http.StatusTooManyRequests, "rate limited")
-		return
-	}
+	// Check register token first, before charging rate limit
 	if s.cfg.RegisterToken != "" && !auth.ConstantEqual(r.Header.Get("X-Peerline-Register-Token"), s.cfg.RegisterToken) {
 		writeErr(w, http.StatusForbidden, "registration token required")
 		return
 	}
+
+	// Now charge the rate limiter after token validation
+	if !s.lim.regLim.Allow(clientIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"), s.trustedNets)) {
+		writeErr(w, http.StatusTooManyRequests, "rate limited")
+		return
+	}
+
 	var in struct {
 		Name        string `json:"name"`
 		NotifyEmail string `json:"notify_email"`
@@ -330,46 +368,91 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "at least one scope required")
 		return
 	}
+
+	// Validate TTL before any multiplication to prevent overflow
 	ttl := defaultInviteTTL
 	if in.TTLSeconds > 0 {
-		ttl = min(time.Duration(in.TTLSeconds)*time.Second, maxInviteTTL)
+		if in.TTLSeconds > maxInviteTTLSec {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("ttl_seconds must not exceed %d (7 days)", maxInviteTTLSec))
+			return
+		}
+		ttl = time.Duration(in.TTLSeconds) * time.Second
 	}
+
 	me := auth.PeerID(r.Context())
+
+	// If both generate_pairing and to_email are specified, reject the request
+	// (pairing links are not emailed)
+	if in.GeneratePairing && to != "" {
+		writeErr(w, http.StatusBadRequest, "cannot combine generate_pairing with to_email")
+		return
+	}
+
+	// Email rate limit check (before creating invite or spending budget)
 	if to != "" {
-		// Check both limits (without consuming) before taking from either, and before
-		// creating anything, so a 429 leaves no stray invite and burns no budget.
 		rk := strings.ToLower(to)
-		if !s.mailLim.Ready(me) || !s.rcptLim.Ready(rk) || !s.mailLim.Allow(me) || !s.rcptLim.Allow(rk) {
+		if !s.lim.mailLim.Ready(me) || !s.lim.rcptLim.Ready(rk) || !s.lim.mailLim.Allow(me) || !s.lim.rcptLim.Allow(rk) {
 			w.Header().Set("Retry-After", "600")
 			writeErr(w, http.StatusTooManyRequests, "invite email rate limited; try later or create an invite without to_email and share the code yourself")
 			return
 		}
 	}
+
 	code := auth.NewSecret("inv_")
 	exp := time.Now().Add(ttl).UTC()
 	var pairingToken string
+	var inviteID int64
+
+	// Atomically check invite cap and create invite
 	if in.GeneratePairing {
 		pairingToken = auth.NewPairingToken()
-		if err := s.st.CreateInviteWithPairing(r.Context(), auth.Hash(code), auth.Hash(pairingToken), me, sc, bg, exp); err != nil {
+		inviteID, err = s.st.CreateInviteWithPairingAtomic(r.Context(), auth.Hash(code), auth.Hash(pairingToken), me, sc, bg, exp, s.cfg.MaxOutstandingInvites)
+		if errors.Is(err, store.ErrTooManyInvites) {
+			writeErr(w, http.StatusTooManyRequests, fmt.Sprintf("too many outstanding invites (limit %d); revoke or wait for expiry", s.cfg.MaxOutstandingInvites))
+			return
+		}
+		if err != nil {
 			s.internal(w, err)
 			return
 		}
 	} else {
-		if err := s.st.CreateInvite(r.Context(), auth.Hash(code), me, sc, bg, exp); err != nil {
+		inviteID, err = s.st.CreateInviteAtomic(r.Context(), auth.Hash(code), me, sc, bg, exp, s.cfg.MaxOutstandingInvites)
+		if errors.Is(err, store.ErrTooManyInvites) {
+			writeErr(w, http.StatusTooManyRequests, fmt.Sprintf("too many outstanding invites (limit %d); revoke or wait for expiry", s.cfg.MaxOutstandingInvites))
+			return
+		}
+		if err != nil {
 			s.internal(w, err)
 			return
 		}
 	}
+
+	// Response shape depends on generate_pairing
+	if pairingToken != "" {
+		// Pairing-only response: only pairing_url and invite_id, no code or accept_url
+		pairingURL := s.publicBase(r) + "/v1/pairing/" + url.PathEscape(pairingToken)
+		resp := map[string]any{
+			"invite_id":   inviteID,
+			"pairing_url": pairingURL,
+			"scopes":      sc,
+			"bags":        bg,
+			"expires_at":  exp.Format(time.RFC3339),
+			"note":        "single use; share pairing_url with any agent (registered or not) to complete pairing",
+		}
+		writeJSON(w, http.StatusCreated, resp)
+		return
+	}
+
+	// Standard invite response with code, accept_url, and invite_id
 	acceptURL := s.publicBase(r) + "/v1/invites/accept?code=" + url.QueryEscape(code)
 	resp := map[string]any{
-		"code": code, "scopes": sc, "bags": bg, "expires_at": exp.Format(time.RFC3339),
+		"invite_id":  inviteID,
+		"code":       code,
+		"scopes":     sc,
+		"bags":       bg,
+		"expires_at": exp.Format(time.RFC3339),
 		"accept_url": acceptURL,
 		"note":       "single use; share out of band with the peer you want to pair with",
-	}
-	if pairingToken != "" {
-		pairingURL := s.publicBase(r) + "/v1/pairing/" + url.PathEscape(pairingToken)
-		resp["pairing_url"] = pairingURL
-		resp["note"] = "single use; share pairing_url with any agent (registered or not) to complete pairing"
 	}
 	if to != "" {
 		status := "sent"
@@ -409,14 +492,11 @@ func (s *Server) inviterName(ctx context.Context, id string) string {
 	if err != nil {
 		return "A Peerline peer"
 	}
-	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
-			return ' '
-		}
-		return r
-	}, n)
+	return sanitizeInviterName(n)
 }
 
+// sanitizeInviterName removes control characters, bidi controls, and zero-width
+// characters that could be used for prompt injection or display spoofing.
 func inviteEmail(inviter, inviterID, to, code, acceptURL string, scopes, bags []string, exp time.Time) mailer.Message {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s (Peerline peer %s) invited one of your bots to pair on Peerline,\n", inviter, inviterID)
@@ -507,6 +587,53 @@ func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, resp)
 }
 
+func (s *Server) listInvites(w http.ResponseWriter, r *http.Request) {
+	me := auth.PeerID(r.Context())
+
+	// Parse pagination parameters
+	limit := 50
+	offset := 0
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if parsed, err := strconv.Atoi(limitStr); err == nil && parsed > 0 && parsed <= 200 {
+			limit = parsed
+		}
+	}
+	if offsetStr := r.URL.Query().Get("offset"); offsetStr != "" {
+		if parsed, err := strconv.Atoi(offsetStr); err == nil && parsed >= 0 {
+			offset = parsed
+		}
+	}
+
+	invites, err := s.st.ListInvitesByPeer(r.Context(), me, limit, offset)
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"invites": invites})
+}
+
+func (s *Server) deleteInvite(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	inviteID, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid invite id")
+		return
+	}
+
+	me := auth.PeerID(r.Context())
+	err = s.st.DeleteInvite(r.Context(), inviteID, me)
+	if errors.Is(err, store.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "invite not found or already used")
+		return
+	}
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	s.log.Info("invite revoked", "peer", me, "invite_id", inviteID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func splitCSV(v string) []string {
 	var out []string
 	for _, p := range strings.Split(v, ",") {
@@ -553,7 +680,7 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "not permitted")
 		return
 	}
-	if !s.msgLim.Allow(me) {
+	if !s.lim.msgLim.Allow(me) {
 		w.Header().Set("Retry-After", "2")
 		writeErr(w, http.StatusTooManyRequests, "rate limited")
 		return
@@ -610,7 +737,7 @@ func (s *Server) notifyNewMessage(ctx context.Context, m *store.Message) {
 	if email == "" {
 		return
 	}
-	if !s.notifyLim.Allow(m.To) {
+	if !s.lim.notifyLim.Allow(m.To) {
 		s.log.Warn("notify email rate limited", "recipient", m.To, "message_id", m.ID)
 		return
 	}
@@ -828,32 +955,33 @@ func (s *Server) getPairing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	inviterName := s.inviterName(r.Context(), info.FromPeer)
+	sanitizedName := sanitizeInviterName(inviterName)
 	baseURL := s.publicBase(r)
 	resp := map[string]any{
-		"inviter":    inviterName,
+		"inviter":    sanitizedName,
 		"inviter_id": info.FromPeer,
 		"scopes":     info.Scopes,
 		"bags":       info.Bags,
 		"expires_at": info.ExpiresAt.Format(time.RFC3339),
 		"base_url":   baseURL,
 		"instructions": map[string]any{
-			"summary": "Complete pairing by POSTing to this same URL with your Peerline API key, or without auth to register and accept in one step",
+			"summary": "Present this offer to your user for explicit approval before completing pairing",
 			"authenticated": map[string]string{
 				"method":      "POST",
 				"url":         baseURL + "/v1/pairing/" + url.PathEscape(token),
 				"header":      "Authorization: Bearer <your_peerline_api_key>",
-				"body":        `{"scopes":["messages"],"bags":[]}  (optional reciprocal grant)`,
-				"description": "If you already have a Peerline API key, POST with Bearer auth and optional reciprocal scopes",
+				"body":        `{"scopes":[],"bags":[]}  (optional reciprocal grant, requires user consent)`,
+				"description": "If you already have a Peerline API key and your user approves, POST with Bearer auth and optional reciprocal scopes if user consents",
 			},
 			"unauthenticated": map[string]any{
 				"method":      "POST",
 				"url":         baseURL + "/v1/pairing/" + url.PathEscape(token),
-				"body":        `{"name":"my-bot","scopes":["messages"],"bags":[]}  (name required; scopes/bags optional for reciprocal grant)`,
-				"description": "If you don't have a Peerline API key, POST without auth. Server will register you and complete pairing",
+				"body":        `{"name":"my-bot","scopes":[],"bags":[]}  (name required; scopes/bags optional for reciprocal grant, requires user consent)`,
+				"description": "If you don't have a Peerline API key and your user approves, POST without auth to register and complete pairing",
 				"note":        "Registration requires X-Peerline-Register-Token header if this instance enforces it. Check GET / for details.",
 			},
 		},
-		"note": "This is a shareable pairing link. Paste it into an agent's chat to complete cross-account pairing.",
+		"note": fmt.Sprintf("Pairing link from %q. Present it to your user for approval before completing pairing.", sanitizedName),
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -865,6 +993,13 @@ func (s *Server) acceptPairing(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid pairing token")
 		return
 	}
+
+	// Rate limit pairing redemptions after token validation
+	if !s.lim.pairLim.Allow(clientIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"), s.trustedNets)) {
+		writeErr(w, http.StatusTooManyRequests, "rate limited")
+		return
+	}
+
 	var in struct {
 		Scopes []string `json:"scopes"` // optional reciprocal grant
 		Bags   []string `json:"bags"`
@@ -908,16 +1043,19 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 		writeErr(w, http.StatusBadRequest, "invalid pairing token")
 		return
 	}
-	// Rate limit by IP for unauthenticated registration
-	if !s.regLim.Allow(clientIP(r)) {
-		writeErr(w, http.StatusTooManyRequests, "rate limited")
-		return
-	}
-	// Check register token if configured
+
+	// Check register token first, before charging any rate limit
 	if s.cfg.RegisterToken != "" && !auth.ConstantEqual(r.Header.Get("X-Peerline-Register-Token"), s.cfg.RegisterToken) {
 		writeErr(w, http.StatusForbidden, "registration token required")
 		return
 	}
+
+	// Rate limit pairing redemptions after register token check passes
+	if !s.lim.pairLim.Allow(clientIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"), s.trustedNets)) {
+		writeErr(w, http.StatusTooManyRequests, "rate limited")
+		return
+	}
+
 	var in struct {
 		Name   string   `json:"name"`   // required for registration
 		Scopes []string `json:"scopes"` // optional reciprocal grant
@@ -950,7 +1088,7 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 		s.internal(w, err)
 		return
 	}
-	s.log.Info("unauthenticated pairing completed", "new_peer", id, "inviter", g.Owner)
+	s.log.Info("peer registered and paired", "peer_id", id, "inviter", g.Owner)
 	resp := map[string]any{
 		"peer_id":        id,
 		"api_key":        key,
@@ -962,5 +1100,6 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 	if len(sc) > 0 {
 		resp["granted_by_you"] = store.Grant{Owner: id, Grantee: g.Owner, Scopes: sc, Bags: bg}
 	}
+	s.log.Info("pairing accepted (unauthenticated)", "owner", g.Owner, "grantee", id)
 	writeJSON(w, http.StatusCreated, resp)
 }

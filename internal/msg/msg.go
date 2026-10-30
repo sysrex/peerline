@@ -41,11 +41,12 @@ func (in Input) Validate() error {
 
 // Limiter is a token bucket per key (e.g. sender peer id). Zero-alloc enough for v0.
 type Limiter struct {
-	mu      sync.Mutex
-	rate    float64 // tokens per second
-	burst   float64
-	buckets map[string]*bucket
-	now     func() time.Time
+	mu         sync.Mutex
+	rate       float64 // tokens per second
+	burst      float64
+	buckets    map[string]*bucket
+	now        func() time.Time
+	pruneAfter time.Duration
 }
 
 type bucket struct {
@@ -55,12 +56,42 @@ type bucket struct {
 
 // NewLimiter allows `perMinute` events per minute with the given burst.
 func NewLimiter(perMinute, burst int) *Limiter {
-	return &Limiter{rate: float64(perMinute) / 60, burst: float64(burst), buckets: map[string]*bucket{}, now: time.Now}
+	rate := float64(perMinute) / 60
+	// Prune after max(10 minutes, 2 × burst/rate) to avoid resetting slow-but-active buckets
+	pruneAfter := 10 * time.Minute
+	if rate > 0 {
+		minAge := time.Duration(2*float64(burst)/rate) * time.Second
+		if minAge > pruneAfter {
+			pruneAfter = minAge
+		}
+	}
+	return &Limiter{
+		rate:       rate,
+		burst:      float64(burst),
+		buckets:    map[string]*bucket{},
+		now:        time.Now,
+		pruneAfter: pruneAfter,
+	}
 }
 
 // NewLimiterPerHour allows `perHour` events per hour with the given burst.
 func NewLimiterPerHour(perHour, burst int) *Limiter {
-	return &Limiter{rate: float64(perHour) / 3600, burst: float64(burst), buckets: map[string]*bucket{}, now: time.Now}
+	rate := float64(perHour) / 3600
+	// Prune after max(2 hours, 2 × burst/rate)
+	pruneAfter := 2 * time.Hour
+	if rate > 0 {
+		minAge := time.Duration(2*float64(burst)/rate) * time.Second
+		if minAge > pruneAfter {
+			pruneAfter = minAge
+		}
+	}
+	return &Limiter{
+		rate:       rate,
+		burst:      float64(burst),
+		buckets:    map[string]*bucket{},
+		now:        time.Now,
+		pruneAfter: pruneAfter,
+	}
 }
 
 // Allow consumes one token for key; false means rate limited.
@@ -69,6 +100,22 @@ func (l *Limiter) Allow(key string) bool { return l.take(key, true) }
 // Ready reports whether Allow(key) would currently succeed, without consuming.
 // Use it to check several limiters before consuming from any of them.
 func (l *Limiter) Ready(key string) bool { return l.take(key, false) }
+
+// Prune removes buckets that haven't been touched in pruneAfter duration.
+// Call periodically to prevent unbounded memory growth.
+func (l *Limiter) Prune() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	t := l.now()
+	var pruned int
+	for key, b := range l.buckets {
+		if t.Sub(b.last) > l.pruneAfter {
+			delete(l.buckets, key)
+			pruned++
+		}
+	}
+	return pruned
+}
 
 func (l *Limiter) take(key string, consume bool) bool {
 	l.mu.Lock()
