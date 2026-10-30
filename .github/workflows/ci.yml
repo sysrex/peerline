@@ -12,6 +12,10 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Use PR head SHA on pull_request, otherwise GITHUB_SHA (which is the merge ref on PRs)
+  GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
 jobs:
   test:
     name: Build and Test
@@ -20,6 +24,8 @@ jobs:
     steps:
     - name: Check out code
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      with:
+        fetch-depth: 0
       
     - name: Set up Go
       uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5.1.0
@@ -34,8 +40,39 @@ jobs:
           exit 1
         fi
 
-    - name: Build
-      run: go build ./...
+    - name: Build with version info
+      run: |
+        # Use exact tag match or 'dev' (avoid git describe suffixes that leak commit in minimal mode)
+        VERSION="$(git describe --tags --exact-match 2>/dev/null || echo dev)"
+        COMMIT="${GIT_SHA}"
+        BUILD_TIME="$(git show -s --format=%cI ${GIT_SHA} 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+        
+        echo "Building with VERSION=${VERSION} COMMIT=${COMMIT} BUILD_TIME=${BUILD_TIME}"
+        
+        # Validate values (reject spaces, quotes, control chars)
+        for val in "$VERSION" "$COMMIT" "$BUILD_TIME"; do
+          case "$val" in
+            *[!A-Za-z0-9._+:/-]*)
+              echo "ERROR: Invalid build value contains forbidden characters: $val" >&2
+              exit 1
+              ;;
+          esac
+        done
+        
+        go build -ldflags="-X github.com/sysrex/peerline/internal/version.Version=${VERSION} \
+          -X github.com/sysrex/peerline/internal/version.Commit=${COMMIT} \
+          -X github.com/sysrex/peerline/internal/version.BuildTime=${BUILD_TIME}" \
+          -o "$RUNNER_TEMP/peerline" ./cmd/peerline
+
+    - name: Verify version output
+      run: |
+        VERSION_OUTPUT="$("$RUNNER_TEMP/peerline" -version)"
+        echo "Version output: $VERSION_OUTPUT"
+        # Verify it contains the commit SHA
+        if ! echo "$VERSION_OUTPUT" | grep -q "${GIT_SHA}"; then
+          echo "ERROR: Version output does not contain commit SHA ${GIT_SHA}"
+          exit 1
+        fi
 
     - name: Vet
       run: go vet ./...
@@ -82,3 +119,74 @@ jobs:
         tags: peerline:test
         cache-from: type=gha
         cache-to: type=gha,mode=max
+
+  docker-smoke:
+    name: Docker Smoke Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - name: Check out code
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      with:
+        fetch-depth: 0
+
+    - name: Build Docker image with version info
+      run: |
+        VERSION="$(git describe --tags --exact-match 2>/dev/null || echo dev)"
+        COMMIT="${GIT_SHA}"
+        BUILD_TIME="$(git show -s --format=%cI ${GIT_SHA} 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+        
+        echo "Building Docker image with VERSION=${VERSION} COMMIT=${COMMIT} BUILD_TIME=${BUILD_TIME}"
+        
+        docker build \
+          --build-arg VERSION="${VERSION}" \
+          --build-arg COMMIT="${COMMIT}" \
+          --build-arg BUILD_TIME="${BUILD_TIME}" \
+          -t peerline:test .
+
+    - name: Smoke test /version endpoint
+      run: |
+        # Start container with tmpfs for database
+        docker run -d --name peerline-test -p 8787:8787 \
+          --tmpfs /data \
+          -e PEERLINE_ADDR=0.0.0.0:8787 \
+          -e PEERLINE_DB=/data/peerline.db \
+          peerline:test
+        
+        # Wait for startup with readiness polling (max 30s)
+        echo "Waiting for server to be ready..."
+        for i in $(seq 1 30); do
+          if curl -sf http://localhost:8787/healthz > /dev/null 2>&1; then
+            echo "Server ready after ${i}s"
+            break
+          fi
+          if [ "$i" -eq 30 ]; then
+            echo "ERROR: Server did not become ready within 30s"
+            docker logs peerline-test
+            exit 1
+          fi
+          sleep 1
+        done
+        
+        # Test /version endpoint
+        curl -f http://localhost:8787/version || (docker logs peerline-test && exit 1)
+        
+        # Verify response structure (should be version-only by default)
+        VERSION_JSON="$(curl -s http://localhost:8787/version)"
+        echo "Version endpoint response: $VERSION_JSON"
+        
+        # Should have "version" key
+        if ! echo "$VERSION_JSON" | grep -q '"version"'; then
+          echo "ERROR: /version response missing 'version' key"
+          exit 1
+        fi
+        
+        # Should NOT have commit or build_time by default
+        if echo "$VERSION_JSON" | grep -q '"commit"'; then
+          echo "ERROR: /version response should not include 'commit' by default"
+          exit 1
+        fi
+        
+        # Clean up
+        docker stop peerline-test
+        docker rm peerline-test

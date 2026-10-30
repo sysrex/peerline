@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 	"github.com/sysrex/peerline/internal/api"
 	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/store"
+	"github.com/sysrex/peerline/internal/version"
 )
 
 func env(k, def string) string {
@@ -27,18 +29,136 @@ func env(k, def string) string {
 	return def
 }
 
+// parseInt parses an env var as int, returning an error if set but non-numeric.
+// Returns (0, nil) if unset (caller provides default).
+func parseInt(val, name string) (int, error) {
+	if val == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(val)
+	if err != nil {
+		return 0, errors.New(name + " must be numeric, got: " + val)
+	}
+	return n, nil
+}
+
+// parseVersionDetail validates and normalizes PEERLINE_VERSION_DETAIL.
+// Accepts "minimal", "full", or "off" (case-insensitive, whitespace-trimmed).
+// Returns an error for any other value to fail-closed on typos.
+func parseVersionDetail(raw string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(raw))
+	switch normalized {
+	case "minimal", "full", "off":
+		return normalized, nil
+	default:
+		return "", fmt.Errorf("must be 'minimal', 'full', or 'off', got: %q", raw)
+	}
+}
+
 func main() {
+	showVersion := flag.Bool("version", false, "print version and exit")
 	addr := flag.String("addr", env("PEERLINE_ADDR", "127.0.0.1:8787"), "listen address")
 	dbPath := flag.String("db", env("PEERLINE_DB", "peerline.db"), "SQLite database path")
 	flag.Parse()
 
+	if *showVersion {
+		fmt.Println(version.String())
+		os.Exit(0)
+	}
+
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	st, err := store.Open(*dbPath)
+	log.Info("peerline starting", "version", version.String())
+	if version.NeedsAttention() {
+		log.Warn("version information incomplete", "commit", version.Info()["commit"])
+	}
+
+	// Validate PEERLINE_VERSION_DETAIL at startup (fail closed on typos)
+	versionDetail, err := parseVersionDetail(env("PEERLINE_VERSION_DETAIL", "minimal"))
 	if err != nil {
+		log.Error("invalid PEERLINE_VERSION_DETAIL value; must be 'minimal', 'full', or 'off'", "value", env("PEERLINE_VERSION_DETAIL", ""))
+		os.Exit(1)
+	}
+
+	// Parse backup environment variables
+	skipBackup := os.Getenv("PEERLINE_SKIP_MIGRATION_BACKUP") == "1"
+	backupDir := os.Getenv("PEERLINE_BACKUP_DIR")
+	backupKeep := 3
+
+	if keepEnv := os.Getenv("PEERLINE_BACKUP_KEEP"); keepEnv != "" {
+		if n, err := strconv.Atoi(keepEnv); err == nil {
+			if n >= 1 {
+				backupKeep = n
+			} else {
+				log.Warn("PEERLINE_BACKUP_KEEP must be >= 1, using default", "invalid_value", keepEnv, "default", 3)
+			}
+		} else {
+			log.Warn("PEERLINE_BACKUP_KEEP must be a number, using default", "invalid_value", keepEnv, "default", 3)
+		}
+	}
+
+	if skipBackup {
+		log.Warn("PEERLINE_SKIP_MIGRATION_BACKUP is enabled, pre-migration backups are disabled")
+	}
+
+	// Open database with explicit options
+	opts := store.OpenOptions{
+		SkipMigrationBackup:  skipBackup,
+		BackupDir:            backupDir,
+		BackupRetentionCount: backupKeep,
+		Logger:               log,
+	}
+
+	st, err := store.OpenWithOptions(*dbPath, opts)
+	if err != nil {
+		// Check for schema-too-new error and exit with distinct code
+		var tooNewErr *store.ErrSchemaTooNew
+		if errors.As(err, &tooNewErr) {
+			log.Error("database schema version is too new for this binary", "err", err)
+			os.Exit(2)
+		}
+		// Check for schema-invalid error
+		var invalidErr *store.ErrSchemaInvalid
+		if errors.As(err, &invalidErr) {
+			log.Error("database schema version is invalid", "err", err)
+			os.Exit(1)
+		}
 		log.Error("open store", "err", err)
 		os.Exit(1)
 	}
 	defer st.Close()
+
+	// Log schema version, max supported, and backup info on startup
+	backupInfo := "none needed"
+	if bp := st.LastBackupPath(); bp != "" {
+		if st.BackupReused() {
+			backupInfo = "reused " + bp
+		} else {
+			backupInfo = bp
+		}
+	} else if skipBackup {
+		backupInfo = "skipped (opt-out)"
+	}
+	dbBase := filepath.Base(*dbPath)
+	log.Info("database opened",
+		"db", dbBase,
+		"schema_version", st.SchemaVersionInUse(),
+		"max_supported", store.SchemaVersion(),
+		"backup", backupInfo)
+
+	// Load key index at startup (#112)
+	keyIndexWarn, _ := strconv.Atoi(os.Getenv("PEERLINE_KEY_INDEX_WARN"))
+	if keyIndexWarn <= 0 {
+		keyIndexWarn = 1_000_000
+	}
+	n, dur, err := st.LoadKeyIndex(context.Background())
+	if err != nil {
+		log.Error("load key index", "err", err)
+		os.Exit(1)
+	}
+	log.Info("key index loaded", "keys", n, "duration_ms", dur.Milliseconds())
+	if n >= keyIndexWarn {
+		log.Warn("key index size exceeds PEERLINE_KEY_INDEX_WARN", "keys", n, "warn_threshold", keyIndexWarn)
+	}
 
 	regTok := os.Getenv("PEERLINE_REGISTER_TOKEN")
 	if regTok == "" {
@@ -107,6 +227,39 @@ func main() {
 		log.Warn("PEERLINE_CODE_PEPPER unset: confirm-mode short codes use a per-process secret, so pending claims cannot be confirmed across a restart")
 	}
 
+	keyIndexRebuildHours, _ := strconv.Atoi(os.Getenv("PEERLINE_KEY_INDEX_REBUILD_HOURS"))
+	if keyIndexRebuildHours <= 0 {
+		keyIndexRebuildHours = 6 // default
+	}
+
+	// Parse rate limiter config (#96: validate at startup)
+	authFailPerMinute, err := parseInt(os.Getenv("PEERLINE_AUTH_FAIL_PER_MINUTE"), "PEERLINE_AUTH_FAIL_PER_MINUTE")
+	if err != nil {
+		log.Error("invalid rate limiter config", "err", err)
+		os.Exit(1)
+	}
+	authFailBurst, err := parseInt(os.Getenv("PEERLINE_AUTH_FAIL_BURST"), "PEERLINE_AUTH_FAIL_BURST")
+	if err != nil {
+		log.Error("invalid rate limiter config", "err", err)
+		os.Exit(1)
+	}
+	writePerMinute, err := parseInt(os.Getenv("PEERLINE_WRITE_PER_MINUTE"), "PEERLINE_WRITE_PER_MINUTE")
+	if err != nil {
+		log.Error("invalid rate limiter config", "err", err)
+		os.Exit(1)
+	}
+	writeBurst, err := parseInt(os.Getenv("PEERLINE_WRITE_BURST"), "PEERLINE_WRITE_BURST")
+	if err != nil {
+		log.Error("invalid rate limiter config", "err", err)
+		os.Exit(1)
+	}
+
+	log.Info("rate limiter config",
+		"auth_fail_per_minute", authFailPerMinute,
+		"auth_fail_burst", authFailBurst,
+		"write_per_minute", writePerMinute,
+		"write_burst", writeBurst)
+
 	apiServer, err := api.New(st, api.Config{
 		RegisterToken:         regTok,
 		CodePepper:            []byte(os.Getenv("PEERLINE_CODE_PEPPER")),
@@ -118,6 +271,12 @@ func main() {
 		TrustedProxies:        trustedProxies,
 		MaxOutstandingInvites: maxOutstandingInvites,
 		RetentionSeconds:      retentionSeconds,
+		AuthFailPerMinute:     authFailPerMinute,
+		AuthFailBurst:         authFailBurst,
+		WritePerMinute:        writePerMinute,
+		WriteBurst:            writeBurst,
+		KeyIndexRebuildHours:  keyIndexRebuildHours,
+		VersionDetail:         versionDetail,
 		MaxBagsPerPeer:        maxBagsPerPeer,
 		MaxBagBytesPerPeer:    maxBagBytesPerPeer,
 	})

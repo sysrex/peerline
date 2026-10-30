@@ -25,6 +25,7 @@ import (
 	"github.com/sysrex/peerline/internal/msg"
 	"github.com/sysrex/peerline/internal/pair"
 	"github.com/sysrex/peerline/internal/store"
+	"github.com/sysrex/peerline/internal/version"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -34,6 +35,8 @@ const (
 	defaultInviteTTL = 1 * time.Hour
 	maxInviteTTL     = 7 * 24 * time.Hour
 	maxInviteTTLSec  = 604800 // 7 days in seconds, checked before multiplication
+	// deprecationDate is 2026-10-30 00:00:00 UTC, the date query-string code acceptance was deprecated (PR #128).
+	deprecationDate = "@1793318400"
 )
 
 type Config struct {
@@ -68,6 +71,18 @@ type Config struct {
 	// RetentionSeconds is how long (in seconds) to keep used invites before purging.
 	// Default is 30 days (2592000 seconds). Set to 0 for the default.
 	RetentionSeconds int64
+	// AuthFailPerMinute and AuthFailBurst control the per-IP rate limit for
+	// authentication failures (invalid Bearer tokens). Default: 30/min, burst 10.
+	AuthFailPerMinute int
+	AuthFailBurst     int
+	// WritePerMinute and WriteBurst control the per-peer rate limit for
+	// authenticated write operations. Default: 10/min, burst 3.
+	WritePerMinute int
+	WriteBurst     int
+	// KeyIndexRebuildHours is how often to do a full key index rebuild (default: 6).
+	KeyIndexRebuildHours int
+	// VersionDetail controls /version response: "minimal" (version only, default), "full" (+ commit + build_time), "off" (404).
+	VersionDetail string
 	// CodePepper keys the claim short code. Empty = random per process, so codes
 	// change on restart; set PEERLINE_CODE_PEPPER in production.
 	CodePepper []byte
@@ -99,6 +114,11 @@ type Server struct {
 }
 
 func New(st *store.Store, cfg Config) (*Server, error) {
+	// Require loaded key index (#112)
+	if !st.KeyIndexLoaded() {
+		return nil, errors.New("key index not loaded; call LoadKeyIndex before New")
+	}
+
 	if cfg.MsgPerMinute <= 0 {
 		cfg.MsgPerMinute = 30
 	}
@@ -128,6 +148,21 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 	}
 	if cfg.MaxOutstandingInvites <= 0 {
 		cfg.MaxOutstandingInvites = 10
+	}
+	if cfg.AuthFailPerMinute <= 0 {
+		cfg.AuthFailPerMinute = 30
+	}
+	if cfg.AuthFailBurst <= 0 {
+		cfg.AuthFailBurst = 10
+	}
+	if cfg.WritePerMinute <= 0 {
+		cfg.WritePerMinute = 10
+	}
+	if cfg.WriteBurst <= 0 {
+		cfg.WriteBurst = 3
+	}
+	if cfg.KeyIndexRebuildHours <= 0 {
+		cfg.KeyIndexRebuildHours = 6
 	}
 	if len(cfg.CodePepper) == 0 {
 		cfg.CodePepper = []byte(auth.NewSecret("pep_"))
@@ -175,7 +210,7 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 	go s.pruneVerifyLoop()
 
 	// Start maintenance tasks
-	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, cfg.RetentionSeconds)
+	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, cfg.RetentionSeconds, cfg.KeyIndexRebuildHours)
 
 	return s, nil
 }
@@ -220,37 +255,39 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/register", s.register)
 	// Registered on the outer mux so it is not behind Bearer auth. The more
 	// specific pattern wins over the /v1/ subtree below.
+	// Only register /version if not disabled
+	if s.cfg.VersionDetail != "off" {
+		mux.HandleFunc("GET /version", s.rateLimitVersion(s.versionHandler))
+	}
 	mux.HandleFunc("GET /v1/public/stats", s.rateLimitGet(s.publicStats))
 	mux.HandleFunc("GET /v1/guide", s.rateLimitGet(s.guide))
 
 	authed := http.NewServeMux()
 	authed.HandleFunc("GET /v1/me", s.rateLimitAuth(s.me))
-	authed.HandleFunc("PUT /v1/me", s.updateMe)
-	authed.HandleFunc("POST /v1/me/verify-email", s.verifyEmail)
-	authed.HandleFunc("POST /v1/invites", s.createInvite)
+	authed.HandleFunc("PUT /v1/me", s.rateLimitWrite(s.updateMe))
+	authed.HandleFunc("POST /v1/me/verify-email", s.rateLimitWrite(s.verifyEmail))
+	authed.HandleFunc("POST /v1/invites", s.rateLimitWrite(s.createInvite))
 	authed.HandleFunc("GET /v1/invites", s.rateLimitAuth(s.listInvites))
-	authed.HandleFunc("DELETE /v1/invites/{id}", s.deleteInvite)
-	authed.HandleFunc("POST /v1/invites/accept", s.acceptInvite)
+	authed.HandleFunc("DELETE /v1/invites/{id}", s.rateLimitWrite(s.deleteInvite))
+	authed.HandleFunc("POST /v1/invites/accept", s.rateLimitWrite(s.acceptInvite))
 	authed.HandleFunc("GET /v1/grants", s.rateLimitAuth(s.listGrants))
-	authed.HandleFunc("DELETE /v1/grants/{peer_id}", s.revokeGrant)
-	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.sendMessage)
+	authed.HandleFunc("DELETE /v1/grants/{peer_id}", s.rateLimitWrite(s.revokeGrant))
+	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.rateLimitWrite(s.sendMessage))
 	authed.HandleFunc("GET /v1/inbox", s.rateLimitAuth(s.inbox)) // polling-friendly rate limit
 	authed.HandleFunc("GET /v1/bags/{name}", s.rateLimitAuth(s.getBag))
 	authed.HandleFunc("PUT /v1/bags/{name}", s.rateLimitBagWrite(s.putBag))
-	authed.HandleFunc("POST /v1/pairing/{token}", s.acceptPairing) // authenticated pairing acceptance
-	lookup := func(ctx context.Context, h string) (string, error) {
-		p, err := s.st.PeerByKeyHash(ctx, h)
-		if err != nil {
-			return "", err
-		}
-		return p.ID, nil
-	}
-	authMW := auth.Middleware(lookup, authed)
+	authed.HandleFunc("POST /v1/pairing/{token}", s.rateLimitWrite(s.acceptPairing)) // authenticated pairing acceptance
+	authMW := s.authMiddleware(authed)
 	mux.Handle("/v1/", authMW)
-	s.claimRoutes(mux, func(h http.Handler) http.Handler { return auth.Middleware(lookup, h) })
+	s.claimRoutes(mux, func(h http.Handler) http.Handler { return s.authMiddleware(h) })
 	// The emailed accept link: only unauthenticated GET shows instructions.
 	// Authenticated GET returns 405; only POST accepts the invite.
 	mux.HandleFunc("GET /v1/invites/accept", func(w http.ResponseWriter, r *http.Request) {
+		// RFC 9745 deprecation headers when ?code= is in the URL (issue #173).
+		if r.URL.Query().Get("code") != "" {
+			w.Header().Set("Deprecation", deprecationDate)
+			w.Header().Set("Link", `<https://github.com/sysrex/peerline#email-invites>; rel="deprecation"; type="text/html"`)
+		}
 		if r.Header.Get("Authorization") != "" {
 			w.Header().Set("Allow", "POST")
 			writeErr(w, http.StatusMethodNotAllowed, "use POST to accept the invite")
@@ -268,6 +305,52 @@ func (s *Server) Handler() http.Handler {
 		s.acceptPairingUnauthenticated(w, r)
 	})
 	return securityHeaders(mux)
+}
+
+// ---- auth middleware ----
+
+// authMiddleware enforces Bearer auth via the in-memory key index (#112).
+// Malformed Bearer headers get 401 and are never charged.
+// Valid-format keys are looked up in the index:
+//   - Hit: request gets peer_id and proceeds to per-peer rate limits.
+//   - Miss: charges per-IP failLim and returns 401, or 429 with Retry-After if over limit.
+//
+// No store lookup happens for a miss.
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok, ok := auth.BearerToken(r)
+		if !ok || !strings.HasPrefix(tok, auth.KeyPrefix) {
+			// Malformed Bearer: 401, no rate limit charge
+			unauthorized(w)
+			return
+		}
+
+		// Lookup in key index
+		keyHash := auth.Hash(tok)
+		peerID, found := s.st.KeyIndexLookup(keyHash)
+		if found {
+			// Hit: proceed with peer_id
+			next.ServeHTTP(w, r.WithContext(auth.WithPeer(r.Context(), peerID)))
+			return
+		}
+
+		// Miss: charge per-IP fail limiter
+		ip := clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets)
+		key := rateLimitKey(ip)
+		if !s.lim.failLim.Allow(key) {
+			w.Header().Set("Retry-After", "60")
+			writeErr(w, http.StatusTooManyRequests, "rate limited")
+			return
+		}
+		unauthorized(w)
+	})
+}
+
+func unauthorized(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Bearer realm="peerline"`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	w.Write([]byte(`{"error":"unauthorized"}`))
 }
 
 // ---- helpers ----
@@ -982,6 +1065,7 @@ var inviteCodeRE = regexp.MustCompile(`^inv_[A-Za-z0-9_-]{16,64}$`)
 func (s *Server) acceptLanding(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	if !inviteCodeRE.MatchString(code) {
 		w.WriteHeader(http.StatusBadRequest)
 		io.WriteString(w, "Peerline: missing or malformed invite code.\n")
@@ -1010,14 +1094,18 @@ func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	q := r.URL.Query()
-	queryOnlyCode := false
+	hasQueryCode := q.Get("code") != ""
+	// RFC 9745 deprecation headers when ?code= is in the URL (issue #173).
+	// Set before validation so all responses on this path carry them.
+	// TODO: confirm-mode invites (#3) will return 404 on this path.
+	if hasQueryCode {
+		w.Header().Set("Deprecation", deprecationDate)
+		w.Header().Set("Link", `<https://github.com/sysrex/peerline#email-invites>; rel="deprecation"; type="text/html"`)
+	}
 	if qc := q.Get("code"); qc != "" {
 		if in.Code != "" && in.Code != qc {
 			writeErr(w, http.StatusBadRequest, "code in body and query differ")
 			return
-		}
-		if in.Code == "" {
-			queryOnlyCode = true
 		}
 		in.Code = qc
 	}
@@ -1043,12 +1131,7 @@ func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
-	// RFC 9745 deprecation headers for query-string-only code path (legacy).
-	// TODO: confirm-mode invites (#3) will return 404 on this path.
-	if queryOnlyCode {
-		w.Header().Set("Deprecation", "@1767225600") // 2026-01-01 00:00:00 UTC
-		w.Header().Set("Link", `<https://github.com/sysrex/peerline#email-invites>; rel="deprecation"; type="text/html"`)
-	}
+	w.Header().Set("Cache-Control", "no-store")
 	resp := map[string]any{"peer_id": g.Owner, "granted_to_you": g}
 	if len(sc) > 0 {
 		resp["granted_by_you"] = store.Grant{Owner: me, Grantee: g.Owner, Scopes: sc, Bags: bg}
@@ -1621,4 +1704,30 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 		resp["granted_by_you"] = store.Grant{Owner: id, Grantee: g.Owner, Scopes: sc, Bags: bg}
 	}
 	writeJSON(w, http.StatusCreated, resp)
+}
+
+// versionHandler serves build version information.
+// This is a public endpoint (no auth) that respects the configured VersionDetail level:
+// "minimal" (default) returns only the version, "full" includes commit and build_time.
+// "off" is handled by not registering the route at all.
+func (s *Server) versionHandler(w http.ResponseWriter, r *http.Request) {
+	detail := s.cfg.VersionDetail
+	if detail == "" || detail == "minimal" {
+		detail = "minimal"
+	} else if detail != "full" {
+		// Unknown values fall back to minimal (fail-closed)
+		detail = "minimal"
+	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	info := version.Info()
+	resp := map[string]string{"version": info["version"]}
+	if detail == "full" {
+		resp["commit"] = version.ShortCommit()
+		resp["build_time"] = info["build_time"]
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }

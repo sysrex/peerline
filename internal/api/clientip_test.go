@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net"
@@ -374,6 +375,9 @@ func TestRateLimitGetWithMultipleXFFHeaders(t *testing.T) {
 		MsgPerMinute:   10,
 		MsgBurst:       10,
 	}
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	srv, err := New(st, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -493,6 +497,9 @@ func TestRateLimitGetRightmostKeying(t *testing.T) {
 		MsgPerMinute:   10,
 		MsgBurst:       10,
 	}
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	srv, err := New(st, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -576,6 +583,9 @@ func TestUntrustedDirectPeer(t *testing.T) {
 		MsgPerMinute:   10,
 		MsgBurst:       10,
 	}
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	srv, err := New(st, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -650,6 +660,9 @@ func TestClientIPAtMultipleCallSites(t *testing.T) {
 		MsgPerMinute:   10,
 		MsgBurst:       10,
 	}
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	srv, err := New(st, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -709,6 +722,9 @@ func TestNewWithInvalidProxyConfig(t *testing.T) {
 			cfg := Config{
 				TrustedProxies: tt.trustedProxies,
 			}
+			if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+				t.Fatal(err)
+			}
 			_, err := New(st, cfg)
 			if err == nil {
 				t.Error("New() succeeded with invalid proxy config, want error")
@@ -737,6 +753,9 @@ func TestNoRequestPanicAfterValidConfig(t *testing.T) {
 	for _, proxies := range validConfigs {
 		cfg := Config{
 			TrustedProxies: proxies,
+		}
+		if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+			t.Fatal(err)
 		}
 		srv, err := New(st, cfg)
 		if err != nil {
@@ -797,6 +816,9 @@ func TestTrustedProxiesStartupLogging(t *testing.T) {
 			cfg := Config{
 				TrustedProxies: tt.trustedProxies,
 				Logger:         logger,
+			}
+			if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+				t.Fatal(err)
 			}
 			srv, err := New(st, cfg)
 			if err != nil {

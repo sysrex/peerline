@@ -266,8 +266,11 @@ type LimiterManager struct {
 	msgLim        *msg.Limiter
 	regLim        *msg.Limiter
 	pairLim       *msg.Limiter
+	failLim       *msg.Limiter // Failed auth lookups (per-IP)
 	getLim        *msg.Limiter
+	versionLim    *msg.Limiter // Dedicated limiter for /version
 	authLim       *msg.Limiter
+	writeLim      *msg.Limiter // Authenticated write operations (per-peer)
 	bagWriteLim   *msg.Limiter // Bag PUTs, keyed by authenticated caller (never the bag owner)
 	mailLim       *msg.Limiter
 	rcptLim       *msg.Limiter
@@ -295,8 +298,11 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 		msgLim:        msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst, clk),
 		regLim:        msg.NewLimiter(10, 5, clk),
 		pairLim:       msg.NewLimiter(10, 5, clk),
+		failLim:       msg.NewLimiter(cfg.AuthFailPerMinute, cfg.AuthFailBurst, clk),
 		getLim:        msg.NewLimiter(getPerMinute, getBurst, clk),
+		versionLim:    msg.NewLimiter(120, 30, clk), // Separate limiter for /version to avoid monitor conflicts
 		authLim:       msg.NewLimiter(authGetPerMinute, authGetBurst, clk),
+		writeLim:      msg.NewLimiter(cfg.WritePerMinute, cfg.WriteBurst, clk),
 		bagWriteLim:   msg.NewLimiter(30, 10, clk),
 		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst, clk),
 		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour, clk),
@@ -318,9 +324,10 @@ func (lm *LimiterManager) all() []*msg.Limiter {
 		lm.msgLim,
 		lm.regLim,
 		lm.pairLim,
-		lm.bagWriteLim,
+		lm.failLim,
 		lm.getLim,
 		lm.authLim,
+		lm.writeLim,
 		lm.bagWriteLim,
 		lm.mailLim,
 		lm.rcptLim,

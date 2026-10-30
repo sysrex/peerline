@@ -8,6 +8,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -22,11 +27,99 @@ var ErrTooManyInvites = errors.New("too many outstanding invites")
 var ErrBagLimitExceeded = errors.New("bag limit exceeded")
 var ErrStorageQuotaExceeded = errors.New("storage quota exceeded")
 
+// ErrSchemaTooNew is returned when the database schema version is newer than this binary supports.
+type ErrSchemaTooNew struct {
+	Have int
+	Max  int
+}
+
+func (e *ErrSchemaTooNew) Error() string {
+	return fmt.Sprintf("database schema version %d is newer than this binary supports (max %d); upgrade the peerline binary or restore from backup", e.Have, e.Max)
+}
+
+// ErrSchemaInvalid is returned when the database schema version is negative or otherwise invalid.
+type ErrSchemaInvalid struct {
+	Have int
+}
+
+func (e *ErrSchemaInvalid) Error() string {
+	return fmt.Sprintf("database schema version %d is invalid (must be >= 0)", e.Have)
+}
+
 var memDBCounter uint64
 
 type Store struct {
-	db  *sql.DB
+	db                 *sql.DB
+	now                func() int64
+	schemaVersionInUse int
+	lastBackupPath     string
+	backupReused       bool
+	keyIndex           *keyIndex
+	keyIndexLoaded     bool
+}
+
+// migrations is the ordered list of schema migration functions.
+// SchemaVersion() returns len(migrations).
+var migrations = []func(*sql.Tx) error{
+	migrateV1NotifyEmail,
+	migrateV2PairingTokenHash,
+	migrateV3InvitePublicID,
+	migrateV4EmailVerification,
+	migrateV5InviteClaimState,
+	migrateV6ClaimOffer,
+}
+
+// SchemaVersion returns the maximum schema version this binary supports.
+func SchemaVersion() int {
+	return len(migrations)
+}
+
+// SchemaVersionInUse returns the schema version this Store is using.
+func (s *Store) SchemaVersionInUse() int {
+	return s.schemaVersionInUse
+}
+
+// LastBackupPath returns the base name of the last backup created or reused, or "" if none.
+func (s *Store) LastBackupPath() string {
+	if s.lastBackupPath == "" {
+		return ""
+	}
+	return filepath.Base(s.lastBackupPath)
+}
+
+// BackupReused returns true if the last backup was reused from a previous attempt.
+func (s *Store) BackupReused() bool {
+	return s.backupReused
+}
+
+// OpenOptions configures Open behavior.
+type OpenOptions struct {
+	// SkipMigrationBackup skips the pre-migration VACUUM INTO backup when true.
+	// Set via PEERLINE_SKIP_MIGRATION_BACKUP=1 or pass explicitly for tests.
+	SkipMigrationBackup bool
+
+	// BackupDir overrides the directory where migration backups are written.
+	// Defaults to the database's directory.
+	BackupDir string
+
+	// BackupRetentionCount limits the number of migration backups to keep (oldest are deleted).
+	// Minimum 1, defaults to 3. Invalid values log a warning and use 3.
+	BackupRetentionCount int
+
+	// Logger for warnings and info messages. Defaults to slog.Default().
+	Logger *slog.Logger
+
+	// vacuumInto is an injectable hook for testing. If nil, uses db.Exec("VACUUM INTO ?", path).
+	vacuumInto func(db *sql.DB, backupPath string) error
+
+	// now is an injectable clock for testing. If nil, uses time.Now().Unix().
+	// Used for backup timestamps and other time-based operations.
 	now func() int64
+
+	// migrationStepHook is an injectable hook for testing migration step failures.
+	// Called before each migration step with (targetVersion, currentVersion). If it returns
+	// an error, the step is skipped and the error is returned.
+	migrationStepHook func(target, current int) error
 }
 
 const schema = `
@@ -84,28 +177,82 @@ CREATE INDEX IF NOT EXISTS invites_expires_at ON invites(expires_at);
 // Open opens the database at path, applies migrations, and returns a Store.
 // Use ":memory:" for tests. It is the only Store constructor; a zero-value Store{} has a nil now func and must not be used directly.
 func Open(path string) (*Store, error) {
+	keepEnv := os.Getenv("PEERLINE_BACKUP_KEEP")
+	var keep int
+	if keepEnv != "" {
+		fmt.Sscanf(keepEnv, "%d", &keep)
+	}
+	if keep < 1 {
+		if keepEnv != "" && keep != 0 {
+			slog.Default().Warn("PEERLINE_BACKUP_KEEP invalid or zero, using default 3", "value", keepEnv)
+		}
+		keep = 3
+	}
+
+	opts := OpenOptions{
+		SkipMigrationBackup:  os.Getenv("PEERLINE_SKIP_MIGRATION_BACKUP") == "1",
+		BackupDir:            os.Getenv("PEERLINE_BACKUP_DIR"),
+		BackupRetentionCount: keep,
+		Logger:               slog.Default(),
+	}
+	return OpenWithOptions(path, opts)
+}
+
+// OpenWithOptions opens the database with custom options.
+func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
+	}
+	if opts.BackupRetentionCount < 1 {
+		opts.Logger.Warn("BackupRetentionCount < 1, using 3", "value", opts.BackupRetentionCount)
+		opts.BackupRetentionCount = 3
+	}
+
 	dsn := buildDSN(path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1) // SQLite: serialize writers, avoids SQLITE_BUSY; keeps :memory: on one conn
+	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
-	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("read user_version: %w", err)
-	}
-	if err := checkVersion(version); err != nil {
+
+	// Guard: check version BEFORE executing schema
+	currentVersion, err := checkSchemaVersion(db)
+	if err != nil {
 		db.Close()
 		return nil, err
 	}
+
+	// Check if database is empty BEFORE executing schema
+	isEmpty, err := isDatabaseEmpty(db)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("check if database is empty: %w", err)
+	}
+
+	var backupPath string
+	var reused bool
+	if currentVersion < SchemaVersion() && !opts.SkipMigrationBackup && !isEmpty {
+		backupPath, reused, err = backupBeforeMigration(db, path, currentVersion, SchemaVersion(), opts)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("migrate: %w", err)
+		}
+	}
+
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
 	}
-	if err := migrate(db); err != nil {
+
+	nowFunc := opts.now
+	if nowFunc == nil {
+		nowFunc = func() int64 { return time.Now().Unix() }
+	}
+
+	schemaInUse, err := runMigrations(db, currentVersion, opts)
+	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
@@ -117,7 +264,15 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("backfill invite public_id: %w", err)
 	}
-	return &Store{db: db, now: func() int64 { return time.Now().Unix() }}, nil
+
+	return &Store{
+		db:                 db,
+		now:                nowFunc,
+		schemaVersionInUse: schemaInUse,
+		lastBackupPath:     backupPath,
+		backupReused:       reused,
+		keyIndex:           newKeyIndex(),
+	}, nil
 }
 
 func buildDSN(path string) string {
@@ -133,23 +288,6 @@ func buildDSN(path string) string {
 		sep = "&"
 	}
 	return path + sep + pragmas
-}
-
-var migrations = []func(*sql.Tx) error{
-	migrateV1NotifyEmail,
-	migrateV2PairingTokenHash,
-	migrateV3InvitePublicID,
-	migrateV4EmailVerification,
-	migrateV5InviteClaimState,
-	migrateV6ClaimOffer,
-}
-
-// checkVersion refuses any user_version this binary cannot account for.
-func checkVersion(v int) error {
-	if v < 0 || v > len(migrations) {
-		return fmt.Errorf("database schema version %d is not supported (this binary supports 0-%d)", v, len(migrations))
-	}
-	return nil
 }
 
 func backfillNullPublicIDs(db *sql.DB) error {
@@ -200,33 +338,348 @@ func checkSchemaShape(db *sql.DB) error {
 }
 
 // migrate applies ordered, idempotent schema upgrades tracked by PRAGMA user_version.
-func migrate(db *sql.DB) error {
-	for i, mig := range migrations {
-		target := i + 1
-		if err := runMigrationStep(db, target, mig); err != nil {
-			return err
-		}
+// checkSchemaVersion reads user_version and validates it's not too new or invalid.
+func checkSchemaVersion(db *sql.DB) (int, error) {
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return 0, fmt.Errorf("read user_version: %w", err)
 	}
+	if version < 0 {
+		return 0, &ErrSchemaInvalid{Have: version}
+	}
+	maxKnown := SchemaVersion()
+	if version > maxKnown {
+		return 0, &ErrSchemaTooNew{Have: version, Max: maxKnown}
+	}
+	return version, nil
+}
+
+// isDatabaseEmpty checks if the database has no user tables (schema not yet applied).
+func isDatabaseEmpty(db *sql.DB) (bool, error) {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count == 0, nil
+}
+
+// setupBackupDir ensures the backup directory exists with 0700 permissions and refuses group/world-writable dirs.
+func setupBackupDir(dir string, logger *slog.Logger) error {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("create backup directory: %w", err)
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("stat backup directory: %w", err)
+	}
+
+	perm := info.Mode().Perm()
+	if perm&0077 != 0 {
+		dirBase := filepath.Base(dir)
+		return fmt.Errorf("backup directory %q is group- or world-writable (mode %04o); fix permissions to 0700", dirBase, perm)
+	}
+
 	return nil
 }
 
+// runMigrations applies pending migrations and returns the resulting schema version.
+func runMigrations(db *sql.DB, currentVersion int, opts OpenOptions) (int, error) {
+	maxKnownVersion := SchemaVersion()
+	if currentVersion >= maxKnownVersion {
+		return currentVersion, nil
+	}
+	for i, mig := range migrations {
+		if err := runMigrationStep(db, i+1, mig, maxKnownVersion, opts); err != nil {
+			return 0, err
+		}
+	}
+	return checkSchemaVersion(db)
+}
+
+// backupSuffixRE matches the timestamp (and optional PID) suffix of backups we create.
+const backupSuffixRE = `\.\d{8}-\d{6}\.\d{6}(\.\d+)?$`
+
+// backupBeforeMigration creates a VACUUM INTO backup of the database before applying migrations.
+// For :memory: databases or brand-new databases, no backup is taken.
+// Returns (backupPath, reused, error).
+func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targetVersion int, opts OpenOptions) (string, bool, error) {
+	var dbPath string
+	err := db.QueryRow(`SELECT file FROM pragma_database_list() WHERE name='main'`).Scan(&dbPath)
+	if err != nil {
+		return "", false, fmt.Errorf("get database path: %w", err)
+	}
+
+	// Skip backup for in-memory databases
+	if dbPath == "" {
+		return "", false, nil
+	}
+
+	// Use explicit path if provided, otherwise use discovered path
+	if explicitPath != "" && explicitPath != ":memory:" {
+		dbPath = explicitPath
+	}
+
+	// Determine backup directory
+	backupDir := opts.BackupDir
+	if backupDir == "" {
+		backupDir = filepath.Dir(dbPath)
+	}
+
+	if err := setupBackupDir(backupDir, opts.Logger); err != nil {
+		return "", false, err
+	}
+
+	dbBase := filepath.Base(dbPath)
+
+	// Check for existing backup matching this migration
+	pattern := regexp.MustCompile(`^` + regexp.QuoteMeta(dbBase) + `\.pre-v` + fmt.Sprintf("%d", targetVersion) + `-from-v` + fmt.Sprintf("%d", currentVersion) + backupSuffixRE)
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		return "", false, fmt.Errorf("read backup directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		if pattern.MatchString(entry.Name()) {
+			existingBackup := filepath.Join(backupDir, entry.Name())
+
+			// Check if backup is newer than both DB and WAL
+			backupInfo, err := os.Stat(existingBackup)
+			if err != nil {
+				continue
+			}
+
+			dbInfo, err := os.Stat(dbPath)
+			if err != nil {
+				continue
+			}
+
+			walPath := dbPath + "-wal"
+			walInfo, err := os.Stat(walPath)
+			walExists := err == nil
+
+			backupNewer := backupInfo.ModTime().After(dbInfo.ModTime())
+			if walExists {
+				backupNewer = backupNewer && backupInfo.ModTime().After(walInfo.ModTime())
+			}
+
+			if backupNewer {
+				// Verify backup integrity
+				if err := verifyBackup(existingBackup, currentVersion); err != nil {
+					opts.Logger.Warn("existing backup failed verification, creating new backup", "backup", filepath.Base(existingBackup), "error", err.Error())
+					continue
+				}
+
+				opts.Logger.Info("reusing existing pre-migration backup", "backup", filepath.Base(existingBackup))
+				return existingBackup, true, nil
+			}
+		}
+	}
+
+	// Create new backup
+	nowFunc := opts.now
+	if nowFunc == nil {
+		nowFunc = func() int64 { return time.Now().Unix() }
+	}
+	timestamp := time.Unix(nowFunc(), 0).UTC().Format("20060102-150405.000000")
+	backupName := fmt.Sprintf("%s.pre-v%d-from-v%d.%s", dbBase, targetVersion, currentVersion, timestamp)
+	backupPath := filepath.Join(backupDir, backupName)
+	if _, err := os.Lstat(backupPath); err == nil {
+		backupPath = fmt.Sprintf("%s.%d", backupPath, os.Getpid())
+	}
+
+	// Check available disk space
+	if err := checkDiskSpace(db, backupDir, opts.Logger); err != nil {
+		return "", false, err
+	}
+
+	// Execute VACUUM INTO
+	vacuumFunc := opts.vacuumInto
+	if vacuumFunc == nil {
+		vacuumFunc = func(db *sql.DB, path string) error {
+			_, err := db.Exec(`VACUUM INTO ?`, path)
+			return err
+		}
+	}
+
+	if err := vacuumFunc(db, backupPath); err != nil {
+		// Clean up partial backup
+		os.Remove(backupPath)
+		return "", false, fmt.Errorf("VACUUM INTO backup: %w", err)
+	}
+
+	if err := os.Chmod(backupPath, 0600); err != nil {
+		os.Remove(backupPath)
+		return "", false, fmt.Errorf("chmod backup: %w", err)
+	}
+
+	// Fsync the backup file
+	if err := fsyncFile(backupPath, opts.Logger); err != nil {
+		opts.Logger.Warn("backup fsync failed", "backup", filepath.Base(backupPath), "error", err.Error())
+	}
+
+	// Verify backup
+	if err := verifyBackup(backupPath, currentVersion); err != nil {
+		os.Remove(backupPath)
+		return "", false, fmt.Errorf("backup verification failed: %w", err)
+	}
+
+	// Enforce retention policy
+	if err := enforceBackupRetention(backupDir, dbBase, backupPath, opts.BackupRetentionCount, opts.Logger); err != nil {
+		opts.Logger.Warn("backup retention cleanup failed", "error", err.Error())
+	}
+
+	return backupPath, false, nil
+}
+
+// verifyBackup runs basic checks on a backup file.
+func verifyBackup(backupPath string, expectedVersion int) error {
+	db, err := sql.Open("sqlite", backupPath+"?mode=ro")
+	if err != nil {
+		return fmt.Errorf("open backup: %w", err)
+	}
+	defer db.Close()
+
+	// Quick check
+	var ok string
+	if err := db.QueryRow(`PRAGMA quick_check`).Scan(&ok); err != nil {
+		return fmt.Errorf("quick_check: %w", err)
+	}
+	if ok != "ok" {
+		return fmt.Errorf("quick_check returned %q", ok)
+	}
+
+	// Check version matches
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return fmt.Errorf("read user_version: %w", err)
+	}
+	if version != expectedVersion {
+		return fmt.Errorf("backup user_version %d != expected %d", version, expectedVersion)
+	}
+
+	// Check peers table is queryable (absent in databases predating the schema)
+	var hasPeers int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='peers'`).Scan(&hasPeers); err != nil {
+		return fmt.Errorf("check peers table: %w", err)
+	}
+	if hasPeers > 0 {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM peers`).Scan(&count); err != nil {
+			return fmt.Errorf("query peers table: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// enforceBackupRetention deletes old backups, keeping at most keepCount total (including excludePath).
+func enforceBackupRetention(backupDir, dbBase, excludePath string, keepCount int, logger *slog.Logger) error {
+	pattern := regexp.MustCompile(`^` + regexp.QuoteMeta(dbBase) + `\.pre-v\d+-from-v\d+` + backupSuffixRE)
+
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		return fmt.Errorf("read backup directory: %w", err)
+	}
+
+	type backupInfo struct {
+		path    string
+		modTime time.Time
+	}
+	var backups []backupInfo
+
+	for _, entry := range entries {
+		if pattern.MatchString(entry.Name()) {
+			fullPath := filepath.Join(backupDir, entry.Name())
+			if fullPath == excludePath {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			backups = append(backups, backupInfo{path: fullPath, modTime: info.ModTime()})
+		}
+	}
+
+	// Sort by mtime, newest first
+	sort.Slice(backups, func(i, j int) bool {
+		return backups[i].modTime.After(backups[j].modTime)
+	})
+
+	// Keep keepCount-1 others (total including excluded == keepCount)
+	toKeep := keepCount - 1
+	if toKeep < 0 {
+		toKeep = 0
+	}
+
+	for i := toKeep; i < len(backups); i++ {
+		if err := os.Remove(backups[i].path); err != nil {
+			logger.Warn("failed to delete old backup", "backup", filepath.Base(backups[i].path), "error", err.Error())
+		}
+	}
+
+	return nil
+}
+
+// checkDiskSpace checks if there's enough disk space for a backup (approximate).
+func checkDiskSpace(db *sql.DB, targetDir string, logger *slog.Logger) error {
+	var pageCount, pageSize int64
+	if err := db.QueryRow(`PRAGMA page_count`).Scan(&pageCount); err != nil {
+		return fmt.Errorf("read page_count: %w", err)
+	}
+	if err := db.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
+		return fmt.Errorf("read page_size: %w", err)
+	}
+
+	dbSize := pageCount * pageSize
+
+	avail, ok, err := availableDiskSpace(targetDir)
+	if !ok || err != nil {
+		logger.Warn("could not check available disk space", "error", fmt.Sprintf("%v", err))
+		return nil // Non-fatal, continue
+	}
+
+	if avail < uint64(dbSize) {
+		return fmt.Errorf("insufficient disk space: need ~%d bytes, available %d bytes", dbSize, avail)
+	}
+
+	return nil
+}
+
+// fsyncFile fsyncs a file to ensure durability.
+func fsyncFile(path string, logger *slog.Logger) error {
+	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
 // runMigrationStep runs a single migration step in its own transaction.
-func runMigrationStep(db *sql.DB, target int, mig func(*sql.Tx) error) error {
+func runMigrationStep(db *sql.DB, target int, mig func(*sql.Tx) error, maxKnownVersion int, opts OpenOptions) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin migration v%d: %w", target, err)
 	}
 	defer tx.Rollback()
 
-	// Read user_version inside tx to ensure consistent view
+	// Re-check version inside tx
 	var version int
 	if err := tx.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return fmt.Errorf("read user_version in migration v%d: %w", target, err)
 	}
 
-	if err := checkVersion(version); err != nil {
-		return err
+	// Validate version
+	if version < 0 {
+		return &ErrSchemaInvalid{Have: version}
 	}
+	if version > maxKnownVersion {
+		return &ErrSchemaTooNew{Have: version, Max: maxKnownVersion}
+	}
+
 	if version >= target {
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit migration v%d skip: %w", target, err)
@@ -234,7 +687,13 @@ func runMigrationStep(db *sql.DB, target int, mig func(*sql.Tx) error) error {
 		return nil
 	}
 
-	// Run migration step on tx (not db) to avoid deadlock with MaxOpenConns=1
+	// Call hook if provided
+	if opts.migrationStepHook != nil {
+		if err := opts.migrationStepHook(target, version); err != nil {
+			return err
+		}
+	}
+
 	if err := mig(tx); err != nil {
 		return fmt.Errorf("migration v%d: %w", target, err)
 	}
@@ -484,6 +943,10 @@ func (s *Store) CreatePeer(ctx context.Context, id, name, keyHash, notifyEmail, 
 	verified := 0
 	_, err := s.db.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email,notify_email_verified,notify_email_token) VALUES(?,?,?,?,?,?,?)`,
 		id, name, keyHash, s.now(), notifyEmail, verified, notifyToken)
+	if err == nil {
+		// Add to key index after successful insert
+		s.keyIndex.add(keyHash, id)
+	}
 	return err
 }
 
@@ -1078,6 +1541,10 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+
+	// Add to key index after successful commit
+	s.keyIndex.add(keyHash, peerID)
+
 	return grant, nil
 }
 
@@ -1326,3 +1793,8 @@ func (s *Store) PutBag(ctx context.Context, owner, name string, content []byte, 
 	}
 	return next, tx.Commit()
 }
+
+// ---- Key Index (#112) ----
+
+// LoadKeyIndex loads all active API key hashes from the peers table into memory.
+// Must be called once at startup before serving requests.
