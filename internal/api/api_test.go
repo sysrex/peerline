@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
+	"html/template"
 	"io"
 	"log/slog"
 	"net"
@@ -1286,8 +1288,9 @@ func TestCSPHomePageNonce(t *testing.T) {
 		t.Fatalf("no nonce found in CSP: %s", csp)
 	}
 
-	// Verify the nonce appears in both the style and script tags
-	html := string(body)
+	// Unescape HTML entities in body before checking nonces
+	// (html/template escapes '+' to '&#43;' in attributes)
+	html := html.UnescapeString(string(body))
 	expectedStyle := `<style nonce="` + nonce + `">`
 	expectedScript := `<script nonce="` + nonce + `">`
 
@@ -1308,6 +1311,123 @@ func TestCSPHomePageNonce(t *testing.T) {
 	// Verify CSP includes connect-src for fetch() calls
 	if !strings.Contains(csp, "connect-src 'self'") {
 		t.Errorf("CSP missing connect-src 'self': %s", csp)
+	}
+
+	// Verify the style body starts with :root and script body starts with (function
+	styleStart := strings.Index(html, `<style nonce="`+nonce+`">`)
+	if styleStart == -1 {
+		t.Fatal("style tag not found")
+	}
+	styleEnd := strings.Index(html[styleStart:], `</style>`)
+	if styleEnd == -1 {
+		t.Fatal("style closing tag not found")
+	}
+	styleBody := html[styleStart+len(`<style nonce="`+nonce+`">`) : styleStart+styleEnd]
+	styleBody = strings.TrimSpace(styleBody)
+	if !strings.HasPrefix(styleBody, ":root") {
+		previewLen := 50
+		if len(styleBody) < previewLen {
+			previewLen = len(styleBody)
+		}
+		t.Errorf("style body should start with ':root', got: %q", styleBody[:previewLen])
+	}
+
+	scriptStart := strings.Index(html, `<script nonce="`+nonce+`">`)
+	if scriptStart == -1 {
+		t.Fatal("script tag not found")
+	}
+	scriptEnd := strings.Index(html[scriptStart:], `</script>`)
+	if scriptEnd == -1 {
+		t.Fatal("script closing tag not found")
+	}
+	scriptBody := html[scriptStart+len(`<script nonce="`+nonce+`">`) : scriptStart+scriptEnd]
+	scriptBody = strings.TrimSpace(scriptBody)
+	if !strings.HasPrefix(scriptBody, "(function") {
+		previewLen := 50
+		if len(scriptBody) < previewLen {
+			previewLen = len(scriptBody)
+		}
+		t.Errorf("script body should start with '(function', got: %q", scriptBody[:previewLen])
+	}
+}
+
+func TestCSPNonceWithSpecialChars(t *testing.T) {
+	// Deterministic test with a nonce containing '+', '/', and '='
+	// to verify html/template escaping doesn't break the page
+	fixedNonce := "ab+c/d=="
+
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Execute template with fixed nonce
+	var buf bytes.Buffer
+	stats := store.Stats{Peers: 0, Messages: 0, Grants: 0, Bags: 0}
+	statsJSON, _ := json.Marshal(stats)
+
+	err = homeTmpl.Execute(&buf, homeData{
+		BaseURL:      "http://localhost",
+		RegisterOpen: true,
+		Nonce:        fixedNonce,
+		StatsJSON:    template.JS(statsJSON),
+		Stats:        stats,
+	})
+	if err != nil {
+		t.Fatalf("template execution failed: %v", err)
+	}
+
+	rendered := buf.String()
+	unescaped := html.UnescapeString(rendered)
+
+	// Verify tags contain the nonce exactly (after unescaping)
+	expectedStyleTag := `<style nonce="` + fixedNonce + `">`
+	expectedScriptTag := `<script nonce="` + fixedNonce + `">`
+
+	if !strings.Contains(unescaped, expectedStyleTag) {
+		t.Errorf("unescaped HTML missing style tag with nonce: want %q", expectedStyleTag)
+		// Show what we got around where it should be
+		if idx := strings.Index(unescaped, "<style"); idx >= 0 {
+			end := idx + 50
+			if end > len(unescaped) {
+				end = len(unescaped)
+			}
+			t.Errorf("found instead: %q", unescaped[idx:end])
+		}
+	}
+
+	if !strings.Contains(unescaped, expectedScriptTag) {
+		t.Errorf("unescaped HTML missing script tag with nonce: want %q", expectedScriptTag)
+		// Show what we got around where it should be (skip the JSON script block)
+		startSearch := strings.Index(unescaped, "</section>")
+		if startSearch >= 0 {
+			if idx := strings.Index(unescaped[startSearch:], "<script"); idx >= 0 {
+				idx += startSearch
+				end := idx + 50
+				if end > len(unescaped) {
+					end = len(unescaped)
+				}
+				t.Errorf("found instead: %q", unescaped[idx:end])
+			}
+		}
+	}
+
+	// Verify no stray '>' after the tags
+	styleTagStart := strings.Index(unescaped, expectedStyleTag)
+	if styleTagStart >= 0 {
+		afterStyleTag := styleTagStart + len(expectedStyleTag)
+		if afterStyleTag < len(unescaped) && unescaped[afterStyleTag] == '>' {
+			t.Error("style tag has stray '>' after opening tag")
+		}
+	}
+
+	scriptTagStart := strings.Index(unescaped, expectedScriptTag)
+	if scriptTagStart >= 0 && scriptTagStart > strings.Index(unescaped, "</section>") {
+		afterScriptTag := scriptTagStart + len(expectedScriptTag)
+		if afterScriptTag < len(unescaped) && unescaped[afterScriptTag] == '>' {
+			t.Error("script tag has stray '>' after opening tag")
+		}
 	}
 }
 
