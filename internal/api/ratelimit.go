@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/netip"
 	"strings"
@@ -64,20 +65,30 @@ func clientIP(remoteAddr string, xffHeaders []string, trustedNets []*net.IPNet) 
 		}
 	}
 
-	// Walk right-to-left through all IPs
-	for i := len(allIPs) - 1; i >= 0; i-- {
+	// Walk right-to-left through all IPs, cap at 50 entries to prevent DoS
+	maxEntries := 50
+	stopIdx := 0
+	if len(allIPs) > maxEntries {
+		stopIdx = len(allIPs) - maxEntries
+	}
+
+	// Track the rightmost trusted IP we've seen (for fallback on malformed entry)
+	lastTrustedIP := remoteIP
+
+	for i := len(allIPs) - 1; i >= stopIdx; i-- {
 		candidate := allIPs[i]
 
 		// Normalize the candidate
 		normalized := parseAndNormalizeIP(candidate)
 		if normalized == "" {
-			// Invalid IP, skip
-			continue
+			// Invalid IP, stop and fall back to last trusted hop (#61)
+			return lastTrustedIP
 		}
 
 		candidateAddr, err := netip.ParseAddr(normalized)
 		if err != nil {
-			continue
+			// Parse error, stop and fall back to last trusted hop (#61)
+			return lastTrustedIP
 		}
 
 		// Check if this IP is in a trusted CIDR
@@ -93,9 +104,12 @@ func clientIP(remoteAddr string, xffHeaders []string, trustedNets []*net.IPNet) 
 		if !isTrusted {
 			return normalized
 		}
+
+		// This IP is trusted, remember it as potential fallback
+		lastTrustedIP = normalized
 	}
 
-	// All XFF entries were trusted (or malformed), fall back to RemoteAddr
+	// All XFF entries were trusted, fall back to RemoteAddr
 	return remoteIP
 }
 
@@ -107,6 +121,15 @@ func parseAndNormalizeIP(s string) string {
 	if err != nil {
 		// Not a host:port, try as bare IP
 		host = s
+	}
+
+	// Handle bare bracketed IPv6 (e.g., "[2001:db8::1]")
+	// Only strip brackets if the interior is a valid IPv6 address
+	if len(host) > 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		interior := host[1 : len(host)-1]
+		if addr, err := netip.ParseAddr(interior); err == nil && addr.Is6() {
+			host = interior
+		}
 	}
 
 	addr, err := netip.ParseAddr(host)
@@ -143,6 +166,8 @@ func rateLimitKey(ip string) string {
 }
 
 // ParseTrustedProxies parses a list of CIDR strings (or bare IPs) into IPNets.
+// Rejects overly broad prefixes (0.0.0.0/0, ::/0, and prefixes shorter than
+// /8 for IPv4 or /32 for IPv6) to prevent misconfiguration (#62).
 func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 	var nets []*net.IPNet
 	for _, cidr := range cidrs {
@@ -172,6 +197,24 @@ func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 		if err != nil {
 			return nil, err
 		}
+
+		// Check prefix length to prevent overly broad trust (#62)
+		ones, bits := ipnet.Mask.Size()
+		isIPv4 := bits == 32
+
+		// Reject /0 for both IPv4 and IPv6
+		if ones == 0 {
+			return nil, fmt.Errorf("parsing %q: prefix length /0 is too broad", cidr)
+		}
+
+		// Enforce minimum prefix length
+		if isIPv4 && ones < 8 {
+			return nil, fmt.Errorf("parsing %q: IPv4 prefix must be at least /8", cidr)
+		}
+		if !isIPv4 && ones < 32 {
+			return nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /32", cidr)
+		}
+
 		nets = append(nets, ipnet)
 	}
 	return nets, nil
