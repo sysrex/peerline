@@ -87,18 +87,35 @@ func Open(path string) (*Store, error) {
 }
 
 // migrate adds columns that CREATE TABLE IF NOT EXISTS will not backfill on
-// databases created before they existed.
+// databases created before they existed. Each column is checked on its own:
+// a database can already have peers.notify_email and still lack
+// invites.pairing_token_hash.
 func migrate(db *sql.DB) error {
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name = 'notify_email'`).Scan(&n); err != nil {
 		return err
 	}
-	if n > 0 {
-		return nil
+	if n == 0 {
+		// Plaintext: Peerline has to address the wake-up mail later. The address
+		// is returned only to the peer who set it.
+		if _, err := db.Exec(`ALTER TABLE peers ADD COLUMN notify_email TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
 	}
-	// Plaintext: Peerline has to address the wake-up mail later. The address
-	// is returned only to the peer who set it.
-	_, err := db.Exec(`ALTER TABLE peers ADD COLUMN notify_email TEXT NOT NULL DEFAULT ''`)
+
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('invites') WHERE name = 'pairing_token_hash'`).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		// Nullable so code-only invites, and rows written before pairing links,
+		// stay valid. SQLite rejects ADD COLUMN ... UNIQUE.
+		if _, err := db.Exec(`ALTER TABLE invites ADD COLUMN pairing_token_hash TEXT`); err != nil {
+			return err
+		}
+	}
+	// Fresh databases already declare the column UNIQUE. Upgraded databases get
+	// the same constraint here. NULL pairing tokens (code-only invites) may repeat.
+	_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS invites_pairing_token_hash ON invites(pairing_token_hash)`)
 	return err
 }
 
