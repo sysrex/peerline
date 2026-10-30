@@ -52,8 +52,13 @@ func ValidAddress(s string) (string, error) {
 
 // ---- dev mode ----
 
-// Log is the dev-mode sender: it logs the full message and reports success.
-type Log struct{ Logger *slog.Logger }
+// Log is the dev-mode sender: it logs recipient, subject and body length and
+// reports success. The body carries invite codes and message previews, so it
+// is logged only when FullBody is set (PEERLINE_DEV_LOG_EMAIL_BODY=1).
+type Log struct {
+	Logger   *slog.Logger
+	FullBody bool
+}
 
 func (l Log) Mode() string { return "log" }
 
@@ -62,20 +67,24 @@ func (l Log) Send(_ context.Context, m Message) error {
 	if lg == nil {
 		lg = slog.Default()
 	}
-	lg.Warn("SMTP not configured; email logged instead of sent (dev mode)",
-		"to", m.To, "subject", m.Subject, "body", m.Body)
+	attrs := []any{"to", m.To, "subject", m.Subject, "body_len", len(m.Body)}
+	if l.FullBody {
+		attrs = append(attrs, "body", m.Body)
+	}
+	lg.Warn("SMTP not configured; email logged instead of sent (dev mode)", attrs...)
 	return nil
 }
 
 // ---- SMTP ----
 
 // SMTP sends via an SMTP relay. Port 465 uses implicit TLS; any other port
-// uses STARTTLS when the server offers it (required when User is set and the
-// host is not localhost, as enforced by net/smtp's PLAIN auth).
+// requires STARTTLS and fails if the server does not offer it, unless
+// AllowPlaintext is set (local dev relays).
 type SMTP struct {
 	Host, User, Pass, From string
 	Port                   int
 	Timeout                time.Duration
+	AllowPlaintext         bool
 	// TLSConfig is optional (tests); defaults to ServerName=Host.
 	TLSConfig *tls.Config
 }
@@ -87,7 +96,7 @@ func (s *SMTP) Mode() string { return "smtp" }
 func FromEnv(lg *slog.Logger) (Sender, error) {
 	host := strings.TrimSpace(os.Getenv("PEERLINE_SMTP_HOST"))
 	if host == "" {
-		return Log{Logger: lg}, nil
+		return Log{Logger: lg, FullBody: os.Getenv("PEERLINE_DEV_LOG_EMAIL_BODY") == "1"}, nil
 	}
 	port := 587
 	if p := os.Getenv("PEERLINE_SMTP_PORT"); p != "" {
@@ -108,7 +117,8 @@ func FromEnv(lg *slog.Logger) (Sender, error) {
 	if (user == "") != (pass == "") {
 		return nil, errors.New("PEERLINE_SMTP_USER and PEERLINE_SMTP_PASS must be set together")
 	}
-	return &SMTP{Host: host, Port: port, User: user, Pass: pass, From: from, Timeout: 10 * time.Second}, nil
+	return &SMTP{Host: host, Port: port, User: user, Pass: pass, From: from, Timeout: 10 * time.Second,
+		AllowPlaintext: os.Getenv("PEERLINE_SMTP_ALLOW_PLAINTEXT") == "1"}, nil
 }
 
 func (s *SMTP) Send(ctx context.Context, m Message) error {
@@ -156,6 +166,8 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 			if err := c.StartTLS(tlsCfg); err != nil {
 				return fmt.Errorf("smtp starttls: %w", err)
 			}
+		} else if !s.AllowPlaintext {
+			return errors.New("smtp: server does not offer STARTTLS (set PEERLINE_SMTP_ALLOW_PLAINTEXT=1 for a local dev relay)")
 		}
 	}
 	if s.User != "" {
