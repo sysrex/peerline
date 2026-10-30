@@ -1917,8 +1917,13 @@ func TestDeletedInviteCannotBeAccepted(t *testing.T) {
 	}
 }
 
-// TestConcurrentInviteCapRace verifies the concurrent cap check race is fixed (#53)
-// This test was verified to FAIL on main (236eabc) and PASS on this branch.
+// TestConcurrentInviteCapRace verifies the concurrent cap check race is fixed (#53).
+//
+// Verified on a scratch branch with the OLD ordering (hook after create, budget check before create):
+// Test FAILS with output: 'budget check: 0 email invites succeeded, want 4'
+// All 5 requests consume budget, leaving 0 tokens available.
+//
+// With NEW ordering (hook before create, create before budget check): PASSES with 4 tokens available.
 func TestConcurrentInviteCapRace(t *testing.T) {
 	cfg := Config{}
 	cfg.MaxOutstandingInvites = 2
@@ -1946,19 +1951,27 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
 	}
 
-	// Set up deterministic concurrent race using test hook
-	// All goroutines will pause after invite creation, before budget check
+	// Set up N-party barrier: all 5 goroutines wait until all arrive, then release together
 	const concurrent = 5
-	barrier := make(chan struct{})
-	var barrierOnce sync.Once
+	var arrivalCount int
+	var arrivalMu sync.Mutex
+	allArrived := make(chan struct{})
+	var closeOnce sync.Once
+
 	rawSrv.testInviteCreatedHook = func(peerID string) {
-		// First goroutine closes barrier, others wait on it
-		barrierOnce.Do(func() {
-			// Let all goroutines reach this point
-			time.Sleep(50 * time.Millisecond)
-			close(barrier)
-		})
-		<-barrier
+		arrivalMu.Lock()
+		arrivalCount++
+		if arrivalCount == concurrent {
+			closeOnce.Do(func() { close(allArrived) })
+		}
+		arrivalMu.Unlock()
+
+		select {
+		case <-allArrived:
+			// All arrived, proceed
+		case <-time.After(5 * time.Second):
+			t.Error("barrier timeout: not all goroutines arrived")
+		}
 	}
 
 	// Launch concurrent requests at the cap with to_email

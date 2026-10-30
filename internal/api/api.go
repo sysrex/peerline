@@ -515,6 +515,12 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	var pairingToken string
 	var publicID string
 
+	// testInviteCreatedHook is called before the atomic cap check for deterministic testing.
+	// Production: nil. Test: N-party barrier synchronizes concurrent requests.
+	if s.testInviteCreatedHook != nil {
+		s.testInviteCreatedHook(me)
+	}
+
 	// Create invite first with atomic cap check (#53)
 	if in.GeneratePairing {
 		pairingToken = auth.NewPairingToken()
@@ -537,11 +543,6 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 			s.internal(w, err)
 			return
 		}
-	}
-
-	// Test hook for deterministic concurrency testing
-	if s.testInviteCreatedHook != nil {
-		s.testInviteCreatedHook(me)
 	}
 
 	// Check email rate limit AFTER creating invite (#53)

@@ -237,6 +237,14 @@ type LimiterManager struct {
 	wg     sync.WaitGroup
 }
 
+// Rate limit constants for public GET endpoints and authenticated endpoints.
+const (
+	getPerMinute     = 60
+	getBurst         = 20
+	authGetPerMinute = 120
+	authGetBurst     = 40
+)
+
 // NewLimiterManager creates and starts a new limiter manager.
 func NewLimiterManager(cfg Config) *LimiterManager {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -245,9 +253,9 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 		msgLim:        msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst, clk),
 		regLim:        msg.NewLimiter(10, 5, clk),
 		pairLim:       msg.NewLimiter(10, 5, clk),
-		getLim:        msg.NewLimiter(60, 20, clk),
-		authLim:       msg.NewLimiter(120, 40, clk), // Higher limit for authenticated polling
 		bagLim:        msg.NewLimiter(10, 5, clk),
+		getLim:        msg.NewLimiter(getPerMinute, getBurst, clk),
+		authLim:       msg.NewLimiter(authGetPerMinute, authGetBurst, clk),
 		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst, clk),
 		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour, clk),
 		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst, clk),
@@ -260,6 +268,22 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 	go lm.pruneLoop()
 
 	return lm
+}
+
+// all returns all limiters in a single list for iteration.
+func (lm *LimiterManager) all() []*msg.Limiter {
+	return []*msg.Limiter{
+		lm.msgLim,
+		lm.regLim,
+		lm.pairLim,
+		lm.bagLim,
+		lm.getLim,
+		lm.authLim,
+		lm.mailLim,
+		lm.rcptLim,
+		lm.notifyLim,
+		lm.notifyAddrLim,
+	}
 }
 
 // pruneLoop periodically prunes stale buckets from all limiters.
@@ -279,9 +303,10 @@ func (lm *LimiterManager) pruneLoop() {
 }
 
 func (lm *LimiterManager) prune() {
-	pruned := lm.msgLim.Prune() + lm.regLim.Prune() + lm.pairLim.Prune() +
-		lm.getLim.Prune() + lm.authLim.Prune() + lm.bagLim.Prune() +
-		lm.mailLim.Prune() + lm.rcptLim.Prune() + lm.notifyLim.Prune() + lm.notifyAddrLim.Prune()
+	pruned := 0
+	for _, lim := range lm.all() {
+		pruned += lim.Prune()
+	}
 	_ = pruned // Could log if needed
 }
 

@@ -67,20 +67,18 @@ type bucket struct {
 	last   time.Time
 }
 
-// Option configures a Limiter at construction time.
-type Option func(*Limiter)
+// LimiterOption configures a Limiter.
+type LimiterOption func(*Limiter)
 
-// WithClock sets the limiter's time source. A nil clock is ignored.
-func WithClock(now func() time.Time) Option {
+// WithClock sets a custom clock function for the limiter (for testing).
+func WithClock(clock func() time.Time) LimiterOption {
 	return func(l *Limiter) {
-		if now != nil {
-			l.now = now
-		}
+		l.now = clock
 	}
 }
 
 // NewLimiter allows `perMinute` events per minute with the given burst.
-func NewLimiter(perMinute, burst int, opts ...Option) *Limiter {
+func NewLimiter(perMinute, burst int, opts ...LimiterOption) *Limiter {
 	rate := float64(perMinute) / 60
 	// Prune after max(10 minutes, 2 × burst/rate) to avoid resetting slow-but-active buckets
 	pruneAfter := 10 * time.Minute
@@ -100,14 +98,14 @@ func NewLimiter(perMinute, burst int, opts ...Option) *Limiter {
 	for i := range l.shards {
 		l.shards[i] = &shard{buckets: make(map[string]*bucket)}
 	}
-	for _, o := range opts {
-		o(l)
+	for _, opt := range opts {
+		opt(l)
 	}
 	return l
 }
 
 // NewLimiterPerHour allows `perHour` events per hour with the given burst.
-func NewLimiterPerHour(perHour, burst int, opts ...Option) *Limiter {
+func NewLimiterPerHour(perHour, burst int, opts ...LimiterOption) *Limiter {
 	rate := float64(perHour) / 3600
 	// Prune after max(2 hours, 2 × burst/rate)
 	pruneAfter := 2 * time.Hour
@@ -127,8 +125,8 @@ func NewLimiterPerHour(perHour, burst int, opts ...Option) *Limiter {
 	for i := range l.shards {
 		l.shards[i] = &shard{buckets: make(map[string]*bucket)}
 	}
-	for _, o := range opts {
-		o(l)
+	for _, opt := range opts {
+		opt(l)
 	}
 	return l
 }
