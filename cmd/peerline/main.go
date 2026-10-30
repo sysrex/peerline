@@ -53,6 +53,9 @@ func main() {
 			log.Error("invalid PEERLINE_TRUSTED_PROXIES CIDR", "err", err)
 			os.Exit(1)
 		}
+	} else {
+		// Warn when running without trusted proxies (#52)
+		log.Warn("PEERLINE_TRUSTED_PROXIES unset: X-Forwarded-For headers are ignored; client IPs will be taken from RemoteAddr only")
 	}
 
 	maxOutstandingInvites, _ := strconv.Atoi(os.Getenv("PEERLINE_MAX_OUTSTANDING_INVITES"))
