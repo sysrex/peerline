@@ -1,11 +1,13 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1954,5 +1956,47 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash7, "dan", "Dan", "hdan", "", "", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("RegisterAndAcceptByPairing at expires_at+1 should return ErrNotFound, got %v", err)
+	}
+}
+
+func TestVersionGuardRefusesWithoutWriting(t *testing.T) {
+	for _, v := range []int{99, -1} {
+		path := t.TempDir() + "/v.db"
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(fmt.Sprintf(`CREATE TABLE marker(x); PRAGMA user_version = %d`, v)); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+		before, _ := os.ReadFile(path)
+
+		if _, err := Open(path); err == nil || !strings.Contains(err.Error(), fmt.Sprint(v)) {
+			t.Fatalf("v=%d: Open err = %v, want unsupported-version error", v, err)
+		}
+		after, _ := os.ReadFile(path)
+		if !bytes.Equal(before, after) {
+			t.Fatalf("v=%d: database file modified by refused Open", v)
+		}
+		for _, sfx := range []string{"-wal", "-shm"} {
+			if _, err := os.Stat(path + sfx); err == nil {
+				t.Fatalf("v=%d: %s created by refused Open", v, sfx)
+			}
+		}
+	}
+}
+
+func TestMigrateRechecksVersionInTransaction(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:recheck?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`PRAGMA user_version = 99`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate(db); err == nil {
+		t.Fatal("migrate accepted a database newer than this binary")
 	}
 }

@@ -88,6 +88,15 @@ func Open(path string) (*Store, error) {
 	db.SetMaxOpenConns(1) // SQLite: serialize writers, avoids SQLITE_BUSY; keeps :memory: on one conn
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("read user_version: %w", err)
+	}
+	if err := checkVersion(version); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
@@ -114,15 +123,23 @@ func buildDSN(path string) string {
 	return path + sep + pragmas
 }
 
+var migrations = []func(*sql.Tx) error{
+	migrateV1NotifyEmail,
+	migrateV2PairingTokenHash,
+	migrateV3InvitePublicID,
+	migrateV4EmailVerification,
+}
+
+// checkVersion refuses any user_version this binary cannot account for.
+func checkVersion(v int) error {
+	if v < 0 || v > len(migrations) {
+		return fmt.Errorf("database schema version %d is not supported (this binary supports 0-%d)", v, len(migrations))
+	}
+	return nil
+}
+
 // migrate applies ordered, idempotent schema upgrades tracked by PRAGMA user_version.
 func migrate(db *sql.DB) error {
-	migrations := []func(*sql.Tx) error{
-		migrateV1NotifyEmail,
-		migrateV2PairingTokenHash,
-		migrateV3InvitePublicID,
-		migrateV4EmailVerification,
-	}
-
 	for i, mig := range migrations {
 		target := i + 1
 		if err := runMigrationStep(db, target, mig); err != nil {
@@ -146,6 +163,9 @@ func runMigrationStep(db *sql.DB, target int, mig func(*sql.Tx) error) error {
 		return fmt.Errorf("read user_version in migration v%d: %w", target, err)
 	}
 
+	if err := checkVersion(version); err != nil {
+		return err
+	}
 	if version >= target {
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit migration v%d skip: %w", target, err)
