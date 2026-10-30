@@ -861,8 +861,14 @@ func truncateUTF8(s string, max int) string {
 //   - Precomposed characters (e.g., é = U+00E9) count as 1 rune
 //   - Hangul syllables (e.g., 한 = U+D55C) count as 1 rune each
 //   - Truncation respects combining-mark cluster boundaries: if cutting at 64
-//     runes would split a base from non-composing marks or leave a dangling
-//     virama (CCC 9), backs off to exclude the entire trailing cluster
+//     runes would split a base from non-composing marks, backs off to exclude
+//     the entire trailing cluster
+//   - Virama-safe: backs off when cutting after a virama (CCC 9), then strips
+//     any remaining trailing viramas to prevent dangling half-form conjuncts or
+//     stacked conjuncts in Indic scripts (issues #182, #206)
+//   - Limitation: archaic Hangul sequences that don't compose (e.g., L L V or
+//     trailing jamo) may leave a lone leading jamo at the cut; these sequences
+//     do not occur in real names
 //
 // Returns "A Peerline peer" if the result is empty after filtering.
 //
@@ -1029,11 +1035,52 @@ func sanitizeInviterName(name string) string {
 				}
 			}
 		}
+
+		// Strip any trailing viramas (CCC 9) after truncation to handle stacked conjuncts
+		// (e.g., क्क्ष where multiple viramas chain, issue #206). Keep dropping entire
+		// clusters until no virama remains at the end.
+		dropCluster := func(t []rune) []rune {
+			for i := len(t) - 1; i >= 0; i-- {
+				r := t[i]
+				isMark := unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) || unicode.Is(unicode.Me, r)
+				props := norm.NFC.PropertiesString(string(r))
+				isVirama := props.CCC() == 9
+				if !isMark && !isVirama {
+					// Found the base, truncate before it
+					return t[:i]
+				}
+			}
+			return t
+		}
+
+		for len(truncated) > 0 {
+			if len(truncated) == 0 {
+				break
+			}
+			lastRune := truncated[len(truncated)-1]
+			props := norm.NFC.PropertiesString(string(lastRune))
+			if props.CCC() == 9 {
+				n := len(truncated)
+				truncated = dropCluster(truncated)
+				if len(truncated) == n {
+					// No progress made, stop to avoid infinite loop
+					break
+				}
+			} else {
+				break
+			}
+		}
+
 		result = string(truncated)
 	}
 
 	// Trim trailing spaces that may have been left by the 64-rune truncation
 	result = strings.TrimRight(result, " ")
+
+	// Return fallback if result is now empty after trimming
+	if result == "" {
+		return fallbackName
+	}
 
 	return result
 }
