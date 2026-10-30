@@ -17,10 +17,10 @@ func TestPurgeExpiredInvites_GrantsAndPeersSurvive(t *testing.T) {
 	defer s.Close()
 
 	// Create peers
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", ""); err != nil {
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -94,10 +94,10 @@ func TestPurgeExpiredInvites_RetentionDefault(t *testing.T) {
 	defer s.Close()
 
 	// Create peers
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", ""); err != nil {
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -163,10 +163,10 @@ func TestPurgeExpiredInvites_ExactCutoffBoundary(t *testing.T) {
 	defer s.Close()
 
 	// Create peers
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", ""); err != nil {
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -307,7 +307,7 @@ func TestPurgeExpiredInvites_MultiBatch(t *testing.T) {
 	defer s.Close()
 
 	// Create a peer
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -369,7 +369,7 @@ func TestPurgeExpiredInvites_CancelledContext(t *testing.T) {
 
 	// Create a peer
 	ctx := context.Background()
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
