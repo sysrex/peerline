@@ -2250,7 +2250,7 @@ func TestSanitizerUnicode(t *testing.T) {
 		// Issue #181: Edge cases for combining-mark cluster boundaries
 		{"cluster ending at rune 64 kept whole", strings.Repeat("a", 63) + "e\u0300", strings.Repeat("a", 63) + "è"},
 		{"cluster + trailing space at cut", strings.Repeat("a", 63) + "e\u0300 zzz", strings.Repeat("a", 63) + "è"},
-		{"4 marks on one base capped at 3", "a\u0300\u0301\u0302\u0303", "à́̃"}, // 4 marks -> 3 marks
+		{"4 marks on one base capped at 3", "a\u0300\u0301\u0302\u0303", "\u00e0\u0301\u0302"}, // 4 marks -> 3 marks
 
 		// Emoji with ZWJ, flags, skin tone modifiers (all filtered: ZWJ is Cf, regional indicators and modifiers are So/Sk)
 		{"ZWJ emoji filtered", "Alice👨‍👩‍👧Smith", "AliceSmith"},
@@ -2258,7 +2258,7 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Skin tone modifier filtered", "Alice👍🏻Smith", "AliceSmith"},
 
 		// NFKC expansion: U+FDFA (ﷺ) expands to 18 characters in NFKC
-		{"ﷺ×5 NFKC expands", strings.Repeat("\uFDFA", 5), "صلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى ا"}, // 5*18=90 -> 64
+		{"ﷺ×5 NFKC expands", strings.Repeat("\uFDFA", 5), "صلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى الله ع"}, // 5*18=90 -> 64
 
 		// Issue #182: Virama cut (CCC 9) - should not leave dangling virama
 		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62)}, // क + virama + ष cut before the conjunct
@@ -2300,10 +2300,10 @@ func TestSanitizerUnicode(t *testing.T) {
 // TestTruncateUTF8 verifies the UTF-8 truncation helper
 func TestTruncateUTF8(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		max      int
-		wantLen  int
+		name    string
+		input   string
+		max     int
+		wantLen int
 	}{
 		{"empty", "", 10, 0},
 		{"shorter than max", "abc", 10, 3},
@@ -2311,7 +2311,7 @@ func TestTruncateUTF8(t *testing.T) {
 		{"max 0", "abc", 0, 0},
 
 		// Cut inside multibyte runes (lead byte should be excluded)
-		{"2-byte rune at cut", "aaa" + "é", 4, 3}, // é is c3 a9, cut at c3
+		{"2-byte rune at cut", "aaa" + "é", 4, 3},       // é is c3 a9, cut at c3
 		{"3-byte rune at cut byte 1", "aa" + "日", 3, 2}, // 日 is e6 97 a5, cut at e6
 		{"3-byte rune at cut byte 2", "aa" + "日", 4, 2}, // cut at 97
 		{"4-byte rune at cut byte 1", "aa" + "😀", 3, 2}, // 😀 is f0 9f 98 80, cut at f0
@@ -2508,11 +2508,11 @@ func FuzzSanitizeInviterName(f *testing.F) {
 	// Seed corpus with edge cases
 	f.Add("Alice")
 	f.Add(strings.Repeat("a", 70))
-	f.Add("e\u0300\u0316") // non-composing marks
-	f.Add("\uFDFA")        // NFKC expands
-	f.Add("\xf0\u00b2")    // invalid byte + NFKC char
+	f.Add("e\u0300\u0316")                 // non-composing marks
+	f.Add("\uFDFA")                        // NFKC expands
+	f.Add("\xf0\u00b2")                    // invalid byte + NFKC char
 	f.Add(strings.Repeat("a", 1022) + "日") // 3-byte rune at 1024
-	f.Add("क्ष")           // Indic conjunct (virama)
+	f.Add("क्ष")                           // Indic conjunct (virama)
 
 	f.Fuzz(func(t *testing.T, input string) {
 		got := sanitizeInviterName(input)
