@@ -297,6 +297,7 @@ func TestGETLimiterSeparateBuckets(t *testing.T) {
 	cfg := Config{
 		Logger:         slog.Default(),
 		TrustedProxies: []string{"10.0.0.0/8"},
+		Now:            func() time.Time { return time.Unix(1000, 0) },
 	}
 
 	// Freeze clock to avoid wall-clock refill
@@ -855,5 +856,33 @@ func TestSingleLogRecordUnauthenticatedPairing(t *testing.T) {
 	// (a second differently-worded line would indicate a bug)
 	if totalRecords > 1 {
 		t.Errorf("expected 1 total log record for pairing, got %d\nLogs:\n%s", totalRecords, logs)
+	}
+}
+
+// The email rate-limit rollback must not depend on the client staying connected (#184).
+func TestRejectEmailRateLimitedSurvivesCancelledRequest(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	s := mustNew(t, st, Config{})
+	if err := st.CreatePeer(context.Background(), "p_a", "A", "h", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	id, err := st.CreateInviteAtomic(context.Background(), "ch", "p_a", []string{"messages"}, nil, time.Now().Add(time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := httptest.NewRequest("POST", "/v1/invites", nil).WithContext(ctx)
+	w := httptest.NewRecorder()
+	s.rejectEmailRateLimited(w, r, id, "p_a")
+	if w.Code != 429 {
+		t.Fatalf("status %d, want 429", w.Code)
+	}
+	if n, _ := st.CountOutstandingInvites(context.Background(), "p_a"); n != 0 {
+		t.Fatalf("orphan invite left behind: %d outstanding", n)
 	}
 }

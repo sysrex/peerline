@@ -266,3 +266,69 @@ func BenchmarkShardedLimiterParallel(b *testing.B) {
 		}
 	})
 }
+
+func TestWithClockRefill(t *testing.T) {
+	now := time.Unix(1000, 0)
+	l := NewLimiter(60, 2, WithClock(func() time.Time { return now }))
+	if !l.Allow("k") || !l.Allow("k") || l.Allow("k") {
+		t.Fatal("want exactly burst=2 allowed")
+	}
+	now = now.Add(time.Second)
+	if !l.Allow("k") || l.Allow("k") {
+		t.Fatal("want exactly one token after 1s")
+	}
+}
+
+func TestReadyDoesNotCreateBucket(t *testing.T) {
+	l := NewLimiter(60, 2)
+	for i := 0; i < 3*bucketsPerShard*shardCount; i++ {
+		l.Ready(fmt.Sprint(i))
+	}
+	for _, s := range l.shards {
+		if len(s.buckets) != 0 {
+			t.Fatalf("Ready created %d buckets", len(s.buckets))
+		}
+	}
+}
+
+func TestFullShardNeverRefillsThrottledBucket(t *testing.T) {
+	now := time.Unix(1000, 0)
+	l := NewLimiter(1, 1, WithClock(func() time.Time { return now }))
+	s := l.shards[0]
+	for i := 0; i < bucketsPerShard; i++ {
+		s.buckets[fmt.Sprint(i)] = &bucket{tokens: 0, last: now}
+	}
+	var key string
+	for i := 0; ; i++ {
+		key = fmt.Sprintf("new%d", i)
+		if l.shardIndex(key) == 0 {
+			break
+		}
+	}
+	if l.Allow(key) {
+		t.Fatal("new key in a shard full of throttled buckets must be denied")
+	}
+	if len(s.buckets) != bucketsPerShard {
+		t.Fatalf("shard size %d, a throttled bucket was evicted", len(s.buckets))
+	}
+}
+
+func TestLimiterRefund(t *testing.T) {
+	l := NewLimiter(1, 2)
+	l.Allow("k")
+	l.Allow("k")
+	if l.Allow("k") {
+		t.Fatal("bucket should be empty")
+	}
+	l.Refund("k")
+	if !l.Allow("k") {
+		t.Fatal("refund should restore one token")
+	}
+	l.Refund("k")
+	l.Refund("k")
+	l.Refund("k")
+	if !l.Allow("k") || !l.Allow("k") || l.Allow("k") {
+		t.Fatal("refund must cap at burst")
+	}
+	l.Refund("never-seen") // no bucket: no-op, no panic
+}

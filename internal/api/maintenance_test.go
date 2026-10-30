@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -16,9 +17,10 @@ type fakePurger struct {
 	purgeReturnCount int
 	purgeReturnErr   error
 	called           chan struct{} // signals when PurgeExpiredInvites is called
+	moreOnce         atomic.Bool   // first call reports more=true
 }
 
-func (f *fakePurger) PurgeExpiredInvites(ctx context.Context, retentionSeconds int64) (int, error) {
+func (f *fakePurger) PurgeExpiredInvites(ctx context.Context, retentionSeconds int64) (int, bool, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, retentionSeconds)
 	f.mu.Unlock()
@@ -26,7 +28,7 @@ func (f *fakePurger) PurgeExpiredInvites(ctx context.Context, retentionSeconds i
 	case f.called <- struct{}{}:
 	default:
 	}
-	return f.purgeReturnCount, f.purgeReturnErr
+	return f.purgeReturnCount, f.moreOnce.CompareAndSwap(true, false), f.purgeReturnErr
 }
 
 func (f *fakePurger) getCalls() []int64 {
@@ -109,4 +111,27 @@ func TestMaintenanceManager_RunsHourly(t *testing.T) {
 			t.Errorf("call %d: expected retention %d, got %d", i, retention, ret)
 		}
 	}
+}
+
+// A capped run (more=true) schedules a follow-up long before the hourly tick.
+func TestMaintenanceManager_FollowUpAfterCappedRun(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakePurger{called: make(chan struct{}, 10)}
+	fake.moreOnce.Store(true)
+	m := NewMaintenanceManager(context.Background(), fake, log, 0, WithFollowUpInterval(10*time.Millisecond))
+	defer m.Stop()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-fake.called:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("no purge call %d; follow-up not scheduled", i+1)
+		}
+	}
+}
+
+func TestWithTickIntervalIgnoresNonPositive(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakePurger{called: make(chan struct{}, 1)}
+	m := NewMaintenanceManager(context.Background(), fake, log, 0, WithTickInterval(0))
+	m.Stop()
 }
