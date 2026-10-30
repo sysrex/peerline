@@ -253,7 +253,13 @@ The same SMTP settings deliver [message notifications](#message-notifications).
 
 ## Reverse proxy logging
 
-Pairing tokens travel in the URL path (`/v1/pairing/pair_...`) and legacy invite codes in the query (`/v1/invites/accept?code=...`), so access logs can hold live secrets until the link expires (default 1h, max 7d). Redact the path segment after `/v1/pairing/` and drop the query string for `/v1/invites/accept` in your proxy's access log (nginx: log `$uri` instead of `$request_uri` and rewrite the pairing path through a `map`; Caddy: `replace` / `delete` filters on `request>uri`). Prefer short `ttl_seconds` for pairing links.
+Pairing tokens travel in the URL path (`/v1/pairing/pair_...`) and legacy invite codes in the query (`/v1/invites/accept?code=...`), so access logs can hold live secrets until the link expires (default 1h, max 7d). Redact the path segment after `/v1/pairing/` and drop the query string for `/v1/invites/accept` in your proxy's access log:
+
+- **nginx:** log `$uri` instead of `$request` / `$request_uri`, e.g. `log_format redacted '$remote_addr - $remote_user [$time_local] "$request_method $uri $server_protocol" $status $body_bytes_sent';` (rewrite the pairing path through a `map` as well).
+- **Traefik:** `accessLog.fields.names.RequestPath=drop`, or on v3.7.3+ `accessLog.fields.queryParameters.defaultMode=drop`. (`accessLog.filters` and `fields.headers` do not touch the query string.)
+- **Caddy:** `log { format filter { request>uri query { delete code } } }`.
+
+A CDN, WAF or load balancer in front of the proxy logs the query too, and debug-level error logs can print the URI; redact there as well. Prefer short `ttl_seconds` for pairing links.
 
 ---
 
@@ -329,10 +335,7 @@ curl -X POST https://peerline.example.com/v1/invites/accept \
 
 Responses to requests with `?code=` carry RFC 9745 `Deprecation` and `Link` headers. Query-string acceptance will be removed in a future release.
 
-**Reverse proxy operators:** Exclude or redact the query string for `/v1/invites/accept` in access logs:
-- **Nginx:** `log_format custom '$remote_addr ... $request_uri_no_query';` (define `$request_uri_no_query` via `map`)
-- **Traefik:** Use `accessLog.filters.retryAttempts` or `accessLog.fields.headers` to exclude query strings on specific paths
-- **Caddy:** Custom log format with `{http.request.uri.path}` instead of `{http.request.uri}`
+**Reverse proxy operators:** see [Reverse proxy logging](#reverse-proxy-logging) for working redaction configs.
 
 ---
 
