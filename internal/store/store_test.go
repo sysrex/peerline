@@ -2298,10 +2298,12 @@ func TestBagLimitsByteCapFileDBRace(t *testing.T) {
 	const attempts = 5
 	const expectedSuccesses = 3
 
+	start1 := make(chan struct{})
 	results := make(chan error, attempts)
 	for i := 0; i < attempts; i++ {
 		i := i
 		go func() {
+			<-start1 // wait for start signal
 			s := s1
 			if i%2 == 1 {
 				s = s2
@@ -2312,6 +2314,7 @@ func TestBagLimitsByteCapFileDBRace(t *testing.T) {
 			results <- err
 		}()
 	}
+	close(start1) // start all goroutines
 
 	var successes int
 	for i := 0; i < attempts; i++ {
@@ -2352,11 +2355,13 @@ func TestBagLimitsByteCapFileDBRace(t *testing.T) {
 	}
 
 	// Try to grow all 3 bags to 40 bytes concurrently (would be 120 total)
-	// At most 2 should succeed (leaving total at 100)
+	// Exactly 1 should succeed (leaving total at 100: 2×30 + 1×40)
+	start2 := make(chan struct{})
 	results2 := make(chan error, 3)
 	for i := 0; i < 3; i++ {
 		i := i
 		go func() {
+			<-start2 // wait for start signal
 			s := s1
 			if i%2 == 1 {
 				s = s2
@@ -2367,6 +2372,7 @@ func TestBagLimitsByteCapFileDBRace(t *testing.T) {
 			results2 <- err
 		}()
 	}
+	close(start2) // start all goroutines
 
 	var updateSuccesses int
 	for i := 0; i < 3; i++ {
@@ -2378,13 +2384,17 @@ func TestBagLimitsByteCapFileDBRace(t *testing.T) {
 		}
 	}
 
-	// Verify total didn't exceed cap
+	if updateSuccesses != 1 {
+		t.Errorf("concurrent updates: got %d successes, want exactly 1", updateSuccesses)
+	}
+
+	// Verify total is exactly 100
 	err = s1.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(LENGTH(content)), 0) FROM bags WHERE owner='irene'`).Scan(&totalBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if totalBytes > byteCap {
-		t.Errorf("update race: total bytes %d exceeds cap %d", totalBytes, byteCap)
+	if totalBytes != byteCap {
+		t.Errorf("update race: total bytes %d, want exactly %d", totalBytes, byteCap)
 	}
 
 	// Test 3: Mixed create and update race
@@ -2400,21 +2410,27 @@ func TestBagLimitsByteCapFileDBRace(t *testing.T) {
 		}
 	}
 
-	// Concurrently: update mixed0 to 40 bytes, update mixed1 to 40 bytes, create mixed2 with 30 bytes
-	// Only 1 operation should succeed (would exceed 100 otherwise)
+	// Concurrently: update mixed0 to 40 bytes (+5), update mixed1 to 40 bytes (+5), create mixed2 with 30 bytes
+	// At most 2 operations can succeed (e.g., 70+5+5=80 or 70+5+30=105>100 or 70+30=100).
+	// Result is in {1, 2} depending on which operations win the race.
+	start3 := make(chan struct{})
 	results3 := make(chan error, 3)
 	go func() {
+		<-start3
 		_, err := s1.PutBag(ctx, "jack", "mixed0", bytes.Repeat([]byte("z"), 40), "jack", -1, 100, byteCap)
 		results3 <- err
 	}()
 	go func() {
+		<-start3
 		_, err := s2.PutBag(ctx, "jack", "mixed1", bytes.Repeat([]byte("z"), 40), "jack", -1, 100, byteCap)
 		results3 <- err
 	}()
 	go func() {
+		<-start3
 		_, err := s1.PutBag(ctx, "jack", "mixed2", bytes.Repeat([]byte("z"), 30), "jack", -1, 100, byteCap)
 		results3 <- err
 	}()
+	close(start3) // start all goroutines
 
 	var mixedSuccesses int
 	for i := 0; i < 3; i++ {
@@ -2424,6 +2440,12 @@ func TestBagLimitsByteCapFileDBRace(t *testing.T) {
 		} else if !errors.Is(err, ErrStorageQuotaExceeded) {
 			t.Errorf("unexpected mixed error: %v", err)
 		}
+	}
+
+	// Both updates could win (70+5+5=80 ≤100), or one update + the create (70+5+30=105>100),
+	// so exactly 1 or 2 operations succeed.
+	if mixedSuccesses < 1 || mixedSuccesses > 2 {
+		t.Errorf("mixed race: got %d successes, want 1 or 2", mixedSuccesses)
 	}
 
 	// Verify total didn't exceed cap

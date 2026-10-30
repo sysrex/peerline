@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -369,11 +370,13 @@ func TestBagLimitsGranteeChargedToOwner(t *testing.T) {
 	pairUp(t, owner, grantee, []string{"bags:write"}, []string{"data", "data2"}, nil)
 
 	// Owner creates 2 bags
-	owner.do("PUT", "/v1/bags/bag1", []byte("owner1"), nil)
-	owner.do("PUT", "/v1/bags/bag2", []byte("owner2"), nil)
+	resp, body := owner.do("PUT", "/v1/bags/bag1", []byte("owner1"), nil)
+	want(t, resp, body, 201)
+	resp, body = owner.do("PUT", "/v1/bags/bag2", []byte("owner2"), nil)
+	want(t, resp, body, 201)
 
 	// Grantee creates a bag in owner's namespace - should succeed
-	resp, body := grantee.do("PUT", "/v1/bags/data?owner="+owner.id, bytes.Repeat([]byte("x"), 20), nil)
+	resp, body = grantee.do("PUT", "/v1/bags/data?owner="+owner.id, bytes.Repeat([]byte("x"), 20), nil)
 	want(t, resp, body, 201)
 
 	// Owner now at 3-bag limit. Grantee's 4th bag should fail with owner's count limit
@@ -388,8 +391,10 @@ func TestBagLimitsGranteeChargedToOwner(t *testing.T) {
 	want(t, resp, body, 201)
 
 	// Test byte quota: grantee write charged to owner
-	owner.do("PUT", "/v1/bags/bag1", bytes.Repeat([]byte("x"), 40), nil)
-	owner.do("PUT", "/v1/bags/bag2", bytes.Repeat([]byte("y"), 40), nil)
+	resp, body = owner.do("PUT", "/v1/bags/bag1", bytes.Repeat([]byte("x"), 40), nil)
+	want(t, resp, body, 200)
+	resp, body = owner.do("PUT", "/v1/bags/bag2", bytes.Repeat([]byte("y"), 40), nil)
+	want(t, resp, body, 200)
 	// owner now at 100 bytes (40+40+20)
 
 	// Grantee tries to write 30 more bytes (would total 120, over 100 limit)
@@ -401,20 +406,66 @@ func TestBagLimitsGranteeChargedToOwner(t *testing.T) {
 }
 
 func TestBagLimitsNonGrantee403(t *testing.T) {
-	// Owner at bag count limit
-	srv := newServer(t, Config{MaxBagsPerPeer: 2, MaxBagBytesPerPeer: 100})
-	owner := register(t, srv, "owner")
-	nonGrantee := register(t, srv, "other")
+	// Test 1: Count cap - non-grantee gets 403, not 413
+	st1, err := store.Open(t.TempDir() + "/test1.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st1.Close()
+	srv1 := httptest.NewServer(New(st1, Config{MaxBagsPerPeer: 2, MaxBagBytesPerPeer: 100}).Handler())
+	defer srv1.Close()
 
-	// Owner creates 2 bags (at limit)
-	owner.do("PUT", "/v1/bags/bag1", []byte("data1"), nil)
-	owner.do("PUT", "/v1/bags/bag2", []byte("data2"), nil)
+	owner1 := register(t, srv1, "owner")
+	nonGrantee1 := register(t, srv1, "other")
 
-	// Non-grantee (no pairing) tries to write to owner's bag - should get 403, not 413
-	resp, body := nonGrantee.do("PUT", "/v1/bags/bag1?owner="+owner.id, []byte("attempt"), nil)
+	// Owner creates 2 bags (at count limit)
+	resp, body := owner1.do("PUT", "/v1/bags/bag1", []byte("data1"), nil)
+	want(t, resp, body, 201)
+	resp, body = owner1.do("PUT", "/v1/bags/bag2", []byte("data2"), nil)
+	want(t, resp, body, 201)
+
+	// Non-grantee tries to create a NEW bag that would exceed owner's count cap
+	// Should get 403 (auth check first), not 413 (quota check second)
+	resp, body = nonGrantee1.do("PUT", "/v1/bags/newbag?owner="+owner1.id, []byte("attempt"), nil)
 	want(t, resp, body, 403)
 	if !strings.Contains(string(body), "not permitted") {
 		t.Errorf("expected not permitted, got: %s", body)
+	}
+
+	// Verify no row was written
+	_, err = st1.GetBag(context.Background(), owner1.id, "newbag")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("newbag was written despite 403; err=%v", err)
+	}
+
+	// Test 2: Byte cap - non-grantee gets 403, not 413
+	st2, err := store.Open(t.TempDir() + "/test2.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	srv2 := httptest.NewServer(New(st2, Config{MaxBagsPerPeer: 10, MaxBagBytesPerPeer: 50}).Handler())
+	defer srv2.Close()
+
+	owner2 := register(t, srv2, "owner2")
+	nonGrantee2 := register(t, srv2, "other2")
+
+	// Owner fills byte quota (50 bytes)
+	resp, body = owner2.do("PUT", "/v1/bags/data", bytes.Repeat([]byte("x"), 50), nil)
+	want(t, resp, body, 201)
+
+	// Non-grantee tries to create a new bag that would exceed owner's byte cap
+	// Should get 403, not 413
+	resp, body = nonGrantee2.do("PUT", "/v1/bags/extra?owner="+owner2.id, []byte("y"), nil)
+	want(t, resp, body, 403)
+	if !strings.Contains(string(body), "not permitted") {
+		t.Errorf("expected not permitted, got: %s", body)
+	}
+
+	// Verify no row was written
+	_, err = st2.GetBag(context.Background(), owner2.id, "extra")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("extra bag was written despite 403; err=%v", err)
 	}
 }
 
