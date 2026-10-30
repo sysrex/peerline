@@ -1029,7 +1029,25 @@ func (s *Server) acceptPairing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Rate limit pairing redemptions after token validation
+	// Check if pairing token exists before charging rate limit (#32)
+	tokenHash := auth.Hash(token)
+	exists, err := s.st.PairingTokenExists(r.Context(), tokenHash)
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	if !exists {
+		// Charge failed-lookup budget (per-IP)
+		ipKey := rateLimitKey(clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets))
+		if !s.lim.failLim.Allow(ipKey) {
+			writeErr(w, http.StatusTooManyRequests, "rate limited")
+			return
+		}
+		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
+		return
+	}
+
+	// Rate limit valid pairing redemptions
 	if !s.lim.pairLim.Allow(rateLimitKey(clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets))) {
 		writeErr(w, http.StatusTooManyRequests, "rate limited")
 		return
@@ -1050,7 +1068,7 @@ func (s *Server) acceptPairing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	me := auth.PeerID(r.Context())
-	g, err := s.st.AcceptInviteByPairingToken(r.Context(), auth.Hash(token), me, sc, bg)
+	g, err := s.st.AcceptInviteByPairingToken(r.Context(), tokenHash, me, sc, bg)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
@@ -1085,7 +1103,25 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Rate limit pairing redemptions after register token check passes
+	// Check if pairing token exists before charging rate limit (#32)
+	tokenHash := auth.Hash(token)
+	exists, err := s.st.PairingTokenExists(r.Context(), tokenHash)
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	if !exists {
+		// Charge failed-lookup budget (per-IP)
+		ipKey := rateLimitKey(clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets))
+		if !s.lim.failLim.Allow(ipKey) {
+			writeErr(w, http.StatusTooManyRequests, "rate limited")
+			return
+		}
+		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
+		return
+	}
+
+	// Rate limit valid pairing redemptions
 	if !s.lim.pairLim.Allow(rateLimitKey(clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets))) {
 		writeErr(w, http.StatusTooManyRequests, "rate limited")
 		return
@@ -1111,7 +1147,7 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 	}
 	// Atomically register and accept the pairing in one transaction
 	id, key := auth.NewID(), auth.NewKey()
-	g, err := s.st.RegisterAndAcceptByPairing(r.Context(), auth.Hash(token), id, in.Name, auth.Hash(key), "", sc, bg)
+	g, err := s.st.RegisterAndAcceptByPairing(r.Context(), tokenHash, id, in.Name, auth.Hash(key), "", sc, bg)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
