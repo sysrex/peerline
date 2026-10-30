@@ -3287,7 +3287,15 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 
 // TestInviteAccept405Comprehensive covers all the edge cases from issue #146 and #174.
 func TestInviteAccept405Comprehensive(t *testing.T) {
-	srv := newServer(t, Config{})
+	// Use fake clock to control invite expiry deterministically
+	var mu sync.Mutex
+	now := time.Now()
+	fakeClock := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}
+	srv := newServer(t, Config{Now: fakeClock})
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
 
 	// Create invites with different states: valid, used, expired, missing
@@ -3305,15 +3313,10 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	want(t, resp, body, 201)
 	var inv3 struct{ Code string }
 	json.Unmarshal(body, &inv3)
-	// Wait for inv3 to expire: poll until POST returns 404 (expired/not found)
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		testResp, _ := b.do("POST", "/v1/invites/accept?code="+inv3.Code, nil, nil)
-		if testResp.StatusCode == 404 {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	// Advance clock past inv3's expiry (1 second TTL)
+	mu.Lock()
+	now = now.Add(2 * time.Second)
+	mu.Unlock()
 
 	// Use inv2
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
@@ -3688,16 +3691,25 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 	assertSecurityHeaders(t, resp.Header, "body-only POST 401")
 
 	// 14. 429 (rate limit) with ?code=: should have deprecation headers
-	// Create a server with very low write rate limit to trigger 429
-	srvLimited := newServer(t, Config{WritePerMinute: 60, WriteBurst: 1})
+	// Use fake clock to control rate limiter refill deterministically
+	var mu429 sync.Mutex
+	now429 := time.Now()
+	fakeClock429 := func() time.Time {
+		mu429.Lock()
+		defer mu429.Unlock()
+		return now429
+	}
+	srvLimited := newServer(t, Config{WritePerMinute: 60, WriteBurst: 1, Now: fakeClock429})
 	c := register(t, srvLimited, "charlie")
 	d := register(t, srvLimited, "dave")
 	respInv, bodyInv := c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, respInv, bodyInv, 201)
 	var inv4 struct{ Code string }
 	json.Unmarshal(bodyInv, &inv4)
-	// Wait for rate limiter to refill (60/min = 1 token per second)
-	time.Sleep(1100 * time.Millisecond)
+	// Advance clock to allow rate limiter refill (60/min = 1 token per second)
+	mu429.Lock()
+	now429 = now429.Add(1100 * time.Millisecond)
+	mu429.Unlock()
 	// Create another invite after bucket refill
 	respInv2, bodyInv2 := c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, respInv2, bodyInv2, 201)
