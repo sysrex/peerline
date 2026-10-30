@@ -141,7 +141,7 @@ func main() {
 	}
 	retentionSeconds := int64(retentionDays * 24 * 60 * 60)
 
-	apiServer := api.New(st, api.Config{
+	apiServer, err := api.New(st, api.Config{
 		RegisterToken:         regTok,
 		Logger:                log,
 		Mailer:                ml,
@@ -152,6 +152,10 @@ func main() {
 		MaxOutstandingInvites: maxOutstandingInvites,
 		RetentionSeconds:      retentionSeconds,
 	})
+	if err != nil {
+		log.Error("failed to create API server", "err", err)
+		os.Exit(1)
+	}
 
 	srv := &http.Server{
 		Addr:              *addr,
