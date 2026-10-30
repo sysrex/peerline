@@ -28,6 +28,19 @@ func env(k, def string) string {
 	return def
 }
 
+// parseVersionDetail validates and normalizes PEERLINE_VERSION_DETAIL.
+// Accepts "minimal", "full", or "off" (case-insensitive, whitespace-trimmed).
+// Returns an error for any other value to fail-closed on typos.
+func parseVersionDetail(raw string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(raw))
+	switch normalized {
+	case "minimal", "full", "off":
+		return normalized, nil
+	default:
+		return "", fmt.Errorf("must be 'minimal', 'full', or 'off', got: %q", raw)
+	}
+}
+
 func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	addr := flag.String("addr", env("PEERLINE_ADDR", "127.0.0.1:8787"), "listen address")
@@ -46,9 +59,9 @@ func main() {
 	}
 
 	// Validate PEERLINE_VERSION_DETAIL at startup (fail closed on typos)
-	versionDetail := strings.ToLower(strings.TrimSpace(env("PEERLINE_VERSION_DETAIL", "minimal")))
-	if versionDetail != "minimal" && versionDetail != "full" && versionDetail != "off" {
-		log.Error("invalid PEERLINE_VERSION_DETAIL value; must be 'minimal', 'full', or 'off'", "value", versionDetail)
+	versionDetail, err := parseVersionDetail(env("PEERLINE_VERSION_DETAIL", "minimal"))
+	if err != nil {
+		log.Error("invalid PEERLINE_VERSION_DETAIL value; must be 'minimal', 'full', or 'off'", "value", env("PEERLINE_VERSION_DETAIL", ""))
 		os.Exit(1)
 	}
 

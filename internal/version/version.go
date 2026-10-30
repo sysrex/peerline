@@ -28,8 +28,9 @@ var (
 	infoOnce map[string]string
 )
 
-// releaseVersionRE matches strict semver releases: vX.Y.Z or X.Y.Z with no build metadata or git describe suffix
-var releaseVersionRE = regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+$`)
+// releaseVersionRE matches strict semver releases: vX.Y.Z or X.Y.Z with no build metadata or git describe suffix.
+// Rejects leading zeros in numeric components (e.g., v01.2.3) and caps each component at 10 digits.
+var releaseVersionRE = regexp.MustCompile(`^v?(0|[1-9][0-9]{0,9})\.(0|[1-9][0-9]{0,9})\.(0|[1-9][0-9]{0,9})$`)
 
 var commitRE = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
 
