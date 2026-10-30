@@ -109,11 +109,33 @@ func buildDSN(path string) string {
 }
 
 // migrate applies ordered, idempotent schema upgrades tracked by PRAGMA user_version.
+// It refuses to start when user_version is newer than this binary supports (fail-closed guard),
+// and takes a VACUUM INTO backup before applying any pending migration.
 func migrate(db *sql.DB) error {
+	// Fail-closed guard: refuse to open a database whose user_version is newer than this binary knows.
+	// This prevents an older binary from silently ignoring new columns, constraints, or semantics
+	// introduced by a later migration (e.g. v4's confirm mode checks).
+	var currentVersion int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&currentVersion); err != nil {
+		return fmt.Errorf("read user_version: %w", err)
+	}
+
 	migrations := []func(*sql.Tx) error{
 		migrateV1NotifyEmail,
 		migrateV2PairingTokenHash,
 		migrateV3InvitePublicID,
+	}
+
+	maxKnownVersion := len(migrations)
+	if currentVersion > maxKnownVersion {
+		return fmt.Errorf("database schema version %d is newer than this binary supports (max %d); upgrade the peerline binary or restore from backup", currentVersion, maxKnownVersion)
+	}
+
+	// Backup before migration if any steps are pending
+	if currentVersion < maxKnownVersion {
+		if err := backupBeforeMigration(db, currentVersion, maxKnownVersion); err != nil {
+			return fmt.Errorf("backup before migration: %w", err)
+		}
 	}
 
 	for i, mig := range migrations {
@@ -122,6 +144,34 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	return nil
+}
+
+// backupBeforeMigration creates a VACUUM INTO backup of the database before applying migrations.
+// For :memory: databases, no backup is taken. The backup path is <db-path>.pre-v<target>.
+func backupBeforeMigration(db *sql.DB, currentVersion, targetVersion int) error {
+	// Extract the database path from the connection
+	// We need to query the database_list to get the file path
+	var dbPath string
+	err := db.QueryRow(`SELECT file FROM pragma_database_list() WHERE name='main'`).Scan(&dbPath)
+	if err != nil {
+		return fmt.Errorf("get database path: %w", err)
+	}
+
+	// Skip backup for in-memory databases (they have no persistent file)
+	if dbPath == "" || strings.Contains(dbPath, ":memory:") || strings.HasPrefix(dbPath, "file:") && strings.Contains(dbPath, "mode=memory") {
+		return nil
+	}
+
+	// Create backup path: <db-path>.pre-v<target>
+	backupPath := fmt.Sprintf("%s.pre-v%d", dbPath, targetVersion)
+
+	// Use VACUUM INTO to create a consistent backup
+	_, err = db.Exec(fmt.Sprintf(`VACUUM INTO '%s'`, backupPath))
+	if err != nil {
+		return fmt.Errorf("create backup at %s: %w", backupPath, err)
+	}
+
 	return nil
 }
 

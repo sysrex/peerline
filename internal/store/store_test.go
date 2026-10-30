@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1408,6 +1409,230 @@ func TestPragmasInEffect(t *testing.T) {
 		})
 	}
 }
+
+// TestFailClosedVersionGuard verifies that the database refuses to open when user_version
+// is newer than the binary supports, and leaves the database untouched.
+func TestFailClosedVersionGuard(t *testing.T) {
+	path := t.TempDir() + "/future.db"
+
+	// Create a database with a future schema version
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Set up a minimal schema
+	if _, err := db.Exec(`CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set user_version to a future version (higher than current max of 3)
+	if _, err := db.Exec(`PRAGMA user_version = 99`); err != nil {
+		t.Fatal(err)
+	}
+
+	var versionBefore int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&versionBefore); err != nil {
+		t.Fatal(err)
+	}
+	if versionBefore != 99 {
+		t.Fatalf("setup failed: user_version = %d, want 99", versionBefore)
+	}
+
+	db.Close()
+
+	// Attempt to open with Store - should fail with clear error message
+	_, err = Open(path)
+	if err == nil {
+		t.Fatal("expected error when opening database with future schema version")
+	}
+
+	// Verify error message mentions both versions
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "99") || !strings.Contains(errMsg, "3") {
+		t.Errorf("error message should mention both schema versions (99 and 3), got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "newer") && !strings.Contains(errMsg, "upgrade") {
+		t.Errorf("error message should mention 'newer' or 'upgrade', got: %s", errMsg)
+	}
+
+	// Verify the database was not modified (user_version still 99)
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var versionAfter int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&versionAfter); err != nil {
+		t.Fatal(err)
+	}
+	if versionAfter != 99 {
+		t.Errorf("database was modified: user_version changed from 99 to %d", versionAfter)
+	}
+}
+
+// TestBackupBeforeMigration verifies that a VACUUM INTO backup is created
+// before any pending migration runs.
+func TestBackupBeforeMigration(t *testing.T) {
+	path := t.TempDir() + "/test.db"
+
+	// Create a v2 database (one version behind current max of 3)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create v2 schema
+	if _, err := db.Exec(`
+		CREATE TABLE peers (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			key_hash TEXT NOT NULL UNIQUE,
+			created_at INTEGER NOT NULL,
+			notify_email TEXT NOT NULL DEFAULT ''
+		);
+		CREATE TABLE invites (
+			code_hash TEXT PRIMARY KEY,
+			from_peer TEXT NOT NULL,
+			scopes TEXT NOT NULL,
+			bags TEXT NOT NULL,
+			expires_at INTEGER NOT NULL,
+			used_by TEXT,
+			pairing_token_hash TEXT
+		);
+		CREATE UNIQUE INDEX invites_pairing_token_hash ON invites(pairing_token_hash) WHERE pairing_token_hash IS NOT NULL;
+		PRAGMA user_version = 2;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert test data to verify backup captures it
+	if _, err := db.Exec(`INSERT INTO peers (id, name, key_hash, created_at) VALUES ('test_peer', 'Test', 'hash1', ?)`, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+
+	db.Close()
+
+	// Backup path should be created
+	backupPath := path + ".pre-v3"
+
+	// Verify backup doesn't exist yet
+	if _, err := os.Stat(backupPath); !os.IsNotExist(err) {
+		t.Fatal("backup file should not exist before migration")
+	}
+
+	// Open with Store - this should create the backup and run migration
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Verify backup was created
+	backupDB, err := sql.Open("sqlite", backupPath)
+	if err != nil {
+		t.Fatalf("backup file was not created at %s: %v", backupPath, err)
+	}
+	defer backupDB.Close()
+
+	// Verify backup contains the test data
+	var peerID string
+	if err := backupDB.QueryRow(`SELECT id FROM peers WHERE id='test_peer'`).Scan(&peerID); err != nil {
+		t.Fatalf("backup does not contain test data: %v", err)
+	}
+	if peerID != "test_peer" {
+		t.Errorf("backup peer_id = %q, want 'test_peer'", peerID)
+	}
+
+	// Verify backup has the old version (2, not 3)
+	var backupVersion int
+	if err := backupDB.QueryRow(`PRAGMA user_version`).Scan(&backupVersion); err != nil {
+		t.Fatal(err)
+	}
+	if backupVersion != 2 {
+		t.Errorf("backup user_version = %d, want 2 (pre-migration)", backupVersion)
+	}
+
+	// Verify main database was migrated to version 3
+	var mainVersion int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&mainVersion); err != nil {
+		t.Fatal(err)
+	}
+	if mainVersion != 3 {
+		t.Errorf("main database user_version = %d, want 3 (post-migration)", mainVersion)
+	}
+}
+
+// TestNoBackupWhenCurrent verifies that no backup is created when the database
+// is already at the current schema version.
+func TestNoBackupWhenCurrent(t *testing.T) {
+	path := t.TempDir() + "/current.db"
+
+	// Create a database at the current version by using Open
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	// Verify it's at version 3
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 3 {
+		t.Fatalf("setup failed: version = %d, want 3", version)
+	}
+
+	db.Close()
+
+	// Remove any backup that might have been created during the first Open
+	// (since it migrated from 0 to 3)
+	backupPath := path + ".pre-v3"
+	os.Remove(backupPath)
+
+	// Open again - no migration should run, no new backup should be created
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Verify no backup was created this time
+	if _, err := os.Stat(backupPath); !os.IsNotExist(err) {
+		t.Error("backup file should not be created when database is already current")
+	}
+}
+
+// TestInMemorySkipsBackup verifies that :memory: databases skip the backup step.
+func TestInMemorySkipsBackup(t *testing.T) {
+	// This should succeed without trying to create a backup file
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Verify it's fully migrated
+	var version int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 3 {
+		t.Errorf("in-memory database user_version = %d, want 3", version)
+	}
+
+	// No file should exist (this is a weak test, but we can't easily verify
+	// that VACUUM INTO was not called)
+}
+
 func TestV3MigrationFreshDB(t *testing.T) {
 	s, err := Open(t.TempDir() + "/test.db")
 	if err != nil {
