@@ -285,3 +285,93 @@ func TestMigrateNotifyEmailAndPairingToken(t *testing.T) {
 		t.Fatalf("invite info %+v %v", info, err)
 	}
 }
+
+// TestPR11AlreadyMigrated verifies databases that PR #11 already migrated upgrade cleanly.
+// PR #11 added pairing_token_hash column and index, but did not use PRAGMA user_version.
+func TestPR11AlreadyMigrated(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/pr11.db"
+
+	// Simulate a database that PR #11 already migrated (has both columns, user_version is 0)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Exec(`
+		CREATE TABLE peers (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			key_hash TEXT NOT NULL UNIQUE,
+			created_at INTEGER NOT NULL,
+			notify_email TEXT NOT NULL DEFAULT ''
+		);
+		CREATE TABLE invites (
+			code_hash TEXT PRIMARY KEY,
+			from_peer TEXT NOT NULL,
+			scopes TEXT NOT NULL,
+			bags TEXT NOT NULL,
+			expires_at INTEGER NOT NULL,
+			used_by TEXT,
+			pairing_token_hash TEXT
+		);
+		CREATE UNIQUE INDEX invites_pairing_token_hash ON invites(pairing_token_hash);
+		CREATE TABLE grants (owner TEXT NOT NULL, grantee TEXT NOT NULL, scopes TEXT NOT NULL, bags TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (owner, grantee));
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Exec(`INSERT INTO peers(id,name,key_hash,created_at,notify_email) VALUES('alice','Alice','ha',1,'alice@example.com')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// user_version should be 0 (PR #11 didn't set it)
+	var version int
+	db.QueryRow(`PRAGMA user_version`).Scan(&version)
+	if version != 0 {
+		t.Fatalf("fixture user_version = %d, want 0", version)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen with our migration code
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Verify user_version is now 2
+	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
+	if version != 2 {
+		t.Fatalf("user_version = %d, want 2", version)
+	}
+
+	// Verify columns exist
+	var notifyEmailCol, pairingCol int
+	s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name='notify_email'`).Scan(&notifyEmailCol)
+	s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('invites') WHERE name='pairing_token_hash'`).Scan(&pairingCol)
+	if notifyEmailCol != 1 || pairingCol != 1 {
+		t.Fatalf("columns missing: notify_email=%d, pairing_token_hash=%d", notifyEmailCol, pairingCol)
+	}
+
+	// Verify index exists
+	var hasIndex int
+	s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='invites_pairing_token_hash'`).Scan(&hasIndex)
+	if hasIndex != 1 {
+		t.Fatal("invites_pairing_token_hash index missing")
+	}
+
+	// Verify old data intact
+	email, err := s.NotifyEmail(ctx, "alice")
+	if err != nil || email != "alice@example.com" {
+		t.Fatalf("notify_email after PR #11 migration: %q %v", email, err)
+	}
+
+	// Verify pairing invites work
+	if err := s.CreateInviteWithPairing(ctx, "code1", "pair1", "alice", []string{"messages"}, nil, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("pairing invite after PR #11 migration: %v", err)
+	}
+}

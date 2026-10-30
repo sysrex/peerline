@@ -936,28 +936,10 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// First verify the pairing token exists and is valid
-	info, err := s.st.GetInviteByPairingToken(r.Context(), auth.Hash(token))
-	if errors.Is(err, store.ErrNotFound) {
-		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
-		return
-	}
-	if err != nil {
-		s.internal(w, err)
-		return
-	}
-	// Register the new peer
-	id, key := auth.NewID(), auth.NewKey()
-	if err := s.st.CreatePeer(r.Context(), id, in.Name, auth.Hash(key), ""); err != nil {
-		s.internal(w, err)
-		return
-	}
-	s.log.Info("peer registered via pairing", "peer_id", id, "inviter", info.FromPeer)
-	// Accept the pairing
-	g, err := s.st.AcceptInviteByPairingToken(r.Context(), auth.Hash(token), id, sc, bg)
+	// Atomically register and accept the pairing in one transaction
+	id, key, g, err := s.st.RegisterAndAcceptByPairing(r.Context(), auth.Hash(token), in.Name, "", sc, bg)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		// Should not happen since we just verified it, but handle anyway
 		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
 		return
 	case errors.Is(err, store.ErrConflict):
@@ -967,6 +949,7 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 		s.internal(w, err)
 		return
 	}
+	s.log.Info("peer registered and paired", "peer_id", id, "inviter", g.Owner)
 	resp := map[string]any{
 		"peer_id":         id,
 		"api_key":         key,

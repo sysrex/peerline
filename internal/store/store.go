@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sysrex/peerline/internal/auth"
 	_ "modernc.org/sqlite"
 )
 
@@ -86,36 +87,75 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-// migrate adds columns that CREATE TABLE IF NOT EXISTS will not backfill on
-// databases created before they existed. Each column is checked on its own:
-// a database can already have peers.notify_email and still lack
-// invites.pairing_token_hash.
+// migrate applies ordered, idempotent schema upgrades tracked by PRAGMA user_version.
 func migrate(db *sql.DB) error {
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return err
+	}
+
+	migrations := []func(*sql.DB) error{
+		migrateV1NotifyEmail,
+		migrateV2PairingTokenHash,
+	}
+
+	for i, mig := range migrations {
+		target := i + 1
+		if version >= target {
+			continue
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin migration v%d: %w", target, err)
+		}
+
+		if err := mig(db); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("migration v%d: %w", target, err)
+		}
+
+		if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, target)); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("update user_version to %d: %w", target, err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v%d: %w", target, err)
+		}
+
+		version = target
+	}
+	return nil
+}
+
+// migrateV1NotifyEmail adds the notify_email column to peers.
+func migrateV1NotifyEmail(db *sql.DB) error {
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name = 'notify_email'`).Scan(&n); err != nil {
 		return err
 	}
-	if n == 0 {
-		// Plaintext: Peerline has to address the wake-up mail later. The address
-		// is returned only to the peer who set it.
-		if _, err := db.Exec(`ALTER TABLE peers ADD COLUMN notify_email TEXT NOT NULL DEFAULT ''`); err != nil {
-			return err
-		}
+	if n > 0 {
+		return nil
 	}
+	// Plaintext: Peerline has to address the wake-up mail later. The address
+	// is returned only to the peer who set it.
+	_, err := db.Exec(`ALTER TABLE peers ADD COLUMN notify_email TEXT NOT NULL DEFAULT ''`)
+	return err
+}
 
+// migrateV2PairingTokenHash adds the pairing_token_hash column and unique index to invites.
+func migrateV2PairingTokenHash(db *sql.DB) error {
+	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('invites') WHERE name = 'pairing_token_hash'`).Scan(&n); err != nil {
 		return err
 	}
 	if n == 0 {
-		// Nullable so code-only invites, and rows written before pairing links,
-		// stay valid. SQLite rejects ADD COLUMN ... UNIQUE.
 		if _, err := db.Exec(`ALTER TABLE invites ADD COLUMN pairing_token_hash TEXT`); err != nil {
 			return err
 		}
 	}
-	// Fresh databases already declare the column UNIQUE. Upgraded databases get
-	// the same constraint here. NULL pairing tokens (code-only invites) may repeat.
-	_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS invites_pairing_token_hash ON invites(pairing_token_hash)`)
+	_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS invites_pairing_token_hash ON invites(pairing_token_hash) WHERE pairing_token_hash IS NOT NULL`)
 	return err
 }
 
@@ -270,90 +310,180 @@ func (s *Store) GetInviteByPairingToken(ctx context.Context, pairingTokenHash st
 }
 
 // AcceptInviteByPairingToken atomically consumes an invite via pairing token and creates grants.
-// Returns the invite code hash (for logging) and the inviter's grant.
 func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash, accepter string, backScopes, backBags []string) (*Grant, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginImmediate(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	var codeHash, from, scopes, bags string
-	var exp int64
-	var used sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT code_hash,from_peer,scopes,bags,expires_at,used_by FROM invites WHERE pairing_token_hash=?`, pairingTokenHash).
-		Scan(&codeHash, &from, &scopes, &bags, &exp, &used)
+	
+	var codeHash string
+	err = tx.QueryRowContext(ctx, `SELECT code_hash FROM invites WHERE pairing_token_hash=?`, pairingTokenHash).Scan(&codeHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp < now() {
-		return nil, ErrNotFound
-	}
-	if from == accepter {
-		return nil, ErrConflict
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE invites SET used_by=? WHERE code_hash=?`, accepter, codeHash); err != nil {
+	
+	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags)
+	if err != nil {
 		return nil, err
 	}
-	up := `INSERT INTO grants(owner,grantee,scopes,bags,created_at) VALUES(?,?,?,?,?)
-	       ON CONFLICT(owner,grantee) DO UPDATE SET scopes=excluded.scopes, bags=excluded.bags, created_at=excluded.created_at`
-	if _, err := tx.ExecContext(ctx, up, from, accepter, scopes, bags, now()); err != nil {
-		return nil, err
-	}
-	if len(backScopes) > 0 {
-		if _, err := tx.ExecContext(ctx, up, accepter, from, join(backScopes), join(backBags), now()); err != nil {
-			return nil, err
-		}
-	}
+	
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return &Grant{Owner: from, Grantee: accepter, Scopes: split(scopes), Bags: split(bags)}, nil
+	return grant, nil
 }
 
 // AcceptInvite atomically consumes an invite and creates the inviter->accepter grant
 // plus, optionally, a reciprocal accepter->inviter grant. Returns the inviter's grant.
 func (s *Store) AcceptInvite(ctx context.Context, codeHash, accepter string, backScopes, backBags []string) (*Grant, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginImmediate(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
+	
+	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags)
+	if err != nil {
+		return nil, err
+	}
+	
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return grant, nil
+}
+
+// RegisterAndAcceptByPairing atomically registers a new peer and accepts a pairing invite.
+// Returns the new peer's ID, key, and the grant from the inviter.
+func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash, name, notifyEmail string, backScopes, backBags []string) (peerID, key string, grant *Grant, err error) {
+	tx, err := s.beginImmediate(ctx)
+	if err != nil {
+		return "", "", nil, err
+	}
+	defer tx.Rollback()
+	
+	var codeHash string
+	err = tx.QueryRowContext(ctx, `SELECT code_hash FROM invites WHERE pairing_token_hash=?`, pairingTokenHash).Scan(&codeHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", nil, ErrNotFound
+	}
+	if err != nil {
+		return "", "", nil, err
+	}
+	
+	peerID, key = auth.NewID(), auth.NewKey()
+	keyHash := auth.Hash(key)
+	_, err = tx.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email) VALUES(?,?,?,?,?)`,
+		peerID, name, keyHash, now(), notifyEmail)
+	if err != nil {
+		return "", "", nil, err
+	}
+	
+	grant, err = acceptInviteInTx(ctx, tx, codeHash, peerID, backScopes, backBags)
+	if err != nil {
+		return "", "", nil, err
+	}
+	
+	if err := tx.Commit(); err != nil {
+		return "", "", nil, err
+	}
+	return peerID, key, grant, nil
+}
+
+// txLike is an interface covering the methods we need from sql.Tx.
+type txLike interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	Commit() error
+	Rollback() error
+}
+
+// beginImmediate starts a transaction with BEGIN IMMEDIATE.
+func (s *Store) beginImmediate(ctx context.Context) (txLike, error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return &immediateTx{conn: conn, ctx: ctx}, nil
+}
+
+// immediateTx wraps a connection with a manually-started IMMEDIATE transaction.
+type immediateTx struct {
+	conn *sql.Conn
+	ctx  context.Context
+}
+
+func (tx *immediateTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return tx.conn.ExecContext(ctx, query, args...)
+}
+
+func (tx *immediateTx) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return tx.conn.QueryRowContext(ctx, query, args...)
+}
+
+func (tx *immediateTx) Commit() error {
+	_, err := tx.conn.ExecContext(tx.ctx, `COMMIT`)
+	tx.conn.Close()
+	return err
+}
+
+func (tx *immediateTx) Rollback() error {
+	tx.conn.ExecContext(tx.ctx, `ROLLBACK`)
+	tx.conn.Close()
+	return nil
+}
+
+// acceptInviteInTx is the shared helper that atomically consumes an invite using a guarded
+// update and creates grants. Must be called within a transaction.
+func acceptInviteInTx(ctx context.Context, tx txLike, codeHash, accepter string, backScopes, backBags []string) (*Grant, error) {
 	var from, scopes, bags string
-	var exp int64
-	var used sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT from_peer,scopes,bags,expires_at,used_by FROM invites WHERE code_hash=?`, codeHash).
-		Scan(&from, &scopes, &bags, &exp, &used)
+	err := tx.QueryRowContext(ctx, `SELECT from_peer,scopes,bags FROM invites WHERE code_hash=?`, codeHash).
+		Scan(&from, &scopes, &bags)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp < now() {
-		return nil, ErrNotFound
-	}
+	
 	if from == accepter {
 		return nil, ErrConflict
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE invites SET used_by=? WHERE code_hash=?`, accepter, codeHash); err != nil {
+	
+	ts := now()
+	res, err := tx.ExecContext(ctx, 
+		`UPDATE invites SET used_by=? WHERE code_hash=? AND used_by IS NULL AND expires_at>=?`,
+		accepter, codeHash, ts)
+	if err != nil {
 		return nil, err
 	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if n != 1 {
+		return nil, ErrNotFound
+	}
+	
 	up := `INSERT INTO grants(owner,grantee,scopes,bags,created_at) VALUES(?,?,?,?,?)
 	       ON CONFLICT(owner,grantee) DO UPDATE SET scopes=excluded.scopes, bags=excluded.bags, created_at=excluded.created_at`
-	if _, err := tx.ExecContext(ctx, up, from, accepter, scopes, bags, now()); err != nil {
+	if _, err := tx.ExecContext(ctx, up, from, accepter, scopes, bags, ts); err != nil {
 		return nil, err
 	}
 	if len(backScopes) > 0 {
-		if _, err := tx.ExecContext(ctx, up, accepter, from, join(backScopes), join(backBags), now()); err != nil {
+		if _, err := tx.ExecContext(ctx, up, accepter, from, join(backScopes), join(backBags), ts); err != nil {
 			return nil, err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
+	
 	return &Grant{Owner: from, Grantee: accepter, Scopes: split(scopes), Bags: split(bags)}, nil
 }
 
