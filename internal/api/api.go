@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -66,6 +67,9 @@ type Config struct {
 	// RetentionSeconds is how long (in seconds) to keep used invites before purging.
 	// Default is 30 days (2592000 seconds). Set to 0 for the default.
 	RetentionSeconds int64
+	// CodePepper keys the claim short code. Empty = random per process, so codes
+	// change on restart; set PEERLINE_CODE_PEPPER in production.
+	CodePepper []byte
 }
 
 type Server struct {
@@ -76,6 +80,7 @@ type Server struct {
 	log         *slog.Logger
 	trustedNets []*net.IPNet
 	now         func() time.Time // clock for invite expiry; defaults to time.Now
+	claims      ClaimStore       // claim/confirm backend; nil = claim routes are not served
 
 	// Test-only hook: called after invite creation, before email limit check
 	testInviteCreatedHook func(peerID string)
@@ -111,6 +116,9 @@ func New(st *store.Store, cfg Config) *Server {
 	}
 	if cfg.MaxOutstandingInvites <= 0 {
 		cfg.MaxOutstandingInvites = 10
+	}
+	if len(cfg.CodePepper) == 0 {
+		cfg.CodePepper = []byte(auth.NewSecret("pep_"))
 	}
 	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
 
@@ -176,14 +184,16 @@ func (s *Server) Handler() http.Handler {
 	authed.HandleFunc("GET /v1/bags/{name}", s.rateLimitAuth(s.getBag))
 	authed.HandleFunc("PUT /v1/bags/{name}", s.rateLimitBagWrite(s.putBag))
 	authed.HandleFunc("POST /v1/pairing/{token}", s.acceptPairing) // authenticated pairing acceptance
-	authMW := auth.Middleware(func(ctx context.Context, h string) (string, error) {
+	lookup := func(ctx context.Context, h string) (string, error) {
 		p, err := s.st.PeerByKeyHash(ctx, h)
 		if err != nil {
 			return "", err
 		}
 		return p.ID, nil
-	}, authed)
+	}
+	authMW := auth.Middleware(lookup, authed)
 	mux.Handle("/v1/", authMW)
+	s.claimRoutes(mux, func(h http.Handler) http.Handler { return auth.Middleware(lookup, h) })
 	// The emailed accept link: only unauthenticated GET shows instructions.
 	// Authenticated GET returns 405; only POST accepts the invite.
 	mux.HandleFunc("GET /v1/invites/accept", func(w http.ResponseWriter, r *http.Request) {
@@ -219,6 +229,10 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
+	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+		writeErr(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+		return false
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
