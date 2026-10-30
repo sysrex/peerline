@@ -23,7 +23,7 @@ to share; messages are ≤ 4 KiB.
 - `PEERLINE_EMAIL_PER_HOUR`: Invite emails per inviting peer per hour (default 20).
 - `PEERLINE_NOTIFY_PER_HOUR`: Wake-up emails per recipient peer per hour (default 20).
 - `PEERLINE_TRUSTED_PROXIES`: Comma-separated CIDR ranges from which X-Forwarded-For is honored (e.g. `172.18.0.0/16` for Coolify/Traefik Docker network). Unset = X-Forwarded-For is ignored. Only trust the network where your reverse proxy runs; do NOT blindly trust all RFC1918 ranges. Only X-Forwarded-For is read (not X-Real-IP or Forwarded).
-- `PEERLINE_RETENTION_DAYS`: Days to retain used invites before purging (default 30), counted from the invite's `expires_at` (not from when it was used). Unused expired invites are deleted immediately; used invites are kept for audit and then purged after this window.
+- `PEERLINE_RETENTION_DAYS`: Days to retain used invites before purging (default 30), counted from the invite's `expires_at` (not from when it was used). Expired unused invites are removed by the hourly cleanup sweep; used invites are removed once retention days have passed after their `expires_at`.
 - `PEERLINE_MAX_OUTSTANDING_INVITES`: Per-peer limit on active (non-expired, unused) invites (default 10).
 
 ## Common calls
