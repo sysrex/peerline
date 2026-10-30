@@ -1632,8 +1632,8 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 
 	// Create and immediately accept invites at different points in time
 
-	// 1. Unused expired invite (expires 100s ago) - should be purged
-	exp1 := time.Unix(currentTime-100, 0)
+	// 1. Unused expired invite (expires 500s ago, beyond 5-minute grace) - should be purged
+	exp1 := time.Unix(currentTime-500, 0)
 	if err := s.CreateInvite(ctx, "code1", "alice", []string{"messages"}, nil, exp1); err != nil {
 		t.Fatal(err)
 	}

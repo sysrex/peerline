@@ -572,7 +572,7 @@ func (s *Store) DeleteInvite(ctx context.Context, publicID, ownerID string) erro
 }
 
 // PurgeExpiredInvites removes expired unused invites and old used invites.
-// Unused invites: deleted when expires_at < now.
+// Unused invites: deleted when expires_at < now - 300 (5-minute grace).
 // Used invites: deleted when expires_at < now - retentionSeconds (default 30 days).
 func (s *Store) PurgeExpiredInvites(ctx context.Context, retentionSeconds int64) (int, error) {
 	if retentionSeconds <= 0 {
@@ -580,19 +580,41 @@ func (s *Store) PurgeExpiredInvites(ctx context.Context, retentionSeconds int64)
 	}
 
 	ts := s.now()
+	graceCutoff := ts - 300 // 5-minute grace window
 	retentionCutoff := ts - retentionSeconds
 
-	// Delete unused expired invites and used invites older than retention window
-	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM invites WHERE 
-			(used_by IS NULL AND expires_at < ?) OR 
-			(used_by IS NOT NULL AND expires_at < ?)`,
-		ts, retentionCutoff)
-	if err != nil {
-		return 0, err
+	totalDeleted := 0
+	batchSize := 500
+
+	for {
+		// Check context before each batch
+		if err := ctx.Err(); err != nil {
+			return totalDeleted, err
+		}
+
+		// Delete in batches using rowid
+		res, err := s.db.ExecContext(ctx,
+			`DELETE FROM invites WHERE rowid IN (
+				SELECT rowid FROM invites 
+				WHERE (used_by IS NULL AND expires_at < ?) 
+				   OR (used_by IS NOT NULL AND expires_at < ?)
+				LIMIT ?
+			)`,
+			graceCutoff, retentionCutoff, batchSize)
+		if err != nil {
+			return totalDeleted, err
+		}
+
+		n, _ := res.RowsAffected()
+		totalDeleted += int(n)
+
+		// Stop if we deleted fewer than batchSize
+		if int(n) < batchSize {
+			break
+		}
 	}
-	n, _ := res.RowsAffected()
-	return int(n), nil
+
+	return totalDeleted, nil
 }
 
 type InviteInfo struct {
