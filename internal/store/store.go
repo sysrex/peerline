@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS invites (
   scopes TEXT NOT NULL,
   bags TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
-  used_by TEXT
+  used_by TEXT,
+  pairing_token_hash TEXT UNIQUE
 );
 -- grants are directional: grantee may act on owner's resources within scopes/bags.
 CREATE TABLE IF NOT EXISTS grants (
@@ -212,6 +213,87 @@ func (s *Store) CreateInvite(ctx context.Context, codeHash, from string, scopes,
 	_, err := s.db.ExecContext(ctx, `INSERT INTO invites(code_hash,from_peer,scopes,bags,expires_at) VALUES(?,?,?,?,?)`,
 		codeHash, from, join(scopes), join(bags), expires.Unix())
 	return err
+}
+
+func (s *Store) CreateInviteWithPairing(ctx context.Context, codeHash, pairingTokenHash, from string, scopes, bags []string, expires time.Time) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO invites(code_hash,from_peer,scopes,bags,expires_at,pairing_token_hash) VALUES(?,?,?,?,?,?)`,
+		codeHash, from, join(scopes), join(bags), expires.Unix(), pairingTokenHash)
+	return err
+}
+
+type InviteInfo struct {
+	FromPeer  string
+	Scopes    []string
+	Bags      []string
+	ExpiresAt time.Time
+}
+
+// GetInviteByPairingToken retrieves invite details by pairing token (does not consume it).
+func (s *Store) GetInviteByPairingToken(ctx context.Context, pairingTokenHash string) (*InviteInfo, error) {
+	var from, scopes, bags string
+	var exp int64
+	var used sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT from_peer,scopes,bags,expires_at,used_by FROM invites WHERE pairing_token_hash=?`, pairingTokenHash).
+		Scan(&from, &scopes, &bags, &exp, &used)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if used.Valid || exp < now() {
+		return nil, ErrNotFound
+	}
+	return &InviteInfo{
+		FromPeer:  from,
+		Scopes:    split(scopes),
+		Bags:      split(bags),
+		ExpiresAt: time.Unix(exp, 0).UTC(),
+	}, nil
+}
+
+// AcceptInviteByPairingToken atomically consumes an invite via pairing token and creates grants.
+// Returns the invite code hash (for logging) and the inviter's grant.
+func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash, accepter string, backScopes, backBags []string) (*Grant, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var codeHash, from, scopes, bags string
+	var exp int64
+	var used sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT code_hash,from_peer,scopes,bags,expires_at,used_by FROM invites WHERE pairing_token_hash=?`, pairingTokenHash).
+		Scan(&codeHash, &from, &scopes, &bags, &exp, &used)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if used.Valid || exp < now() {
+		return nil, ErrNotFound
+	}
+	if from == accepter {
+		return nil, ErrConflict
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE invites SET used_by=? WHERE code_hash=?`, accepter, codeHash); err != nil {
+		return nil, err
+	}
+	up := `INSERT INTO grants(owner,grantee,scopes,bags,created_at) VALUES(?,?,?,?,?)
+	       ON CONFLICT(owner,grantee) DO UPDATE SET scopes=excluded.scopes, bags=excluded.bags, created_at=excluded.created_at`
+	if _, err := tx.ExecContext(ctx, up, from, accepter, scopes, bags, now()); err != nil {
+		return nil, err
+	}
+	if len(backScopes) > 0 {
+		if _, err := tx.ExecContext(ctx, up, accepter, from, join(backScopes), join(backBags), now()); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &Grant{Owner: from, Grantee: accepter, Scopes: split(scopes), Bags: split(bags)}, nil
 }
 
 // AcceptInvite atomically consumes an invite and creates the inviter->accepter grant
