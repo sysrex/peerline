@@ -42,6 +42,7 @@ func newServer(t *testing.T, cfg Config) *httptest.Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
+	prepareTestConfig(t, st, &cfg)
 	apiSrv, err := New(st, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -61,6 +62,7 @@ func newServerWithAccess(t *testing.T, cfg Config) (*httptest.Server, *Server, *
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
+	prepareTestConfig(t, st, &cfg)
 	s, err := New(st, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -88,6 +90,7 @@ func newServerWithDB(t *testing.T, cfg Config) (*httptest.Server, *Server, *stor
 	}
 	t.Cleanup(func() { db.Close() })
 
+	prepareTestConfig(t, st, &cfg)
 	s, err := New(st, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -1967,7 +1970,7 @@ func TestMaintenanceManagerStops(t *testing.T) {
 
 	ctx := context.Background()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	mgr := NewMaintenanceManager(ctx, st, logger, 30*24*60*60)
+	mgr := NewMaintenanceManager(ctx, st, logger, 30*24*60*60, 6)
 
 	// Let it run a bit
 	time.Sleep(100 * time.Millisecond)
@@ -2256,6 +2259,7 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 	}
 	defer st.Close()
 
+	prepareTestConfig(t, st, &cfg)
 	rawSrv, err := New(st, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -2405,6 +2409,7 @@ func TestSingleLogLineUnauthenticatedPairing(t *testing.T) {
 
 	cfg := Config{}
 	cfg.Logger = logger
+	prepareTestConfig(t, st, &cfg)
 	apiSrv, err := New(st, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -2902,7 +2907,9 @@ func TestAPIClock(t *testing.T) {
 	}
 	defer st.Close()
 
-	srv, err := New(st, Config{})
+	bareCfg := Config{}
+	prepareTestConfig(t, st, &bareCfg)
+	srv, err := New(st, bareCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3841,5 +3848,39 @@ func TestVersionOffIndistinguishableFromUnknownRoute(t *testing.T) {
 		if c, _, _, _ := probe("GET", "/version"); c == http.StatusTooManyRequests {
 			t.Fatal("off mode must never rate limit")
 		}
+	}
+}
+
+// TestNewRequiresLoadedKeyIndex verifies that api.New returns an error if the key index is not loaded.
+func TestNewRequiresLoadedKeyIndex(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Don't load the key index
+	cfg := Config{
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AuthFailPerMinute: 30,
+		AuthFailBurst:     10,
+	}
+
+	// api.New should fail without loaded index
+	_, err = New(st, cfg)
+	if err == nil {
+		t.Fatal("api.New succeeded without loaded key index")
+	}
+	if !strings.Contains(err.Error(), "key index not loaded") {
+		t.Fatalf("want 'key index not loaded' error, got: %v", err)
+	}
+
+	// After loading, it should succeed
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, err = New(st, cfg)
+	if err != nil {
+		t.Fatalf("api.New failed after LoadKeyIndex: %v", err)
 	}
 }

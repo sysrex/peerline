@@ -29,11 +29,7 @@ func TestRevokePreventsPairingGetAndPost(t *testing.T) {
 		Logger:                slog.Default(),
 		MaxOutstandingInvites: 10,
 	}
-	apiSrv, err := New(st, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(apiSrv.Handler())
+	srv := httptest.NewServer(newTestServer(st, cfg, time.Now).Handler())
 	defer srv.Close()
 
 	// Register a peer and create a pairing invite
@@ -121,11 +117,7 @@ func TestConcurrentInviteCapAtAPILevel(t *testing.T) {
 		Logger:                slog.Default(),
 		MaxOutstandingInvites: cap,
 	}
-	apiSrv, err := New(st, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(apiSrv.Handler())
+	srv := httptest.NewServer(newTestServer(st, cfg, time.Now).Handler())
 	defer srv.Close()
 
 	alice := register(t, srv, "alice")
@@ -215,11 +207,7 @@ func TestCapBeforeEmailBudget(t *testing.T) {
 		EmailRcptPerHour:      10,
 		Mailer:                capturer,
 	}
-	apiSrv, err := New(st, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(apiSrv.Handler())
+	srv := httptest.NewServer(newTestServer(st, cfg, time.Now).Handler())
 	defer srv.Close()
 
 	alice := register(t, srv, "alice")
@@ -694,11 +682,7 @@ func TestAcceptByCodeAfterRevoke(t *testing.T) {
 		Logger:                slog.Default(),
 		MaxOutstandingInvites: 10,
 	}
-	apiSrv, err := New(st, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(apiSrv.Handler())
+	srv := httptest.NewServer(newTestServer(st, cfg, time.Now).Handler())
 	defer srv.Close()
 
 	// Register peers
@@ -743,11 +727,7 @@ func TestDeleteUsedInviteReturns404(t *testing.T) {
 		Logger:                slog.Default(),
 		MaxOutstandingInvites: 10,
 	}
-	apiSrv, err := New(st, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(apiSrv.Handler())
+	srv := httptest.NewServer(newTestServer(st, cfg, time.Now).Handler())
 	defer srv.Close()
 
 	// Register peers
@@ -797,11 +777,7 @@ func TestSingleLogRecordUnauthenticatedPairing(t *testing.T) {
 		Logger:                logger,
 		MaxOutstandingInvites: 10,
 	}
-	apiSrv, err := New(st, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(apiSrv.Handler())
+	srv := httptest.NewServer(newTestServer(st, cfg, time.Now).Handler())
 	defer srv.Close()
 
 	// Register a peer and create a pairing invite
