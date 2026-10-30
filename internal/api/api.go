@@ -568,7 +568,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.Mailer.Mode() == "log" {
 			status = "logged"
 		}
-		m := inviteEmail(s.inviterName(r.Context(), me), me, to, code, acceptURL, sc, bg, exp)
+		m := inviteEmail(s.inviterName(r.Context(), me), me, to, code, s.publicBase(r), sc, bg, exp)
 		// Detach from client cancellation; the SMTP sender has its own timeout.
 		if err := s.cfg.Mailer.Send(context.WithoutCancel(r.Context()), m); err != nil {
 			s.log.Error("invite email failed", "inviter", me, "err", err)
@@ -751,7 +751,7 @@ func sanitizeInviterName(name string) string {
 	return result
 }
 
-func inviteEmail(inviter, inviterID, to, code, acceptURL string, scopes, bags []string, exp time.Time) mailer.Message {
+func inviteEmail(inviter, inviterID, to, code, publicBase string, scopes, bags []string, exp time.Time) mailer.Message {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s (Peerline peer %s) invited one of your bots to pair on Peerline,\n", inviter, inviterID)
 	b.WriteString("a deny-all relay that lets bots on different accounts exchange short messages.\n\n")
@@ -761,11 +761,10 @@ func inviteEmail(inviter, inviterID, to, code, acceptURL string, scopes, bags []
 	}
 	fmt.Fprintf(&b, "Expires: %s (single use)\n\n", exp.Format(time.RFC3339))
 	b.WriteString("Accept with your bot's own Peerline API key (POST with code in body):\n\n")
-	baseURL := acceptURL[:strings.Index(acceptURL, "/v1/invites/accept")+len("/v1/invites/accept")]
 	fmt.Fprintf(&b, "  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" \\\n")
 	fmt.Fprintf(&b, "    -H \"Content-Type: application/json\" \\\n")
 	fmt.Fprintf(&b, "    -d '{\"code\":\"%s\"}' \\\n", code)
-	fmt.Fprintf(&b, "    '%s'\n\n", baseURL)
+	fmt.Fprintf(&b, "    '%s/v1/invites/accept'\n\n", publicBase)
 	fmt.Fprintf(&b, "Or give your bot this one-time code to paste:\n\n  %s\n\n", code)
 	b.WriteString("Accepting only lets your bot act within the scopes above on the inviter's side;\nnothing of yours is shared unless you grant scopes back.\n")
 	b.WriteString("If you don't recognise the inviter, ignore this email. The code expires on its own.\n")
@@ -807,10 +806,14 @@ func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	q := r.URL.Query()
+	queryOnlyCode := false
 	if qc := q.Get("code"); qc != "" {
 		if in.Code != "" && in.Code != qc {
 			writeErr(w, http.StatusBadRequest, "code in body and query differ")
 			return
+		}
+		if in.Code == "" {
+			queryOnlyCode = true
 		}
 		in.Code = qc
 	}
@@ -835,6 +838,12 @@ func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		s.internal(w, err)
 		return
+	}
+	// RFC 9745 deprecation headers for query-string-only code path (legacy).
+	// TODO: confirm-mode invites (#3) will return 404 on this path.
+	if queryOnlyCode {
+		w.Header().Set("Deprecation", "@1767225600") // 2026-01-01 00:00:00 UTC
+		w.Header().Set("Link", `<https://github.com/sysrex/peerline#email-invites>; rel="deprecation"; type="text/html"`)
 	}
 	resp := map[string]any{"peer_id": g.Owner, "granted_to_you": g}
 	if len(sc) > 0 {

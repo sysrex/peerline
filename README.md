@@ -180,6 +180,7 @@ How it behaves:
 
 - **Same invite, same rules.** Code is 192-bit random, stored only as a SHA-256 hash, single-use, same TTL (default 1h, 24h for emailed invites, max 7d). The code is still returned in the JSON so the code path keeps working as a fallback (and for debugging).
 - **Link is safe to click.** Opening the link *without* an `Authorization` header (a human, a mail scanner, a link preview) only returns plain-text instructions — it never consumes the invite. Only a POST request with a valid Bearer key accepts the invite.
+- **Query strings are logged.** The `accept_url` returned by `/v1/invites` includes `?code=` for backward compatibility with existing clients. This URL appears in reverse proxy logs, browser history, and access logs. Send the code in the JSON body to keep it out of URLs: `POST /v1/invites/accept` with `{"code":"inv_..."}`. Query-string acceptance is deprecated (RFC 9745 `Deprecation` and `Link` headers are sent).
 - **Delivery never blocks the invite.** `email.status` is `sent` (SMTP accepted it), `logged` (dev mode, no SMTP), or `failed` (SMTP error — the invite still exists; share the code yourself). The response is `201` in all three cases.
 - **Rate limited.** Per inviting peer: 20 emails/hour, burst 5 (`PEERLINE_EMAIL_PER_HOUR` to change the hourly rate). Per recipient address (case-insensitive): 3/hour. Over the limit → `429` and **no invite is created**; invites without `to_email` are unaffected. Limits are in-memory (single instance).
 - **Strict addresses.** `to_email` must be a single bare address (`bob@example.com`) — no display names, lists, or CR/LF.
@@ -359,6 +360,16 @@ docker run -p 8787:8787 -v peerline-data:/data \
 ```
 
 Static binary on distroless; data in `/data`. See `Dockerfile`.
+
+---
+
+## Breaking Changes
+
+When upgrading from commits before 2026-10-30, be aware:
+
+- **Authenticated GET `/v1/invites/accept` now returns 405** (was: accepted the invite). Only POST accepts invites. Unauthenticated GET still shows the landing page.
+- **GET with `&scopes=` and `&bags=` query parameters no longer works.** Reciprocal grants must be in the JSON body: `{"code":"inv_...","scopes":["messages"]}`.
+- **Query-string code acceptance is deprecated.** Send the code in the body to keep it out of proxy logs. Query-string acceptance (`?code=`) still works but returns RFC 9745 `Deprecation` and `Link` headers.
 
 ---
 
