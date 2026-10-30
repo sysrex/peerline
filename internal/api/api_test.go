@@ -1728,7 +1728,7 @@ func TestRateLimitWithMultipleXFFHeaders(t *testing.T) {
 	// Multiple XFF headers should be combined: ["203.0.113.10", "10.0.0.2", "10.0.0.3"]
 	req.Header.Add("X-Forwarded-For", "203.0.113.10, 10.0.0.2")
 	req.Header.Add("X-Forwarded-For", "10.0.0.3")
-	
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
