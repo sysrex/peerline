@@ -973,3 +973,15 @@ func TestSMTPImplicitTLS(t *testing.T) {
 		}
 	})
 }
+
+func TestIsLoopbackAddr(t *testing.T) {
+	for addr, want := range map[string]bool{"127.0.0.1:25": true, "[::1]:25": true, "10.0.0.5:25": false, "[2001:db8::1]:25": false} {
+		a, err := net.ResolveTCPAddr("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := isLoopbackAddr(a); got != want {
+			t.Errorf("isLoopbackAddr(%s) = %v, want %v", addr, got, want)
+		}
+	}
+}
