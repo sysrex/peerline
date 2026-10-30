@@ -41,3 +41,13 @@ func prepareTestConfig(t testing.TB, st *store.Store, cfg *Config) {
 	}
 	applyTestLimitDefaults(cfg)
 }
+
+func mustNew(t testing.TB, st *store.Store, cfg Config) *Server {
+	t.Helper()
+	prepareTestConfig(t, st, &cfg)
+	srv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv
+}

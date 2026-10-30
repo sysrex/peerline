@@ -268,6 +268,7 @@ type LimiterManager struct {
 	pairLim       *msg.Limiter
 	failLim       *msg.Limiter // Failed auth lookups (per-IP)
 	getLim        *msg.Limiter
+	versionLim    *msg.Limiter // Dedicated limiter for /version
 	authLim       *msg.Limiter
 	writeLim      *msg.Limiter // Authenticated write operations (per-peer)
 	bagWriteLim   *msg.Limiter // Bag PUTs, keyed by authenticated caller (never the bag owner)
@@ -299,6 +300,7 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 		pairLim:       msg.NewLimiter(10, 5, clk),
 		failLim:       msg.NewLimiter(cfg.AuthFailPerMinute, cfg.AuthFailBurst, clk),
 		getLim:        msg.NewLimiter(getPerMinute, getBurst, clk),
+		versionLim:    msg.NewLimiter(120, 30, clk), // Separate limiter for /version to avoid monitor conflicts
 		authLim:       msg.NewLimiter(authGetPerMinute, authGetBurst, clk),
 		writeLim:      msg.NewLimiter(cfg.WritePerMinute, cfg.WriteBurst, clk),
 		bagWriteLim:   msg.NewLimiter(30, 10, clk),

@@ -25,6 +25,7 @@ import (
 	"github.com/sysrex/peerline/internal/msg"
 	"github.com/sysrex/peerline/internal/pair"
 	"github.com/sysrex/peerline/internal/store"
+	"github.com/sysrex/peerline/internal/version"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -34,6 +35,8 @@ const (
 	defaultInviteTTL = 1 * time.Hour
 	maxInviteTTL     = 7 * 24 * time.Hour
 	maxInviteTTLSec  = 604800 // 7 days in seconds, checked before multiplication
+	// deprecationDate is 2026-10-30 00:00:00 UTC, the date query-string code acceptance was deprecated (PR #128).
+	deprecationDate = "@1793318400"
 )
 
 type Config struct {
@@ -78,6 +81,8 @@ type Config struct {
 	WriteBurst     int
 	// KeyIndexRebuildHours is how often to do a full key index rebuild (default: 6).
 	KeyIndexRebuildHours int
+	// VersionDetail controls /version response: "minimal" (version only, default), "full" (+ commit + build_time), "off" (404).
+	VersionDetail string
 	// CodePepper keys the claim short code. Empty = random per process, so codes
 	// change on restart; set PEERLINE_CODE_PEPPER in production.
 	CodePepper []byte
@@ -250,6 +255,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/register", s.register)
 	// Registered on the outer mux so it is not behind Bearer auth. The more
 	// specific pattern wins over the /v1/ subtree below.
+	// Only register /version if not disabled
+	if s.cfg.VersionDetail != "off" {
+		mux.HandleFunc("GET /version", s.rateLimitVersion(s.versionHandler))
+	}
 	mux.HandleFunc("GET /v1/public/stats", s.rateLimitGet(s.publicStats))
 	mux.HandleFunc("GET /v1/guide", s.rateLimitGet(s.guide))
 
@@ -274,6 +283,11 @@ func (s *Server) Handler() http.Handler {
 	// The emailed accept link: only unauthenticated GET shows instructions.
 	// Authenticated GET returns 405; only POST accepts the invite.
 	mux.HandleFunc("GET /v1/invites/accept", func(w http.ResponseWriter, r *http.Request) {
+		// RFC 9745 deprecation headers when ?code= is in the URL (issue #173).
+		if r.URL.Query().Get("code") != "" {
+			w.Header().Set("Deprecation", deprecationDate)
+			w.Header().Set("Link", `<https://github.com/sysrex/peerline#email-invites>; rel="deprecation"; type="text/html"`)
+		}
 		if r.Header.Get("Authorization") != "" {
 			w.Header().Set("Allow", "POST")
 			writeErr(w, http.StatusMethodNotAllowed, "use POST to accept the invite")
@@ -281,7 +295,7 @@ func (s *Server) Handler() http.Handler {
 		}
 		s.acceptLanding(w, r)
 	})
-	// Pairing endpoints: GET shows details (no auth), POST accepts (optionally creating a new peer)
+	// Pairing endpoints: GET shows details, POST accepts (optionally creating a new peer)
 	mux.HandleFunc("GET /v1/pairing/{token}", s.rateLimitGet(s.getPairing))
 	mux.HandleFunc("POST /v1/pairing/{token}", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "" {
@@ -744,7 +758,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.Mailer.Mode() == "log" {
 			status = "logged"
 		}
-		m := inviteEmail(s.inviterName(r.Context(), me), me, to, code, acceptURL, sc, bg, exp)
+		m := inviteEmail(s.inviterName(r.Context(), me), me, to, code, s.publicBase(r), sc, bg, exp)
 		// Detach from client cancellation; the SMTP sender has its own timeout.
 		if err := s.cfg.Mailer.Send(r.Context(), m); err != nil {
 			s.log.Error("invite email failed", "inviter", me, "err", err)
@@ -841,7 +855,6 @@ func truncateUTF8(s string, max int) string {
 //     virama (CCC 9), backs off to exclude the entire trailing cluster
 //
 // Returns "A Peerline peer" if the result is empty after filtering.
-// Max length 64 runes (not bytes).
 //
 // Note: Cross-script homoglyphs (e.g., Cyrillic а vs Latin a) are not fully solvable here
 // and require application-level awareness or visual similarity detection.
@@ -1015,7 +1028,7 @@ func sanitizeInviterName(name string) string {
 	return result
 }
 
-func inviteEmail(inviter, inviterID, to, code, acceptURL string, scopes, bags []string, exp time.Time) mailer.Message {
+func inviteEmail(inviter, inviterID, to, code, publicBase string, scopes, bags []string, exp time.Time) mailer.Message {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s (Peerline peer %s) invited one of your bots to pair on Peerline,\n", inviter, inviterID)
 	b.WriteString("a deny-all relay that lets bots on different accounts exchange short messages.\n\n")
@@ -1024,10 +1037,12 @@ func inviteEmail(inviter, inviterID, to, code, acceptURL string, scopes, bags []
 		fmt.Fprintf(&b, "Bags: %s\n", strings.Join(bags, ", "))
 	}
 	fmt.Fprintf(&b, "Expires: %s (single use)\n\n", exp.Format(time.RFC3339))
-	b.WriteString("Accept with your bot's own Peerline API key:\n\n")
-	fmt.Fprintf(&b, "  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" \\\n    -H \"Content-Type: application/json\" \\\n    -d '{\"code\":\"%s\"}' \\\n    %s\n\n", code, strings.Split(acceptURL, "?")[0])
-	fmt.Fprintf(&b, "Or use the link (deprecated; code appears in logs):\n\n  %s\n\n", acceptURL)
-	fmt.Fprintf(&b, "Or give your bot this one-time code:\n\n  %s\n\n", code)
+	b.WriteString("Accept with your bot's own Peerline API key (POST with code in body):\n\n")
+	fmt.Fprintf(&b, "  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" \\\n")
+	fmt.Fprintf(&b, "    -H \"Content-Type: application/json\" \\\n")
+	fmt.Fprintf(&b, "    -d '{\"code\":\"%s\"}' \\\n", code)
+	fmt.Fprintf(&b, "    '%s/v1/invites/accept'\n\n", publicBase)
+	fmt.Fprintf(&b, "Or give your bot this one-time code to paste:\n\n  %s\n\n", code)
 	b.WriteString("Accepting only lets your bot act within the scopes above on the inviter's side;\nnothing of yours is shared unless you grant scopes back.\n")
 	b.WriteString("If you don't recognise the inviter, ignore this email. The code expires on its own.\n")
 	return mailer.Message{To: to, Subject: "Peerline: " + inviter + " invited your bot to pair", Body: b.String()}
@@ -1040,16 +1055,20 @@ var inviteCodeRE = regexp.MustCompile(`^inv_[A-Za-z0-9_-]{16,64}$`)
 func (s *Server) acceptLanding(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	if !inviteCodeRE.MatchString(code) {
 		w.WriteHeader(http.StatusBadRequest)
 		io.WriteString(w, "Peerline: missing or malformed invite code.\n")
 		return
 	}
-	u := s.publicBase(r) + "/v1/invites/accept?code=" + url.QueryEscape(code)
-	fmt.Fprintf(w, "Peerline invite\n\nThis link must be opened by your bot with its Peerline API key:\n\n"+
-		"  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" '%s'\n\n"+
-		"Optionally grant scopes back in the same call with a JSON body, e.g. {\"scopes\":[\"messages\"]}.\n"+
-		"Or paste the one-time code into your bot: %s\n\nNothing has been accepted yet.\n", u, code)
+	u := s.publicBase(r) + "/v1/invites/accept"
+	fmt.Fprintf(w, "Peerline invite\n\nAccept with your bot's Peerline API key (use POST with code in body):\n\n"+
+		"  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" \\\n"+
+		"    -H \"Content-Type: application/json\" \\\n"+
+		"    -d '{\"code\":\"%s\"}' \\\n"+
+		"    '%s'\n\n"+
+		"Optionally grant scopes back in the same call: {\"code\":\"%s\",\"scopes\":[\"messages\"]}.\n"+
+		"Or paste the one-time code into your bot: %s\n\nNothing has been accepted yet.\n", code, u, code, code)
 }
 
 func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
@@ -1058,22 +1077,27 @@ func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 		Scopes []string `json:"scopes"` // optional reciprocal grant to the inviter
 		Bags   []string `json:"bags"`
 	}
-	// Body is optional when the code comes from the emailed link (?code=).
-	if r.Method == http.MethodPost && r.ContentLength != 0 {
+	// Body is optional when the code comes from the query string (?code=).
+	if r.ContentLength != 0 {
 		if !decode(w, r, &in) {
 			return
 		}
 	}
 	q := r.URL.Query()
+	hasQueryCode := q.Get("code") != ""
+	// RFC 9745 deprecation headers when ?code= is in the URL (issue #173).
+	// Set before validation so all responses on this path carry them.
+	// TODO: confirm-mode invites (#3) will return 404 on this path.
+	if hasQueryCode {
+		w.Header().Set("Deprecation", deprecationDate)
+		w.Header().Set("Link", `<https://github.com/sysrex/peerline#email-invites>; rel="deprecation"; type="text/html"`)
+	}
 	if qc := q.Get("code"); qc != "" {
 		if in.Code != "" && in.Code != qc {
 			writeErr(w, http.StatusBadRequest, "code in body and query differ")
 			return
 		}
 		in.Code = qc
-	}
-	if r.Method == http.MethodGet {
-		in.Scopes, in.Bags = splitCSV(q.Get("scopes")), splitCSV(q.Get("bags"))
 	}
 	if in.Code == "" {
 		writeErr(w, http.StatusBadRequest, "code required (JSON body or ?code=)")
@@ -1097,6 +1121,7 @@ func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	resp := map[string]any{"peer_id": g.Owner, "granted_to_you": g}
 	if len(sc) > 0 {
 		resp["granted_by_you"] = store.Grant{Owner: me, Grantee: g.Owner, Scopes: sc, Bags: bg}
@@ -1669,4 +1694,30 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 		resp["granted_by_you"] = store.Grant{Owner: id, Grantee: g.Owner, Scopes: sc, Bags: bg}
 	}
 	writeJSON(w, http.StatusCreated, resp)
+}
+
+// versionHandler serves build version information.
+// This is a public endpoint (no auth) that respects the configured VersionDetail level:
+// "minimal" (default) returns only the version, "full" includes commit and build_time.
+// "off" is handled by not registering the route at all.
+func (s *Server) versionHandler(w http.ResponseWriter, r *http.Request) {
+	detail := s.cfg.VersionDetail
+	if detail == "" || detail == "minimal" {
+		detail = "minimal"
+	} else if detail != "full" {
+		// Unknown values fall back to minimal (fail-closed)
+		detail = "minimal"
+	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	info := version.Info()
+	resp := map[string]string{"version": info["version"]}
+	if detail == "full" {
+		resp["commit"] = version.ShortCommit()
+		resp["build_time"] = info["build_time"]
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }

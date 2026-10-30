@@ -60,6 +60,21 @@ func (s *Server) rateLimitWrite(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// rateLimitVersion wraps /version with a dedicated rate limiter (per-IP).
+// Separate from getLim so monitors don't drain the shared bucket.
+func (s *Server) rateLimitVersion(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ip := clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets)
+		key := rateLimitKey(ip)
+		if !s.lim.versionLim.Allow(key) {
+			w.Header().Set("Retry-After", "10")
+			writeErr(w, http.StatusTooManyRequests, "rate limited")
+			return
+		}
+		h(w, r)
+	}
+}
+
 // rateLimitBagWrite limits bag writes per authenticated caller, so a grantee
 // spends its own budget and never the bag owner's.
 func (s *Server) rateLimitBagWrite(h http.HandlerFunc) http.HandlerFunc {

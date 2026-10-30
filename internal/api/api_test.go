@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
+	"html/template"
 	"io"
 	"log/slog"
 	"net"
@@ -33,16 +35,6 @@ type client struct {
 	id  string
 }
 
-func mustNew(t *testing.T, st *store.Store, cfg Config) *Server {
-	t.Helper()
-	prepareTestConfig(t, st, &cfg)
-	s, err := New(st, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return s
-}
-
 func newServer(t *testing.T, cfg Config) *httptest.Server {
 	t.Helper()
 	st, err := store.Open(t.TempDir() + "/t.db")
@@ -50,33 +42,13 @@ func newServer(t *testing.T, cfg Config) *httptest.Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-
-	// Load key index (required by api.New)
-	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
-	// Set high write limits for tests unless explicitly configured
-	if cfg.WritePerMinute == 0 {
-		cfg.WritePerMinute = 1000
-		cfg.WriteBurst = 100
-	}
-	// Set high auth fail limits for tests unless explicitly configured
-	if cfg.AuthFailPerMinute == 0 {
-		cfg.AuthFailPerMinute = 1000
-		cfg.AuthFailBurst = 100
-	}
-	// Set high invite cap for tests unless explicitly configured
-	if cfg.MaxOutstandingInvites == 0 {
-		cfg.MaxOutstandingInvites = 100
-	}
-
-	apiServer, err := New(st, cfg)
+	prepareTestConfig(t, st, &cfg)
+	apiSrv, err := New(st, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(apiServer.Stop)
-	srv := httptest.NewServer(apiServer.Handler())
+	t.Cleanup(apiSrv.Stop)
+	srv := httptest.NewServer(apiSrv.Handler())
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -90,6 +62,7 @@ func newServerWithAccess(t *testing.T, cfg Config) (*httptest.Server, *Server, *
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
+	prepareTestConfig(t, st, &cfg)
 	s, err := New(st, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -117,17 +90,7 @@ func newServerWithDB(t *testing.T, cfg Config) (*httptest.Server, *Server, *stor
 	}
 	t.Cleanup(func() { db.Close() })
 
-	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if cfg.WritePerMinute == 0 {
-		cfg.WritePerMinute = 1000
-		cfg.WriteBurst = 100
-	}
-	if cfg.AuthFailPerMinute == 0 {
-		cfg.AuthFailPerMinute = 1000
-		cfg.AuthFailBurst = 100
-	}
+	prepareTestConfig(t, st, &cfg)
 	s, err := New(st, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -1433,8 +1396,8 @@ func TestDeleteInviteByID(t *testing.T) {
 }
 
 func TestInviteCodeNeverLogged(t *testing.T) {
-	var logBuf bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+	var logs syncBuf
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 
 	srv := newServer(t, Config{Logger: logger})
 	a := register(t, srv, "alice")
@@ -1451,18 +1414,19 @@ func TestInviteCodeNeverLogged(t *testing.T) {
 	// Delete the invite (triggers log)
 	a.do("DELETE", fmt.Sprintf("/v1/invites/%s", inv.PublicID), nil, nil)
 
+	// Positive control: logs should contain expected events
+	logStr := logs.String()
+	if !strings.Contains(logStr, inv.PublicID) {
+		t.Error("public_id should be logged (positive control)")
+	}
+
 	// Check logs don't contain the code or any prefix
-	logs := logBuf.String()
-	if strings.Contains(logs, inv.Code) {
+	if strings.Contains(logStr, inv.Code) {
 		t.Error("invite code found in logs")
 	}
 	codePrefix := inv.Code[:10]
-	if strings.Contains(logs, codePrefix) {
+	if strings.Contains(logStr, codePrefix) {
 		t.Error("invite code prefix found in logs")
-	}
-	// Should contain public_id
-	if !strings.Contains(logs, inv.PublicID) {
-		t.Error("public_id not found in logs")
 	}
 }
 
@@ -1652,8 +1616,9 @@ func TestCSPHomePageNonce(t *testing.T) {
 		t.Fatalf("no nonce found in CSP: %s", csp)
 	}
 
-	// Verify the nonce appears in both the style and script tags
-	html := strings.NewReplacer("&#43;", "+", "&#61;", "=").Replace(string(body)) // html/template escapes base64 + and =
+	// Unescape HTML entities in body before checking nonces
+	// (html/template escapes '+' to '&#43;' in attributes)
+	html := html.UnescapeString(string(body))
 	expectedStyle := `<style nonce="` + nonce + `">`
 	expectedScript := `<script nonce="` + nonce + `">`
 
@@ -1674,6 +1639,123 @@ func TestCSPHomePageNonce(t *testing.T) {
 	// Verify CSP includes connect-src for fetch() calls
 	if !strings.Contains(csp, "connect-src 'self'") {
 		t.Errorf("CSP missing connect-src 'self': %s", csp)
+	}
+
+	// Verify the style body starts with :root and script body starts with (function
+	styleStart := strings.Index(html, `<style nonce="`+nonce+`">`)
+	if styleStart == -1 {
+		t.Fatal("style tag not found")
+	}
+	styleEnd := strings.Index(html[styleStart:], `</style>`)
+	if styleEnd == -1 {
+		t.Fatal("style closing tag not found")
+	}
+	styleBody := html[styleStart+len(`<style nonce="`+nonce+`">`) : styleStart+styleEnd]
+	styleBody = strings.TrimSpace(styleBody)
+	if !strings.HasPrefix(styleBody, ":root") {
+		previewLen := 50
+		if len(styleBody) < previewLen {
+			previewLen = len(styleBody)
+		}
+		t.Errorf("style body should start with ':root', got: %q", styleBody[:previewLen])
+	}
+
+	scriptStart := strings.Index(html, `<script nonce="`+nonce+`">`)
+	if scriptStart == -1 {
+		t.Fatal("script tag not found")
+	}
+	scriptEnd := strings.Index(html[scriptStart:], `</script>`)
+	if scriptEnd == -1 {
+		t.Fatal("script closing tag not found")
+	}
+	scriptBody := html[scriptStart+len(`<script nonce="`+nonce+`">`) : scriptStart+scriptEnd]
+	scriptBody = strings.TrimSpace(scriptBody)
+	if !strings.HasPrefix(scriptBody, "(function") {
+		previewLen := 50
+		if len(scriptBody) < previewLen {
+			previewLen = len(scriptBody)
+		}
+		t.Errorf("script body should start with '(function', got: %q", scriptBody[:previewLen])
+	}
+}
+
+func TestCSPNonceWithSpecialChars(t *testing.T) {
+	// Deterministic test with a nonce containing '+', '/', and '='
+	// to verify html/template escaping doesn't break the page
+	fixedNonce := "ab+c/d=="
+
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Execute template with fixed nonce
+	var buf bytes.Buffer
+	stats := store.Stats{Peers: 0, Messages: 0, Grants: 0, Bags: 0}
+	statsJSON, _ := json.Marshal(stats)
+
+	err = homeTmpl.Execute(&buf, homeData{
+		BaseURL:      "http://localhost",
+		RegisterOpen: true,
+		Nonce:        fixedNonce,
+		StatsJSON:    template.JS(statsJSON),
+		Stats:        stats,
+	})
+	if err != nil {
+		t.Fatalf("template execution failed: %v", err)
+	}
+
+	rendered := buf.String()
+	unescaped := html.UnescapeString(rendered)
+
+	// Verify tags contain the nonce exactly (after unescaping)
+	expectedStyleTag := `<style nonce="` + fixedNonce + `">`
+	expectedScriptTag := `<script nonce="` + fixedNonce + `">`
+
+	if !strings.Contains(unescaped, expectedStyleTag) {
+		t.Errorf("unescaped HTML missing style tag with nonce: want %q", expectedStyleTag)
+		// Show what we got around where it should be
+		if idx := strings.Index(unescaped, "<style"); idx >= 0 {
+			end := idx + 50
+			if end > len(unescaped) {
+				end = len(unescaped)
+			}
+			t.Errorf("found instead: %q", unescaped[idx:end])
+		}
+	}
+
+	if !strings.Contains(unescaped, expectedScriptTag) {
+		t.Errorf("unescaped HTML missing script tag with nonce: want %q", expectedScriptTag)
+		// Show what we got around where it should be (skip the JSON script block)
+		startSearch := strings.Index(unescaped, "</section>")
+		if startSearch >= 0 {
+			if idx := strings.Index(unescaped[startSearch:], "<script"); idx >= 0 {
+				idx += startSearch
+				end := idx + 50
+				if end > len(unescaped) {
+					end = len(unescaped)
+				}
+				t.Errorf("found instead: %q", unescaped[idx:end])
+			}
+		}
+	}
+
+	// Verify no stray '>' after the tags
+	styleTagStart := strings.Index(unescaped, expectedStyleTag)
+	if styleTagStart >= 0 {
+		afterStyleTag := styleTagStart + len(expectedStyleTag)
+		if afterStyleTag < len(unescaped) && unescaped[afterStyleTag] == '>' {
+			t.Error("style tag has stray '>' after opening tag")
+		}
+	}
+
+	scriptTagStart := strings.Index(unescaped, expectedScriptTag)
+	if scriptTagStart >= 0 && scriptTagStart > strings.Index(unescaped, "</section>") {
+		afterScriptTag := scriptTagStart + len(expectedScriptTag)
+		if afterScriptTag < len(unescaped) && unescaped[afterScriptTag] == '>' {
+			t.Error("script tag has stray '>' after opening tag")
+		}
 	}
 }
 
@@ -2170,8 +2252,6 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 	cfg.EmailPerHour = 10
 	cfg.EmailBurst = 5 // 5 tokens available
 	cfg.EmailRcptPerHour = 20
-	cfg.WritePerMinute = 1000 // High limit for test
-	cfg.WriteBurst = 100
 
 	st, err := store.Open(t.TempDir() + "/t.db")
 	if err != nil {
@@ -2179,10 +2259,7 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 	}
 	defer st.Close()
 
-	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
+	prepareTestConfig(t, st, &cfg)
 	rawSrv, err := New(st, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -2332,17 +2409,12 @@ func TestSingleLogLineUnauthenticatedPairing(t *testing.T) {
 
 	cfg := Config{}
 	cfg.Logger = logger
-
-	// Load key index (required by api.New)
-	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
-	apiServer, err := New(st, cfg)
+	prepareTestConfig(t, st, &cfg)
+	apiSrv, err := New(st, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(apiServer.Handler())
+	srv := httptest.NewServer(apiSrv.Handler())
 	defer srv.Close()
 
 	alice := register(t, srv, "Alice")
@@ -2500,7 +2572,7 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Empty string", "", "A Peerline peer"},
 		{"Only spaces", "   ", "A Peerline peer"},
 
-		// Issue #68: Length tests (64 runes max)
+		// Issue #68: Length tests (64 runes max, counted on final NFC output)
 		{"70 ASCII letters", strings.Repeat("a", 70), strings.Repeat("a", 64)},
 		{"30 CJK chars under byte limit", strings.Repeat("日", 30), strings.Repeat("日", 30)},
 		// 64 runes (not bytes): "日" is 3 bytes, 64 copies = 192 bytes, should keep exactly 64 runes
@@ -2835,11 +2907,9 @@ func TestAPIClock(t *testing.T) {
 	}
 	defer st.Close()
 
-	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
-	srv, err := New(st, Config{})
+	bareCfg := Config{}
+	prepareTestConfig(t, st, &bareCfg)
+	srv, err := New(st, bareCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2941,37 +3011,519 @@ func TestRateLimitWithMultipleXFFHeaders(t *testing.T) {
 	}
 }
 
-// TestNewRequiresLoadedKeyIndex verifies that api.New returns an error if the key index is not loaded.
-func TestNewRequiresLoadedKeyIndex(t *testing.T) {
-	st, err := store.Open(t.TempDir() + "/t.db")
+// TestInviteAcceptGETDoesNotChangeState verifies that authenticated GET
+// /v1/invites/accept returns 405 and does not consume the invite (issue #28).
+func TestInviteAcceptGETDoesNotChangeState(t *testing.T) {
+	srv := newServer(t, Config{})
+	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+
+	// Alice creates an invite for Bob
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv struct {
+		Code      string `json:"code"`
+		AcceptURL string `json:"accept_url"`
+	}
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
+	}
+
+	// Authenticated GET returns 405 and does not accept the invite
+	resp, body = b.do("GET", "/v1/invites/accept?code="+inv.Code, nil, nil)
+	want(t, resp, body, 405)
+	if !strings.Contains(string(body), "use POST to accept") {
+		t.Errorf("expected 405 error message, got: %s", body)
+	}
+	if resp.Header.Get("Allow") != "POST" {
+		t.Errorf("expected Allow: POST header, got: %s", resp.Header.Get("Allow"))
+	}
+
+	// Verify invite is still pending: Bob can still accept with POST
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv.Code}, nil)
+	want(t, resp, body, 200)
+
+	// Verify pairing succeeded: Bob can now message Alice
+	resp, body = b.do("POST", "/v1/peers/"+a.id+"/messages", map[string]any{"type": "note", "body": "test"}, nil)
+	want(t, resp, body, 201)
+}
+
+// TestInviteAcceptUnauthenticatedGETShowsLanding verifies that unauthenticated
+// GET /v1/invites/accept shows the landing page and does not consume the invite.
+func TestInviteAcceptUnauthenticatedGETShowsLanding(t *testing.T) {
+	srv := newServer(t, Config{})
+	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+
+	// Alice creates an invite
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv struct{ Code string }
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unauthenticated GET shows landing page (no key)
+	bNoAuth := &client{t: t, srv: srv, key: ""}
+	resp, body = bNoAuth.do("GET", "/v1/invites/accept?code="+inv.Code, nil, nil)
+	want(t, resp, body, 200)
+	if resp.Header.Get("Content-Type") != "text/plain; charset=utf-8" {
+		t.Errorf("expected text/plain content type, got: %s", resp.Header.Get("Content-Type"))
+	}
+	if !strings.Contains(string(body), "Peerline invite") {
+		t.Errorf("expected landing page content, got: %s", body)
+	}
+	if !strings.Contains(string(body), "curl -X POST") {
+		t.Errorf("expected POST instruction in landing page, got: %s", body)
+	}
+	// Landing page should show code in body format (JSON)
+	if !strings.Contains(string(body), `"code":"`) || !strings.Contains(string(body), "Content-Type: application/json") {
+		t.Errorf("expected code in JSON body format in landing page, got: %s", body)
+	}
+
+	// Verify invite is still pending: Bob can accept with POST
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv.Code}, nil)
+	want(t, resp, body, 200)
+}
+
+// TestInviteAcceptGETWithScopesReturns405 verifies that authenticated GET with
+// &scopes= and &bags= returns 405 and creates no grant (issue #28).
+func TestInviteAcceptGETWithScopesReturns405(t *testing.T) {
+	srv := newServer(t, Config{})
+	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+
+	// Alice creates an invite for Bob
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv struct{ Code string }
+	json.Unmarshal(body, &inv)
+
+	// Authenticated GET with &scopes= and &bags= returns 405
+	resp, body = b.do("GET", "/v1/invites/accept?code="+inv.Code+"&scopes=messages&bags=x", nil, nil)
+	want(t, resp, body, 405)
+
+	// Verify no grant was created (both directions should be empty)
+	resp, body = a.do("GET", "/v1/grants", nil, nil)
+	want(t, resp, body, 200)
+	var aGrants struct {
+		Grants []any `json:"grants"`
+	}
+	json.Unmarshal(body, &aGrants)
+	if len(aGrants.Grants) != 0 {
+		t.Errorf("alice grants: want 0, got %d: %s", len(aGrants.Grants), body)
+	}
+
+	resp, body = b.do("GET", "/v1/grants", nil, nil)
+	want(t, resp, body, 200)
+	var bGrants struct {
+		Grants []any `json:"grants"`
+	}
+	json.Unmarshal(body, &bGrants)
+	if len(bGrants.Grants) != 0 {
+		t.Errorf("bob grants: want 0, got %d: %s", len(bGrants.Grants), body)
+	}
+
+	// Invite is still pending: Bob can accept with POST
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv.Code}, nil)
+	want(t, resp, body, 200)
+}
+
+// TestInviteAcceptPathsNeverLogCode verifies that invite codes never appear in
+// logs across all accept paths: POST body, POST query, GET 405, HEAD, landing, failed (issue #28, #146).
+// TestInviteAcceptPathsNeverLogCode verifies that invite codes never appear in
+// logs across all accept paths, including success, error, and failure cases (issue #28, #146, #174).
+// This test captures only the slog logger; there is no http.Server.ErrorLog or access-log middleware today.
+func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
+	var logs syncBuf
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	srv := newServer(t, Config{Logger: logger})
+	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+	c := register(t, srv, "carol")
+
+	// Create invites for different test cases
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv1 struct{ Code string }
+	json.Unmarshal(body, &inv1)
+
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv2 struct{ Code string }
+	json.Unmarshal(body, &inv2)
+
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv3 struct{ Code string }
+	json.Unmarshal(body, &inv3)
+
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv4 struct{ Code string }
+	json.Unmarshal(body, &inv4)
+
+	// Test all accept paths:
+	// 1. POST with body code (successful)
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv1.Code}, nil)
+	want(t, resp, body, 200)
+
+	// 2. POST with query code (successful, deprecated)
+	resp, body = b.do("POST", "/v1/invites/accept?code="+inv2.Code, nil, nil)
+	want(t, resp, body, 200)
+
+	// 3. Authenticated GET (405)
+	resp, body = c.do("GET", "/v1/invites/accept?code="+inv3.Code, nil, nil)
+	want(t, resp, body, 405)
+
+	// 4. HEAD with auth (405)
+	req, _ := http.NewRequest("HEAD", srv.URL+"/v1/invites/accept?code="+inv3.Code, nil)
+	req.Header.Set("Authorization", "Bearer "+c.key)
+	resp2, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
-
-	// Don't load the key index
-	cfg := Config{
-		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		AuthFailPerMinute: 30,
-		AuthFailBurst:     10,
+	resp2.Body.Close()
+	if resp2.StatusCode != 405 {
+		t.Errorf("HEAD: want 405, got %d", resp2.StatusCode)
 	}
 
-	// api.New should fail without loaded index
-	_, err = New(st, cfg)
-	if err == nil {
-		t.Fatal("api.New succeeded without loaded key index")
+	// 5. Unauthenticated landing page
+	anon := &client{t: t, srv: srv, key: ""}
+	resp, body = anon.do("GET", "/v1/invites/accept?code="+inv3.Code, nil, nil)
+	want(t, resp, body, 200)
+
+	// 6. Failed accept (well-formed but unknown code)
+	unknownCode := auth.NewSecret("inv_")
+	resp, body = c.do("POST", "/v1/invites/accept", map[string]any{"code": unknownCode}, nil)
+	want(t, resp, body, 404)
+
+	// 7. Failed: bad scopes (code stays valid)
+	resp, body = c.do("POST", "/v1/invites/accept", map[string]any{"code": inv3.Code, "scopes": []string{"BadScope"}}, nil)
+	want(t, resp, body, 400)
+
+	// 8. Failed: accepting own invite (code stays valid)
+	resp, body = a.do("POST", "/v1/invites/accept", map[string]any{"code": inv4.Code}, nil)
+	want(t, resp, body, 400)
+
+	// 9. Failed: body/query mismatch (both codes stay valid)
+	resp, body = c.do("POST", "/v1/invites/accept?code="+inv3.Code, map[string]any{"code": inv4.Code}, nil)
+	want(t, resp, body, 400)
+
+	// Positive control: assert logs captured expected events
+	logStr := logs.String()
+	if !strings.Contains(logStr, "pairing accepted") {
+		t.Error("logs should contain 'pairing accepted' (positive control)")
 	}
-	if !strings.Contains(err.Error(), "key index not loaded") {
-		t.Fatalf("want 'key index not loaded' error, got: %v", err)
+	if !strings.Contains(logStr, "peer registered") {
+		t.Error("logs should contain 'peer registered' (positive control)")
 	}
 
-	// After loading, it should succeed
-	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+	// Check logs don't contain any of the codes or their prefixes
+	for _, code := range []string{inv1.Code, inv2.Code, inv3.Code, inv4.Code, unknownCode} {
+		if strings.Contains(logStr, code) {
+			t.Errorf("invite code %s found in logs", code)
+		}
+		if len(code) >= 10 && strings.Contains(logStr, code[:10]) {
+			t.Errorf("invite code prefix %s found in logs", code[:10])
+		}
+	}
+}
+
+// TestInviteAccept405Comprehensive covers all the edge cases from issue #146 and #174.
+func TestInviteAccept405Comprehensive(t *testing.T) {
+	srv := newServer(t, Config{})
+	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+
+	// Create invites with different states: valid, used, expired, missing
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv1 struct{ Code string }
+	json.Unmarshal(body, &inv1)
+
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv2 struct{ Code string }
+	json.Unmarshal(body, &inv2)
+
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
+	want(t, resp, body, 201)
+	var inv3 struct{ Code string }
+	json.Unmarshal(body, &inv3)
+	time.Sleep(2 * time.Second) // Let it expire
+
+	// Use inv2
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
+	want(t, resp, body, 200)
+
+	missingCode := auth.NewSecret("inv_")
+
+	// Test 1: HEAD with auth returns 405 with deprecation headers
+	req, _ := http.NewRequest("HEAD", srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = New(st, cfg)
+	resp2.Body.Close()
+	if resp2.StatusCode != 405 {
+		t.Errorf("HEAD with auth: want 405, got %d", resp2.StatusCode)
+	}
+	if resp2.Header.Get("Allow") != "POST" {
+		t.Errorf("HEAD Allow header: want POST, got %s", resp2.Header.Get("Allow"))
+	}
+	if resp2.Header.Get("Deprecation") == "" {
+		t.Error("HEAD with auth: missing Deprecation header")
+	}
+	if resp2.Header.Get("Link") == "" {
+		t.Error("HEAD with auth: missing Link header")
+	}
+
+	// Test 2: HEAD without auth shows landing page (ServeMux routes HEAD to GET)
+	req, _ = http.NewRequest("HEAD", srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
+	resp2, err = http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("api.New failed after LoadKeyIndex: %v", err)
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 200 {
+		t.Errorf("HEAD without auth: want 200, got %d", resp2.StatusCode)
+	}
+	if resp2.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("HEAD without auth: want Cache-Control no-store, got %s", resp2.Header.Get("Cache-Control"))
+	}
+
+	// Test 3: GET with invalid/bogus Bearer token returns 405 (not 401)
+	resp, body = b.do("GET", "/v1/invites/accept?code="+inv1.Code, nil, map[string]string{"Authorization": "Bearer pl_bogus"})
+	want(t, resp, body, 405)
+	if !strings.Contains(string(body), "use POST to accept") {
+		t.Errorf("bogus key GET body: %s", body)
+	}
+
+	// Test 4: 405 responses are identical for valid, used, expired, missing codes (no oracle)
+	get405 := func(code string) ([]byte, http.Header) {
+		r, b := b.do("GET", "/v1/invites/accept?code="+code, nil, nil)
+		if r.StatusCode != 405 {
+			t.Fatalf("expected 405 for code %s, got %d", code, r.StatusCode)
+		}
+		return b, r.Header
+	}
+	validBody, validHdr := get405(inv1.Code)
+	usedBody, usedHdr := get405(inv2.Code)
+	expiredBody, expiredHdr := get405(inv3.Code)
+	missingBody, missingHdr := get405(missingCode)
+
+	for i, pair := range []struct {
+		name string
+		body []byte
+		hdr  http.Header
+	}{
+		{"used", usedBody, usedHdr},
+		{"expired", expiredBody, expiredHdr},
+		{"missing", missingBody, missingHdr},
+	} {
+		if !bytes.Equal(validBody, pair.body) {
+			t.Errorf("405 body differs for %s:\nvalid: %s\n%s: %s", pair.name, validBody, pair.name, pair.body)
+		}
+		for _, h := range []string{"Allow", "Content-Type", "Deprecation", "Link"} {
+			if validHdr.Get(h) != pair.hdr.Get(h) {
+				t.Errorf("405 header %s differs for %s (test %d): valid=%q %s=%q",
+					h, pair.name, i, validHdr.Get(h), pair.name, pair.hdr.Get(h))
+			}
+		}
+	}
+
+	// Test 5: Body and query code mismatch returns 400
+	resp, body = b.do("POST", "/v1/invites/accept?code="+inv1.Code, map[string]any{"code": "inv_other"}, nil)
+	want(t, resp, body, 400)
+	if !strings.Contains(string(body), "code in body and query differ") {
+		t.Errorf("mismatch error: %s", body)
+	}
+
+	// Test 6: Other methods (strict, issue #174)
+	// PUT/PATCH should get 405 from the authed mux (handler exists but wrong method).
+	// DELETE gets 404 (no handler at all in authed mux).
+	for _, method := range []string{"PUT", "PATCH"} {
+		r, _ := http.NewRequest(method, srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
+		r.Header.Set("Authorization", "Bearer "+b.key)
+		rsp, err := http.DefaultClient.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rsp.Body.Close()
+		if rsp.StatusCode != 405 {
+			t.Errorf("%s: want 405, got %d", method, rsp.StatusCode)
+		}
+		if rsp.Header.Get("Allow") == "" {
+			t.Errorf("%s: missing Allow header", method)
+		}
+	}
+	// DELETE: no handler in authed mux, should get 404
+	r, _ := http.NewRequest("DELETE", srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
+	r.Header.Set("Authorization", "Bearer "+b.key)
+	rsp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsp.Body.Close()
+	if rsp.StatusCode != 404 {
+		t.Errorf("DELETE: want 404, got %d", rsp.StatusCode)
+	}
+
+	// Test 7: Trailing slash returns 404 (strict, issue #174)
+	resp, body = b.do("POST", "/v1/invites/accept/?code="+inv1.Code, nil, nil)
+	if resp.StatusCode != 404 {
+		t.Errorf("trailing slash POST: want 404, got %d", resp.StatusCode)
+	}
+	req, _ = http.NewRequest("GET", srv.URL+"/v1/invites/accept/?code="+inv1.Code, nil)
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	resp2, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 404 {
+		t.Errorf("trailing slash GET: want 404, got %d", resp2.StatusCode)
+	}
+
+	// Test 8: HEAD trailing slash
+	req, _ = http.NewRequest("HEAD", srv.URL+"/v1/invites/accept/?code="+inv1.Code, nil)
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	resp2, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 404 {
+		t.Errorf("HEAD trailing slash: want 404, got %d", resp2.StatusCode)
+	}
+
+	// Test 9: Unauthenticated landing with bad code returns 400
+	anon := &client{t: t, srv: srv, key: ""}
+	resp, body = anon.do("GET", "/v1/invites/accept?code=inv_bad", nil, nil)
+	want(t, resp, body, 400)
+	if !strings.Contains(string(body), "malformed") {
+		t.Errorf("bad code landing: %s", body)
+	}
+
+	// Verify inv1 is still pending after all the above
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv1.Code}, nil)
+	want(t, resp, body, 200)
+}
+
+// TestInviteAcceptDeprecationHeaders verifies that query-only codes get
+// Deprecation and Link headers, but body codes do not (issue #28, #146).
+// TestInviteAcceptDeprecationHeaders verifies RFC 9745 deprecation headers
+// on all responses where the request has ?code= (issue #28, #146, #173, #174).
+func TestInviteAcceptDeprecationHeaders(t *testing.T) {
+	srv := newServer(t, Config{})
+	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv1 struct{ Code string }
+	json.Unmarshal(body, &inv1)
+
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv2 struct{ Code string }
+	json.Unmarshal(body, &inv2)
+
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv3 struct{ Code string }
+	json.Unmarshal(body, &inv3)
+
+	// 1. Query-only POST success: should have headers and Cache-Control
+	resp, body = b.do("POST", "/v1/invites/accept?code="+inv1.Code, nil, nil)
+	want(t, resp, body, 200)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("query-only POST success: missing Deprecation header")
+	}
+	if !strings.HasPrefix(resp.Header.Get("Deprecation"), "@") {
+		t.Errorf("Deprecation format: want @<unix>, got %s", resp.Header.Get("Deprecation"))
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("query-only POST success: missing Link header")
+	}
+	if !strings.Contains(resp.Header.Get("Link"), "rel=\"deprecation\"") {
+		t.Errorf("Link rel: want deprecation, got %s", resp.Header.Get("Link"))
+	}
+	if resp.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("query-only POST success: want Cache-Control no-store, got %s", resp.Header.Get("Cache-Control"))
+	}
+
+	// 2. Body-only POST success: should NOT have deprecation headers
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
+	want(t, resp, body, 200)
+	if resp.Header.Get("Deprecation") != "" {
+		t.Errorf("body-only POST: unexpected Deprecation header: %s", resp.Header.Get("Deprecation"))
+	}
+	if resp.Header.Get("Link") != "" {
+		t.Errorf("body-only POST: unexpected Link header: %s", resp.Header.Get("Link"))
+	}
+	if resp.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("body-only POST: want Cache-Control no-store, got %s", resp.Header.Get("Cache-Control"))
+	}
+
+	// 3. Query-only POST error (404): should have headers (issue #173)
+	resp, body = b.do("POST", "/v1/invites/accept?code="+inv1.Code, nil, nil) // already used
+	want(t, resp, body, 404)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("query-only POST 404: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("query-only POST 404: missing Link header")
+	}
+
+	// 4. Query-only POST error (400: bad scopes): should have headers
+	resp, body = b.do("POST", "/v1/invites/accept?code="+inv3.Code, map[string]any{"scopes": []string{"BadScope"}}, nil)
+	want(t, resp, body, 400)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("query-only POST 400 bad scopes: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("query-only POST 400 bad scopes: missing Link header")
+	}
+
+	// 5. Query-only POST error (400: own invite): should have headers
+	resp, body = a.do("POST", "/v1/invites/accept?code="+inv3.Code, nil, nil)
+	want(t, resp, body, 400)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("query-only POST 400 own invite: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("query-only POST 400 own invite: missing Link header")
+	}
+
+	// 6. Body+query POST (body wins): should have headers (issue #173)
+	resp, body = b.do("POST", "/v1/invites/accept?code="+inv3.Code, map[string]any{"code": inv3.Code}, nil)
+	want(t, resp, body, 200)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("body+query POST: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("body+query POST: missing Link header")
+	}
+
+	// 7. Unauthenticated landing GET with ?code=: should have headers (issue #173)
+	anon := &client{t: t, srv: srv, key: ""}
+	resp, body = anon.do("GET", "/v1/invites/accept?code="+inv2.Code, nil, nil)
+	want(t, resp, body, 200)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("unauthenticated landing GET: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("unauthenticated landing GET: missing Link header")
+	}
+	if resp.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("unauthenticated landing GET: want Cache-Control no-store, got %s", resp.Header.Get("Cache-Control"))
+	}
+
+	// 8. Authenticated GET 405 with ?code=: should have headers (already tested in 405 comprehensive)
+	resp, body = b.do("GET", "/v1/invites/accept?code="+inv2.Code, nil, nil)
+	want(t, resp, body, 405)
+	if resp.Header.Get("Deprecation") == "" {
+		t.Error("authenticated GET 405: missing Deprecation header")
+	}
+	if resp.Header.Get("Link") == "" {
+		t.Error("authenticated GET 405: missing Link header")
 	}
 }
 
@@ -3031,5 +3583,304 @@ func TestCSPNonceUniqueAndErrorResponsesStrict(t *testing.T) {
 		if got := resp.Header.Get("Content-Security-Policy"); got != strict {
 			t.Errorf("%s %s (%d): CSP %q", c.method, c.path, resp.StatusCode, got)
 		}
+	}
+}
+
+func TestVersionEndpoint(t *testing.T) {
+	tests := []struct {
+		name        string
+		detail      string
+		wantStatus  int
+		wantKeys    []string
+		wantMissing []string
+	}{
+		{
+			name:        "minimal (default)",
+			detail:      "",
+			wantStatus:  http.StatusOK,
+			wantKeys:    []string{"version"},
+			wantMissing: []string{"commit", "build_time"},
+		},
+		{
+			name:        "minimal explicit",
+			detail:      "minimal",
+			wantStatus:  http.StatusOK,
+			wantKeys:    []string{"version"},
+			wantMissing: []string{"commit", "build_time"},
+		},
+		{
+			name:       "full",
+			detail:     "full",
+			wantStatus: http.StatusOK,
+			wantKeys:   []string{"version", "commit", "build_time"},
+		},
+		{
+			name:       "off",
+			detail:     "off",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:        "unknown value falls back to minimal",
+			detail:      "invalid",
+			wantStatus:  http.StatusOK,
+			wantKeys:    []string{"version"},
+			wantMissing: []string{"commit", "build_time"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newServer(t, Config{VersionDetail: tt.detail})
+			req, _ := http.NewRequest("GET", srv.URL+"/version", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("expected status %d, got %d", tt.wantStatus, resp.StatusCode)
+			}
+
+			// Check Cache-Control header
+			if cc := resp.Header.Get("Cache-Control"); !strings.Contains(cc, "no-store") {
+				t.Errorf("expected Cache-Control to contain no-store, got %q", cc)
+			}
+
+			if tt.wantStatus == http.StatusOK {
+				var info map[string]string
+				if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+					t.Fatalf("failed to decode response: %v", err)
+				}
+
+				// Assert exact key set
+				expectedKeys := make(map[string]bool)
+				for _, key := range tt.wantKeys {
+					expectedKeys[key] = true
+				}
+				for key := range info {
+					if !expectedKeys[key] {
+						t.Errorf("unexpected key %q in response (expected only %v)", key, tt.wantKeys)
+					}
+				}
+
+				// Check expected keys are present and non-empty
+				for _, key := range tt.wantKeys {
+					val, ok := info[key]
+					if !ok {
+						t.Errorf("missing expected key %q", key)
+					} else if val == "" {
+						t.Errorf("key %q has empty value", key)
+					}
+				}
+
+				// Check unwanted keys are absent
+				for _, key := range tt.wantMissing {
+					if _, ok := info[key]; ok {
+						t.Errorf("unexpected key %q present", key)
+					}
+				}
+
+				// For full mode, commit should be short (<=12 chars or "unknown")
+				if tt.detail == "full" {
+					commit := info["commit"]
+					if commit != "unknown" && len(commit) > 12 {
+						t.Errorf("full mode commit should be <=12 chars, got %d (%q)", len(commit), commit)
+					}
+				}
+
+				// Version should never expose branch names
+				version := info["version"]
+				if strings.Contains(version, "/") || strings.Contains(version, "merge") {
+					t.Errorf("version should not contain branch-like strings, got %q", version)
+				}
+
+				// Assert security headers from securityHeaders wrapper
+				headers := map[string]string{
+					"Content-Security-Policy": "default-src 'none'",
+					"X-Frame-Options":         "DENY",
+					"X-Content-Type-Options":  "nosniff",
+					"Referrer-Policy":         "no-referrer",
+				}
+				for header, expectedSubstring := range headers {
+					value := resp.Header.Get(header)
+					if !strings.Contains(value, expectedSubstring) {
+						t.Errorf("header %s should contain %q, got: %s", header, expectedSubstring, value)
+					}
+				}
+			}
+
+			// Check Content-Type (except for off mode, which returns plain text 404)
+			if tt.detail != "off" {
+				if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+					t.Errorf("expected Content-Type application/json, got %s", ct)
+				}
+			}
+		})
+	}
+}
+
+func TestVersionEndpointNoAuth(t *testing.T) {
+	// Version endpoint should be public (no auth required) even with RegisterToken
+	srv := newServer(t, Config{RegisterToken: "secret"})
+	req, _ := http.NewRequest("GET", srv.URL+"/version", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("version endpoint should not require auth, got status %d", resp.StatusCode)
+	}
+}
+
+func TestVersionEndpointRateLimit(t *testing.T) {
+	srv := newServer(t, Config{})
+	client := http.Client{Timeout: 2 * time.Second}
+	foundRateLimit := false
+
+	// The version endpoint has a separate limiter with burst of 30
+	for i := 0; i < 50; i++ {
+		req, _ := http.NewRequest("GET", srv.URL+"/version", nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			foundRateLimit = true
+
+			// Check for Retry-After header
+			if ra := resp.Header.Get("Retry-After"); ra == "" {
+				t.Error("429 response should include Retry-After header")
+			}
+
+			// Check uniform 429 body
+			var errResp map[string]string
+			if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+				t.Errorf("failed to decode 429 body: %v", err)
+			} else if errMsg, ok := errResp["error"]; !ok || !strings.Contains(errMsg, "rate") {
+				t.Errorf("429 response should contain rate limit error, got: %v", errResp)
+			}
+
+			// Verify security headers are present on 429
+			if csp := resp.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'none'") {
+				t.Errorf("429 missing strict CSP, got: %s", csp)
+			}
+
+			resp.Body.Close()
+			break
+		}
+		resp.Body.Close()
+	}
+
+	if !foundRateLimit {
+		t.Fatal("versionLim not wired: no 429 returned after 50 requests (burst is 30)")
+	}
+}
+
+func TestVersionEndpointHEAD(t *testing.T) {
+	srv := newServer(t, Config{})
+	req, _ := http.NewRequest("HEAD", srv.URL+"/version", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("HEAD /version should return 200, got %d", resp.StatusCode)
+	}
+
+	// Content-Type should still be set
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected Content-Type application/json, got %s", ct)
+	}
+
+	// Body should be empty for HEAD
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) > 0 {
+		t.Errorf("HEAD response should have empty body, got %d bytes", len(body))
+	}
+}
+
+func TestVersionEndpointMethodNotAllowed(t *testing.T) {
+	srv := newServer(t, Config{})
+	methods := []string{"POST", "PUT", "DELETE", "PATCH"}
+
+	for _, method := range methods {
+		t.Run(method, func(t *testing.T) {
+			req, _ := http.NewRequest(method, srv.URL+"/version", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusMethodNotAllowed {
+				t.Errorf("%s /version should return 405, got %d", method, resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestVersionOffIndistinguishableFromUnknownRoute(t *testing.T) {
+	srv := newServer(t, Config{VersionDetail: "off"})
+	probe := func(method, path string) (int, string, string, string) {
+		req, _ := http.NewRequest(method, srv.URL+path, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, resp.Header.Get("Content-Type"), resp.Header.Get("Allow"), string(b)
+	}
+	for _, m := range []string{"GET", "HEAD", "POST"} {
+		c1, t1, a1, b1 := probe(m, "/version")
+		c2, t2, a2, b2 := probe(m, "/does-not-exist")
+		if c1 != c2 || t1 != t2 || a1 != a2 || b1 != b2 {
+			t.Errorf("%s /version differs from unknown route: %d %q %q %q vs %d %q %q %q", m, c1, t1, a1, b1, c2, t2, a2, b2)
+		}
+	}
+	for i := 0; i < 40; i++ {
+		if c, _, _, _ := probe("GET", "/version"); c == http.StatusTooManyRequests {
+			t.Fatal("off mode must never rate limit")
+		}
+	}
+}
+
+// TestNewRequiresLoadedKeyIndex verifies that api.New returns an error if the key index is not loaded.
+func TestNewRequiresLoadedKeyIndex(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Don't load the key index
+	cfg := Config{
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AuthFailPerMinute: 30,
+		AuthFailBurst:     10,
+	}
+
+	// api.New should fail without loaded index
+	_, err = New(st, cfg)
+	if err == nil {
+		t.Fatal("api.New succeeded without loaded key index")
+	}
+	if !strings.Contains(err.Error(), "key index not loaded") {
+		t.Fatalf("want 'key index not loaded' error, got: %v", err)
+	}
+
+	// After loading, it should succeed
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, err = New(st, cfg)
+	if err != nil {
+		t.Fatalf("api.New failed after LoadKeyIndex: %v", err)
 	}
 }

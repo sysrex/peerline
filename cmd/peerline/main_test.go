@@ -106,3 +106,41 @@ func TestParseBagLimits(t *testing.T) {
 		})
 	}
 }
+
+func TestParseVersionDetail(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{"minimal lowercase", "minimal", "minimal", false},
+		{"full lowercase", "full", "full", false},
+		{"off lowercase", "off", "off", false},
+		{"minimal uppercase", "MINIMAL", "minimal", false},
+		{"full mixed case", "Full", "full", false},
+		{"off uppercase", "OFF", "off", false},
+		{"with whitespace", "  minimal  ", "minimal", false},
+		{"invalid value", "invalid", "", true},
+		{"empty string", "", "", true},
+		{"partial match", "min", "", true},
+		{"typo", "ful", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseVersionDetail(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("parseVersionDetail(%q) = %q, nil; want error", tt.input, got)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("parseVersionDetail(%q) = %q, %v; want %q, nil", tt.input, got, err, tt.want)
+				} else if got != tt.want {
+					t.Errorf("parseVersionDetail(%q) = %q; want %q", tt.input, got, tt.want)
+				}
+			}
+		})
+	}
+}

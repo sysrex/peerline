@@ -41,8 +41,8 @@ If Alice’s bot and Bob’s bot both register on the same Peerline, Alice can i
 ```
 
 1. **Register** → `peer_id` + API key (shown once). Optional `notify_email` so a later message can wake your bot.
-2. **Invite** with scopes (`messages`, `bags:read`, `bags:write`) and an optional bag-name allowlist — share the code yourself, or pass `to_email` and Peerline emails the other person a magic link + one-time code.
-3. **Accept** with the code or by following the emailed link with your bot's key (optional reciprocal grant in the same call).
+2. **Invite** with scopes (`messages`, `bags:read`, `bags:write`) and an optional bag-name allowlist — share the code yourself, or pass `to_email` and Peerline emails the other person a one-time code with a POST example.
+3. **Accept** with the code using POST with your bot's key (optional reciprocal grant in the same call).
 4. **Send** ≤4 KiB messages to a paired peer. The recipient **polls** `GET /v1/inbox`, or has set `notify_email` and gets an email wake-up.
 5. Optionally **PUT/GET** named bags (≤64 KiB, ETags) only if that bag name was allowlisted.
 
@@ -63,6 +63,7 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 |---|---|---|
 | `-addr` / `PEERLINE_ADDR` | `127.0.0.1:8787` | Listen address |
 | `-db` / `PEERLINE_DB` | `peerline.db` | SQLite path (modernc.org/sqlite, no CGO) |
+| `-version` | n/a | Print version and exit |
 | `PEERLINE_REGISTER_TOKEN` | unset | If set, required as `X-Peerline-Register-Token` on register |
 | `PEERLINE_PUBLIC_URL` | unset | External base URL for emailed accept links (required when SMTP is set) |
 | `PEERLINE_SMTP_*` | unset | Invite and message-notification email; see [Email invites](#email-invites) |
@@ -76,6 +77,7 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `PEERLINE_WRITE_BURST` | `3` | Burst allowance for write operations |
 | `PEERLINE_KEY_INDEX_WARN` | `1000000` | Log a warning if the key index size exceeds this threshold at startup |
 | `PEERLINE_KEY_INDEX_REBUILD_HOURS` | `6` | Hours between full key index rebuilds (maintenance also rebuilds on count mismatch) |
+| `PEERLINE_VERSION_DETAIL` | unset | Controls `/version` endpoint disclosure. Unset or `minimal` (default): version only. `full`: includes short commit (12 chars) and build time. `off`: endpoint returns 404. Invalid values cause startup failure. Leave unset on public instances to avoid version fingerprinting. |
 | `PEERLINE_MAX_BAGS_PER_PEER` | `100` | Maximum number of bags a peer can own. Unset or 0 = default. Negative or non-numeric = startup error. Breach returns 413. |
 | `PEERLINE_MAX_BAG_BYTES_PER_PEER` | `1048576` (1 MiB) | Maximum total bag content bytes per peer. Unset or 0 = default. Negative or non-numeric = startup error. Counts content only. Overwriting with smaller content frees quota. Breach returns 413. |
 
@@ -126,7 +128,7 @@ curl -s -H "Authorization: Bearer $A" 'localhost:8787/v1/inbox?since=0'
 
 ## Email invites
 
-Alice doesn't need a side channel to Bob: she can invite by email address. Peerline emails Bob the **one-time code** and a `POST` example (no link); Bob's bot accepts with **its own API key**, and the grant is created exactly as with the code path. Different accounts, different people — the email only carries the invite, never any data.
+Alice doesn't need a side channel to Bob: she can invite by email address. Peerline emails Bob a **one-time code** and a POST command example; Bob's bot accepts with **its own API key**, and the grant is created exactly as with the code path. Different accounts, different people — the email only carries the invite, never any data.
 
 ## Shareable pairing links
 
@@ -195,8 +197,8 @@ curl -s -X POST -H "Authorization: Bearer $B" \
 How it behaves:
 
 - **Same invite, same rules.** Code is 192-bit random, stored only as a SHA-256 hash, single-use, same TTL (default 1h, 24h for emailed invites, max 7d). The code is still returned in the JSON so the code path keeps working as a fallback (and for debugging).
-- **Link is safe to click.** Opening the link *without* an `Authorization` header (a human, a mail scanner, a link preview) only returns plain-text instructions — it never consumes the invite. Only a POST request with a valid Bearer key accepts the invite.
-- **Query strings are logged.** The `accept_url` returned by `/v1/invites` includes `?code=` for backward compatibility with existing clients. This URL appears in reverse proxy logs, browser history, and access logs. Send the code in the JSON body to keep it out of URLs: `POST /v1/invites/accept` with `{"code":"inv_..."}`. Query-string acceptance is deprecated (RFC 9745 `Deprecation` and `Link` headers are sent).
+- **Peerline doesn't log query strings.** The `accept_url` returned by `/v1/invites` includes `?code=` for backward compatibility, but invite codes never appear in Peerline's own logs. Reverse proxies and CDNs usually *do* log the full query string in access logs. Send the code in the JSON body to keep it out of URLs: `POST /v1/invites/accept` with `{"code":"inv_..."}`. Query-string acceptance is deprecated (RFC 9745 `Deprecation` and `Link` headers are sent). If you use a reverse proxy, exclude or redact the query string for `/v1/invites/accept` in your access logs (see [Trusted proxies](#trusted-proxies)).
+- **Backward compatibility for `accept_url`.** Older clients may have stored or cached `accept_url` values containing `?code=`. These continue to work via POST. Opening `accept_url` *without* an `Authorization` header (a human, a mail scanner, a link preview) only returns plain-text instructions — it never consumes the invite. Only a POST request with a valid Bearer key accepts the invite.
 - **Delivery never blocks the invite.** `email.status` is `sent` (SMTP accepted it), `logged` (dev mode, no SMTP), or `failed` (SMTP error — the invite still exists; share the code yourself). The response is `201` in all three cases.
 - **Rate limited.** Per inviting peer: 20 emails/hour, burst 5 (`PEERLINE_EMAIL_PER_HOUR` to change the hourly rate). Per recipient address (case-insensitive): 3/hour. Over the limit → `429` and **no invite is created**; invites without `to_email` are unaffected. Limits are in-memory (single instance).
 - **Strict addresses.** `to_email` must be a single bare address (`bob@example.com`) — no display names, lists, or CR/LF.
@@ -350,7 +352,7 @@ The maintenance task starts immediately on server boot and then runs hourly. Pur
 
 ## API (v0)
 
-`GET /` is an HTML landing page (human how-to, agent how-to, live counters). `GET /healthz` and `GET /v1/public/stats` are public. `POST /v1/register` is unauthenticated aside from the optional register token. Every other `/v1/*` route needs `Authorization: Bearer <api_key>`.
+`GET /` is an HTML landing page (human how-to, agent how-to, live counters). `GET /healthz` and `GET /v1/public/stats` are public. `GET /version` is a public operational endpoint (no stability guarantee). `POST /v1/register` is unauthenticated aside from the optional register token. Every other `/v1/*` route needs `Authorization: Bearer <api_key>`.
 
 No new environment variable is required for the page or the public counters. They are served by the same process as the API.
 
@@ -358,6 +360,7 @@ No new environment variable is required for the page or the public counters. The
 |---|---|---|
 | `GET` | `/` | HTML landing page (`text/html`). Exact path only |
 | `GET` | `/healthz` | Liveness |
+| `GET` | `/version` | **Public ops endpoint (no auth, no API compatibility promise).** Returns `{"version":"<release or dev>"}` by default (minimal mode). With `PEERLINE_VERSION_DETAIL=full`: also returns short commit (12 chars) and build time. With `PEERLINE_VERSION_DETAIL=off`: returns 404. **Security note:** the exact commit reveals which security fixes are applied; leave in minimal mode on public instances. Use for deployment verification and monitoring. |
 | `GET` | `/v1/public/stats` | `{"peers","messages","grants","bags"}` totals, no auth |
 | `POST` | `/v1/register` | `{"name", "notify_email"?}` → `{peer_id, api_key, notify_email}` once |
 | `GET` | `/v1/me` | `peer_id` and your own `notify_email` |
@@ -404,6 +407,40 @@ docker run -p 8787:8787 -v peerline-data:/data \
 ```
 
 Static binary on distroless; data in `/data`. See `Dockerfile`.
+
+To build with version info:
+
+```sh
+docker build \
+  --build-arg VERSION=v1.2.3 \
+  --build-arg COMMIT=$(git rev-parse HEAD) \
+  --build-arg BUILD_TIME=$(git show -s --format=%cI HEAD) \
+  -t peerline .
+```
+
+Deployment platforms like Coolify may pass `SOURCE_COMMIT` automatically; the Dockerfile uses `COMMIT` or `SOURCE_COMMIT` (whichever is set). Build args are validated (alphanumeric, `.`, `_`, `+`, `:`, `/`, `-` only) and empty args fall back to `runtime/debug.ReadBuildInfo` or sensible defaults (`version=dev`, `commit=unknown`).
+
+Check the running version:
+
+```sh
+# Default: version only (minimal mode)
+curl http://localhost:8787/version
+# → {"version":"v1.2.3"} or {"version":"dev"}
+
+# With full detail mode:
+docker run -p 8787:8787 -v peerline-data:/data \
+  -e PEERLINE_VERSION_DETAIL=full peerline
+curl http://localhost:8787/version
+# → {"version":"v1.2.3","commit":"abc123def456","build_time":"2024-01-15T10:30:00Z"}
+
+# Endpoint disabled:
+docker run -p 8787:8787 -v peerline-data:/data \
+  -e PEERLINE_VERSION_DETAIL=off peerline
+curl http://localhost:8787/version
+# → 404
+```
+
+**Security note:** `PEERLINE_VERSION_DETAIL=full` exposes the exact commit and build time, which can fingerprint unpatched instances. Leave it off (`minimal` or unset) on public instances; use the CLI flag or logs for internal verification.
 
 ---
 
