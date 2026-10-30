@@ -8,35 +8,32 @@ import (
 	"github.com/sysrex/peerline/internal/auth"
 )
 
-// A NULL public_id row (older binary after the v3 step) gets an id on the next Open,
-// so it is listed and can be revoked (#66, #67).
-func TestNullPublicIDBackfilledOnOpen(t *testing.T) {
-	path := t.TempDir() + "/test.db"
-	st, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	if err := st.CreatePeer(ctx, "p_testpeer123", "TestPeer", auth.Hash("k"), "", ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.db.ExecContext(ctx,
-		`INSERT INTO invites(code_hash, from_peer, scopes, bags, expires_at, public_id) VALUES('h', 'p_testpeer123', 'messages', '', ?, NULL)`,
-		time.Now().Add(time.Hour).Unix()); err != nil {
-		t.Fatal(err)
-	}
-	st.Close()
-
-	st, err = Open(path)
+// TestPublicIDNotNull verifies that v5 makes public_id NOT NULL with a default, so an older
+// binary's insert (no public_id column) still gets an id and an explicit NULL is refused (#66, #77).
+func TestPublicIDNotNull(t *testing.T) {
+	st, err := Open(t.TempDir() + "/test.db")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	invites, err := st.ListInvitesByPeer(ctx, "p_testpeer123", 50, 0)
-	if err != nil || len(invites) != 1 || invites[0].PublicID == "" {
-		t.Fatalf("list after reopen: %v %+v", err, invites)
+	ctx := context.Background()
+	peerID := "p_testpeer123"
+	if err := st.CreatePeer(ctx, peerID, "TestPeer", auth.Hash("test-key"), "", ""); err != nil {
+		t.Fatal(err)
 	}
-	if err := st.DeleteInvite(ctx, invites[0].PublicID, "p_testpeer123"); err != nil {
-		t.Fatalf("revoke backfilled invite: %v", err)
+	exp := time.Now().Add(time.Hour).Unix()
+	if _, err := st.db.ExecContext(ctx,
+		`INSERT INTO invites(code_hash, from_peer, scopes, bags, expires_at, public_id) VALUES('h1', ?, 'messages', '', ?, NULL)`,
+		peerID, exp); err == nil {
+		t.Fatal("NULL public_id accepted")
+	}
+	if _, err := st.db.ExecContext(ctx,
+		`INSERT INTO invites(code_hash, from_peer, scopes, bags, expires_at) VALUES('h2', ?, 'messages', '', ?)`,
+		peerID, exp); err != nil {
+		t.Fatal(err)
+	}
+	invites, err := st.ListInvitesByPeer(ctx, peerID, 50, 0)
+	if err != nil || len(invites) != 1 || invites[0].PublicID == "" {
+		t.Fatalf("want one invite with default public_id, got %v %v", invites, err)
 	}
 }
