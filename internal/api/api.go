@@ -27,13 +27,11 @@ import (
 )
 
 const (
-	MaxBagBytes       = 64 << 10
-	authLookupTimeout = 2 * time.Second // #100: bounded auth lookup
-	defaultRetryAfter = 2               // seconds
-	maxJSONBytes      = 16 << 10
-	defaultInviteTTL  = 1 * time.Hour
-	maxInviteTTL      = 7 * 24 * time.Hour
-	maxInviteTTLSec   = 604800 // 7 days in seconds, checked before multiplication
+	MaxBagBytes      = 64 << 10
+	maxJSONBytes     = 16 << 10
+	defaultInviteTTL = 1 * time.Hour
+	maxInviteTTL     = 7 * 24 * time.Hour
+	maxInviteTTLSec  = 604800 // 7 days in seconds, checked before multiplication
 )
 
 type Config struct {
@@ -66,12 +64,6 @@ type Config struct {
 	// RetentionSeconds is how long (in seconds) to keep used invites before purging.
 	// Default is 30 days (2592000 seconds). Set to 0 for the default.
 	RetentionSeconds int64
-	// AuthFailPerMinute / AuthFailBurst limit failed Bearer token lookups per IP.
-	AuthFailPerMinute int
-	AuthFailBurst     int
-	// WritePerMinute / WriteBurst limit authenticated write operations per peer.
-	WritePerMinute int
-	WriteBurst     int
 }
 
 type Server struct {
@@ -81,14 +73,10 @@ type Server struct {
 	maint       *MaintenanceManager
 	log         *slog.Logger
 	trustedNets []*net.IPNet
+	now         func() time.Time // clock for invite expiry; defaults to time.Now
 }
 
-func New(st *store.Store, cfg Config) (*Server, error) {
-	// Ensure key index has been loaded before serving (#112)
-	if !st.KeyIndexLoaded() {
-		return nil, fmt.Errorf("key index not loaded: call Store.LoadKeyIndex before api.New")
-	}
-
+func New(st *store.Store, cfg Config) *Server {
 	if cfg.MsgPerMinute <= 0 {
 		cfg.MsgPerMinute = 30
 	}
@@ -119,18 +107,6 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 	if cfg.MaxOutstandingInvites <= 0 {
 		cfg.MaxOutstandingInvites = 10
 	}
-	if cfg.AuthFailPerMinute <= 0 {
-		cfg.AuthFailPerMinute = 30
-	}
-	if cfg.AuthFailBurst <= 0 {
-		cfg.AuthFailBurst = 10
-	}
-	if cfg.WritePerMinute <= 0 {
-		cfg.WritePerMinute = 30
-	}
-	if cfg.WriteBurst <= 0 {
-		cfg.WriteBurst = 10
-	}
 	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
 
 	trustedNets, err := ParseTrustedProxies(cfg.TrustedProxies)
@@ -146,12 +122,13 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 		log:         cfg.Logger,
 		lim:         NewLimiterManager(cfg),
 		trustedNets: trustedNets,
+		now:         time.Now,
 	}
 
 	// Start maintenance tasks
 	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, cfg.RetentionSeconds)
 
-	return s, nil
+	return s
 }
 
 // Stop gracefully stops background tasks.
@@ -176,20 +153,27 @@ func (s *Server) Handler() http.Handler {
 
 	authed := http.NewServeMux()
 	authed.HandleFunc("GET /v1/me", s.rateLimitAuth(s.me))
-	authed.HandleFunc("PUT /v1/me", s.rateLimitWrite(s.updateMe))
-	authed.HandleFunc("POST /v1/invites", s.rateLimitWrite(s.createInvite))
+	authed.HandleFunc("PUT /v1/me", s.updateMe)
+	authed.HandleFunc("POST /v1/me/verify-email", s.verifyEmail)
+	authed.HandleFunc("POST /v1/invites", s.createInvite)
 	authed.HandleFunc("GET /v1/invites", s.rateLimitAuth(s.listInvites))
-	authed.HandleFunc("DELETE /v1/invites/{id}", s.rateLimitWrite(s.deleteInvite))
-	authed.HandleFunc("POST /v1/invites/accept", s.rateLimitWrite(s.acceptInvite))
-	authed.HandleFunc("GET /v1/invites/accept", s.rateLimitWrite(s.acceptInvite)) // emailed magic link (Bearer required)
+	authed.HandleFunc("DELETE /v1/invites/{id}", s.deleteInvite)
+	authed.HandleFunc("POST /v1/invites/accept", s.acceptInvite)
+	authed.HandleFunc("GET /v1/invites/accept", s.acceptInvite) // emailed magic link (Bearer required)
 	authed.HandleFunc("GET /v1/grants", s.rateLimitAuth(s.listGrants))
-	authed.HandleFunc("DELETE /v1/grants/{peer_id}", s.rateLimitWrite(s.revokeGrant))
-	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.rateLimitWrite(s.sendMessage))
+	authed.HandleFunc("DELETE /v1/grants/{peer_id}", s.revokeGrant)
+	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.sendMessage)
 	authed.HandleFunc("GET /v1/inbox", s.rateLimitAuth(s.inbox)) // polling-friendly rate limit
 	authed.HandleFunc("GET /v1/bags/{name}", s.rateLimitAuth(s.getBag))
-	authed.HandleFunc("PUT /v1/bags/{name}", s.rateLimitWrite(s.putBag))
-	authed.HandleFunc("POST /v1/pairing/{token}", s.rateLimitWrite(s.acceptPairing)) // authenticated pairing acceptance
-	authMW := s.authMiddleware(authed)
+	authed.HandleFunc("PUT /v1/bags/{name}", s.putBag)
+	authed.HandleFunc("POST /v1/pairing/{token}", s.acceptPairing) // authenticated pairing acceptance
+	authMW := auth.Middleware(func(ctx context.Context, h string) (string, error) {
+		p, err := s.st.PeerByKeyHash(ctx, h)
+		if err != nil {
+			return "", err
+		}
+		return p.ID, nil
+	}, authed)
 	mux.Handle("/v1/", authMW)
 	// The emailed accept link: with a Bearer key it accepts (same flow as
 	// POST); without one (a human clicking, or a link scanner) it only shows
@@ -248,137 +232,6 @@ func (s *Server) internal(w http.ResponseWriter, err error) {
 
 // ---- auth ----
 
-// authMiddleware wraps Bearer authentication with rate limiting for failed lookups (#55, #92, #93).
-// authMiddleware requires a valid Bearer token and uses an in-memory key index (#112).
-// Missing or malformed headers return identical 401 with no charge.
-// The key index maps key hashes to peer IDs and is loaded once at startup.
-// On index hit, the request proceeds with per-peer write limits (no failed-auth charge).
-// On index miss, the failed-auth limiter (per-IP) is charged and returns identical 401.
-// Over-budget IPs get uniform 429 with Retry-After. No store lookup on miss.
-func (s *Server) authMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tok, ok := auth.BearerToken(r)
-		ip := clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets)
-		ipKey := rateLimitKey(ip)
-
-		// Missing or malformed Bearer token: identical 401 with no charge
-		if !ok || !strings.HasPrefix(tok, auth.KeyPrefix) {
-			s.unauthorized(w)
-			return
-		}
-
-		keyHash := auth.Hash(tok)
-
-		// Look up key hash in the index
-		peerID, hit := s.st.KeyIndexLookup(keyHash)
-		if hit {
-			// Index hit: proceed with per-peer limits, no failed-auth charge
-			// Verify the peer still exists in the store (#100: bounded timeout)
-			lookupCtx, cancel := context.WithTimeout(r.Context(), authLookupTimeout)
-			defer cancel()
-
-			p, err := s.st.PeerByKeyHash(lookupCtx, keyHash)
-			if errors.Is(err, store.ErrNotFound) {
-				// Peer was deleted but index is stale: remove from index, warn, return 401
-				s.st.InvalidatePeerCache(peerID)
-				s.log.Warn("key index stale: peer not found", "peer_id", peerID)
-				s.unauthorized(w)
-				return
-			}
-			if err != nil {
-				// #96: classify store errors
-				s.handleAuthStoreError(w, r, err, ip)
-				return
-			}
-			if p == nil || p.ID == "" {
-				// Shouldn't happen: return 401
-				s.unauthorized(w)
-				return
-			}
-
-			// Success: authenticate with peer ID from index
-			next.ServeHTTP(w, r.WithContext(auth.WithPeer(r.Context(), p.ID)))
-			return
-		}
-
-		// Index miss: charge failed-auth limiter per IP
-		charged := s.lim.authFailLim.Allow(ipKey)
-		if !charged {
-			// Over budget: uniform 429
-			s.rateLimitedUniform(w, s.cfg.AuthFailPerMinute)
-			return
-		}
-
-		// Within budget: return identical 401 (no store lookup on miss)
-		s.unauthorized(w)
-	})
-}
-
-func (s *Server) unauthorized(w http.ResponseWriter) {
-	w.Header().Set("WWW-Authenticate", `Bearer realm="peerline"`)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusUnauthorized)
-	w.Write([]byte(`{"error":"unauthorized"}`))
-}
-
-// handleAuthStoreError classifies store errors during auth lookup (#96, #100).
-// Context canceled: no response (client is gone).
-// Deadline exceeded (our timeout, request context still valid): 503 + Retry-After.
-// Database busy: 503 + Retry-After.
-// Other errors: 500.
-func (s *Server) handleAuthStoreError(w http.ResponseWriter, r *http.Request, err error, ip string) {
-	// #96: Client canceled or disconnected - don't log at error level, don't write response
-	if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
-		s.log.Debug("auth lookup canceled", "ip", ip)
-		return
-	}
-
-	// #100: Our timeout fired (request context still alive) - service unavailable
-	if errors.Is(err, context.DeadlineExceeded) && r.Context().Err() == nil {
-		s.log.Warn("auth lookup timeout", "ip", ip, "timeout", authLookupTimeout)
-		w.Header().Set("Retry-After", strconv.Itoa(defaultRetryAfter))
-		writeErr(w, http.StatusServiceUnavailable, "service temporarily unavailable")
-		return
-	}
-
-	// #96: Database busy - service unavailable (don't log at error level)
-	if isSQLiteBusy(err) {
-		s.log.Warn("auth lookup: database busy", "ip", ip)
-		w.Header().Set("Retry-After", strconv.Itoa(defaultRetryAfter))
-		writeErr(w, http.StatusServiceUnavailable, "service temporarily unavailable")
-		return
-	}
-
-	// Other errors: internal error
-	s.internal(w, err)
-}
-
-// isSQLiteBusy returns true if err indicates SQLite SQLITE_BUSY or SQLITE_LOCKED.
-func isSQLiteBusy(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "SQLITE_BUSY")
-}
-
-// rateLimitedUniform returns a uniform 429 response for over-budget IPs.
-// The response is identical whether the key is valid-uncached or unknown.
-// Retry-After is derived from the configured failed-auth rate: ceil(60/perMinute), minimum 1.
-func (s *Server) rateLimitedUniform(w http.ResponseWriter, perMinute int) {
-	retryAfter := 1
-	if perMinute > 0 {
-		retryAfter = (60 + perMinute - 1) / perMinute // ceil(60/perMinute)
-	}
-	if retryAfter < 1 {
-		retryAfter = 1
-	}
-	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusTooManyRequests)
-	w.Write([]byte(`{"error":"rate limited"}`))
-}
-
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	// Check register token first, before charging rate limit
 	if s.cfg.RegisterToken != "" && !auth.ConstantEqual(r.Header.Get("X-Peerline-Register-Token"), s.cfg.RegisterToken) {
@@ -409,21 +262,50 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "notify_email: invalid email address")
 		return
 	}
+
+	// Generate verification token if email is set
+	token := ""
+	if notify != "" {
+		token = auth.NewSecret("eml_")
+	}
+
 	id, key := auth.NewID(), auth.NewKey()
-	if err := s.st.CreatePeer(r.Context(), id, in.Name, auth.Hash(key), notify); err != nil {
+	if err := s.st.CreatePeer(r.Context(), id, in.Name, auth.Hash(key), notify, token); err != nil {
 		s.internal(w, err)
 		return
 	}
+
+	// Send verification email if address is set
+	if notify != "" && token != "" {
+		verifyURL := s.publicBase(r) + "/v1/me/verify-email?token=" + url.QueryEscape(token)
+		msg := s.verificationEmail(id, notify, verifyURL)
+		ctx := context.WithoutCancel(r.Context())
+		if err := s.cfg.Mailer.Send(ctx, msg); err != nil {
+			s.log.Error("verification email failed", "peer", id, "err", err)
+			// Continue - verification can be resent
+		} else {
+			s.log.Info("verification email sent", "peer", id)
+		}
+	}
+
 	s.log.Info("peer registered", "peer_id", id, "notify_email_set", notify != "")
-	writeJSON(w, http.StatusCreated, map[string]string{
-		"peer_id": id, "name": in.Name, "api_key": key, "notify_email": notify,
-		"note": "api_key is shown once; store it securely",
-	})
+	resp := map[string]any{
+		"peer_id":      id,
+		"name":         in.Name,
+		"api_key":      key,
+		"notify_email": notify,
+		"verified":     false,
+		"note":         "api_key is shown once; store it securely",
+	}
+	if notify != "" {
+		resp["note"] = "api_key is shown once; store it securely. Check your email for a verification link to enable notifications."
+	}
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	id := auth.PeerID(r.Context())
-	email, err := s.st.NotifyEmail(r.Context(), id)
+	email, verified, _, err := s.st.GetNotifyEmailWithStatus(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "peer not found")
@@ -432,7 +314,11 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"peer_id": id, "notify_email": email})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"peer_id":      id,
+		"notify_email": email,
+		"verified":     verified,
+	})
 }
 
 func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
@@ -452,7 +338,14 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	me := auth.PeerID(r.Context())
-	if err := s.st.SetNotifyEmail(r.Context(), me, email); err != nil {
+
+	// Generate verification token if setting email
+	token := ""
+	if email != "" {
+		token = auth.NewSecret("eml_")
+	}
+
+	if err := s.st.SetNotifyEmail(r.Context(), me, email, token); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "peer not found")
 			return
@@ -460,8 +353,35 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
-	s.log.Info("notify email updated", "peer_id", me, "set", email != "")
-	s.me(w, r)
+
+	// Send verification email if address is set
+	if email != "" && token != "" {
+		verifyURL := s.publicBase(r) + "/v1/me/verify-email?token=" + url.QueryEscape(token)
+		msg := s.verificationEmail(me, email, verifyURL)
+		// Detach from client cancellation
+		ctx := context.WithoutCancel(r.Context())
+		if err := s.cfg.Mailer.Send(ctx, msg); err != nil {
+			s.log.Error("verification email failed", "peer", me, "err", err)
+			// Continue - verification can be resent
+		} else {
+			s.log.Info("verification email sent", "peer", me)
+		}
+	}
+
+	s.log.Info("notify email updated", "peer_id", me, "set", email != "", "verified", false)
+
+	// Return current status
+	currentEmail, verified, _, err := s.st.GetNotifyEmailWithStatus(r.Context(), me)
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"peer_id":      me,
+		"notify_email": currentEmail,
+		"verified":     verified,
+		"note":         "Check your email for a verification link to enable notifications",
+	})
 }
 
 // normalizeNotifyEmail returns "" to clear, or one bare address.
@@ -471,6 +391,45 @@ func normalizeNotifyEmail(raw string) (string, error) {
 		return "", nil
 	}
 	return mailer.ValidAddress(raw)
+}
+
+// verificationEmail creates the email body for email address verification.
+func (s *Server) verificationEmail(peerID, to, verifyURL string) mailer.Message {
+	var b strings.Builder
+	b.WriteString("Verify your email address to enable Peerline message notifications.\n\n")
+	fmt.Fprintf(&b, "Peer: %s\n\n", peerID)
+	b.WriteString("Click the link below or open it in your bot's HTTP client:\n\n")
+	fmt.Fprintf(&b, "  %s\n\n", verifyURL)
+	fmt.Fprintf(&b, "  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" \\\n    '%s'\n\n", verifyURL)
+	b.WriteString("If you didn't set this address, ignore this email.\n")
+	return mailer.Message{
+		To:      to,
+		Subject: "Peerline: Verify your email address",
+		Body:    b.String(),
+	}
+}
+
+// verifyEmail handles email verification via token.
+func (s *Server) verifyEmail(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		writeErr(w, http.StatusBadRequest, "token required")
+		return
+	}
+	me := auth.PeerID(r.Context())
+	if err := s.st.VerifyNotifyEmail(r.Context(), me, token); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusBadRequest, "invalid or expired token")
+			return
+		}
+		s.internal(w, err)
+		return
+	}
+	s.log.Info("email verified", "peer_id", me)
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status": "verified",
+		"note":   "Email verified successfully. You will now receive message notifications.",
+	})
 }
 
 // ---- pairing ----
@@ -550,7 +509,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	code := auth.NewSecret("inv_")
-	exp := time.Now().Add(ttl).UTC()
+	exp := s.now().Add(ttl).UTC()
 	var pairingToken string
 	var publicID string
 
@@ -648,32 +607,62 @@ func (s *Server) inviterName(ctx context.Context, id string) string {
 
 // sanitizeInviterName applies NFKC normalization and filters characters that can be used
 // for prompt injection or homoglyph attacks. Allows Unicode letters (L*), numbers (N*),
-// combining marks (Mn, Mc), spaces, and basic ASCII punctuation (. , - _ ').
-// Filters all Cf format characters (including zero-width and bidi controls), variation selectors,
-// Hangul fillers, and tag characters. Collapses repeated spaces and trims the result.
+// combining marks (Mn, Mc) with constraints, spaces (including tab/newline mapped to space),
+// and basic ASCII punctuation (. , - _ ').
+//
+// Filters:
+//   - All Cf format characters (including zero-width and bidi controls)
+//   - Variation selectors (both standard and extended ranges, plus unicode property)
+//   - Hangul fillers (U+115F, U+1160, U+3164, U+FFA0)
+//   - Tag characters (U+E0000–U+E007F)
+//   - Invisible Mn characters (U+034F, U+180B-180D, U+180F, U+17B4-17B5)
+//   - Other_Default_Ignorable_Code_Point property
+//   - Zl and Zp line/paragraph separators (U+2028, U+2029)
+//
+// Combining mark constraints (counted in decomposed NFD form, issue #84):
+//   - Only allowed directly after a letter or number
+//   - Maximum 3 marks per base character (counted in NFD; visible result)
+//   - Marks after space, punctuation, or at start are dropped
+//
+// Whitespace handling:
+//   - Tab, newline, and all unicode.IsSpace chars become a single space
+//   - Repeated spaces are collapsed
+//
+// Returns "A Peerline peer" if the result is empty after filtering.
 // Max length 64 runes (not bytes).
 //
 // Note: Cross-script homoglyphs (e.g., Cyrillic а vs Latin a) are not fully solvable here
 // and require application-level awareness or visual similarity detection.
 func sanitizeInviterName(name string) string {
-	const maxRunes = 64
+	const (
+		maxRunes        = 64
+		maxMarksPerBase = 3 // Issue #84 specifies 3 marks per base (issue #63 asked for 2 but #84 is the live tracker)
+		fallbackName    = "A Peerline peer"
+	)
 
-	// Apply NFKC normalization (compatibility decomposition + canonical composition)
+	// Apply NFKC normalization first (compatibility decomposition + canonical composition)
 	// This normalizes fullwidth/halfwidth chars, ligatures, compatibility forms
-	normalized := norm.NFKC.String(name)
+	nfkc := norm.NFKC.String(name)
+
+	// Then apply NFD (canonical decomposition) to separate all base+mark combinations
+	// This ensures we can accurately count and limit marks per base character
+	nfd := norm.NFD.String(nfkc)
 
 	var out strings.Builder
 	lastWasSpace := false
 	runeCount := 0
+	marksAfterBase := 0
+	lastWasBaseChar := false // tracks if last was letter/number (valid base for marks)
 
-	for _, r := range normalized {
+	for _, r := range nfd {
 		// Filter Hangul fillers: U+115F, U+1160, U+3164, U+FFA0
 		if r == 0x115F || r == 0x1160 || r == 0x3164 || r == 0xFFA0 {
 			continue
 		}
 
 		// Filter variation selectors: U+FE00–U+FE0F (standard), U+E0100–U+E01EF (extended)
-		if (r >= 0xFE00 && r <= 0xFE0F) || (r >= 0xE0100 && r <= 0xE01EF) {
+		// Also filter via unicode property for completeness
+		if (r >= 0xFE00 && r <= 0xFE0F) || (r >= 0xE0100 && r <= 0xE01EF) || unicode.Is(unicode.Variation_Selector, r) {
 			continue
 		}
 
@@ -682,28 +671,67 @@ func sanitizeInviterName(name string) string {
 			continue
 		}
 
+		// Filter Zl (line separator) and Zp (paragraph separator): U+2028, U+2029
+		// These are unicode.IsSpace but should be removed, not converted to space
+		if unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
+			continue
+		}
+
 		// Filter tag characters: U+E0000–U+E007F
 		if r >= 0xE0000 && r <= 0xE007F {
 			continue
 		}
 
-		// Allow: Unicode letters (L*), numbers (N*), combining marks (Mn, Mc), space, and basic ASCII punctuation
-		if unicode.IsLetter(r) || unicode.IsNumber(r) || unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) {
+		// Filter invisible Mn characters and default ignorables
+		// U+034F COMBINING GRAPHEME JOINER, U+180B-180D Mongolian free variation selectors,
+		// U+180F, U+17B4-17B5 Khmer inherent vowels
+		if r == 0x034F || (r >= 0x180B && r <= 0x180D) || r == 0x180F || r == 0x17B4 || r == 0x17B5 {
+			continue
+		}
+		if unicode.Is(unicode.Other_Default_Ignorable_Code_Point, r) {
+			continue
+		}
+
+		// Check if this is a combining mark (Mn or Mc)
+		isMark := unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r)
+
+		if isMark {
+			// Only allow marks after a base character (letter/number)
+			// and limit to maxMarksPerBase per base character
+			if lastWasBaseChar && marksAfterBase < maxMarksPerBase {
+				out.WriteRune(r)
+				marksAfterBase++
+				runeCount++
+				// Keep lastWasBaseChar true so we stay in this mark sequence
+			}
+			// Otherwise drop the mark
+		} else if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			// Base character: letter or number
 			out.WriteRune(r)
 			lastWasSpace = false
+			lastWasBaseChar = true
+			marksAfterBase = 0 // Reset mark counter for new base
 			runeCount++
-		} else if r == ' ' {
-			// Collapse repeated spaces
+		} else if unicode.IsSpace(r) || r == '\t' || r == '\n' || r == '\r' {
+			// Map all whitespace (including tab/newline) to single space
 			if !lastWasSpace && out.Len() > 0 {
 				out.WriteRune(' ')
 				lastWasSpace = true
+				lastWasBaseChar = false
+				marksAfterBase = 0
 				runeCount++
 			}
 		} else if r == '.' || r == ',' || r == '-' || r == '_' || r == '\'' {
 			// Basic ASCII punctuation
 			out.WriteRune(r)
 			lastWasSpace = false
+			lastWasBaseChar = false // punctuation is not a valid base for marks
+			marksAfterBase = 0
 			runeCount++
+		} else {
+			// Other characters: reset state but don't write
+			lastWasBaseChar = false
+			marksAfterBase = 0
 		}
 
 		// Stop if we exceed max runes
@@ -712,7 +740,16 @@ func sanitizeInviterName(name string) string {
 		}
 	}
 
-	return strings.TrimSpace(out.String())
+	// Apply NFC (canonical composition) to the filtered result
+	// This recomposes base+mark sequences into precomposed forms where possible
+	result := norm.NFC.String(strings.TrimSpace(out.String()))
+
+	// Return fallback if result is empty
+	if result == "" {
+		return fallbackName
+	}
+
+	return result
 }
 
 func inviteEmail(inviter, inviterID, to, code, acceptURL string, scopes, bags []string, exp time.Time) mailer.Message {
@@ -952,18 +989,28 @@ const notifyPreviewMax = 200
 func (s *Server) notifyNewMessage(ctx context.Context, m *store.Message) {
 	// The message is already stored. Don't drop the wake-up if the client hangs up.
 	ctx = context.WithoutCancel(ctx)
-	email, err := s.st.NotifyEmail(ctx, m.To)
+
+	// Only send to verified emails
+	email, err := s.st.GetVerifiedNotifyEmail(ctx, m.To)
 	if err != nil {
 		s.log.Error("notify email lookup", "recipient", m.To, "message_id", m.ID, "err", err)
 		return
 	}
 	if email == "" {
-		return
+		return // No verified email set
 	}
+
+	// Check both per-peer and per-address rate limits
+	normalizedAddr := strings.ToLower(email)
 	if !s.lim.notifyLim.Allow(m.To) {
-		s.log.Warn("notify email rate limited", "recipient", m.To, "message_id", m.ID)
+		s.log.Warn("notify email rate limited (per-peer)", "recipient", m.To, "message_id", m.ID)
 		return
 	}
+	if !s.lim.notifyAddrLim.Allow(normalizedAddr) {
+		s.log.Warn("notify email rate limited (per-address)", "address", normalizedAddr, "recipient", m.To, "message_id", m.ID)
+		return
+	}
+
 	status := "sent"
 	if s.cfg.Mailer.Mode() == "log" {
 		status = "logged"
@@ -983,7 +1030,9 @@ func (s *Server) notifyEmail(m *store.Message, to string) mailer.Message {
 	fmt.Fprintf(&b, "Type: %s\n", m.Type)
 	fmt.Fprintf(&b, "Created: %s\n\n", m.CreatedAt.UTC().Format(time.RFC3339))
 	fmt.Fprintf(&b, "Preview:\n%s\n", bodyPreview(m.Body, s.cfg.RegisterToken, notifyPreviewMax))
-	b.WriteString("\nRead the full message from your Peerline inbox (GET /v1/inbox).\n")
+	b.WriteString("\nRead the full message from your Peerline inbox (GET /v1/inbox).\n\n")
+	b.WriteString("---\n")
+	fmt.Fprintf(&b, "You received this notification because peer %s sent a message to peer %s, and %s has this email set as their verified notification address. To stop receiving these notifications, clear your notify_email via PUT /v1/me.\n", m.From, m.To, m.To)
 	return mailer.Message{
 		To:      to,
 		Subject: "Peerline: new message from " + m.From,
@@ -1335,7 +1384,7 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 	}
 	// Atomically register and accept the pairing in one transaction
 	id, key := auth.NewID(), auth.NewKey()
-	g, err := s.st.RegisterAndAcceptByPairing(r.Context(), tokenHash, id, in.Name, auth.Hash(key), "", sc, bg)
+	g, err := s.st.RegisterAndAcceptByPairing(r.Context(), tokenHash, id, in.Name, auth.Hash(key), "", "", sc, bg)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")

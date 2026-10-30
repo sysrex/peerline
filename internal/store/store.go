@@ -23,6 +23,7 @@ var memDBCounter uint64
 
 type Store struct {
 	db             *sql.DB
+	now            func() int64
 	keyIndex       *keyIndex
 	keyIndexLoaded bool
 }
@@ -34,7 +35,9 @@ CREATE TABLE IF NOT EXISTS peers (
   name TEXT NOT NULL,
   key_hash TEXT NOT NULL UNIQUE,
   created_at INTEGER NOT NULL,
-  notify_email TEXT NOT NULL DEFAULT ''
+  notify_email TEXT NOT NULL DEFAULT '',
+  notify_email_verified INTEGER NOT NULL DEFAULT 0,
+  notify_email_token TEXT
 );
 CREATE TABLE IF NOT EXISTS invites (
   code_hash TEXT PRIMARY KEY,
@@ -76,7 +79,8 @@ CREATE TABLE IF NOT EXISTS bags (
 );
 `
 
-// Open opens (and migrates) the database at path. Use ":memory:" for tests.
+// Open opens the database at path, applies migrations, and returns a Store.
+// Use ":memory:" for tests. It is the only Store constructor; a zero-value Store{} has a nil now func and must not be used directly.
 func Open(path string) (*Store, error) {
 	dsn := buildDSN(path)
 	db, err := sql.Open("sqlite", dsn)
@@ -94,7 +98,11 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	return &Store{db: db, keyIndex: newKeyIndex()}, nil
+	return &Store{
+		db:       db,
+		now:      func() int64 { return time.Now().Unix() },
+		keyIndex: newKeyIndex(),
+	}, nil
 }
 
 func buildDSN(path string) string {
@@ -118,6 +126,7 @@ func migrate(db *sql.DB) error {
 		migrateV1NotifyEmail,
 		migrateV2PairingTokenHash,
 		migrateV3InvitePublicID,
+		migrateV4EmailVerification,
 	}
 
 	for i, mig := range migrations {
@@ -289,9 +298,34 @@ func migrateV3InvitePublicID(tx *sql.Tx) error {
 	return nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+// migrateV4EmailVerification adds notify_email_verified and notify_email_token columns to peers.
+func migrateV4EmailVerification(tx *sql.Tx) error {
+	// Check if notify_email_verified column exists
+	var hasVerified int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name = 'notify_email_verified'`).Scan(&hasVerified); err != nil {
+		return err
+	}
+	if hasVerified == 0 {
+		if _, err := tx.Exec(`ALTER TABLE peers ADD COLUMN notify_email_verified INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
 
-var now = func() int64 { return time.Now().Unix() }
+	// Check if notify_email_token column exists
+	var hasToken int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name = 'notify_email_token'`).Scan(&hasToken); err != nil {
+		return err
+	}
+	if hasToken == 0 {
+		if _, err := tx.Exec(`ALTER TABLE peers ADD COLUMN notify_email_token TEXT`); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *Store) Close() error { return s.db.Close() }
 
 // generatePublicID returns a random 16-byte hex string for invite public_id.
 func generatePublicID() (string, error) {
@@ -310,8 +344,10 @@ type Peer struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-func (s *Store) CreatePeer(ctx context.Context, id, name, keyHash, notifyEmail string) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email) VALUES(?,?,?,?,?)`, id, name, keyHash, now(), notifyEmail)
+func (s *Store) CreatePeer(ctx context.Context, id, name, keyHash, notifyEmail, notifyToken string) error {
+	verified := 0
+	_, err := s.db.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email,notify_email_verified,notify_email_token) VALUES(?,?,?,?,?,?,?)`,
+		id, name, keyHash, s.now(), notifyEmail, verified, notifyToken)
 	if err == nil {
 		// Add to key index after successful insert
 		s.keyIndex.add(keyHash, id)
@@ -330,8 +366,22 @@ func (s *Store) NotifyEmail(ctx context.Context, id string) (string, error) {
 }
 
 // SetNotifyEmail sets or clears the wake-up address. email is "" to clear.
-func (s *Store) SetNotifyEmail(ctx context.Context, id, email string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE peers SET notify_email=? WHERE id=?`, email, id)
+// When setting a new email, it marks it as unverified and generates a confirmation token.
+func (s *Store) SetNotifyEmail(ctx context.Context, id, email, token string) error {
+	verified := 0
+	if email == "" {
+		// Clearing email
+		res, err := s.db.ExecContext(ctx, `UPDATE peers SET notify_email=?, notify_email_verified=0, notify_email_token=NULL WHERE id=?`, email, id)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	}
+	// Setting new email: unverified with token
+	res, err := s.db.ExecContext(ctx, `UPDATE peers SET notify_email=?, notify_email_verified=?, notify_email_token=? WHERE id=?`, email, verified, token, id)
 	if err != nil {
 		return err
 	}
@@ -339,6 +389,46 @@ func (s *Store) SetNotifyEmail(ctx context.Context, id, email string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// GetNotifyEmailWithStatus returns the email, whether it's verified, and the verification token.
+func (s *Store) GetNotifyEmailWithStatus(ctx context.Context, id string) (email string, verified bool, token string, err error) {
+	var verifiedInt int
+	var tokenNull sql.NullString
+	err = s.db.QueryRowContext(ctx, `SELECT notify_email, notify_email_verified, notify_email_token FROM peers WHERE id=?`, id).Scan(&email, &verifiedInt, &tokenNull)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, "", ErrNotFound
+	}
+	if err != nil {
+		return "", false, "", err
+	}
+	verified = verifiedInt != 0
+	if tokenNull.Valid {
+		token = tokenNull.String
+	}
+	return email, verified, token, nil
+}
+
+// VerifyNotifyEmail marks the email as verified if the token matches.
+func (s *Store) VerifyNotifyEmail(ctx context.Context, id, token string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE peers SET notify_email_verified=1, notify_email_token=NULL WHERE id=? AND notify_email_token=?`, id, token)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// GetVerifiedNotifyEmail returns the email only if it's verified, or "" if unset/unverified.
+func (s *Store) GetVerifiedNotifyEmail(ctx context.Context, id string) (string, error) {
+	var email string
+	err := s.db.QueryRowContext(ctx, `SELECT notify_email FROM peers WHERE id=? AND notify_email_verified=1 AND notify_email != ''`, id).Scan(&email)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return email, err
 }
 
 func (s *Store) PeerByKeyHash(ctx context.Context, keyHash string) (*Peer, error) {
@@ -439,7 +529,7 @@ func (s *Store) CreateInviteAtomic(ctx context.Context, codeHash, from string, s
 	defer tx.Rollback()
 
 	var count int
-	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`, from, now()).Scan(&count)
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`, from, s.now()).Scan(&count)
 	if err != nil {
 		return "", err
 	}
@@ -475,7 +565,7 @@ func (s *Store) CreateInviteWithPairingAtomic(ctx context.Context, codeHash, pai
 	defer tx.Rollback()
 
 	var count int
-	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`, from, now()).Scan(&count)
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`, from, s.now()).Scan(&count)
 	if err != nil {
 		return "", err
 	}
@@ -516,7 +606,7 @@ func (s *Store) CountOutstandingInvites(ctx context.Context, peerID string) (int
 	var count int
 	err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`,
-		peerID, now()).Scan(&count)
+		peerID, s.now()).Scan(&count)
 	return count, err
 }
 
@@ -533,7 +623,7 @@ func (s *Store) ListInvitesByPeer(ctx context.Context, peerID string, limit, off
 		 WHERE from_peer=? AND expires_at>=? AND public_id IS NOT NULL
 		 ORDER BY ROWID
 		 LIMIT ? OFFSET ?`,
-		peerID, now(), limit, offset)
+		peerID, s.now(), limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -578,27 +668,52 @@ func (s *Store) DeleteInvite(ctx context.Context, publicID, ownerID string) erro
 }
 
 // PurgeExpiredInvites removes expired unused invites and old used invites.
-// Unused invites: deleted when expires_at < now.
+// Unused invites: deleted when expires_at < now - 300 (5-minute grace).
 // Used invites: deleted when expires_at < now - retentionSeconds (default 30 days).
 func (s *Store) PurgeExpiredInvites(ctx context.Context, retentionSeconds int64) (int, error) {
 	if retentionSeconds <= 0 {
 		retentionSeconds = 30 * 24 * 60 * 60 // 30 days default
 	}
 
-	ts := now()
+	ts := s.now()
+	graceCutoff := ts - 300 // 5-minute grace window
 	retentionCutoff := ts - retentionSeconds
 
-	// Delete unused expired invites and used invites older than retention window
-	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM invites WHERE 
-			(used_by IS NULL AND expires_at < ?) OR 
-			(used_by IS NOT NULL AND expires_at < ?)`,
-		ts, retentionCutoff)
-	if err != nil {
-		return 0, err
+	totalDeleted := 0
+	batchSize := 500
+
+	for {
+		// Check context before each batch
+		if err := ctx.Err(); err != nil {
+			return totalDeleted, err
+		}
+
+		// Delete in batches using rowid
+		res, err := s.db.ExecContext(ctx,
+			`DELETE FROM invites WHERE rowid IN (
+				SELECT rowid FROM invites 
+				WHERE (used_by IS NULL AND expires_at < ?) 
+				   OR (used_by IS NOT NULL AND expires_at < ?)
+				LIMIT ?
+			)`,
+			graceCutoff, retentionCutoff, batchSize)
+		if err != nil {
+			return totalDeleted, err
+		}
+
+		n, err := res.RowsAffected()
+		if err != nil {
+			return totalDeleted, err
+		}
+		totalDeleted += int(n)
+
+		// Stop if we deleted fewer than batchSize
+		if int(n) < batchSize {
+			break
+		}
 	}
-	n, _ := res.RowsAffected()
-	return int(n), nil
+
+	return totalDeleted, nil
 }
 
 type InviteInfo struct {
@@ -621,7 +736,7 @@ func (s *Store) GetInviteByPairingToken(ctx context.Context, pairingTokenHash st
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp < now() {
+	if used.Valid || exp < s.now() {
 		return nil, ErrNotFound
 	}
 	return &InviteInfo{
@@ -646,7 +761,7 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp < now() {
+	if used.Valid || exp < s.now() {
 		return nil, ErrNotFound
 	}
 
@@ -656,7 +771,7 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 	}
 	defer tx.Rollback()
 
-	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags)
+	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags, s.now())
 	if err != nil {
 		return nil, err
 	}
@@ -670,7 +785,7 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 // PairingTokenExists checks if a pairing token exists (is valid and not yet redeemed).
 func (s *Store) PairingTokenExists(ctx context.Context, pairingTokenHash string) (bool, error) {
 	var exists int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM invites WHERE pairing_token_hash=? AND used_by IS NULL AND expires_at >= ?`, pairingTokenHash, time.Now().Unix()).Scan(&exists)
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM invites WHERE pairing_token_hash=? AND used_by IS NULL AND expires_at >= ?`, pairingTokenHash, s.now()).Scan(&exists)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -694,7 +809,7 @@ func (s *Store) AcceptInvite(ctx context.Context, codeHash, accepter string, bac
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp < now() {
+	if used.Valid || exp < s.now() {
 		return nil, ErrNotFound
 	}
 
@@ -704,7 +819,7 @@ func (s *Store) AcceptInvite(ctx context.Context, codeHash, accepter string, bac
 	}
 	defer tx.Rollback()
 
-	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags)
+	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags, s.now())
 	if err != nil {
 		return nil, err
 	}
@@ -717,7 +832,7 @@ func (s *Store) AcceptInvite(ctx context.Context, codeHash, accepter string, bac
 
 // RegisterAndAcceptByPairing atomically registers a new peer and accepts a pairing invite.
 // Returns the grant from the inviter.
-func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash, peerID, name, keyHash, notifyEmail string, backScopes, backBags []string) (grant *Grant, err error) {
+func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash, peerID, name, keyHash, notifyEmail, notifyToken string, backScopes, backBags []string) (grant *Grant, err error) {
 	// #14 fix: Read-only check before BeginTx to avoid taking write lock for invalid tokens
 	var codeHash, fromPeer string
 	var exp int64
@@ -730,8 +845,8 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 	if err != nil {
 		return nil, err
 	}
-	ts := now()
-	if used.Valid || exp < ts {
+	preCheckTime := s.now()
+	if used.Valid || exp < preCheckTime {
 		return nil, ErrNotFound
 	}
 
@@ -742,13 +857,17 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 	}
 	defer tx.Rollback()
 
-	_, err = tx.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email) VALUES(?,?,?,?,?)`,
-		peerID, name, keyHash, ts, notifyEmail)
+	// Take timestamp inside tx for expires_at guard and created_at
+	ts := s.now()
+
+	verified := 0
+	_, err = tx.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email,notify_email_verified,notify_email_token) VALUES(?,?,?,?,?,?,?)`,
+		peerID, name, keyHash, ts, notifyEmail, verified, notifyToken)
 	if err != nil {
 		return nil, err
 	}
 
-	grant, err = acceptInviteInTx(ctx, tx, codeHash, peerID, backScopes, backBags)
+	grant, err = acceptInviteInTx(ctx, tx, codeHash, peerID, backScopes, backBags, ts)
 	if err != nil {
 		return nil, err
 	}
@@ -756,14 +875,16 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+
 	// Add to key index after successful commit
 	s.keyIndex.add(keyHash, peerID)
+
 	return grant, nil
 }
 
 // acceptInviteInTx is the shared helper that atomically consumes an invite using a guarded
 // update and creates grants. Must be called within a transaction.
-func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string, backScopes, backBags []string) (*Grant, error) {
+func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string, backScopes, backBags []string, now int64) (*Grant, error) {
 	var from, scopes, bags string
 	err := tx.QueryRowContext(ctx, `SELECT from_peer,scopes,bags FROM invites WHERE code_hash=?`, codeHash).
 		Scan(&from, &scopes, &bags)
@@ -778,10 +899,9 @@ func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string
 		return nil, ErrConflict
 	}
 
-	ts := now()
 	res, err := tx.ExecContext(ctx,
 		`UPDATE invites SET used_by=? WHERE code_hash=? AND used_by IS NULL AND expires_at>=?`,
-		accepter, codeHash, ts)
+		accepter, codeHash, now)
 	if err != nil {
 		return nil, err
 	}
@@ -795,11 +915,11 @@ func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string
 
 	up := `INSERT INTO grants(owner,grantee,scopes,bags,created_at) VALUES(?,?,?,?,?)
 	       ON CONFLICT(owner,grantee) DO UPDATE SET scopes=excluded.scopes, bags=excluded.bags, created_at=excluded.created_at`
-	if _, err := tx.ExecContext(ctx, up, from, accepter, scopes, bags, ts); err != nil {
+	if _, err := tx.ExecContext(ctx, up, from, accepter, scopes, bags, now); err != nil {
 		return nil, err
 	}
 	if len(backScopes) > 0 {
-		if _, err := tx.ExecContext(ctx, up, accepter, from, join(backScopes), join(backBags), ts); err != nil {
+		if _, err := tx.ExecContext(ctx, up, accepter, from, join(backScopes), join(backBags), now); err != nil {
 			return nil, err
 		}
 	}
@@ -865,7 +985,7 @@ type Message struct {
 }
 
 func (s *Store) InsertMessage(ctx context.Context, m *Message) error {
-	ts := now()
+	ts := s.now()
 	res, err := s.db.ExecContext(ctx, `INSERT INTO messages(sender,recipient,type,body,reply_to,created_at) VALUES(?,?,?,?,?,?)`,
 		m.From, m.To, m.Type, m.Body, m.ReplyTo, ts)
 	if err != nil {
@@ -953,9 +1073,84 @@ func (s *Store) PutBag(ctx context.Context, owner, name string, content []byte, 
 	next := cur + 1
 	_, err = tx.ExecContext(ctx, `INSERT INTO bags(owner,name,content,version,updated_by,updated_at) VALUES(?,?,?,?,?,?)
 		ON CONFLICT(owner,name) DO UPDATE SET content=excluded.content, version=excluded.version,
-		updated_by=excluded.updated_by, updated_at=excluded.updated_at`, owner, name, content, next, by, now())
+		updated_by=excluded.updated_by, updated_at=excluded.updated_at`, owner, name, content, next, by, s.now())
 	if err != nil {
 		return 0, err
 	}
 	return next, tx.Commit()
+}
+
+// ---- Key Index (#112) ----
+
+// LoadKeyIndex loads all active API key hashes from the peers table into memory.
+// Must be called once at startup before serving requests.
+// Returns the number of keys loaded, the duration, and any error.
+func (s *Store) LoadKeyIndex(ctx context.Context) (int, time.Duration, error) {
+	start := time.Now()
+	rows, err := s.db.QueryContext(ctx, "SELECT key_hash, id FROM peers")
+	if err != nil {
+		return 0, 0, err
+	}
+	defer rows.Close()
+
+	s.keyIndex.clear()
+	count := 0
+	for rows.Next() {
+		var keyHash, peerID string
+		if err := rows.Scan(&keyHash, &peerID); err != nil {
+			return 0, 0, err
+		}
+		s.keyIndex.add(keyHash, peerID)
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return 0, 0, err
+	}
+
+	s.keyIndexLoaded = true
+	return count, time.Since(start), nil
+}
+
+// KeyIndexLoaded returns true if LoadKeyIndex has been called.
+func (s *Store) KeyIndexLoaded() bool {
+	return s.keyIndexLoaded
+}
+
+// KeyIndexLookup returns the peer ID for the given key hash, or empty string if not found.
+func (s *Store) KeyIndexLookup(keyHash string) (peerID string, ok bool) {
+	return s.keyIndex.Lookup(keyHash)
+}
+
+// InvalidatePeerCache removes all key hashes for the given peer ID from the index.
+// Used when a peer is deleted or a key is rotated.
+func (s *Store) InvalidatePeerCache(peerID string) {
+	s.keyIndexRemove(peerID)
+}
+
+// KeyIndexLen returns the number of entries in the key index.
+func (s *Store) KeyIndexLen() int {
+	return s.keyIndex.Len()
+}
+
+// keyIndexRemove is the unexported helper for the remove-before/after-commit pattern.
+func (s *Store) keyIndexRemove(peerID string) {
+	s.keyIndex.remove(peerID)
+}
+
+// ReconcileKeyIndex compares the index size with the peers table row count.
+// If they differ, it rebuilds the index from the database.
+// Returns true if a rebuild was performed.
+func (s *Store) ReconcileKeyIndex(ctx context.Context) (bool, error) {
+	var rowCount int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM peers").Scan(&rowCount); err != nil {
+		return false, err
+	}
+
+	if s.keyIndex.Len() != rowCount {
+		// Desync detected: rebuild
+		_, _, err := s.LoadKeyIndex(ctx)
+		return true, err
+	}
+
+	return false, nil
 }

@@ -35,17 +35,17 @@ func TestStoreBasics(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err := s.CreatePeer(ctx, "a", "alice", "ha", "alice@example.com"); err != nil {
+	if err := s.CreatePeer(ctx, "a", "alice", "ha", "alice@example.com", ""); err != nil {
 		t.Fatal(err)
 	}
-	s.CreatePeer(ctx, "b", "bob", "hb", "")
+	s.CreatePeer(ctx, "b", "bob", "hb", "", "")
 	if email, err := s.NotifyEmail(ctx, "a"); err != nil || email != "alice@example.com" {
 		t.Fatal(email, err)
 	}
 	if email, err := s.NotifyEmail(ctx, "b"); err != nil || email != "" {
 		t.Fatal(email, err)
 	}
-	if err := s.SetNotifyEmail(ctx, "a", ""); err != nil {
+	if err := s.SetNotifyEmail(ctx, "a", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if email, err := s.NotifyEmail(ctx, "a"); err != nil || email != "" {
@@ -80,10 +80,10 @@ func TestStats(t *testing.T) {
 	if err != nil || st != (Stats{}) {
 		t.Fatalf("empty: %+v %v", st, err)
 	}
-	if err := s.CreatePeer(ctx, "a", "alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "a", "alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "b", "bob", "hb", ""); err != nil {
+	if err := s.CreatePeer(ctx, "b", "bob", "hb", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.CreateInvite(ctx, "c2", "a", []string{"messages"}, nil, time.Now().Add(time.Hour)); err != nil {
@@ -137,10 +137,10 @@ func TestNotifyEmailMigration(t *testing.T) {
 	if err != nil || email != "" {
 		t.Fatalf("migrated email %q %v", email, err)
 	}
-	if err := s.SetNotifyEmail(ctx, "p_old", "old@example.com"); err != nil {
+	if err := s.SetNotifyEmail(ctx, "p_old", "old@example.com", "tok1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetNotifyEmail(ctx, "missing", "a@b.co"); !errors.Is(err, ErrNotFound) {
+	if err := s.SetNotifyEmail(ctx, "missing", "a@b.co", "tok2"); !errors.Is(err, ErrNotFound) {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -210,8 +210,8 @@ func TestV0SchemaMigration(t *testing.T) {
 
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 3 {
-		t.Fatalf("user_version = %d, want 3", version)
+	if version != 4 {
+		t.Fatalf("user_version = %d, want 4", version)
 	}
 
 	email, err := s.NotifyEmail(ctx, "alice")
@@ -278,8 +278,8 @@ func TestV1SchemaMigration(t *testing.T) {
 
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 3 {
-		t.Fatalf("user_version = %d, want 3", version)
+	if version != 4 {
+		t.Fatalf("user_version = %d, want 4", version)
 	}
 
 	email, err := s.NotifyEmail(ctx, "alice")
@@ -497,8 +497,8 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 			// Verify user_version is 2
 			var version int
 			migratedStore.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-			if version != 3 {
-				t.Fatalf("user_version = %d, want 3", version)
+			if version != 4 {
+				t.Fatalf("user_version = %d, want 4", version)
 			}
 
 			// Compare full schema
@@ -545,7 +545,7 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 			}
 
 			// Verify uniqueness behavior: duplicate pairing_token_hash rejected, multiple NULLs allowed
-			if err := migratedStore.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+			if err := migratedStore.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 				t.Fatal(err)
 			}
 			exp := time.Now().Add(time.Hour)
@@ -577,7 +577,7 @@ func TestConcurrentPairingRedemption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s1.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s1.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	pairingHash := "pairing_hash_123"
@@ -601,7 +601,7 @@ func TestConcurrentPairingRedemption(t *testing.T) {
 				return
 			}
 			defer s.Close()
-			_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash, id, name, kh, "", nil, nil)
+			_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash, id, name, kh, "", "", nil, nil)
 			results <- err
 		}(peerID, peerName, keyHash)
 	}
@@ -655,7 +655,7 @@ func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 	}
 	defer s.Close()
 
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -666,7 +666,7 @@ func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = s.RegisterAndAcceptByPairing(ctx, expiredHash, "bob", "Bob", "hb", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(ctx, expiredHash, "bob", "Bob", "hb", "", "", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for expired, got %v", err)
 	}
@@ -681,7 +681,7 @@ func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 
 	// Test 2: Already-used pairing token
 	usedHash := "used_hash"
-	if err := s.CreatePeer(ctx, "carol", "Carol", "hc", ""); err != nil {
+	if err := s.CreatePeer(ctx, "carol", "Carol", "hc", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.CreateInviteWithPairing(ctx, "code_used", usedHash, "alice", []string{"messages"}, nil, time.Now().Add(time.Hour)); err != nil {
@@ -692,7 +692,7 @@ func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = s.RegisterAndAcceptByPairing(ctx, usedHash, "dave", "Dave", "hd", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(ctx, usedHash, "dave", "Dave", "hd", "", "", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for used invite, got %v", err)
 	}
@@ -705,7 +705,7 @@ func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 	}
 
 	// Test 3: Invalid token (doesn't exist)
-	_, err = s.RegisterAndAcceptByPairing(ctx, "nonexistent_hash", "eve", "Eve", "he", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(ctx, "nonexistent_hash", "eve", "Eve", "he", "", "", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for nonexistent, got %v", err)
 	}
@@ -727,10 +727,10 @@ func TestExpiredInviteRejection(t *testing.T) {
 	}
 	defer s.Close()
 
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", ""); err != nil {
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -773,7 +773,7 @@ func TestRollbackAfterPeerInsert(t *testing.T) {
 	}
 	defer s.Close()
 
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -789,7 +789,7 @@ func TestRollbackAfterPeerInsert(t *testing.T) {
 	defer s.db.Exec(`DROP TRIGGER IF EXISTS rollback_test_trigger`)
 
 	// Try to register - peer INSERT will succeed but grant INSERT will fail due to trigger
-	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash, "bob", "Bob", "hb", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash, "bob", "Bob", "hb", "", "", nil, nil)
 	if err == nil {
 		t.Fatal("expected error due to injected failure")
 	}
@@ -816,7 +816,7 @@ func TestRollbackAfterPeerInsert(t *testing.T) {
 	if _, err := s.db.Exec(`DROP TRIGGER rollback_test_trigger`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.RegisterAndAcceptByPairing(ctx, pairingHash, "carol", "Carol", "hc", "", nil, nil); err != nil {
+	if _, err := s.RegisterAndAcceptByPairing(ctx, pairingHash, "carol", "Carol", "hc", "", "", nil, nil); err != nil {
 		t.Fatalf("invite should still be redeemable after trigger removed: %v", err)
 	}
 }
@@ -831,7 +831,7 @@ func TestContextCancellationBeforeTransaction(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -860,7 +860,7 @@ func TestContextCancellationBeforeTransaction(t *testing.T) {
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := s.RegisterAndAcceptByPairing(cancelCtx, pairingHash, "bob", "Bob", "hb", "", nil, nil)
+		_, err := s.RegisterAndAcceptByPairing(cancelCtx, pairingHash, "bob", "Bob", "hb", "", "", nil, nil)
 		done <- err
 	}()
 
@@ -880,12 +880,12 @@ func TestContextCancellationBeforeTransaction(t *testing.T) {
 
 	// DB should not be wedged - normal operations should work
 	normalCtx := context.Background()
-	if err := s.CreatePeer(normalCtx, "carol", "Carol", "hc", ""); err != nil {
+	if err := s.CreatePeer(normalCtx, "carol", "Carol", "hc", "", ""); err != nil {
 		t.Fatalf("DB wedged after cancel: %v", err)
 	}
 
 	// Original pairing token should still be redeemable
-	_, err = s.RegisterAndAcceptByPairing(normalCtx, pairingHash, "dave", "Dave", "hd", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(normalCtx, pairingHash, "dave", "Dave", "hd", "", "", nil, nil)
 	if err != nil {
 		t.Fatalf("pairing redemption failed after cancel: %v", err)
 	}
@@ -908,7 +908,7 @@ func TestContextCancellationMidTransaction(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -930,7 +930,7 @@ func TestContextCancellationMidTransaction(t *testing.T) {
 	defer s.db.Exec(`DROP TRIGGER IF EXISTS cancel_test_trigger`)
 
 	// Try to register and accept - should fail due to cancellation after peer INSERT
-	_, err = s.RegisterAndAcceptByPairing(cancelCtx, pairingHash, "bob", "Bob", "hb", "", nil, nil)
+	_, err = s.RegisterAndAcceptByPairing(cancelCtx, pairingHash, "bob", "Bob", "hb", "", "", nil, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got: %v", err)
 	}
@@ -961,12 +961,12 @@ func TestContextCancellationMidTransaction(t *testing.T) {
 
 	// Verify DB isn't wedged: next accept should succeed
 	normalCtx := context.Background()
-	if _, err := s.RegisterAndAcceptByPairing(normalCtx, pairingHash, "carol", "Carol", "hc", "", nil, nil); err != nil {
+	if _, err := s.RegisterAndAcceptByPairing(normalCtx, pairingHash, "carol", "Carol", "hc", "", "", nil, nil); err != nil {
 		t.Fatalf("DB wedged after mid-tx cancel: %v", err)
 	}
 
 	// Verify a plain write succeeds
-	if err := s.CreatePeer(normalCtx, "dave", "Dave", "hd", ""); err != nil {
+	if err := s.CreatePeer(normalCtx, "dave", "Dave", "hd", "", ""); err != nil {
 		t.Fatalf("plain write failed after mid-tx cancel: %v", err)
 	}
 
@@ -1052,7 +1052,7 @@ func TestPairingTokenHashMigration(t *testing.T) {
 	if err := s.CreateInviteWithPairing(ctx, "c-dup", "tok-hash", "p_old", []string{"messages"}, nil, until); err == nil {
 		t.Fatal("expected unique pairing token hash")
 	}
-	if err := s.CreatePeer(ctx, "p_new", "new", "hn", ""); err != nil {
+	if err := s.CreatePeer(ctx, "p_new", "new", "hn", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	g, err := s.AcceptInvite(ctx, "legacy", "p_new", nil, nil)
@@ -1199,8 +1199,8 @@ func TestPR11AlreadyMigrated(t *testing.T) {
 
 	// Verify user_version advanced to 2
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 3 {
-		t.Fatalf("user_version = %d, want 3", version)
+	if version != 4 {
+		t.Fatalf("user_version = %d, want 4", version)
 	}
 
 	// Verify columns still exist
@@ -1248,8 +1248,8 @@ func TestPR11AlreadyMigrated(t *testing.T) {
 
 	// Verify user_version unchanged
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 3 {
-		t.Fatalf("user_version after second migrate = %d, want 3", version)
+	if version != 4 {
+		t.Fatalf("user_version after second migrate = %d, want 4", version)
 	}
 
 	// Verify columns still present
@@ -1418,7 +1418,7 @@ func TestV3MigrationFreshDB(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a peer and invite
-	if err := s.CreatePeer(ctx, "alice", "Alice", "hash1", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "hash1", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1514,8 +1514,8 @@ func TestV2ToV3Migration(t *testing.T) {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 {
-		t.Errorf("user_version = %d, want 3", version)
+	if version != 4 {
+		t.Errorf("user_version = %d, want 4", version)
 	}
 
 	// Verify all rows have public_id
@@ -1599,8 +1599,8 @@ func TestV3MigrationIdempotent(t *testing.T) {
 	// Verify user_version is still 3
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 3 {
-		t.Errorf("user_version = %d, want 3", version)
+	if version != 4 {
+		t.Errorf("user_version = %d, want 4", version)
 	}
 }
 
@@ -1615,25 +1615,25 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 	defer s.Close()
 
 	// Create peers
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", ""); err != nil {
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
 	// Mock time
-	origNow := now
-	defer func() { now = origNow }()
+	origNow := s.now
+	defer func() { s.now = origNow }()
 
 	// Start at a base time
 	currentTime := int64(2000000)
-	now = func() int64 { return currentTime }
+	s.now = func() int64 { return currentTime }
 
 	// Create and immediately accept invites at different points in time
 
-	// 1. Unused expired invite (expires 100s ago) - should be purged
-	exp1 := time.Unix(currentTime-100, 0)
+	// 1. Unused expired invite (expires 500s ago, beyond 5-minute grace) - should be purged
+	exp1 := time.Unix(currentTime-500, 0)
 	if err := s.CreateInvite(ctx, "code1", "alice", []string{"messages"}, nil, exp1); err != nil {
 		t.Fatal(err)
 	}
@@ -1643,7 +1643,7 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 	tenDaysAgo := currentTime - 10*24*60*60
 	exp2 := time.Unix(tenDaysAgo-100, 0) // expired 10 days + 100s ago
 	// Temporarily go back in time to create and accept it
-	now = func() int64 { return tenDaysAgo - 200 } // before exp2
+	s.now = func() int64 { return tenDaysAgo - 200 } // before exp2
 	if err := s.CreateInvite(ctx, "code2", "alice", []string{"messages"}, nil, exp2); err != nil {
 		t.Fatal(err)
 	}
@@ -1651,31 +1651,31 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Return to current time
-	now = func() int64 { return currentTime }
+	s.now = func() int64 { return currentTime }
 
 	// 3. Used invite that expired 40 days ago - should be PURGED (beyond 30-day retention)
 	fortyDaysAgo := currentTime - 40*24*60*60
 	exp3 := time.Unix(fortyDaysAgo-100, 0) // expired 40 days + 100s ago
 	// Temporarily go back in time to create and accept it
-	now = func() int64 { return fortyDaysAgo - 200 } // before exp3
+	s.now = func() int64 { return fortyDaysAgo - 200 } // before exp3
 	if err := s.CreateInvite(ctx, "code3", "alice", []string{"messages"}, nil, exp3); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "charlie", "Charlie", "hc", ""); err != nil {
+	if err := s.CreatePeer(ctx, "charlie", "Charlie", "hc", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.AcceptInvite(ctx, "code3", "charlie", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	// Return to current time
-	now = func() int64 { return currentTime }
+	s.now = func() int64 { return currentTime }
 
 	// 4. Used invite not yet expired - should be KEPT
 	exp4 := time.Unix(currentTime+24*60*60, 0) // expires in 1 day
 	if err := s.CreateInvite(ctx, "code4", "alice", []string{"messages"}, nil, exp4); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreatePeer(ctx, "dave", "Dave", "hd", ""); err != nil {
+	if err := s.CreatePeer(ctx, "dave", "Dave", "hd", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.AcceptInvite(ctx, "code4", "dave", nil, nil); err != nil {
@@ -1741,5 +1741,218 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 	}
 	if !found2 || !found4 {
 		t.Errorf("expected code2 and code4 to remain, got hashes: %v", codes)
+	}
+}
+
+// TestPairingTokenExpiryWithClock verifies that PairingTokenExists and the accept paths
+// respect s.now() for expiry checks.
+func TestPairingTokenExpiryWithClock(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	// Create peers
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inject fake clock
+	origNow := s.now
+	defer func() { s.now = origNow }()
+
+	currentTime := int64(1000000)
+	s.now = func() int64 { return currentTime }
+
+	// Create a pairing invite that expires at currentTime + 100
+	codeHash := "code_test"
+	pairingHash := "pair_test"
+	expiresAt := time.Unix(currentTime+100, 0)
+	if err := s.CreateInviteWithPairing(ctx, codeHash, pairingHash, "alice", []string{"messages"}, nil, expiresAt); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Token is valid 10 seconds before expiry
+	s.now = func() int64 { return currentTime + 90 }
+	exists, err := s.PairingTokenExists(ctx, pairingHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Error("token should exist 10 seconds before expiry")
+	}
+
+	// 2. Token is still valid 1 second before expiry
+	s.now = func() int64 { return currentTime + 99 }
+	exists, err = s.PairingTokenExists(ctx, pairingHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Error("token should exist 1 second before expiry")
+	}
+
+	// 3. Token is invalid 1 second after expiry
+	s.now = func() int64 { return currentTime + 101 }
+	exists, err = s.PairingTokenExists(ctx, pairingHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Error("token should not exist 1 second after expiry")
+	}
+
+	// 4. GetInviteByPairingToken rejects expired token
+	codeHash2 := "code_test2"
+	pairingHash2 := "pair_test2"
+	expiresAt2 := time.Unix(currentTime+200, 0)
+	s.now = func() int64 { return currentTime + 50 }
+	if err := s.CreateInviteWithPairing(ctx, codeHash2, pairingHash2, "alice", []string{"messages"}, nil, expiresAt2); err != nil {
+		t.Fatal(err)
+	}
+	s.now = func() int64 { return currentTime + 201 }
+	_, err = s.GetInviteByPairingToken(ctx, pairingHash2)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetInviteByPairingToken should return ErrNotFound for expired token, got %v", err)
+	}
+
+	// 5. AcceptInviteByPairingToken rejects expired token
+	s.now = func() int64 { return currentTime + 202 }
+	_, err = s.AcceptInviteByPairingToken(ctx, pairingHash2, "bob", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("AcceptInviteByPairingToken should return ErrNotFound for expired token, got %v", err)
+	}
+
+	// 6. RegisterAndAcceptByPairing rejects expired token (pre-check)
+	s.now = func() int64 { return currentTime + 203 }
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash2, "charlie", "Charlie", "hc", "", "", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("RegisterAndAcceptByPairing should return ErrNotFound for expired token in pre-check, got %v", err)
+	}
+
+	// 7. RegisterAndAcceptByPairing: token expires between pre-check and tx
+	// Create a third invite
+	codeHash3 := "code_test3"
+	pairingHash3 := "pair_test3"
+	expiresAt3 := time.Unix(currentTime+300, 0)
+	s.now = func() int64 { return currentTime + 100 }
+	if err := s.CreateInviteWithPairing(ctx, codeHash3, pairingHash3, "alice", []string{"messages"}, nil, expiresAt3); err != nil {
+		t.Fatal(err)
+	}
+
+	// Deterministic state-flag clock: first call (pre-check) passes, second call (tx) fails
+	callCount := 0
+	s.now = func() int64 {
+		callCount++
+		if callCount == 1 {
+			return currentTime + 299 // Before expiry: pre-check passes
+		}
+		return currentTime + 301 // After expiry: tx fails
+	}
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash3, "dave", "Dave", "hd", "", "", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("RegisterAndAcceptByPairing should return ErrNotFound when token expires between pre-check and tx, got %v", err)
+	}
+	if callCount != 2 {
+		t.Errorf("expected 2 clock calls (pre-check + tx), got %d", callCount)
+	}
+
+	// Assert no orphan peer, no grant, invite's used_by is NULL
+	var peerCount int
+	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM peers WHERE id = ? OR name = ?", "dave", "Dave").Scan(&peerCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if peerCount != 0 {
+		t.Errorf("expected no peer row for dave, got count %d", peerCount)
+	}
+
+	var grantCount int
+	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM grants WHERE grantee = ?", "dave").Scan(&grantCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grantCount != 0 {
+		t.Errorf("expected no grant for dave, got count %d", grantCount)
+	}
+
+	var usedBy sql.NullString
+	err = s.db.QueryRowContext(ctx, "SELECT used_by FROM invites WHERE pairing_token_hash = ?", pairingHash3).Scan(&usedBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usedBy.Valid {
+		t.Errorf("invite used_by should be NULL, got %q", usedBy.String)
+	}
+
+	// Exact boundary tests for AcceptInviteByPairingToken
+	// Create invite expiring at currentTime + 400
+	codeHash4 := "code_test4"
+	pairingHash4 := "pair_test4"
+	expiresAt4 := time.Unix(currentTime+400, 0)
+	s.now = func() int64 { return currentTime + 200 }
+	if err := s.CreateInviteWithPairing(ctx, codeHash4, pairingHash4, "alice", []string{"messages"}, nil, expiresAt4); err != nil {
+		t.Fatal(err)
+	}
+
+	// At exact expiry time: should be accepted
+	s.now = func() int64 { return currentTime + 400 }
+	_, err = s.AcceptInviteByPairingToken(ctx, pairingHash4, "bob", nil, nil)
+	if err != nil {
+		t.Errorf("AcceptInviteByPairingToken at exact expiry (now == expires_at) should succeed, got %v", err)
+	}
+
+	// Create another invite for +1 test
+	codeHash5 := "code_test5"
+	pairingHash5 := "pair_test5"
+	expiresAt5 := time.Unix(currentTime+500, 0)
+	s.now = func() int64 { return currentTime + 200 }
+	if err := s.CreateInviteWithPairing(ctx, codeHash5, pairingHash5, "alice", []string{"messages"}, nil, expiresAt5); err != nil {
+		t.Fatal(err)
+	}
+
+	// One second after expiry: should be rejected
+	s.now = func() int64 { return currentTime + 501 }
+	_, err = s.AcceptInviteByPairingToken(ctx, pairingHash5, "bob", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("AcceptInviteByPairingToken at expires_at+1 should return ErrNotFound, got %v", err)
+	}
+
+	// Exact boundary tests for RegisterAndAcceptByPairing
+	// Create invite expiring at currentTime + 600
+	codeHash6 := "code_test6"
+	pairingHash6 := "pair_test6"
+	expiresAt6 := time.Unix(currentTime+600, 0)
+	s.now = func() int64 { return currentTime + 200 }
+	if err := s.CreateInviteWithPairing(ctx, codeHash6, pairingHash6, "alice", []string{"messages"}, nil, expiresAt6); err != nil {
+		t.Fatal(err)
+	}
+
+	// At exact expiry time: should be accepted
+	s.now = func() int64 { return currentTime + 600 }
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash6, "carol", "Carol", "hc", "", "", nil, nil)
+	if err != nil {
+		t.Errorf("RegisterAndAcceptByPairing at exact expiry (now == expires_at) should succeed, got %v", err)
+	}
+
+	// Create another invite for +1 test
+	codeHash7 := "code_test7"
+	pairingHash7 := "pair_test7"
+	expiresAt7 := time.Unix(currentTime+700, 0)
+	s.now = func() int64 { return currentTime + 200 }
+	if err := s.CreateInviteWithPairing(ctx, codeHash7, pairingHash7, "alice", []string{"messages"}, nil, expiresAt7); err != nil {
+		t.Fatal(err)
+	}
+
+	// One second after expiry: should be rejected
+	s.now = func() int64 { return currentTime + 701 }
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash7, "dan", "Dan", "hdan", "", "", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("RegisterAndAcceptByPairing at expires_at+1 should return ErrNotFound, got %v", err)
 	}
 }

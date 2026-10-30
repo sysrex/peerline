@@ -10,12 +10,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/sysrex/peerline/internal/store"
+	"golang.org/x/text/unicode/norm"
 )
 
 type client struct {
@@ -25,11 +26,6 @@ type client struct {
 	id  string
 }
 
-type testServer struct {
-	http *httptest.Server
-	api  *Server
-}
-
 func newServer(t *testing.T, cfg Config) *httptest.Server {
 	t.Helper()
 	st, err := store.Open(t.TempDir() + "/t.db")
@@ -37,37 +33,9 @@ func newServer(t *testing.T, cfg Config) *httptest.Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	// Load key index before creating server
-	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	apiSrv, err := New(st, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(apiSrv.Handler())
+	srv := httptest.NewServer(New(st, cfg).Handler())
 	t.Cleanup(srv.Close)
 	return srv
-}
-
-func newServerWithAPI(t *testing.T, cfg Config) *testServer {
-	t.Helper()
-	st, err := store.Open(t.TempDir() + "/t.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { st.Close() })
-	// Load key index before creating server
-	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	apiSrv, err := New(st, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	httpSrv := httptest.NewServer(apiSrv.Handler())
-	t.Cleanup(httpSrv.Close)
-	return &testServer{http: httpSrv, api: apiSrv}
 }
 
 func (c *client) do(method, path string, body any, hdr map[string]string) (*http.Response, []byte) {
@@ -821,11 +789,11 @@ func TestXFFParsing(t *testing.T) {
 			want:        "203.0.113.50", // rightmost untrusted, not leftmost spoof
 		},
 		{
-			name:        "malformed IP in XFF skipped",
+			name:        "malformed IP in XFF stops walk",
 			remoteAddr:  "10.0.0.1:1234",
-			xff:         []string{"not-an-ip, 203.0.113.60, 10.0.0.2"},
+			xff:         []string{"203.0.113.60, not-an-ip"},
 			trustedNets: trustedNets,
-			want:        "203.0.113.60", // skips malformed, takes next valid untrusted
+			want:        "10.0.0.1", // stops at malformed, falls back to last trusted (remoteAddr)
 		},
 	}
 
@@ -1365,51 +1333,15 @@ func doAnon(t *testing.T, srv *httptest.Server, method, path string, body any, h
 
 // Lifecycle tests for LimiterManager and MaintenanceManager
 
-func TestNewRequiresLoadedKeyIndex(t *testing.T) {
-	st, err := store.Open(t.TempDir() + "/test.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-
-	cfg := Config{
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}
-
-	// Attempt to create server without loading key index should fail
-	_, err = New(st, cfg)
-	if err == nil {
-		t.Fatal("expected error when key index not loaded, got nil")
-	}
-	if !strings.Contains(err.Error(), "key index not loaded") {
-		t.Fatalf("expected 'key index not loaded' error, got: %v", err)
-	}
-
-	// Load key index
-	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
-	// Now it should succeed
-	_, err = New(st, cfg)
-	if err != nil {
-		t.Fatalf("expected success after loading key index, got: %v", err)
-	}
-}
-
 func TestLimiterManagerStops(t *testing.T) {
 	cfg := Config{
-		MsgPerMinute:      60,
-		MsgBurst:          10,
-		EmailPerHour:      10,
-		EmailBurst:        5,
-		EmailRcptPerHour:  10,
-		NotifyPerHour:     10,
-		NotifyBurst:       5,
-		AuthFailPerMinute: 30,
-		AuthFailBurst:     10,
-		WritePerMinute:    30,
-		WriteBurst:        10,
+		MsgPerMinute:     60,
+		MsgBurst:         10,
+		EmailPerHour:     10,
+		EmailBurst:       5,
+		EmailRcptPerHour: 10,
+		NotifyPerHour:    10,
+		NotifyBurst:      5,
 	}
 	mgr := NewLimiterManager(cfg)
 
@@ -1567,18 +1499,10 @@ func TestSingleLogLineUnauthenticatedPairing(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	// Load key index
-	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
-		t.Fatal(err)
-	}
 
 	cfg := Config{}
 	cfg.Logger = logger
-	apiSrv, err := New(st, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(apiSrv.Handler())
+	srv := httptest.NewServer(New(st, cfg).Handler())
 	defer srv.Close()
 
 	alice := register(t, srv, "Alice")
@@ -1640,6 +1564,8 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Mixed valid", "Alice-O'Neil, Jr.", "Alice-O'Neil, Jr."},
 		{"Hindi with combining marks", "राजेश कुमार", "राजेश कुमार"},
 		{"Thai with combining marks", "สมชาย ใจดี", "สมชาย ใจดี"},
+		// Issue #68: Devanagari test
+		{"Devanagari", "हिन्दी", "हिन्दी"},
 
 		// Bidi controls (Cf category) - all filtered
 		{"Bidi LRE", "Alice\u202AEvil", "AliceEvil"},
@@ -1675,6 +1601,45 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Variation selector FE0F", "Alice\uFE0FEvil", "AliceEvil"},
 		{"Variation selector E0100", "Alice\U000E0100Evil", "AliceEvil"},
 
+		// Issue #35: Additional Cf characters and Zl/Zp
+		{"U+061C Arabic letter mark", "Alice\u061CEvil", "AliceEvil"},
+		{"U+2060 Word joiner", "Alice\u2060Evil", "AliceEvil"},
+		{"U+00AD Soft hyphen", "Alice\u00ADEvil", "AliceEvil"},
+		{"U+2028 Line separator", "Alice\u2028Evil", "AliceEvil"},
+		{"U+2029 Paragraph separator", "Alice\u2029Evil", "AliceEvil"},
+
+		// Issue #63 & #84: Invisible Mn characters
+		{"U+034F COMBINING GRAPHEME JOINER", "a\u034Fb", "ab"},
+		{"U+0334 Combining tilde overlay", "a\u0334b", "a\u0334b"},
+		{"U+180B Mongolian FVS1", "a\u180Bb", "ab"},
+		{"U+180C Mongolian FVS2", "a\u180Cb", "ab"},
+		{"U+180D Mongolian FVS3", "a\u180Db", "ab"},
+		{"U+180F Mongolian FVS4", "a\u180Fb", "ab"},
+		{"U+17B4 Khmer inherent vowel", "a\u17B4b", "ab"},
+		{"U+17B5 Khmer inherent vowel", "a\u17B5b", "ab"},
+
+		// Issue #84: Combining marks constraints
+		// Mark limit is checked in NFD (decomposed) form to ensure visible result has max 3 marks per base
+		{"3 marks allowed", "a\u0301\u0302\u0303", "á\u0302\u0303"},                          // a + 3 marks -> á + 2 marks (NFC composition)
+		{"20 marks capped at 3", "a" + strings.Repeat("\u0301", 20), "á́́"},                  // a + 20 marks -> a + 3 marks (may compose)
+		{"64 marks alone becomes fallback", strings.Repeat("\u0301", 64), "A Peerline peer"}, // No base -> fallback (issue #68)
+		{"100 marks capped at 3", "a" + strings.Repeat("\u0301", 100), "á́́"},                // a + 100 marks -> a + 3 marks
+		{"Mark after space dropped", "a \u0301b", "a b"},
+		{"Mark at start dropped", "\u0301abc", "abc"},
+		{"Mark after punctuation dropped", "a.\u0301b", "a.b"},
+		{"Mark after letter then punctuation", "a\u0301.b", "á.b"}, // a+mark -> á (NFC)
+
+		// Issue #68: Tab and newline handling
+		{"Tab becomes space", "Alice\tSmith", "Alice Smith"},
+		{"Newline becomes space", "Alice\nSmith", "Alice Smith"},
+		{"Carriage return becomes space", "Alice\rSmith", "Alice Smith"},
+		{"Tab with spaces", "Alice  \t  Smith", "Alice Smith"},
+
+		// Issue #68: Empty result fallback
+		{"Only symbols becomes fallback", "★★★", "A Peerline peer"},
+		{"Only filtered chars", "\u200B\u200C\uFEFF", "A Peerline peer"},
+		{"Only marks becomes fallback", "\u0301\u0302\u0303", "A Peerline peer"},
+
 		// NFKC normalization
 		{"Fullwidth ASCII", "Ａｌｉｃｅ", "Alice"},  // Fullwidth → ASCII
 		{"Superscript", "Alice²", "Alice2"},    // ² → 2
@@ -1686,16 +1651,18 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Multiple spaces", "Alice   Smith", "Alice Smith"},
 		{"Leading spaces", "   Alice", "Alice"},
 		{"Trailing spaces", "Alice   ", "Alice"},
-		{"Mixed whitespace", "Alice  \t  Smith", "Alice Smith"}, // Tab becomes space, then collapsed
 
 		// Emoji and symbols (filtered out)
 		{"Emoji removed", "Alice 😀 Smith", "Alice Smith"},
 		{"Symbol removed", "Alice ★ Smith", "Alice Smith"},
 
 		// Edge cases
-		{"Empty string", "", ""},
-		{"Only spaces", "   ", ""},
-		{"Only filtered chars", "\u200B\u200C\uFEFF", ""},
+		{"Empty string", "", "A Peerline peer"},
+		{"Only spaces", "   ", "A Peerline peer"},
+
+		// Issue #68: Length tests (64 runes max)
+		{"70 ASCII letters", strings.Repeat("a", 70), strings.Repeat("a", 64)},
+		{"30 CJK chars under byte limit", strings.Repeat("日", 30), strings.Repeat("日", 30)},
 		// 64 runes (not bytes): "日" is 3 bytes, 64 copies = 192 bytes, should keep exactly 64 runes
 		{"Long multibyte truncated at 64 runes", strings.Repeat("日", 70), strings.Repeat("日", 64)},
 	}
@@ -1706,234 +1673,138 @@ func TestSanitizerUnicode(t *testing.T) {
 			if got != tt.want {
 				t.Errorf("sanitizeInviterName(%q) = %q, want %q", tt.input, got, tt.want)
 			}
+
+			// For tests involving combining marks, verify that NFD form has at most 3 marks per base
+			if strings.Contains(tt.name, "marks") || strings.Contains(tt.name, "Devanagari") || strings.Contains(tt.name, "Thai") || strings.Contains(tt.name, "Hindi") {
+				nfd := norm.NFD.String(got)
+				consecutiveMarks := 0
+				maxMarks := 0
+				for _, r := range nfd {
+					isMark := unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r)
+					if isMark {
+						consecutiveMarks++
+						if consecutiveMarks > maxMarks {
+							maxMarks = consecutiveMarks
+						}
+					} else if unicode.IsLetter(r) || unicode.IsNumber(r) {
+						consecutiveMarks = 0
+					} else {
+						consecutiveMarks = 0
+					}
+				}
+				if maxMarks > 3 {
+					t.Errorf("sanitizeInviterName(%q) NFD has %d consecutive marks (max 3 allowed), NFD=%q", tt.input, maxMarks, nfd)
+				}
+			}
 		})
 	}
 }
 
-// TestAuthFailRateLimit tests that failed Bearer token lookups are rate-limited per IP (#55).
-// With the cache, valid keys that have been used before continue to work even when IP is rate-limited.
-func TestAuthFailRateLimit(t *testing.T) {
-	cfg := Config{
-		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		AuthFailPerMinute: 5,
-		AuthFailBurst:     2,
+// TestAPIClock verifies that api.Server.now is used in createInvite.
+// Note: the API clock (Server.now, time.Time) and the store clock (Store.now, int64)
+// are independent and can disagree; this test only fakes the API clock.
+func TestAPIClock(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
 	}
-	srv := newServer(t, cfg)
-	c := &client{t: t, srv: srv}
+	defer st.Close()
 
-	// Register a valid peer
-	alice := register(t, srv, "alice")
+	srv := New(st, Config{})
+	defer srv.Stop()
 
-	// Valid key works (index hit, no failed-auth charge)
-	resp, _ := alice.do("GET", "/v1/me", nil, nil)
+	// Stub the clock and verify non-nil default
+	if srv.now == nil {
+		t.Fatal("New() should set non-nil default clock")
+	}
+	fixedTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	srv.now = func() time.Time { return fixedTime }
+
+	// Create test server and client
+	testSrv := httptest.NewServer(srv.Handler())
+	defer testSrv.Close()
+
+	// Register a peer
+	c := &client{t: t, srv: testSrv}
+	resp, body := c.do("POST", "/v1/register", map[string]string{"name": "alice"}, nil)
+	want(t, resp, body, 201)
+	var reg struct{ PeerID, APIKey string }
+	if err := json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&reg.PeerID, &reg.APIKey}); err != nil {
+		t.Fatal(err)
+	}
+	c.id, c.key = reg.PeerID, reg.APIKey
+
+	// Create an invite with default TTL (1h)
+	resp, body = c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+
+	var inv struct {
+		ExpiresAt string `json:"expires_at"`
+	}
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
+	}
+
+	expTime, err := time.Parse(time.RFC3339, inv.ExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := fixedTime.Add(time.Hour).UTC()
+	if !expTime.Equal(expected) {
+		t.Errorf("expires_at = %v, want %v", expTime, expected)
+	}
+
+	// Boundary test: advance clock by 100 seconds and create another invite
+	srv.now = func() time.Time { return fixedTime.Add(100 * time.Second) }
+	resp, body = c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
+	}
+	expTime, err = time.Parse(time.RFC3339, inv.ExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected = fixedTime.Add(100*time.Second + time.Hour).UTC()
+	if !expTime.Equal(expected) {
+		t.Errorf("expires_at after +100s = %v, want %v", expTime, expected)
+	}
+}
+
+// TestRateLimitWithMultipleXFFHeaders verifies that multiple X-Forwarded-For
+// header lines are properly combined when the RemoteAddr is trusted (#61).
+func TestRateLimitWithMultipleXFFHeaders(t *testing.T) {
+	// Unit test coverage for multiple XFF headers is in clientip_test.go
+	// This integration test verifies end-to-end behavior through the HTTP handler
+	srv := newServer(t, Config{
+		TrustedProxies: []string{"127.0.0.0/8"},
+		MsgPerMinute:   10,
+		MsgBurst:       10,
+	})
+
+	// Register and pair two peers
+	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+	pairUp(t, a, b, []string{"messages"}, nil, nil)
+
+	// Make a request with custom XFF headers to verify they're processed
+	// This tests that the rate limiting sees the combined XFF list
+	req, _ := http.NewRequest("GET", srv.URL+"/v1/inbox", nil)
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	// Multiple XFF headers should be combined: ["203.0.113.10", "10.0.0.2", "10.0.0.3"]
+	req.Header.Add("X-Forwarded-For", "203.0.113.10, 10.0.0.2")
+	req.Header.Add("X-Forwarded-For", "10.0.0.3")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// The request should succeed (not testing rate limiting here, just that it works)
 	if resp.StatusCode != 200 {
-		t.Fatalf("valid key: want 200, got %d", resp.StatusCode)
-	}
-
-	// Exhaust the rate limiter with invalid keys (burst=2)
-	for i := 0; i < 2; i++ {
-		resp, _ := c.do("GET", "/v1/me", nil, map[string]string{"Authorization": "Bearer pl_invalid_key_" + strconv.Itoa(i)})
-		if resp.StatusCode != 401 {
-			t.Fatalf("invalid key %d: want 401, got %d", i, resp.StatusCode)
-		}
-	}
-
-	// Next invalid request is over budget: 429
-	resp, _ = c.do("GET", "/v1/me", nil, map[string]string{"Authorization": "Bearer pl_invalid_key_exceeded"})
-	if resp.StatusCode != 429 {
-		t.Fatalf("over-budget invalid key: want 429, got %d", resp.StatusCode)
-	}
-	if resp.Header.Get("Retry-After") == "" {
-		t.Fatal("429 response must have Retry-After header")
-	}
-
-	// Valid key from the same over-budget IP still works (index hit, no failed-auth charge)
-	resp, _ = alice.do("GET", "/v1/me", nil, nil)
-	if resp.StatusCode != 200 {
-		t.Fatalf("valid key from over-budget IP: want 200, got %d", resp.StatusCode)
+		t.Errorf("expected 200, got %d", resp.StatusCode)
 	}
 }
-
-// TestWriteRateLimit tests that authenticated write operations are rate-limited per peer (#55).
-func TestWriteRateLimit(t *testing.T) {
-	cfg := Config{
-		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
-		WritePerMinute: 10,
-		WriteBurst:     5, // Higher burst to account for pairing setup + test operations
-	}
-	srv := newServer(t, cfg)
-	alice := register(t, srv, "alice")
-	bob := register(t, srv, "bob")
-
-	// Pair alice and bob for message sending (uses 1 write for alice: create invite; bob's accept is his write)
-	pairUp(t, alice, bob, []string{"messages"}, nil, []string{"messages"})
-
-	// Alice sends 4 messages - should all succeed (alice has used 1 + 4 = 5 writes, exactly the burst)
-	for i := 0; i < 4; i++ {
-		resp, _ := alice.do("POST", "/v1/peers/"+bob.id+"/messages", map[string]string{
-			"type": "note",
-			"body": "message " + strconv.Itoa(i),
-		}, nil)
-		if resp.StatusCode != 201 {
-			t.Fatalf("message %d: want 201, got %d", i, resp.StatusCode)
-		}
-	}
-
-	// 6th write should be rate-limited (alice: 1 invite create + 4 messages = 5, next exceeds burst)
-	resp, _ := alice.do("POST", "/v1/peers/"+bob.id+"/messages", map[string]string{
-		"type": "note",
-		"body": "message exceeded",
-	}, nil)
-	if resp.StatusCode != 429 {
-		t.Fatalf("rate-limited write: want 429, got %d", resp.StatusCode)
-	}
-
-	// Bob should still be able to send (different peer, has used 1 accept + 0 messages = 1)
-	resp, _ = bob.do("POST", "/v1/peers/"+alice.id+"/messages", map[string]string{
-		"type": "note",
-		"body": "bob message",
-	}, nil)
-	if resp.StatusCode != 201 {
-		t.Fatalf("bob's message: want 201, got %d", resp.StatusCode)
-	}
-
-	// Alice's reads should still work (not rate-limited)
-	resp, _ = alice.do("GET", "/v1/inbox", nil, nil)
-	if resp.StatusCode != 200 {
-		t.Fatalf("alice read after write limit: want 200, got %d", resp.StatusCode)
-	}
-}
-
-// TestWriteRateLimitInvites tests that invite operations are rate-limited (#55).
-func TestWriteRateLimitInvites(t *testing.T) {
-	cfg := Config{
-		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
-		WritePerMinute: 5,
-		WriteBurst:     2,
-	}
-	srv := newServer(t, cfg)
-	alice := register(t, srv, "alice")
-
-	// Create 2 invites (burst allowance)
-	for i := 0; i < 2; i++ {
-		resp, _ := alice.do("POST", "/v1/invites", map[string]any{
-			"scopes": []string{"messages"},
-		}, nil)
-		if resp.StatusCode != 201 {
-			t.Fatalf("invite %d: want 201, got %d", i, resp.StatusCode)
-		}
-	}
-
-	// 3rd invite should be rate-limited
-	resp, _ := alice.do("POST", "/v1/invites", map[string]any{
-		"scopes": []string{"messages"},
-	}, nil)
-	if resp.StatusCode != 429 {
-		t.Fatalf("rate-limited invite: want 429, got %d", resp.StatusCode)
-	}
-}
-
-// TestWriteRateLimitBags tests that PUT /v1/bags is rate-limited (#55).
-func TestWriteRateLimitBags(t *testing.T) {
-	cfg := Config{
-		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
-		WritePerMinute: 5,
-		WriteBurst:     2,
-	}
-	srv := newServer(t, cfg)
-	alice := register(t, srv, "alice")
-
-	// Put 2 bags (burst allowance)
-	for i := 0; i < 2; i++ {
-		resp, _ := alice.do("PUT", "/v1/bags/test"+strconv.Itoa(i), []byte("data"), nil)
-		if resp.StatusCode != 201 {
-			t.Fatalf("bag %d: want 201, got %d", i, resp.StatusCode)
-		}
-	}
-
-	// 3rd put should be rate-limited
-	resp, _ := alice.do("PUT", "/v1/bags/test3", []byte("data"), nil)
-	if resp.StatusCode != 429 {
-		t.Fatalf("rate-limited bag put: want 429, got %d", resp.StatusCode)
-	}
-
-	// GET should still work (not rate-limited by write limiter)
-	resp, _ = alice.do("GET", "/v1/bags/test0", nil, nil)
-	if resp.StatusCode != 200 {
-		t.Fatalf("bag get after write limit: want 200, got %d", resp.StatusCode)
-	}
-}
-
-// TestAuthFailDoesNotLeakKeyExistence tests that rate-limited and non-existent keys
-// return identical responses (#55).
-func TestAuthFailDoesNotLeakKeyExistence(t *testing.T) {
-	cfg := Config{
-		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		AuthFailPerMinute: 5,
-		AuthFailBurst:     2,
-	}
-	srv := newServer(t, cfg)
-	c := &client{t: t, srv: srv}
-
-	// First two requests: non-existent keys (both should be 401)
-	resp1, body1 := c.do("GET", "/v1/me", nil, map[string]string{"Authorization": "Bearer pl_nonexistent_key_abc123"})
-	if resp1.StatusCode != 401 {
-		t.Fatalf("first non-existent key: want 401, got %d", resp1.StatusCode)
-	}
-
-	resp2, body2 := c.do("GET", "/v1/me", nil, map[string]string{"Authorization": "Bearer pl_another_invalid_key"})
-	if resp2.StatusCode != 401 {
-		t.Fatalf("second non-existent key: want 401, got %d", resp2.StatusCode)
-	}
-
-	// Both 401 responses should have identical body
-	if string(body1) != string(body2) {
-		t.Fatalf("401 responses differ:\n1: %s\n2: %s", body1, body2)
-	}
-
-	// Third request: over budget, should get 429
-	resp3, body3 := c.do("GET", "/v1/me", nil, map[string]string{"Authorization": "Bearer pl_over_budget_key"})
-	if resp3.StatusCode != 429 {
-		t.Fatalf("over-budget key: want 429, got %d", resp3.StatusCode)
-	}
-
-	// 429 response should have Retry-After header
-	if resp3.Header.Get("Retry-After") == "" {
-		t.Fatal("429 response missing Retry-After header")
-	}
-
-	// 401 and 429 should have different bodies (429 says "rate limited")
-	if string(body1) == string(body3) {
-		t.Fatal("401 and 429 should have different messages")
-	}
-}
-
-// TestAuthFailPerIPNotPerKey tests that the failed-auth limiter is keyed by IP, not by key.
-func TestAuthFailPerIPNotPerKey(t *testing.T) {
-	cfg := Config{
-		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
-		AuthFailPerMinute: 5,
-		AuthFailBurst:     2,
-	}
-	srv := newServer(t, cfg)
-	c := &client{t: t, srv: srv}
-
-	// Try different invalid keys from the same IP (exhaust burst)
-	for i := 0; i < 2; i++ {
-		resp, _ := c.do("GET", "/v1/me", nil, map[string]string{"Authorization": "Bearer pl_different_key_" + strconv.Itoa(i)})
-		if resp.StatusCode != 401 {
-			t.Fatalf("request %d: want 401, got %d", i, resp.StatusCode)
-		}
-	}
-
-	// Third different key should be over budget -> 429
-	resp, _ := c.do("GET", "/v1/me", nil, map[string]string{"Authorization": "Bearer pl_yet_another_key"})
-	if resp.StatusCode != 429 {
-		t.Fatalf("rate-limited request: want 429, got %d", resp.StatusCode)
-	}
-	if resp.Header.Get("Retry-After") == "" {
-		t.Fatal("429 response missing Retry-After header")
-	}
-}
-
-// TestAuthFailCacheAllowsKnownKeys tests that cached valid keys work even when IP is over budget (#55).

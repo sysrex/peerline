@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/netip"
 	"strings"
@@ -64,20 +65,30 @@ func clientIP(remoteAddr string, xffHeaders []string, trustedNets []*net.IPNet) 
 		}
 	}
 
-	// Walk right-to-left through all IPs
-	for i := len(allIPs) - 1; i >= 0; i-- {
+	// Walk right-to-left through all IPs, cap at 50 entries to prevent DoS
+	maxEntries := 50
+	stopIdx := 0
+	if len(allIPs) > maxEntries {
+		stopIdx = len(allIPs) - maxEntries
+	}
+
+	// Track the rightmost trusted IP we've seen (for fallback on malformed entry)
+	lastTrustedIP := remoteIP
+
+	for i := len(allIPs) - 1; i >= stopIdx; i-- {
 		candidate := allIPs[i]
 
 		// Normalize the candidate
 		normalized := parseAndNormalizeIP(candidate)
 		if normalized == "" {
-			// Invalid IP, skip
-			continue
+			// Invalid IP, stop and fall back to last trusted hop (#61)
+			return lastTrustedIP
 		}
 
 		candidateAddr, err := netip.ParseAddr(normalized)
 		if err != nil {
-			continue
+			// Parse error, stop and fall back to last trusted hop (#61)
+			return lastTrustedIP
 		}
 
 		// Check if this IP is in a trusted CIDR
@@ -93,9 +104,12 @@ func clientIP(remoteAddr string, xffHeaders []string, trustedNets []*net.IPNet) 
 		if !isTrusted {
 			return normalized
 		}
+
+		// This IP is trusted, remember it as potential fallback
+		lastTrustedIP = normalized
 	}
 
-	// All XFF entries were trusted (or malformed), fall back to RemoteAddr
+	// All XFF entries were trusted, fall back to RemoteAddr
 	return remoteIP
 }
 
@@ -107,6 +121,15 @@ func parseAndNormalizeIP(s string) string {
 	if err != nil {
 		// Not a host:port, try as bare IP
 		host = s
+	}
+
+	// Handle bare bracketed IPv6 (e.g., "[2001:db8::1]")
+	// Only strip brackets if the interior is a valid IPv6 address
+	if len(host) > 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		interior := host[1 : len(host)-1]
+		if addr, err := netip.ParseAddr(interior); err == nil && addr.Is6() {
+			host = interior
+		}
 	}
 
 	addr, err := netip.ParseAddr(host)
@@ -143,6 +166,8 @@ func rateLimitKey(ip string) string {
 }
 
 // ParseTrustedProxies parses a list of CIDR strings (or bare IPs) into IPNets.
+// Rejects overly broad prefixes (0.0.0.0/0, ::/0, and prefixes shorter than
+// /8 for IPv4 or /32 for IPv6) to prevent misconfiguration (#62).
 func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 	var nets []*net.IPNet
 	for _, cidr := range cidrs {
@@ -172,6 +197,24 @@ func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 		if err != nil {
 			return nil, err
 		}
+
+		// Check prefix length to prevent overly broad trust (#62)
+		ones, bits := ipnet.Mask.Size()
+		isIPv4 := bits == 32
+
+		// Reject /0 for both IPv4 and IPv6
+		if ones == 0 {
+			return nil, fmt.Errorf("parsing %q: prefix length /0 is too broad", cidr)
+		}
+
+		// Enforce minimum prefix length
+		if isIPv4 && ones < 8 {
+			return nil, fmt.Errorf("parsing %q: IPv4 prefix must be at least /8", cidr)
+		}
+		if !isIPv4 && ones < 32 {
+			return nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /32", cidr)
+		}
+
 		nets = append(nets, ipnet)
 	}
 	return nets, nil
@@ -179,17 +222,16 @@ func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 
 // LimiterManager manages multiple rate limiters with proper lifecycle and pruning.
 type LimiterManager struct {
-	msgLim      *msg.Limiter
-	regLim      *msg.Limiter
-	pairLim     *msg.Limiter
-	failLim     *msg.Limiter // Failed pairing token lookups (per-IP)
-	getLim      *msg.Limiter
-	authLim     *msg.Limiter
-	mailLim     *msg.Limiter
-	rcptLim     *msg.Limiter
-	notifyLim   *msg.Limiter
-	authFailLim *msg.Limiter // Failed Bearer lookups (per-IP, #55)
-	writeLim    *msg.Limiter // Authenticated writes (per-peer, #55)
+	msgLim        *msg.Limiter
+	regLim        *msg.Limiter
+	pairLim       *msg.Limiter
+	failLim       *msg.Limiter // Failed pairing token lookups (per-IP)
+	getLim        *msg.Limiter
+	authLim       *msg.Limiter
+	mailLim       *msg.Limiter
+	rcptLim       *msg.Limiter
+	notifyLim     *msg.Limiter
+	notifyAddrLim *msg.Limiter // Per-address notification rate limit
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -200,19 +242,18 @@ type LimiterManager struct {
 func NewLimiterManager(cfg Config) *LimiterManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	lm := &LimiterManager{
-		msgLim:      msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst),
-		regLim:      msg.NewLimiter(10, 5),
-		pairLim:     msg.NewLimiter(10, 5),
-		failLim:     msg.NewLimiter(30, 10), // Failed pairing lookups: more lenient per-IP budget
-		getLim:      msg.NewLimiter(60, 20),
-		authLim:     msg.NewLimiter(120, 40), // Higher limit for authenticated polling
-		mailLim:     msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst),
-		rcptLim:     msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour),
-		notifyLim:   msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst),
-		authFailLim: msg.NewLimiter(cfg.AuthFailPerMinute, cfg.AuthFailBurst),
-		writeLim:    msg.NewLimiter(cfg.WritePerMinute, cfg.WriteBurst),
-		ctx:         ctx,
-		cancel:      cancel,
+		msgLim:        msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst),
+		regLim:        msg.NewLimiter(10, 5),
+		pairLim:       msg.NewLimiter(10, 5),
+		failLim:       msg.NewLimiter(30, 10), // Failed pairing lookups: more lenient per-IP budget
+		getLim:        msg.NewLimiter(60, 20),
+		authLim:       msg.NewLimiter(120, 40), // Higher limit for authenticated polling
+		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst),
+		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour),
+		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst),
+		notifyAddrLim: msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst), // Same limits, but per-address
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 
 	lm.wg.Add(1)
@@ -240,8 +281,7 @@ func (lm *LimiterManager) pruneLoop() {
 func (lm *LimiterManager) prune() {
 	pruned := lm.msgLim.Prune() + lm.regLim.Prune() + lm.pairLim.Prune() + lm.failLim.Prune() +
 		lm.getLim.Prune() + lm.authLim.Prune() +
-		lm.mailLim.Prune() + lm.rcptLim.Prune() + lm.notifyLim.Prune() +
-		lm.authFailLim.Prune() + lm.writeLim.Prune()
+		lm.mailLim.Prune() + lm.rcptLim.Prune() + lm.notifyLim.Prune() + lm.notifyAddrLim.Prune()
 	_ = pruned // Could log if needed
 }
 

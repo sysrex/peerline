@@ -20,10 +20,21 @@ type MaintenanceManager struct {
 	cancel           context.CancelFunc
 	wg               sync.WaitGroup
 	retentionSeconds int64
+	tickInterval     time.Duration
+}
+
+// MaintenanceManagerOption configures a MaintenanceManager.
+type MaintenanceManagerOption func(*MaintenanceManager)
+
+// WithTickInterval sets the interval between purge runs (default 1 hour).
+func WithTickInterval(d time.Duration) MaintenanceManagerOption {
+	return func(m *MaintenanceManager) {
+		m.tickInterval = d
+	}
 }
 
 // NewMaintenanceManager creates and starts a maintenance manager.
-func NewMaintenanceManager(ctx context.Context, store StorePurger, log *slog.Logger, retentionSeconds int64) *MaintenanceManager {
+func NewMaintenanceManager(ctx context.Context, store StorePurger, log *slog.Logger, retentionSeconds int64, opts ...MaintenanceManagerOption) *MaintenanceManager {
 	ctx, cancel := context.WithCancel(ctx)
 	m := &MaintenanceManager{
 		store:            store,
@@ -31,6 +42,11 @@ func NewMaintenanceManager(ctx context.Context, store StorePurger, log *slog.Log
 		ctx:              ctx,
 		cancel:           cancel,
 		retentionSeconds: retentionSeconds,
+		tickInterval:     1 * time.Hour,
+	}
+
+	for _, opt := range opts {
+		opt(m)
 	}
 
 	m.wg.Add(1)
@@ -47,7 +63,7 @@ func (m *MaintenanceManager) maintenanceLoop() {
 	m.purgeExpired()
 
 	// Then run every hour
-	ticker := time.NewTicker(1 * time.Hour)
+	ticker := time.NewTicker(m.tickInterval)
 	defer ticker.Stop()
 
 	for {
