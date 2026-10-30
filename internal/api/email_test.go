@@ -84,9 +84,12 @@ func TestEmailInviteDevMode(t *testing.T) {
 	if !strings.Contains(msgs[0].Body, inv.Code) {
 		t.Fatalf("email body should contain invite code %s", inv.Code)
 	}
-	// Email should contain the code in the accept URL
-	if !strings.Contains(msgs[0].Body, "?code="+inv.Code) {
-		t.Fatalf("email body should contain code in URL query string")
+	// Email carries the code in the POST body, never in a URL query string
+	if strings.Contains(msgs[0].Body, "?code=") {
+		t.Fatalf("email body must not put the code in a URL query string")
+	}
+	if !strings.Contains(msgs[0].Body, `{"code":"`+inv.Code+`"}`) {
+		t.Fatalf("email body should contain code in the POST body example")
 	}
 
 	// Fix #26: invite code must NOT appear in logs
@@ -95,8 +98,8 @@ func TestEmailInviteDevMode(t *testing.T) {
 		t.Fatalf("invite code leaked in dev mode log: %s", l)
 	}
 	// Email should show code in body format (JSON), not query string
-	if !strings.Contains(l, `'{\"code\":\"`) || !strings.Contains(l, "POST") || !strings.Contains(l, "Content-Type: application/json") {
-		t.Fatalf("email should show POST with code in JSON body: %s", l)
+	if b := msgs[0].Body; !strings.Contains(b, "POST") || !strings.Contains(b, "Content-Type: application/json") {
+		t.Fatalf("email should show POST with code in JSON body: %s", b)
 	}
 
 	// Unauthenticated click (human / mail scanner) shows instructions and does not consume.
