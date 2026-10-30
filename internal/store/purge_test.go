@@ -29,15 +29,15 @@ func TestPurgeExpiredInvites_GrantsAndPeersSurvive(t *testing.T) {
 	defer func() { s.now = origNow }()
 
 	currentTime := int64(2000000)
-	
+
 	// Create and accept an invite in the past, with an expiry that's now beyond retention
 	// Used invites are purged when expires_at < now - retention (30 days default)
 	// So we need expires_at to be at least 31 days ago
 	thirtyOneDaysAgo := currentTime - 31*24*60*60
-	
+
 	// Go back in time to create and accept the invite
 	s.now = func() int64 { return thirtyOneDaysAgo - 100 }
-	
+
 	// Create invite that expires at thirtyOneDaysAgo
 	exp := time.Unix(thirtyOneDaysAgo, 0)
 	if err := s.CreateInvite(ctx, "code1", "alice", []string{"messages"}, nil, exp); err != nil {
@@ -128,7 +128,7 @@ func TestPurgeExpiredInvites_RetentionDefault(t *testing.T) {
 	if _, err := s.AcceptInvite(ctx, "code2", "bob", nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	
+
 	// Move to current time
 	s.now = func() int64 { return currentTime }
 
@@ -222,7 +222,7 @@ func TestPurgeExpiredInvites_ExactCutoffBoundary(t *testing.T) {
 	if _, err := s.AcceptInvite(ctx, "ret-within", "bob", nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	
+
 	// Used invite expired (retention + 1) ago (beyond retention) - should be purged
 	expBeyondRetention := time.Unix(currentTime-retention-1, 0)
 	s.now = func() int64 { return currentTime - retention - 200 }
@@ -232,7 +232,7 @@ func TestPurgeExpiredInvites_ExactCutoffBoundary(t *testing.T) {
 	if _, err := s.AcceptInvite(ctx, "ret-beyond", "bob", nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	
+
 	// Return to current time
 	s.now = func() int64 { return currentTime }
 
@@ -246,11 +246,11 @@ func TestPurgeExpiredInvites_ExactCutoffBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	
+
 	// Debug: check what remains after purge
 	s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM invites").Scan(&inviteCount)
 	t.Logf("After purge: %d invites remain, %d were purged", inviteCount, count)
-	
+
 	// Should purge: grace-beyond, ret-beyond = 2 invites
 	if count != 2 {
 		t.Errorf("expected 2 purged invites, got %d", count)
@@ -258,7 +258,7 @@ func TestPurgeExpiredInvites_ExactCutoffBoundary(t *testing.T) {
 
 	// Verify the invites at and within boundaries still exist
 	var exists bool
-	
+
 	// grace-at should exist (at boundary, not purged)
 	row := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM invites WHERE code_hash = ?)", "grace-at")
 	if err := row.Scan(&exists); err != nil {
@@ -267,7 +267,7 @@ func TestPurgeExpiredInvites_ExactCutoffBoundary(t *testing.T) {
 	if !exists {
 		t.Error("invite at grace boundary was purged")
 	}
-	
+
 	// grace-within should exist
 	row = s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM invites WHERE code_hash = ?)", "grace-within")
 	if err := row.Scan(&exists); err != nil {
