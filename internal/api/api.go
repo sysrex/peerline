@@ -782,8 +782,11 @@ func truncateUTF8(s string, max int) string {
 //   - Precomposed characters (e.g., é = U+00E9) count as 1 rune
 //   - Hangul syllables (e.g., 한 = U+D55C) count as 1 rune each
 //   - Truncation respects combining-mark cluster boundaries: if cutting at 64
-//     runes would split a base from non-composing marks or leave a dangling
-//     virama (CCC 9), backs off to exclude the entire trailing cluster
+//     runes would split a base from non-composing marks, backs off to exclude
+//     the entire trailing cluster
+//   - Virama-safe: strips any trailing viramas (CCC 9) after truncation to
+//     prevent dangling half-form conjuncts in Indic scripts (issue #182)
+//   - Archaic Hangul L+V cut (lone leading jamo at boundary) is out of scope
 //
 // Returns "A Peerline peer" if the result is empty after filtering.
 //
@@ -950,11 +953,29 @@ func sanitizeInviterName(name string) string {
 				}
 			}
 		}
+
+		// Strip any trailing viramas (CCC 9) after truncation to handle chained conjuncts
+		// (e.g., क्ष्म where multiple viramas chain). Keep at least one rune.
+		for len(truncated) > 1 {
+			lastRune := truncated[len(truncated)-1]
+			props := norm.NFC.PropertiesString(string(lastRune))
+			if props.CCC() == 9 {
+				truncated = truncated[:len(truncated)-1]
+			} else {
+				break
+			}
+		}
+
 		result = string(truncated)
 	}
 
 	// Trim trailing spaces that may have been left by the 64-rune truncation
 	result = strings.TrimRight(result, " ")
+
+	// Return fallback if result is now empty after trimming
+	if result == "" {
+		return fallbackName
+	}
 
 	return result
 }

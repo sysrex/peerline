@@ -2593,7 +2593,9 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"ﷺ×5 NFKC expands", strings.Repeat("\uFDFA", 5), "صلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى الله ع"}, // 5*18=90 -> 64
 
 		// Issue #182: Virama cut (CCC 9) - should not leave dangling virama
-		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62)}, // क + virama + ष cut before the conjunct
+		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62)},             // क + virama + ष cut before the conjunct
+		{"chained virama at 64", strings.Repeat("a", 60) + "क्ष्म" + "bbb", strings.Repeat("a", 60) + "क"}, // क्ष्म (3 consonants, 2 viramas) -> keep only क
+		{"many chained viramas", strings.Repeat("क्", 32) + "का", strings.Repeat("क्", 30) + "क"},          // 32 क् pairs + का -> 61 runes ending in क (no trailing virama)
 	}
 
 	for _, tt := range tests {
@@ -2680,36 +2682,50 @@ func TestTruncateUTF8(t *testing.T) {
 	}
 }
 
-// TestSanitizerPropertyBeforeFix is a property test that SHOULD FAIL on main (dcc099a)
-// before the guard fix, demonstrating the bugs in issue #181.
-// After the fix (truncateUTF8 + ToValidUTF8), all these properties hold.
-func TestSanitizerPropertyBeforeFix(t *testing.T) {
-	// Test cases that fail on main before the guard fix:
-	// 1. Input over 1024 bytes with multibyte rune at boundary -> invalid UTF-8 in guarded string
-	// 2. Invalid byte mid-string -> non-idempotent (e.g., "\xf0\u00b2" -> "\u00b2" -> "2")
+// TestSanitizerGuardInvariants verifies the input guard produces valid UTF-8 and idempotent output.
+// The "\xf0\u00b2" row fails on main@dcc099a (invalid UTF-8 disables NFKC for the next character,
+// breaking idempotence: "\xf0\u00b2" -> "\u00b2" -> "2"). Other rows exercise boundary conditions.
+func TestSanitizerGuardInvariants(t *testing.T) {
 	testCases := []struct {
 		name  string
 		input string
+		want  string // expected output (empty string means just check invariants)
 	}{
-		{"1022a + 日 at 1024", strings.Repeat("a", 1022) + "日"},
-		{"1021a + 😀 at 1024", strings.Repeat("a", 1021) + "😀"},
-		{"invalid byte disables NFKC", "\xf0\u00b2"}, // should become "2", not "\u00b2"
-		{"0x80 runs near cut", strings.Repeat("a", 1020) + string([]byte{0x80, 0x80, 0x80, 0x80})},
+		// Invalid byte disables NFKC on dcc099a: \xf0² -> ² -> 2 (not idempotent)
+		{"invalid byte disables NFKC", "\xf0\u00b2", "2"},
+		{"invalid byte then compat Greek", "\xf1ϐ", "β"},
+
+		// Exact byte boundaries at the guard
+		{"1023 bytes (no cut)", strings.Repeat("a", 1023), strings.Repeat("a", 64)},
+		{"1024 bytes (exact cut)", strings.Repeat("a", 1024), strings.Repeat("a", 64)},
+		{"1025 bytes (over cut)", strings.Repeat("a", 1025), strings.Repeat("a", 64)},
+
+		// Multibyte rune straddling the 1024-byte cut
+		{"1022a + 日 at 1024", strings.Repeat("a", 1022) + "日", strings.Repeat("a", 64)},
+		{"1021a + 😀 at 1024", strings.Repeat("a", 1021) + "😀", strings.Repeat("a", 64)},
+
+		// Continuation byte runs near cut
+		{"0x80 runs near cut", strings.Repeat("a", 1020) + string([]byte{0x80, 0x80, 0x80, 0x80}), strings.Repeat("a", 64)},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := sanitizeInviterName(tc.input)
 
-			// Property 1: Output is valid UTF-8
+			// Invariant 1: Output is valid UTF-8
 			if !utf8.ValidString(got) {
-				t.Errorf("sanitizeInviterName(%q) returned invalid UTF-8", tc.name)
+				t.Errorf("sanitizeInviterName(%q) returned invalid UTF-8", tc.input)
 			}
 
-			// Property 2: Idempotent
+			// Invariant 2: Idempotent
 			got2 := sanitizeInviterName(got)
 			if got != got2 {
-				t.Errorf("sanitizeInviterName not idempotent for %q: first=%q, second=%q", tc.name, got, got2)
+				t.Errorf("sanitizeInviterName not idempotent for %q: first=%q, second=%q", tc.input, got, got2)
+			}
+
+			// Check expected output if provided
+			if tc.want != "" && got != tc.want {
+				t.Errorf("sanitizeInviterName(%q) = %q, want %q", tc.input, got, tc.want)
 			}
 		})
 	}
@@ -2840,11 +2856,13 @@ func FuzzSanitizeInviterName(f *testing.F) {
 	// Seed corpus with edge cases
 	f.Add("Alice")
 	f.Add(strings.Repeat("a", 70))
-	f.Add("e\u0300\u0316")                 // non-composing marks
-	f.Add("\uFDFA")                        // NFKC expands
-	f.Add("\xf0\u00b2")                    // invalid byte + NFKC char
-	f.Add(strings.Repeat("a", 1022) + "日") // 3-byte rune at 1024
-	f.Add("क्ष")                           // Indic conjunct (virama)
+	f.Add("e\u0300\u0316")                           // non-composing marks
+	f.Add("\uFDFA")                                  // NFKC expands
+	f.Add("\xf0\u00b2")                              // invalid byte + NFKC char
+	f.Add(strings.Repeat("a", 1022) + "日")           // 3-byte rune at 1024
+	f.Add("क्ष")                                     // Indic conjunct (virama)
+	f.Add(strings.Repeat("a", 60) + "क्ष्म" + "bbb") // Chained virama (force CCC 9 strip)
+	f.Add(strings.Repeat("ब", 70))                   // Force 64-rune cap path
 
 	f.Fuzz(func(t *testing.T, input string) {
 		got := sanitizeInviterName(input)
@@ -2888,6 +2906,33 @@ func FuzzSanitizeInviterName(f *testing.F) {
 		got2 := sanitizeInviterName(got)
 		if got != got2 {
 			t.Errorf("sanitizeInviterName not idempotent for input %q: first=%q, second=%q", input, got, got2)
+		}
+
+		// Invariant 8: Every output rune is in the allowlist (L*, N*, Mn, Mc, space, . , - _ ')
+		// and no U+FFFD
+		for _, r := range got {
+			if r == '\uFFFD' {
+				t.Errorf("sanitizeInviterName(%q) contains U+FFFD: %q", input, got)
+			}
+			isAllowed := unicode.IsLetter(r) || unicode.IsNumber(r) ||
+				unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) ||
+				r == ' ' || r == '.' || r == ',' || r == '-' || r == '_' || r == '\''
+			if !isAllowed {
+				t.Errorf("sanitizeInviterName(%q) contains disallowed rune %U (%c): %q", input, r, r, got)
+			}
+		}
+
+		// Invariant 9: Truncated output never ends in CCC 9 (virama) unless it's the only rune
+		// This only applies when the 64-rune cap was hit (force truncation by appending text)
+		truncationTest := input + strings.Repeat("ब", 70)
+		gotTruncated := sanitizeInviterName(truncationTest)
+		runesTruncated := []rune(gotTruncated)
+		if len(runesTruncated) > 1 && utf8.RuneCountInString(gotTruncated) == 64 {
+			lastRune := runesTruncated[len(runesTruncated)-1]
+			props := norm.NFC.PropertiesString(string(lastRune))
+			if props.CCC() == 9 {
+				t.Errorf("sanitizeInviterName(%q+...70×ब) truncated output ends in CCC 9 (virama) rune %U: %q", input, lastRune, gotTruncated)
+			}
 		}
 	})
 }
