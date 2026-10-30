@@ -4,7 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"log/slog"
+	"math/big"
 	"net"
 	"strings"
 	"testing"
@@ -268,11 +275,113 @@ func TestSMTPRequireTLS(t *testing.T) {
 	})
 
 	t.Run("RequireTLS true works when STARTTLS offered", func(t *testing.T) {
-		// This test would require a full TLS handshake mock, which is complex.
-		// The existing TestSMTPSend on port 465 covers implicit TLS.
-		// For STARTTLS upgrade, we verify the error path (no STARTTLS offered)
-		// and the code path is straightforward: c.StartTLS succeeds or fails.
-		// In practice, the real SMTP sender's TLS upgrade is tested via integration.
-		t.Skip("STARTTLS upgrade requires complex TLS mock; covered by implicit TLS test and error path")
+		// Generate self-signed cert for localhost
+		priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		template := x509.Certificate{
+			SerialNumber: big.NewInt(1),
+			Subject:      pkix.Name{CommonName: "localhost"},
+			NotBefore:    time.Now(),
+			NotAfter:     time.Now().Add(time.Hour),
+			KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+			ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+			DNSNames:     []string{"localhost"},
+			IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		}
+		certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cert := tls.Certificate{
+			Certificate: [][]byte{certDER},
+			PrivateKey:  priv,
+		}
+
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		success := make(chan bool, 1)
+		go func() {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			r, w := bufio.NewReader(c), bufio.NewWriter(c)
+			say := func(s string) { w.WriteString(s + "\r\n"); w.Flush() }
+
+			say("220 test")
+			for {
+				line, err := r.ReadString('\n')
+				if err != nil {
+					return
+				}
+				cmd := strings.ToUpper(strings.TrimSpace(line))
+				switch {
+				case strings.HasPrefix(cmd, "EHLO"):
+					say("250-test")
+					say("250 STARTTLS")
+				case cmd == "STARTTLS":
+					say("220 Ready to start TLS")
+					w.Flush()
+					// Upgrade to TLS
+					tlsConn := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{cert}})
+					if err := tlsConn.Handshake(); err != nil {
+						return
+					}
+					c = tlsConn
+					r, w = bufio.NewReader(c), bufio.NewWriter(c)
+				case strings.HasPrefix(cmd, "HELO"):
+					say("250 test")
+				case strings.HasPrefix(cmd, "MAIL"), strings.HasPrefix(cmd, "RCPT"):
+					say("250 ok")
+				case cmd == "DATA":
+					say("354 go")
+					for {
+						l, err := r.ReadString('\n')
+						if err != nil {
+							return
+						}
+						if l == ".\r\n" {
+							break
+						}
+					}
+					say("250 queued")
+				case cmd == "QUIT":
+					say("221 bye")
+					success <- true
+					return
+				default:
+					say("502 no")
+				}
+			}
+		}()
+
+		port := ln.Addr().(*net.TCPAddr).Port
+		certPool := x509.NewCertPool()
+		certPool.AddCert(&x509.Certificate{Raw: certDER})
+		s := &SMTP{
+			Host:       "127.0.0.1",
+			Port:       port,
+			From:       "test@example.com",
+			Timeout:    5 * time.Second,
+			RequireTLS: true,
+			TLSConfig:  &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+		}
+		err = s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
+		if err != nil {
+			t.Fatalf("STARTTLS upgrade failed: %v", err)
+		}
+		select {
+		case <-success:
+			// Server completed successfully
+		case <-time.After(2 * time.Second):
+			t.Fatal("server did not complete")
+		}
 	})
 }
