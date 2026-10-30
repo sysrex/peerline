@@ -632,7 +632,9 @@ func (s *Server) inviterName(ctx context.Context, id string) string {
 //   - Maximum 64 runes counted on the final NFC (composed) output
 //   - Precomposed characters (e.g., é = U+00E9) count as 1 rune
 //   - Hangul syllables (e.g., 한 = U+D55C) count as 1 rune each
-//   - If truncation is needed, ensures no dangling combining marks are left
+//   - Truncation respects grapheme cluster boundaries: if cutting at 64 runes
+//     would split a base from non-composing marks, backs off to exclude the
+//     entire trailing cluster
 //
 // Returns "A Peerline peer" if the result is empty after filtering.
 //
@@ -643,7 +645,18 @@ func sanitizeInviterName(name string) string {
 		maxRunes        = 64
 		maxMarksPerBase = 3 // Issue #84 specifies 3 marks per base (issue #63 asked for 2 but #84 is the live tracker)
 		fallbackName    = "A Peerline peer"
+		maxInputBytes   = 1024 // Guard against unbounded normalization work
 	)
+
+	// Guard: truncate raw input to maxInputBytes on a UTF-8 boundary
+	// to prevent huge stored names from causing unbounded NFKC/NFD work
+	if len(name) > maxInputBytes {
+		name = name[:maxInputBytes]
+		// Back off to a valid UTF-8 boundary
+		for len(name) > 0 && !utf8.ValidString(name) {
+			name = name[:len(name)-1]
+		}
+	}
 
 	// Apply NFKC normalization first (compatibility decomposition + canonical composition)
 	// This normalizes fullwidth/halfwidth chars, ligatures, compatibility forms
@@ -748,8 +761,28 @@ func sanitizeInviterName(name string) string {
 	// This ensures precomposed characters (é), Hangul syllables (한), etc. count as 1 rune each
 	runes := []rune(result)
 	if len(runes) > maxRunes {
-		// Truncate at maxRunes. NFC form ensures no incomplete grapheme clusters.
-		result = string(runes[:maxRunes])
+		// Truncate at maxRunes, but check if this splits a grapheme cluster.
+		// NFC does not guarantee boundaries: e.g., e+grave+combining-mark-below doesn't compose,
+		// so cutting after 'e' leaves dangling marks.
+		// If the next rune (at position maxRunes) is a combining mark, back off to drop
+		// the entire trailing base+marks cluster.
+		truncated := runes[:maxRunes]
+		if len(runes) > maxRunes {
+			nextRune := runes[maxRunes]
+			if unicode.Is(unicode.Mn, nextRune) || unicode.Is(unicode.Mc, nextRune) || unicode.Is(unicode.Me, nextRune) {
+				// Backed-off: scan backwards to find the base character and drop it too
+				for i := len(truncated) - 1; i >= 0; i-- {
+					r := truncated[i]
+					isMark := unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) || unicode.Is(unicode.Me, r)
+					if !isMark {
+						// Found the base, truncate before it
+						truncated = truncated[:i]
+						break
+					}
+				}
+			}
+		}
+		result = string(truncated)
 	}
 
 	return result

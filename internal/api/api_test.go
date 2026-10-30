@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/sysrex/peerline/internal/store"
 	"golang.org/x/text/unicode/norm"
@@ -1825,8 +1826,8 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"70 precomposed é gives 64", strings.Repeat("é", 70), strings.Repeat("é", 64)},
 		// Hangul syllables: 한 (U+D55C) is 1 rune in NFC, decomposes to 3 jamo in NFD
 		{"70 Hangul syllables gives 64", strings.Repeat("한", 70), strings.Repeat("한", 64)},
-		// Truncation at mark boundary: 64 'a' + 64 combining marks, truncate without leaving dangling marks
-		{"Truncation drops trailing marks", strings.Repeat("a\u0301", 70), strings.Repeat("á", 64)},
+		// a+acute recomposes to á in NFC, 70 gives 64
+		{"70 a+acute recomposes to 64 á", strings.Repeat("a\u0301", 70), strings.Repeat("á", 64)},
 	}
 
 	for _, tt := range tests {
@@ -1859,6 +1860,51 @@ func TestSanitizerUnicode(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestSanitizerSplitCluster verifies that truncation respects grapheme cluster boundaries
+func TestSanitizerSplitCluster(t *testing.T) {
+	// 63 'a' + e+grave+combining-mark-below (doesn't compose in NFC) + "zzz"
+	// Should give 63 'a' without the partial cluster
+	input := strings.Repeat("a", 63) + "e\u0300\u0316" + "zzz"
+	got := sanitizeInviterName(input)
+	want := strings.Repeat("a", 63)
+
+	if got != want {
+		t.Errorf("sanitizeInviterName split cluster = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
+
+	// Verify UTF-8 validity
+	if !utf8.ValidString(got) {
+		t.Errorf("sanitizeInviterName returned invalid UTF-8")
+	}
+
+	// Verify result is NFC
+	if !norm.NFC.IsNormalString(got) {
+		t.Errorf("sanitizeInviterName result is not NFC normalized")
+	}
+
+	// Verify no trailing combining marks
+	runes := []rune(got)
+	if len(runes) > 0 {
+		lastRune := runes[len(runes)-1]
+		if unicode.Is(unicode.Mn, lastRune) || unicode.Is(unicode.Mc, lastRune) || unicode.Is(unicode.Me, lastRune) {
+			t.Errorf("sanitizeInviterName has trailing combining mark U+%04X", lastRune)
+		}
+	}
+}
+
+// TestSanitizerHugeInput verifies the input guard prevents unbounded normalization work
+func TestSanitizerHugeInput(t *testing.T) {
+	// 100 KB of 'a' characters
+	input := strings.Repeat("a", 100*1024)
+	got := sanitizeInviterName(input)
+
+	// Should return 64 'a' characters (truncated at input guard, then at 64 runes)
+	want := strings.Repeat("a", 64)
+	if got != want {
+		t.Errorf("sanitizeInviterName(100KB input) = %q (len %d), want %q (len %d)", got[:20]+"...", len([]rune(got)), want, len([]rune(want)))
 	}
 }
 
