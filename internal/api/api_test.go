@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -60,9 +61,67 @@ func newServer(t *testing.T, cfg Config) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(apiServer.Stop)
 	srv := httptest.NewServer(apiServer.Handler())
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// newServerWithAccess returns a test server along with the underlying Server and Store for tests that need internal access.
+func newServerWithAccess(t *testing.T, cfg Config) (*httptest.Server, *Server, *store.Store) {
+	t.Helper()
+	dbPath := t.TempDir() + "/t.db"
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	s, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Stop)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	return srv, s, st
+}
+
+// newServerWithDB returns a test server along with a raw database connection for tests that need to manipulate DB state directly.
+func newServerWithDB(t *testing.T, cfg Config) (*httptest.Server, *Server, *store.Store, *sql.DB) {
+	t.Helper()
+	dbPath := t.TempDir() + "/t.db"
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	// Open a second connection for test manipulation
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WritePerMinute == 0 {
+		cfg.WritePerMinute = 1000
+		cfg.WriteBurst = 100
+	}
+	if cfg.AuthFailPerMinute == 0 {
+		cfg.AuthFailPerMinute = 1000
+		cfg.AuthFailBurst = 100
+	}
+	s, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Stop)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	return srv, s, st, db
 }
 
 func (c *client) do(method, path string, body any, hdr map[string]string) (*http.Response, []byte) {
@@ -131,6 +190,20 @@ func pairUp(t *testing.T, a, b *client, scopes, bags []string, back []string) {
 	// invite is single-use
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv.Code}, nil)
 	want(t, resp, body, 404)
+}
+
+// extractVerifyToken extracts the verification token from an email body.
+func extractVerifyToken(body string) string {
+	tokenStart := strings.Index(body, "token=eml_")
+	if tokenStart == -1 {
+		return ""
+	}
+	tokenStart += len("token=")
+	tokenEnd := strings.IndexAny(body[tokenStart:], "'\n ")
+	if tokenEnd == -1 {
+		tokenEnd = len(body[tokenStart:])
+	}
+	return body[tokenStart : tokenStart+tokenEnd]
 }
 
 func TestAuthRequired(t *testing.T) {

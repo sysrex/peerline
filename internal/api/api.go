@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -86,10 +87,15 @@ type Server struct {
 	st          *store.Store
 	cfg         Config
 	lim         *LimiterManager
+	verifyLim   *msg.Limiter // Per-peer/per-address verification email rate limit (3/hour)
 	maint       *MaintenanceManager
 	log         *slog.Logger
 	trustedNets []*net.IPNet
 	now         func() time.Time // clock for invite expiry; defaults to time.Now
+
+	// For pruning verifyLim
+	pruneDone chan struct{}
+	pruneOnce sync.Once
 
 	// Test-only hook: called after invite creation, before email limit check
 	testInviteCreatedHook func(peerID string)
@@ -175,9 +181,14 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 		cfg:         cfg,
 		log:         cfg.Logger,
 		lim:         NewLimiterManager(cfg),
+		verifyLim:   msg.NewLimiterPerHour(3, 3), // 3 verification emails per peer/address per hour
 		trustedNets: trustedNets,
 		now:         time.Now,
+		pruneDone:   make(chan struct{}),
 	}
+
+	// Start pruning verifyLim every 15 minutes
+	go s.pruneVerifyLoop()
 
 	// Start maintenance tasks
 	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, cfg.RetentionSeconds, cfg.KeyIndexRebuildHours)
@@ -197,6 +208,23 @@ func (s *Server) Stop() {
 	}
 	if s.maint != nil {
 		s.maint.Stop()
+	}
+	// Stop verifyLim pruning
+	s.pruneOnce.Do(func() { close(s.pruneDone) })
+}
+
+// pruneVerifyLoop periodically prunes stale buckets from verifyLim.
+func (s *Server) pruneVerifyLoop() {
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.pruneDone:
+			return
+		case <-ticker.C:
+			s.verifyLim.Prune()
+		}
 	}
 }
 
@@ -362,20 +390,30 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Generate verification token if email is set
-	token := ""
+	var tokenWithExpiry string
+	var rawToken string
 	if notify != "" {
-		token = auth.NewSecret("eml_")
+		// Rate limit verification emails per-address
+		normalizedAddr := strings.ToLower(notify)
+		if !s.verifyLim.Allow(normalizedAddr) {
+			// Per-address budget exhausted: register anyway but skip email
+			tokenWithExpiry = "" // Leave unverified
+		} else {
+			rawToken = auth.NewSecret("eml_")
+			issuedAt := s.now().Unix()
+			tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
+		}
 	}
 
 	id, key := auth.NewID(), auth.NewKey()
-	if err := s.st.CreatePeer(r.Context(), id, in.Name, auth.Hash(key), notify, token); err != nil {
+	if err := s.st.CreatePeer(r.Context(), id, in.Name, auth.Hash(key), notify, tokenWithExpiry); err != nil {
 		s.internal(w, err)
 		return
 	}
 
 	// Send verification email if address is set
-	if notify != "" && token != "" {
-		verifyURL := s.publicBase(r) + "/v1/me/verify-email?token=" + url.QueryEscape(token)
+	if notify != "" && rawToken != "" {
+		verifyURL := s.publicBase(r) + "/v1/me/verify-email?token=" + url.QueryEscape(rawToken)
 		msg := s.verificationEmail(id, notify, verifyURL)
 		ctx := context.WithoutCancel(r.Context())
 		if err := s.cfg.Mailer.Send(ctx, msg); err != nil {
@@ -403,7 +441,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	id := auth.PeerID(r.Context())
-	email, verified, _, err := s.st.GetNotifyEmailWithStatus(r.Context(), id)
+	email, verified, err := s.st.GetNotifyEmailStatus(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "peer not found")
@@ -438,12 +476,26 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 	me := auth.PeerID(r.Context())
 
 	// Generate verification token if setting email
-	token := ""
+	var tokenWithExpiry string
+	var rawToken string
 	if email != "" {
-		token = auth.NewSecret("eml_")
+		// Rate limit verification emails: check per-address first, then per-peer
+		normalizedAddr := strings.ToLower(email)
+		if !s.verifyLim.Allow(normalizedAddr) {
+			// Per-address budget exhausted
+			writeErr(w, http.StatusTooManyRequests, "verification email rate limited (per-address); try later")
+			return
+		} else if !s.verifyLim.Allow(me) {
+			writeErr(w, http.StatusTooManyRequests, "verification email rate limited; try later")
+			return
+		} else {
+			rawToken = auth.NewSecret("eml_")
+			issuedAt := s.now().Unix()
+			tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
+		}
 	}
 
-	if err := s.st.SetNotifyEmail(r.Context(), me, email, token); err != nil {
+	if err := s.st.SetNotifyEmail(r.Context(), me, email, tokenWithExpiry); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "peer not found")
 			return
@@ -453,8 +505,8 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Send verification email if address is set
-	if email != "" && token != "" {
-		verifyURL := s.publicBase(r) + "/v1/me/verify-email?token=" + url.QueryEscape(token)
+	if email != "" && rawToken != "" {
+		verifyURL := s.publicBase(r) + "/v1/me/verify-email?token=" + url.QueryEscape(rawToken)
 		msg := s.verificationEmail(me, email, verifyURL)
 		// Detach from client cancellation
 		ctx := context.WithoutCancel(r.Context())
@@ -469,7 +521,7 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 	s.log.Info("notify email updated", "peer_id", me, "set", email != "", "verified", false)
 
 	// Return current status
-	currentEmail, verified, _, err := s.st.GetNotifyEmailWithStatus(r.Context(), me)
+	currentEmail, verified, err := s.st.GetNotifyEmailStatus(r.Context(), me)
 	if err != nil {
 		s.internal(w, err)
 		return
@@ -496,10 +548,9 @@ func (s *Server) verificationEmail(peerID, to, verifyURL string) mailer.Message 
 	var b strings.Builder
 	b.WriteString("Verify your email address to enable Peerline message notifications.\n\n")
 	fmt.Fprintf(&b, "Peer: %s\n\n", peerID)
-	b.WriteString("Click the link below or open it in your bot's HTTP client:\n\n")
-	fmt.Fprintf(&b, "  %s\n\n", verifyURL)
+	b.WriteString("To verify, send an authenticated POST request:\n\n")
 	fmt.Fprintf(&b, "  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" \\\n    '%s'\n\n", verifyURL)
-	b.WriteString("If you didn't set this address, ignore this email.\n")
+	b.WriteString("This link expires in 24 hours. If you didn't set this address, ignore this email.\n")
 	return mailer.Message{
 		To:      to,
 		Subject: "Peerline: Verify your email address",
@@ -508,18 +559,22 @@ func (s *Server) verificationEmail(peerID, to, verifyURL string) mailer.Message 
 }
 
 // verifyEmail handles email verification via token.
+// Returns identical 404 for all failures: wrong token, expired, already used, wrong peer, malformed.
 func (s *Server) verifyEmail(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
 	if token == "" {
-		writeErr(w, http.StatusBadRequest, "token required")
+		writeErr(w, http.StatusNotFound, "not found")
 		return
 	}
 	me := auth.PeerID(r.Context())
-	if err := s.st.VerifyNotifyEmail(r.Context(), me, token); err != nil {
+	tokenHash := auth.Hash(token)
+	if err := s.st.VerifyNotifyEmail(r.Context(), me, tokenHash); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			writeErr(w, http.StatusBadRequest, "invalid or expired token")
+			// All token validation failures return identical 404
+			writeErr(w, http.StatusNotFound, "not found")
 			return
 		}
+		// Real DB errors are internal server errors, not token oracles
 		s.internal(w, err)
 		return
 	}

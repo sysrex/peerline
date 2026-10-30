@@ -242,7 +242,7 @@ func TestAllAuthenticatedWriteRoutesLimited(t *testing.T) {
 		{
 			name:   "PUT /v1/me",
 			method: "PUT",
-			body:   map[string]any{"notify_email": "test@example.com"},
+			body:   map[string]any{"notify_email": ""},
 			setup:  func(alice, _ *client) string { return "/v1/me" },
 		},
 		{

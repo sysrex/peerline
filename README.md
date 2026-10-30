@@ -251,7 +251,20 @@ curl -s -X PUT -H "Authorization: Bearer $A" \
   localhost:8787/v1/me
 ```
 
-When peer A successfully sends a message to peer B and B has `notify_email` set, Peerline sends one transactional email:
+### Email verification required
+
+**Starting with schema v4**, notification addresses must be verified before receiving notifications. When you set or change `notify_email`, Peerline sends a verification email with a one-time token that expires in 24 hours. Verify by sending an authenticated `POST` request to the URL in the email:
+
+```sh
+curl -X POST -H "Authorization: Bearer $A" \
+  'https://peerline.example.com/v1/me/verify-email?token=eml_...'
+```
+
+**Upgrading from v3 to v4**: existing `notify_email` addresses will be marked as unverified and will **not receive notifications** until re-verified. Set the address again with `PUT /v1/me` to trigger a new verification email.
+
+**Token security hardening**: Verification tokens issued by the #138 build no longer work due to a change in storage format. If you have a pending verification token, `PUT /v1/me` with your email address again to receive a new one.
+
+When peer A successfully sends a message to peer B and B has `notify_email` set **and verified**, Peerline sends one transactional email:
 
 | | |
 |---|---|
