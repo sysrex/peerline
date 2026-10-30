@@ -33,7 +33,17 @@ func newServer(t *testing.T, cfg Config) *httptest.Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	srv := httptest.NewServer(New(st, cfg).Handler())
+
+	// Load key index (required by api.New)
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	apiServer, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(apiServer.Handler())
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -1364,7 +1374,7 @@ func TestMaintenanceManagerStops(t *testing.T) {
 
 	ctx := context.Background()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	mgr := NewMaintenanceManager(ctx, st, logger, 30*24*60*60)
+	mgr := NewMaintenanceManager(ctx, st, logger, 30*24*60*60, 6)
 
 	// Let it run a bit
 	time.Sleep(100 * time.Millisecond)
@@ -1502,7 +1512,17 @@ func TestSingleLogLineUnauthenticatedPairing(t *testing.T) {
 
 	cfg := Config{}
 	cfg.Logger = logger
-	srv := httptest.NewServer(New(st, cfg).Handler())
+
+	// Load key index (required by api.New)
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	apiServer, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(apiServer.Handler())
 	defer srv.Close()
 
 	alice := register(t, srv, "Alice")
@@ -1710,7 +1730,14 @@ func TestAPIClock(t *testing.T) {
 	}
 	defer st.Close()
 
-	srv := New(st, Config{})
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := New(st, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer srv.Stop()
 
 	// Stub the clock and verify non-nil default
@@ -1806,5 +1833,39 @@ func TestRateLimitWithMultipleXFFHeaders(t *testing.T) {
 	// The request should succeed (not testing rate limiting here, just that it works)
 	if resp.StatusCode != 200 {
 		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
+// TestNewRequiresLoadedKeyIndex verifies that api.New returns an error if the key index is not loaded.
+func TestNewRequiresLoadedKeyIndex(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Don't load the key index
+	cfg := Config{
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AuthFailPerMinute: 30,
+		AuthFailBurst:     10,
+	}
+
+	// api.New should fail without loaded index
+	_, err = New(st, cfg)
+	if err == nil {
+		t.Fatal("api.New succeeded without loaded key index")
+	}
+	if !strings.Contains(err.Error(), "key index not loaded") {
+		t.Fatalf("want 'key index not loaded' error, got: %v", err)
+	}
+
+	// After loading, it should succeed
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, err = New(st, cfg)
+	if err != nil {
+		t.Fatalf("api.New failed after LoadKeyIndex: %v", err)
 	}
 }

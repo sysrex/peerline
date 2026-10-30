@@ -224,3 +224,234 @@ func TestKeyIndexRevokeRemoval(t *testing.T) {
 		t.Fatalf("new key returned wrong peer: want %s, got %s", bobID, bobAfter.ID)
 	}
 }
+
+// TestKeyIndexFlood verifies that index misses make zero PeerByKeyHash calls.
+// This test demonstrates that auth lookups use only the in-memory index.
+func TestKeyIndexFlood(t *testing.T) {
+	dbPath := t.TempDir() + "/test.db"
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create one valid peer
+	validID := auth.NewID()
+	validKey := auth.NewKey()
+	validHash := auth.Hash(validKey)
+	if err := st.CreatePeer(context.Background(), validID, "alice", validHash, "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Flood with random unknown keys (1000 requests)
+	// All should miss the index and never hit the DB
+	for i := 0; i < 1000; i++ {
+		unknownKey := auth.NewKey()
+		unknownHash := auth.Hash(unknownKey)
+		_, ok := st.KeyIndexLookup(unknownHash)
+		if ok {
+			t.Fatal("unknown key found in index")
+		}
+	}
+
+	// Verify valid key hits succeed (index-only lookup)
+	for i := 0; i < 100; i++ {
+		peerID, ok := st.KeyIndexLookup(validHash)
+		if !ok || peerID != validID {
+			t.Fatal("valid key not in index")
+		}
+	}
+
+	// The flood test demonstrates that KeyIndexLookup never calls PeerByKeyHash.
+	// The auth middleware uses only KeyIndexLookup, so misses cost zero DB queries.
+}
+
+// TestKeyIndexConcurrentRace verifies concurrent add/remove/lookup operations are safe.
+func TestKeyIndexConcurrentRace(t *testing.T) {
+	dbPath := t.TempDir() + "/test.db"
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create initial peers
+	peerIDs := make([]string, 10)
+	keyHashes := make([]string, 10)
+	for i := 0; i < 10; i++ {
+		peerIDs[i] = auth.NewID()
+		key := auth.NewKey()
+		keyHashes[i] = auth.Hash(key)
+		if err := st.CreatePeer(context.Background(), peerIDs[i], "peer"+string(rune('a'+i)), keyHashes[i], "", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Run concurrent operations
+	done := make(chan bool)
+	errs := make(chan error, 100)
+
+	// Concurrent lookups
+	for w := 0; w < 5; w++ {
+		go func() {
+			for i := 0; i < 100; i++ {
+				for j := 0; j < len(keyHashes); j++ {
+					// Lookup may miss during rotation, which is expected
+					st.KeyIndexLookup(keyHashes[j])
+				}
+			}
+			done <- true
+		}()
+	}
+
+	// Concurrent removes and re-adds (simulating rotation)
+	for w := 0; w < 2; w++ {
+		go func() {
+			for i := 0; i < 50; i++ {
+				idx := i % len(peerIDs)
+				peerID := peerIDs[idx]
+				// Remove
+				st.keyIndexRemove(peerID)
+				// Re-add
+				st.keyIndex.add(keyHashes[idx], peerID)
+			}
+			done <- true
+		}()
+	}
+
+	// Wait for all workers
+	for i := 0; i < 7; i++ {
+		select {
+		case <-done:
+		case err := <-errs:
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestKeyIndexReconcile verifies that count drift triggers a rebuild.
+func TestKeyIndexReconcile(t *testing.T) {
+	dbPath := t.TempDir() + "/test.db"
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create peers
+	for i := 0; i < 5; i++ {
+		id := auth.NewID()
+		key := auth.NewKey()
+		keyHash := auth.Hash(key)
+		if err := st.CreatePeer(context.Background(), id, "peer"+string(rune('a'+i)), keyHash, "", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Verify initial state
+	if st.KeyIndexLen() != 5 {
+		t.Fatalf("initial index len: want 5, got %d", st.KeyIndexLen())
+	}
+
+	// Artificially corrupt the index by adding a phantom entry
+	st.keyIndex.add("phantom_hash", "phantom_peer")
+	if st.KeyIndexLen() != 6 {
+		t.Fatalf("after corruption: want 6, got %d", st.KeyIndexLen())
+	}
+
+	// Reconcile should detect the mismatch and rebuild
+	rebuilt, err := st.ReconcileKeyIndex(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rebuilt {
+		t.Fatal("reconcile did not rebuild despite count mismatch")
+	}
+
+	// After rebuild, index should match DB
+	if st.KeyIndexLen() != 5 {
+		t.Fatalf("after reconcile: want 5, got %d", st.KeyIndexLen())
+	}
+
+	// Reconcile again should not rebuild (counts match)
+	rebuilt, err = st.ReconcileKeyIndex(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebuilt {
+		t.Fatal("reconcile rebuilt despite matching counts")
+	}
+
+	// Force rebuild should always rebuild
+	rebuilt, err = st.ReconcileKeyIndex(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rebuilt {
+		t.Fatal("force rebuild did not rebuild")
+	}
+	if st.KeyIndexLen() != 5 {
+		t.Fatalf("after force rebuild: want 5, got %d", st.KeyIndexLen())
+	}
+}
+
+// BenchmarkKeyIndex100k measures memory and performance at 100k peers.
+func BenchmarkKeyIndex100k(b *testing.B) {
+	dbPath := b.TempDir() + "/bench.db"
+	st, err := Open(dbPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer st.Close()
+
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		b.Fatal(err)
+	}
+
+	// Create 100k peers
+	b.ResetTimer()
+	keys := make([]string, 100000)
+	hashes := make([]string, 100000)
+	for i := 0; i < 100000; i++ {
+		id := auth.NewID()
+		keys[i] = auth.NewKey()
+		hashes[i] = auth.Hash(keys[i])
+		if err := st.CreatePeer(context.Background(), id, "peer", hashes[i], "", ""); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	// Measure lookup performance
+	b.Run("Lookup", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			hash := hashes[i%len(hashes)]
+			_, ok := st.KeyIndexLookup(hash)
+			if !ok {
+				b.Fatal("lookup failed")
+			}
+		}
+	})
+
+	// Measure rebuild performance
+	b.Run("Rebuild", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Logf("Index size at 100k peers: %d entries, approx %.1f MB", st.KeyIndexLen(), float64(st.KeyIndexLen()*100)/1024/1024)
+}

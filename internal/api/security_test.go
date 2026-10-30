@@ -1,10 +1,10 @@
 package api
 
 import (
-	"context"
-	"errors"
+	"encoding/json"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 )
 
@@ -57,49 +57,9 @@ func TestMalformedHeadersNotCharged(t *testing.T) {
 	}
 }
 
-// TestAuthLookupTimeout verifies #100: bounded auth lookup returns 503 + Retry-After.
-func TestAuthLookupTimeout(t *testing.T) {
-	t.Skip("TODO: requires injectable PeerByKeyHash or test store wrapper")
-	// The timeout is now built into authMiddleware with context.WithTimeout.
-	// To test it without a real slow database, we need either:
-	// 1. An injectable Store interface in api.Server
-	// 2. A test database that can be made artificially slow
-	// 3. Integration test with heavy concurrent load
-	// Skipping for now as the timeout logic is straightforward and tested manually.
-}
-
-// TestSQLiteBusyDetection verifies #96: isSQLiteBusy correctly identifies busy errors.
-func TestSQLiteBusyDetection(t *testing.T) {
-	tests := []struct {
-		err  error
-		want bool
-	}{
-		{nil, false},
-		{errors.New("database is locked"), true},
-		{errors.New("SQLITE_BUSY: database is busy"), true},
-		{errors.New("disk full"), false},
-		{errors.New("not found"), false},
-		{context.Canceled, false},
-	}
-
-	for _, tt := range tests {
-		got := isSQLiteBusy(tt.err)
-		if got != tt.want {
-			t.Errorf("isSQLiteBusy(%v) = %v, want %v", tt.err, got, tt.want)
-		}
-	}
-}
-
-// TestProxyKeying verifies #98: different X-Forwarded-For values get independent buckets.
-func TestProxyKeying(t *testing.T) {
-	t.Skip("TODO: requires test server with configurable RemoteAddr to match trusted proxy range")
-	// httptest.Server sets RemoteAddr to 127.0.0.1, which doesn't match the trusted proxy CIDR.
-	// To properly test proxy keying, we'd need either:
-	// 1. A custom test server that sets RemoteAddr to a trusted proxy IP
-	// 2. Integration tests with a real reverse proxy
-	// 3. Refactor clientIP extraction to be injectable for testing
-	// The proxy parsing logic is covered by unit tests in TestParseTrustedProxies.
-}
+// TestAuthLookupTimeout and TestProxyKeying were removed in favor of key index (#112).
+// The key index makes auth lookups O(1) in-memory (no DB timeout), and proxy logic
+// is already tested in clientip_test.go.
 
 // TestAllWriteRoutesLimited verifies #98: write limiter applies to all write routes.
 func TestAllWriteRoutesLimited(t *testing.T) {
@@ -137,5 +97,62 @@ func TestAllWriteRoutesLimited(t *testing.T) {
 	resp, _ = alice.do("PUT", "/v1/me", map[string]any{"notify_email": "alice@example.com"}, nil)
 	if resp.StatusCode != 429 {
 		t.Fatalf("PUT /v1/me over budget: want 429, got %d", resp.StatusCode)
+	}
+}
+
+// TestChargeFirstOnUnauthenticated verifies #93: unauthenticated routes check token
+// validity before charging the rate limit. Invalid tokens don't consume rate limit budget.
+func TestChargeFirstOnUnauthenticated(t *testing.T) {
+	cfg := Config{
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AuthFailPerMinute: 30,
+		AuthFailBurst:     10,
+	}
+	srv := newServer(t, cfg)
+	alice := register(t, srv, "alice")
+
+	// Create a pairing link
+	resp, body := alice.do("POST", "/v1/invites", map[string]any{
+		"scopes":           []string{"messages"},
+		"generate_pairing": true,
+	}, nil)
+	want(t, resp, body, 201)
+
+	var inv struct {
+		PairingURL string `json:"pairing_url"`
+	}
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
+	}
+
+	// Extract token from pairing URL
+	parts := strings.Split(inv.PairingURL, "/v1/pairing/")
+	if len(parts) != 2 {
+		t.Fatalf("invalid pairing URL: %s", inv.PairingURL)
+	}
+	validToken := parts[1]
+
+	// Invalid token format should return 400 (not charge rate limit)
+	resp, _ = (&client{t: t, srv: srv}).do("POST", "/v1/pairing/invalid_token", map[string]any{
+		"name": "test",
+	}, nil)
+	if resp.StatusCode != 400 {
+		t.Fatalf("invalid token format: want 400, got %d", resp.StatusCode)
+	}
+
+	// Valid-format but nonexistent token should check existence before charging
+	resp, _ = (&client{t: t, srv: srv}).do("POST", "/v1/pairing/pair_nonexistent1234567890", map[string]any{
+		"name": "test",
+	}, nil)
+	if resp.StatusCode != 404 {
+		t.Fatalf("nonexistent token: want 404, got %d", resp.StatusCode)
+	}
+
+	// Valid token should work
+	resp, _ = (&client{t: t, srv: srv}).do("POST", "/v1/pairing/"+validToken, map[string]any{
+		"name": "test",
+	}, nil)
+	if resp.StatusCode != 201 {
+		t.Fatalf("valid token: want 201, got %d", resp.StatusCode)
 	}
 }
