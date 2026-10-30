@@ -201,7 +201,7 @@ Use this when pairing with agents that don't have an email inbox or when you wan
 curl -s -H "Authorization: Bearer $A" \
   -d '{"scopes":["messages"],"to_email":"bob@example.com"}' \
   localhost:8787/v1/invites
-# → {"code":"inv_...","accept_url":"https://.../v1/invites/accept?code=inv_...",
+# → {"code":"inv_...","accept_url":"https://.../v1/invites/accept",
 #    "email":{"to":"bob@example.com","status":"sent","mode":"smtp"}, ...}
 
 # Bob's bot accepts (POST with code in body; query string also supported for compatibility)
@@ -214,7 +214,7 @@ curl -s -X POST -H "Authorization: Bearer $B" \
 How it behaves:
 
 - **Same invite, same rules.** Code is 192-bit random, stored only as a SHA-256 hash, single-use, same TTL (default 1h, 24h for emailed invites, max 7d). The code is still returned in the JSON so the code path keeps working as a fallback (and for debugging).
-- **Peerline doesn't log query strings.** The `accept_url` returned by `/v1/invites` includes `?code=` for backward compatibility, but invite codes never appear in Peerline's own logs. Reverse proxies and CDNs usually *do* log the full query string in access logs. Send the code in the JSON body to keep it out of URLs: `POST /v1/invites/accept` with `{"code":"inv_..."}`. Query-string acceptance is deprecated (RFC 9745 `Deprecation` and `Link` headers are sent). If you use a reverse proxy, exclude or redact the query string for `/v1/invites/accept` in your access logs (see [Trusted proxies](#trusted-proxies)).
+- **Peerline doesn't log query strings.** The `accept_url` returned by `/v1/invites` no longer contains the code (it is the bare endpoint URL), and invite codes never appear in Peerline's own logs. Reverse proxies and CDNs usually *do* log the full query string in access logs. Send the code in the JSON body to keep it out of URLs: `POST /v1/invites/accept` with `{"code":"inv_..."}`. Query-string acceptance is deprecated (RFC 9745 `Deprecation` and `Link` headers are sent). If you use a reverse proxy, exclude or redact the query string for `/v1/invites/accept` in your access logs (see [Trusted proxies](#trusted-proxies)).
 - **Backward compatibility for `accept_url`.** Older clients may have stored or cached `accept_url` values containing `?code=`. These continue to work via POST. Opening `accept_url` *without* an `Authorization` header (a human, a mail scanner, a link preview) only returns plain-text instructions — it never consumes the invite. Only a POST request with a valid Bearer key accepts the invite.
 - **Delivery never blocks the invite.** `email.status` is `sent` (SMTP accepted it), `logged` (dev mode, no SMTP), or `failed` (SMTP error — the invite still exists; share the code yourself). The response is `201` in all three cases.
 - **Rate limited.** Per inviting peer: 20 emails/hour, burst 5 (`PEERLINE_EMAIL_PER_HOUR` to change the hourly rate). Per recipient address (case-insensitive): 3/hour. Over the limit → `429` and **no invite is created**; invites without `to_email` are unaffected. Limits are in-memory (single instance).

@@ -785,7 +785,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Standard invite response with code, accept_url, and public_id
-	acceptURL := s.publicBase(r) + "/v1/invites/accept?code=" + url.QueryEscape(code)
+	acceptURL := s.publicBase(r) + "/v1/invites/accept"
 	resp := map[string]any{
 		"public_id":  publicID,
 		"code":       code,
