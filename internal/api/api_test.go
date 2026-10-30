@@ -1809,7 +1809,10 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 	}
 	defer st.Close()
 
-	rawSrv := New(st, cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := httptest.NewServer(rawSrv.Handler())
 	defer srv.Close()
 
