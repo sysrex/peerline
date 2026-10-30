@@ -13,8 +13,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/sysrex/peerline/internal/store"
+	"golang.org/x/text/unicode/norm"
 )
 
 type client struct {
@@ -1562,6 +1564,8 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Mixed valid", "Alice-O'Neil, Jr.", "Alice-O'Neil, Jr."},
 		{"Hindi with combining marks", "राजेश कुमार", "राजेश कुमार"},
 		{"Thai with combining marks", "สมชาย ใจดี", "สมชาย ใจดี"},
+		// Issue #68: Devanagari test
+		{"Devanagari", "हिन्दी", "हिन्दी"},
 
 		// Bidi controls (Cf category) - all filtered
 		{"Bidi LRE", "Alice\u202AEvil", "AliceEvil"},
@@ -1597,6 +1601,45 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Variation selector FE0F", "Alice\uFE0FEvil", "AliceEvil"},
 		{"Variation selector E0100", "Alice\U000E0100Evil", "AliceEvil"},
 
+		// Issue #35: Additional Cf characters and Zl/Zp
+		{"U+061C Arabic letter mark", "Alice\u061CEvil", "AliceEvil"},
+		{"U+2060 Word joiner", "Alice\u2060Evil", "AliceEvil"},
+		{"U+00AD Soft hyphen", "Alice\u00ADEvil", "AliceEvil"},
+		{"U+2028 Line separator", "Alice\u2028Evil", "AliceEvil"},
+		{"U+2029 Paragraph separator", "Alice\u2029Evil", "AliceEvil"},
+
+		// Issue #63 & #84: Invisible Mn characters
+		{"U+034F COMBINING GRAPHEME JOINER", "a\u034Fb", "ab"},
+		{"U+0334 Combining tilde overlay", "a\u0334b", "a\u0334b"},
+		{"U+180B Mongolian FVS1", "a\u180Bb", "ab"},
+		{"U+180C Mongolian FVS2", "a\u180Cb", "ab"},
+		{"U+180D Mongolian FVS3", "a\u180Db", "ab"},
+		{"U+180F Mongolian FVS4", "a\u180Fb", "ab"},
+		{"U+17B4 Khmer inherent vowel", "a\u17B4b", "ab"},
+		{"U+17B5 Khmer inherent vowel", "a\u17B5b", "ab"},
+
+		// Issue #84: Combining marks constraints
+		// Mark limit is checked in NFD (decomposed) form to ensure visible result has max 3 marks per base
+		{"3 marks allowed", "a\u0301\u0302\u0303", "á\u0302\u0303"},                          // a + 3 marks -> á + 2 marks (NFC composition)
+		{"20 marks capped at 3", "a" + strings.Repeat("\u0301", 20), "á́́"},                  // a + 20 marks -> a + 3 marks (may compose)
+		{"64 marks alone becomes fallback", strings.Repeat("\u0301", 64), "A Peerline peer"}, // No base -> fallback (issue #68)
+		{"100 marks capped at 3", "a" + strings.Repeat("\u0301", 100), "á́́"},                // a + 100 marks -> a + 3 marks
+		{"Mark after space dropped", "a \u0301b", "a b"},
+		{"Mark at start dropped", "\u0301abc", "abc"},
+		{"Mark after punctuation dropped", "a.\u0301b", "a.b"},
+		{"Mark after letter then punctuation", "a\u0301.b", "á.b"}, // a+mark -> á (NFC)
+
+		// Issue #68: Tab and newline handling
+		{"Tab becomes space", "Alice\tSmith", "Alice Smith"},
+		{"Newline becomes space", "Alice\nSmith", "Alice Smith"},
+		{"Carriage return becomes space", "Alice\rSmith", "Alice Smith"},
+		{"Tab with spaces", "Alice  \t  Smith", "Alice Smith"},
+
+		// Issue #68: Empty result fallback
+		{"Only symbols becomes fallback", "★★★", "A Peerline peer"},
+		{"Only filtered chars", "\u200B\u200C\uFEFF", "A Peerline peer"},
+		{"Only marks becomes fallback", "\u0301\u0302\u0303", "A Peerline peer"},
+
 		// NFKC normalization
 		{"Fullwidth ASCII", "Ａｌｉｃｅ", "Alice"},  // Fullwidth → ASCII
 		{"Superscript", "Alice²", "Alice2"},    // ² → 2
@@ -1608,16 +1651,18 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Multiple spaces", "Alice   Smith", "Alice Smith"},
 		{"Leading spaces", "   Alice", "Alice"},
 		{"Trailing spaces", "Alice   ", "Alice"},
-		{"Mixed whitespace", "Alice  \t  Smith", "Alice Smith"}, // Tab becomes space, then collapsed
 
 		// Emoji and symbols (filtered out)
 		{"Emoji removed", "Alice 😀 Smith", "Alice Smith"},
 		{"Symbol removed", "Alice ★ Smith", "Alice Smith"},
 
 		// Edge cases
-		{"Empty string", "", ""},
-		{"Only spaces", "   ", ""},
-		{"Only filtered chars", "\u200B\u200C\uFEFF", ""},
+		{"Empty string", "", "A Peerline peer"},
+		{"Only spaces", "   ", "A Peerline peer"},
+
+		// Issue #68: Length tests (64 runes max)
+		{"70 ASCII letters", strings.Repeat("a", 70), strings.Repeat("a", 64)},
+		{"30 CJK chars under byte limit", strings.Repeat("日", 30), strings.Repeat("日", 30)},
 		// 64 runes (not bytes): "日" is 3 bytes, 64 copies = 192 bytes, should keep exactly 64 runes
 		{"Long multibyte truncated at 64 runes", strings.Repeat("日", 70), strings.Repeat("日", 64)},
 	}
@@ -1627,6 +1672,29 @@ func TestSanitizerUnicode(t *testing.T) {
 			got := sanitizeInviterName(tt.input)
 			if got != tt.want {
 				t.Errorf("sanitizeInviterName(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+
+			// For tests involving combining marks, verify that NFD form has at most 3 marks per base
+			if strings.Contains(tt.name, "marks") || strings.Contains(tt.name, "Devanagari") || strings.Contains(tt.name, "Thai") || strings.Contains(tt.name, "Hindi") {
+				nfd := norm.NFD.String(got)
+				consecutiveMarks := 0
+				maxMarks := 0
+				for _, r := range nfd {
+					isMark := unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r)
+					if isMark {
+						consecutiveMarks++
+						if consecutiveMarks > maxMarks {
+							maxMarks = consecutiveMarks
+						}
+					} else if unicode.IsLetter(r) || unicode.IsNumber(r) {
+						consecutiveMarks = 0
+					} else {
+						consecutiveMarks = 0
+					}
+				}
+				if maxMarks > 3 {
+					t.Errorf("sanitizeInviterName(%q) NFD has %d consecutive marks (max 3 allowed), NFD=%q", tt.input, maxMarks, nfd)
+				}
 			}
 		})
 	}
