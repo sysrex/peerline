@@ -152,12 +152,10 @@ func TestNotifyOnSuccessfulMessage(t *testing.T) {
 		t.Fatalf("expected 1 verification email, got %d", len(msgs))
 	}
 	verifyEmail := msgs[0]
-	tokenStart := strings.Index(verifyEmail.Body, "token=eml_") + 6
-	tokenEnd := strings.Index(verifyEmail.Body[tokenStart:], "\n")
-	if tokenEnd == -1 {
-		tokenEnd = strings.Index(verifyEmail.Body[tokenStart:], " ")
+	verifyToken := extractVerifyToken(verifyEmail.Body)
+	if verifyToken == "" {
+		t.Fatal("failed to extract verification token")
 	}
-	verifyToken := verifyEmail.Body[tokenStart : tokenStart+tokenEnd]
 	resp, body = b.do("POST", "/v1/me/verify-email?token="+verifyToken, nil, nil)
 	want(t, resp, body, 200)
 
@@ -298,12 +296,10 @@ func TestNotifyDevModeLogsAndStillSucceeds(t *testing.T) {
 	// Extract and verify
 	msgs := cap.all()
 	verifyEmail := msgs[0]
-	tokenStart := strings.Index(verifyEmail.Body, "token=eml_") + 6
-	tokenEnd := strings.Index(verifyEmail.Body[tokenStart:], "\n")
-	if tokenEnd == -1 {
-		tokenEnd = strings.Index(verifyEmail.Body[tokenStart:], " ")
+	verifyToken := extractVerifyToken(verifyEmail.Body)
+	if verifyToken == "" {
+		t.Fatal("failed to extract verification token")
 	}
-	verifyToken := verifyEmail.Body[tokenStart : tokenStart+tokenEnd]
 	resp, body = b.do("POST", "/v1/me/verify-email?token="+verifyToken, nil, nil)
 	want(t, resp, body, 200)
 

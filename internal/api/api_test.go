@@ -3,7 +3,9 @@ package api
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"html/template"
@@ -31,6 +33,15 @@ type client struct {
 	id  string
 }
 
+func mustNew(t *testing.T, st *store.Store, cfg Config) *Server {
+	t.Helper()
+	s, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
 func newServer(t *testing.T, cfg Config) *httptest.Server {
 	t.Helper()
 	st, err := store.Open(t.TempDir() + "/t.db")
@@ -38,9 +49,60 @@ func newServer(t *testing.T, cfg Config) *httptest.Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	srv := httptest.NewServer(New(st, cfg).Handler())
+	apiSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(apiSrv.Stop)
+	srv := httptest.NewServer(apiSrv.Handler())
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// newServerWithAccess returns a test server along with the underlying Server and Store for tests that need internal access.
+func newServerWithAccess(t *testing.T, cfg Config) (*httptest.Server, *Server, *store.Store) {
+	t.Helper()
+	dbPath := t.TempDir() + "/t.db"
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	s, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Stop)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	return srv, s, st
+}
+
+// newServerWithDB returns a test server along with a raw database connection for tests that need to manipulate DB state directly.
+func newServerWithDB(t *testing.T, cfg Config) (*httptest.Server, *Server, *store.Store, *sql.DB) {
+	t.Helper()
+	dbPath := t.TempDir() + "/t.db"
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	// Open a second connection for test manipulation
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	s, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Stop)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	return srv, s, st, db
 }
 
 func (c *client) do(method, path string, body any, hdr map[string]string) (*http.Response, []byte) {
@@ -109,6 +171,20 @@ func pairUp(t *testing.T, a, b *client, scopes, bags []string, back []string) {
 	// invite is single-use
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv.Code}, nil)
 	want(t, resp, body, 404)
+}
+
+// extractVerifyToken extracts the verification token from an email body.
+func extractVerifyToken(body string) string {
+	tokenStart := strings.Index(body, "token=eml_")
+	if tokenStart == -1 {
+		return ""
+	}
+	tokenStart += len("token=")
+	tokenEnd := strings.IndexAny(body[tokenStart:], "'\n ")
+	if tokenEnd == -1 {
+		tokenEnd = len(body[tokenStart:])
+	}
+	return body[tokenStart : tokenStart+tokenEnd]
 }
 
 func TestAuthRequired(t *testing.T) {
@@ -261,6 +337,257 @@ func TestReadOnlyBagScope(t *testing.T) {
 	// reciprocal grant: alice may message bob
 	resp, body = a.do("POST", "/v1/peers/"+b.id+"/messages", map[string]any{"type": "note", "body": "x"}, nil)
 	want(t, resp, body, 201)
+}
+
+func TestBagStorageLimits(t *testing.T) {
+	// limit to 3 bags and 100 bytes total
+	srv := newServer(t, Config{MaxBagsPerPeer: 3, MaxBagBytesPerPeer: 100})
+	a := register(t, srv, "alice")
+
+	// create 3 bags under the limits
+	resp, body := a.do("PUT", "/v1/bags/a", bytes.Repeat([]byte("x"), 30), nil)
+	want(t, resp, body, 201)
+	resp, body = a.do("PUT", "/v1/bags/b", bytes.Repeat([]byte("y"), 30), nil)
+	want(t, resp, body, 201)
+	resp, body = a.do("PUT", "/v1/bags/c", bytes.Repeat([]byte("z"), 30), nil)
+	want(t, resp, body, 201)
+
+	// 4th bag exceeds count limit
+	resp, body = a.do("PUT", "/v1/bags/d", []byte("w"), nil)
+	want(t, resp, body, 413)
+	if !strings.Contains(string(body), "bag count limit reached") {
+		t.Errorf("count limit body: %s", body)
+	}
+
+	// updating existing bag should still work (at count cap)
+	resp, body = a.do("PUT", "/v1/bags/a", bytes.Repeat([]byte("x"), 35), nil)
+	want(t, resp, body, 200)
+
+	// growing beyond byte quota
+	resp, body = a.do("PUT", "/v1/bags/a", bytes.Repeat([]byte("x"), 100), nil)
+	want(t, resp, body, 413)
+	if !strings.Contains(string(body), "storage quota exceeded") {
+		t.Errorf("quota body: %s", body)
+	}
+
+	// shrinking while over quota should work
+	resp, body = a.do("PUT", "/v1/bags/a", []byte("small"), nil)
+	want(t, resp, body, 200)
+
+	// new bag that would exceed byte limit
+	srv2 := newServer(t, Config{MaxBagBytesPerPeer: 50})
+	b := register(t, srv2, "bob")
+	resp, body = b.do("PUT", "/v1/bags/small", bytes.Repeat([]byte("x"), 40), nil)
+	want(t, resp, body, 201)
+	resp, body = b.do("PUT", "/v1/bags/big", bytes.Repeat([]byte("y"), 20), nil)
+	want(t, resp, body, 413)
+}
+
+func TestBagStorageShrinkOverQuota(t *testing.T) {
+	// Share a store across two API servers with different byte caps
+	tmpFile := t.TempDir() + "/shrink.db"
+	st, err := store.Open(tmpFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Server with large cap
+	srv1 := httptest.NewServer(mustNew(t, st, Config{MaxBagBytesPerPeer: 1000}).Handler())
+	defer srv1.Close()
+	a1 := &client{t: t, srv: srv1}
+
+	// Register alice
+	resp, body := a1.do("POST", "/v1/register", []byte(`{"name":"Alice"}`), nil)
+	want(t, resp, body, 201)
+	var reg struct {
+		PeerID string `json:"peer_id"`
+		APIKey string `json:"api_key"`
+	}
+	if err := json.Unmarshal(body, &reg); err != nil {
+		t.Fatal(err)
+	}
+	a1.id = reg.PeerID
+	a1.key = reg.APIKey
+
+	// Create two bags totaling 100 bytes
+	resp, body = a1.do("PUT", "/v1/bags/data1", bytes.Repeat([]byte("x"), 60), nil)
+	want(t, resp, body, 201)
+	resp, body = a1.do("PUT", "/v1/bags/data2", bytes.Repeat([]byte("y"), 40), nil)
+	want(t, resp, body, 201)
+
+	// Now create a server with 50-byte cap (alice is over quota)
+	srv2 := httptest.NewServer(mustNew(t, st, Config{MaxBagBytesPerPeer: 50}).Handler())
+	defer srv2.Close()
+	a2 := &client{t: t, srv: srv2, key: a1.key, id: a1.id}
+
+	// Shrinking data1 from 60→55 should work even though total stays over (95 > 50)
+	resp, body = a2.do("PUT", "/v1/bags/data1", bytes.Repeat([]byte("x"), 55), nil)
+	want(t, resp, body, 200)
+
+	// Growing data1 by 1 byte should fail
+	resp, body = a2.do("PUT", "/v1/bags/data1", bytes.Repeat([]byte("x"), 56), nil)
+	want(t, resp, body, 413)
+	if !strings.Contains(string(body), "storage quota exceeded") {
+		t.Errorf("expected storage quota exceeded, got: %s", body)
+	}
+
+	// Creating a new bag should fail
+	resp, body = a2.do("PUT", "/v1/bags/data3", []byte("z"), nil)
+	want(t, resp, body, 413)
+	if !strings.Contains(string(body), "storage quota exceeded") {
+		t.Errorf("expected storage quota exceeded, got: %s", body)
+	}
+}
+
+func TestBagLimitsGranteeChargedToOwner(t *testing.T) {
+	// Owner has 3-bag limit
+	srv := newServer(t, Config{MaxBagsPerPeer: 3, MaxBagBytesPerPeer: 100})
+	owner := register(t, srv, "owner")
+	grantee := register(t, srv, "grantee")
+
+	// Grant bags:write to grantee for data and data2
+	pairUp(t, owner, grantee, []string{"bags:write"}, []string{"data", "data2"}, nil)
+
+	// Owner creates 2 bags
+	resp, body := owner.do("PUT", "/v1/bags/bag1", []byte("owner1"), nil)
+	want(t, resp, body, 201)
+	resp, body = owner.do("PUT", "/v1/bags/bag2", []byte("owner2"), nil)
+	want(t, resp, body, 201)
+
+	// Grantee creates a bag in owner's namespace - should succeed
+	resp, body = grantee.do("PUT", "/v1/bags/data?owner="+owner.id, bytes.Repeat([]byte("x"), 20), nil)
+	want(t, resp, body, 201)
+
+	// Owner now at 3-bag limit. Grantee's 4th bag should fail with owner's count limit
+	resp, body = grantee.do("PUT", "/v1/bags/data2?owner="+owner.id, []byte("test"), nil)
+	want(t, resp, body, 413)
+	if !strings.Contains(string(body), "storage limit reached") {
+		t.Errorf("expected generic limit for grantee, got: %s", body)
+	}
+
+	// Grantee can still create in their own namespace (their quota is separate)
+	resp, body = grantee.do("PUT", "/v1/bags/mine", []byte("grantee data"), nil)
+	want(t, resp, body, 201)
+
+	// Test byte quota: grantee write charged to owner
+	resp, body = owner.do("PUT", "/v1/bags/bag1", bytes.Repeat([]byte("x"), 40), nil)
+	want(t, resp, body, 200)
+	resp, body = owner.do("PUT", "/v1/bags/bag2", bytes.Repeat([]byte("y"), 40), nil)
+	want(t, resp, body, 200)
+	// owner now at 100 bytes (40+40+20)
+
+	// Grantee tries to write 30 more bytes (would total 120, over 100 limit)
+	resp, body = grantee.do("PUT", "/v1/bags/data?owner="+owner.id, bytes.Repeat([]byte("z"), 30), nil)
+	want(t, resp, body, 413)
+	if !strings.Contains(string(body), "storage limit reached") {
+		t.Errorf("expected generic limit for grantee, got: %s", body)
+	}
+}
+
+func TestBagWriteRateLimitPerCaller(t *testing.T) {
+	srv := newServer(t, Config{})
+	owner := register(t, srv, "owner")
+	grantee := register(t, srv, "grantee")
+	pairUp(t, owner, grantee, []string{"bags:write"}, []string{"data"}, nil)
+
+	limited := false
+	for i := 0; i < 40; i++ {
+		resp, _ := grantee.do("PUT", "/v1/bags/data?owner="+owner.id, []byte("x"), nil)
+		if resp.StatusCode == 429 {
+			if resp.Header.Get("Retry-After") == "" {
+				t.Error("429 without Retry-After")
+			}
+			limited = true
+			break
+		}
+	}
+	if !limited {
+		t.Fatal("bag PUT burst was never rate limited")
+	}
+	resp, body := owner.do("PUT", "/v1/bags/mine", []byte("ok"), nil)
+	want(t, resp, body, 201)
+}
+
+func TestBagLimitsNonGrantee403(t *testing.T) {
+	// Test 1: Count cap - non-grantee gets 403, not 413
+	st1, err := store.Open(t.TempDir() + "/test1.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st1.Close()
+	srv1 := httptest.NewServer(mustNew(t, st1, Config{MaxBagsPerPeer: 2, MaxBagBytesPerPeer: 100}).Handler())
+	defer srv1.Close()
+
+	owner1 := register(t, srv1, "owner")
+	nonGrantee1 := register(t, srv1, "other")
+
+	// Owner creates 2 bags (at count limit)
+	resp, body := owner1.do("PUT", "/v1/bags/bag1", []byte("data1"), nil)
+	want(t, resp, body, 201)
+	resp, body = owner1.do("PUT", "/v1/bags/bag2", []byte("data2"), nil)
+	want(t, resp, body, 201)
+
+	// Non-grantee tries to create a NEW bag that would exceed owner's count cap
+	// Should get 403 (auth check first), not 413 (quota check second)
+	resp, body = nonGrantee1.do("PUT", "/v1/bags/newbag?owner="+owner1.id, []byte("attempt"), nil)
+	want(t, resp, body, 403)
+	if !strings.Contains(string(body), "not permitted") {
+		t.Errorf("expected not permitted, got: %s", body)
+	}
+
+	// Verify no row was written
+	_, err = st1.GetBag(context.Background(), owner1.id, "newbag")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("newbag was written despite 403; err=%v", err)
+	}
+
+	// Test 2: Byte cap - non-grantee gets 403, not 413
+	st2, err := store.Open(t.TempDir() + "/test2.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	srv2 := httptest.NewServer(mustNew(t, st2, Config{MaxBagsPerPeer: 10, MaxBagBytesPerPeer: 50}).Handler())
+	defer srv2.Close()
+
+	owner2 := register(t, srv2, "owner2")
+	nonGrantee2 := register(t, srv2, "other2")
+
+	// Owner fills byte quota (50 bytes)
+	resp, body = owner2.do("PUT", "/v1/bags/data", bytes.Repeat([]byte("x"), 50), nil)
+	want(t, resp, body, 201)
+
+	// Non-grantee tries to create a new bag that would exceed owner's byte cap
+	// Should get 403, not 413
+	resp, body = nonGrantee2.do("PUT", "/v1/bags/extra?owner="+owner2.id, []byte("y"), nil)
+	want(t, resp, body, 403)
+	if !strings.Contains(string(body), "not permitted") {
+		t.Errorf("expected not permitted, got: %s", body)
+	}
+
+	// Verify no row was written
+	_, err = st2.GetBag(context.Background(), owner2.id, "extra")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("extra bag was written despite 403; err=%v", err)
+	}
+}
+
+func TestBagStorageDefaults(t *testing.T) {
+	// Test that New applies defaults
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	srv := mustNew(t, st, Config{})
+	if srv.cfg.MaxBagsPerPeer != 100 {
+		t.Errorf("got MaxBagsPerPeer %d, want 100", srv.cfg.MaxBagsPerPeer)
+	}
+	if srv.cfg.MaxBagBytesPerPeer != 1048576 {
+		t.Errorf("got MaxBagBytesPerPeer %d, want 1048576", srv.cfg.MaxBagBytesPerPeer)
+	}
 }
 
 func TestInviteValidation(t *testing.T) {
@@ -1933,7 +2260,10 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 	}
 	defer st.Close()
 
-	rawSrv := New(st, cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := httptest.NewServer(rawSrv.Handler())
 	defer srv.Close()
 
@@ -2079,7 +2409,11 @@ func TestSingleLogLineUnauthenticatedPairing(t *testing.T) {
 
 	cfg := Config{}
 	cfg.Logger = logger
-	srv := httptest.NewServer(New(st, cfg).Handler())
+	apiSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(apiSrv.Handler())
 	defer srv.Close()
 
 	alice := register(t, srv, "Alice")
@@ -2248,6 +2582,22 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"70 Hangul syllables gives 64", strings.Repeat("한", 70), strings.Repeat("한", 64)},
 		// a+acute recomposes to á in NFC, 70 gives 64
 		{"70 a+acute recomposes to 64 á", strings.Repeat("a\u0301", 70), strings.Repeat("á", 64)},
+
+		// Issue #181: Edge cases for combining-mark cluster boundaries
+		{"cluster ending at rune 64 kept whole", strings.Repeat("a", 63) + "e\u0300", strings.Repeat("a", 63) + "è"},
+		{"cluster + trailing space at cut", strings.Repeat("a", 63) + "e\u0300 zzz", strings.Repeat("a", 63) + "è"},
+		{"4 marks on one base capped at 3", "a\u0300\u0301\u0302\u0303", "\u00e0\u0301\u0302"}, // 4 marks -> 3 marks
+
+		// Emoji with ZWJ, flags, skin tone modifiers (all filtered: ZWJ is Cf, regional indicators and modifiers are So/Sk)
+		{"ZWJ emoji filtered", "Alice👨‍👩‍👧Smith", "AliceSmith"},
+		{"Flag emoji filtered", "Alice🇺🇸Smith", "AliceSmith"},
+		{"Skin tone modifier filtered", "Alice👍🏻Smith", "AliceSmith"},
+
+		// NFKC expansion: U+FDFA (ﷺ) expands to 18 characters in NFKC
+		{"ﷺ×5 NFKC expands", strings.Repeat("\uFDFA", 5), "صلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى الله ع"}, // 5*18=90 -> 64
+
+		// Issue #182: Virama cut (CCC 9) - should not leave dangling virama
+		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62)}, // क + virama + ष cut before the conjunct
 	}
 
 	for _, tt := range tests {
@@ -2278,6 +2628,92 @@ func TestSanitizerUnicode(t *testing.T) {
 				if maxMarks > 3 {
 					t.Errorf("sanitizeInviterName(%q) NFD has %d consecutive marks (max 3 allowed), NFD=%q", tt.input, maxMarks, nfd)
 				}
+			}
+		})
+	}
+}
+
+// TestTruncateUTF8 verifies the UTF-8 truncation helper
+func TestTruncateUTF8(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		max     int
+		wantLen int
+	}{
+		{"empty", "", 10, 0},
+		{"shorter than max", "abc", 10, 3},
+		{"exact max", "abcde", 5, 5},
+		{"max 0", "abc", 0, 0},
+
+		// Cut inside multibyte runes (lead byte should be excluded)
+		{"2-byte rune at cut", "aaa" + "é", 4, 3},       // é is c3 a9, cut at c3
+		{"3-byte rune at cut byte 1", "aa" + "日", 3, 2}, // 日 is e6 97 a5, cut at e6
+		{"3-byte rune at cut byte 2", "aa" + "日", 4, 2}, // cut at 97
+		{"4-byte rune at cut byte 1", "aa" + "😀", 3, 2}, // 😀 is f0 9f 98 80, cut at f0
+		{"4-byte rune at cut byte 2", "aa" + "😀", 4, 2}, // cut at 9f
+		{"4-byte rune at cut byte 3", "aa" + "😀", 5, 2}, // cut at 98
+
+		// Multiple multibyte runes
+		{"multiple 3-byte", strings.Repeat("日", 10), 10, 9}, // 9 bytes = 3 runes
+
+		// Continuation byte runs (exercises backoff loop)
+		{"continuation bytes at cut", "aaa" + string([]byte{0x80, 0x80, 0x80}), 4, 2}, // backs off past 0x80 at position 3
+		{"many continuation bytes", string([]byte{0x80, 0x80, 0x80, 0x80, 0x80}), 3, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncateUTF8(tt.input, tt.max)
+
+			// Check length
+			if len(got) != tt.wantLen {
+				t.Errorf("truncateUTF8(%q, %d) len = %d, want %d", tt.input, tt.max, len(got), tt.wantLen)
+			}
+
+			// Check valid UTF-8
+			if !utf8.ValidString(got) {
+				t.Errorf("truncateUTF8(%q, %d) returned invalid UTF-8: %q", tt.input, tt.max, got)
+			}
+
+			// Check it's a prefix
+			if !strings.HasPrefix(tt.input, got) {
+				t.Errorf("truncateUTF8(%q, %d) = %q, not a prefix", tt.input, tt.max, got)
+			}
+		})
+	}
+}
+
+// TestSanitizerPropertyBeforeFix is a property test that SHOULD FAIL on main (dcc099a)
+// before the guard fix, demonstrating the bugs in issue #181.
+// After the fix (truncateUTF8 + ToValidUTF8), all these properties hold.
+func TestSanitizerPropertyBeforeFix(t *testing.T) {
+	// Test cases that fail on main before the guard fix:
+	// 1. Input over 1024 bytes with multibyte rune at boundary -> invalid UTF-8 in guarded string
+	// 2. Invalid byte mid-string -> non-idempotent (e.g., "\xf0\u00b2" -> "\u00b2" -> "2")
+	testCases := []struct {
+		name  string
+		input string
+	}{
+		{"1022a + 日 at 1024", strings.Repeat("a", 1022) + "日"},
+		{"1021a + 😀 at 1024", strings.Repeat("a", 1021) + "😀"},
+		{"invalid byte disables NFKC", "\xf0\u00b2"}, // should become "2", not "\u00b2"
+		{"0x80 runs near cut", strings.Repeat("a", 1020) + string([]byte{0x80, 0x80, 0x80, 0x80})},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeInviterName(tc.input)
+
+			// Property 1: Output is valid UTF-8
+			if !utf8.ValidString(got) {
+				t.Errorf("sanitizeInviterName(%q) returned invalid UTF-8", tc.name)
+			}
+
+			// Property 2: Idempotent
+			got2 := sanitizeInviterName(got)
+			if got != got2 {
+				t.Errorf("sanitizeInviterName not idempotent for %q: first=%q, second=%q", tc.name, got, got2)
 			}
 		})
 	}
@@ -2324,7 +2760,7 @@ func TestSanitizerHugeInput(t *testing.T) {
 	// Should return 64 'a' characters (truncated at input guard, then at 64 runes)
 	want := strings.Repeat("a", 64)
 	if got != want {
-		t.Errorf("sanitizeInviterName(100KB input) = %q (len %d), want %q (len %d)", got[:20]+"...", len([]rune(got)), want, len([]rune(want)))
+		t.Errorf("sanitizeInviterName(100KB input) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
 	}
 }
 
@@ -2338,6 +2774,37 @@ func TestSanitizerInputGuardInvalidUTF8(t *testing.T) {
 
 	if got != want {
 		t.Errorf("sanitizeInviterName(2000 bytes with invalid at byte 10) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
+}
+
+// TestSanitizerInputGuardContinuationBytes verifies the guard handles continuation byte runs
+func TestSanitizerInputGuardContinuationBytes(t *testing.T) {
+	// Place runs of 0x80 (continuation bytes) near the 1024-byte cut
+	// These are invalid UTF-8 and should be replaced by U+FFFD, then filtered
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			"continuation bytes at 1020-1024",
+			strings.Repeat("a", 1020) + string([]byte{0x80, 0x80, 0x80, 0x80}) + strings.Repeat("b", 100),
+			strings.Repeat("a", 64),
+		},
+		{
+			"continuation bytes before cut",
+			strings.Repeat("a", 1010) + string([]byte{0x80, 0x80}) + strings.Repeat("a", 12) + strings.Repeat("b", 100),
+			strings.Repeat("a", 64), // 0x80 replaced by U+FFFD (category So), filtered out, so we get 1022 'a' -> 64 'a'
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeInviterName(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeInviterName(%s) = %q (len %d), want %q (len %d)", tt.name, got, len([]rune(got)), tt.want, len([]rune(tt.want)))
+			}
+		})
 	}
 }
 
@@ -2372,6 +2839,63 @@ func TestSanitizerTrailingSpaceTrim(t *testing.T) {
 	}
 }
 
+// FuzzSanitizeInviterName verifies invariants over random inputs
+func FuzzSanitizeInviterName(f *testing.F) {
+	// Seed corpus with edge cases
+	f.Add("Alice")
+	f.Add(strings.Repeat("a", 70))
+	f.Add("e\u0300\u0316")                 // non-composing marks
+	f.Add("\uFDFA")                        // NFKC expands
+	f.Add("\xf0\u00b2")                    // invalid byte + NFKC char
+	f.Add(strings.Repeat("a", 1022) + "日") // 3-byte rune at 1024
+	f.Add("क्ष")                           // Indic conjunct (virama)
+
+	f.Fuzz(func(t *testing.T, input string) {
+		got := sanitizeInviterName(input)
+
+		// Invariant 1: Output is valid UTF-8
+		if !utf8.ValidString(got) {
+			t.Errorf("sanitizeInviterName(%q) returned invalid UTF-8: %q", input, got)
+		}
+
+		// Invariant 2: Output is NFC normalized
+		if !norm.NFC.IsNormalString(got) {
+			t.Errorf("sanitizeInviterName(%q) returned non-NFC string: %q", input, got)
+		}
+
+		// Invariant 3: At most 64 runes
+		runeCount := utf8.RuneCountInString(got)
+		if runeCount > 64 {
+			t.Errorf("sanitizeInviterName(%q) returned %d runes (> 64): %q", input, runeCount, got)
+		}
+
+		// Invariant 4: Non-empty (fallback applied if needed)
+		if got == "" {
+			t.Errorf("sanitizeInviterName(%q) returned empty string", input)
+		}
+
+		// Invariant 5: No leading/trailing space
+		if strings.TrimSpace(got) != got {
+			t.Errorf("sanitizeInviterName(%q) has leading/trailing space: %q", input, got)
+		}
+
+		// Invariant 6: No leading combining mark
+		runes := []rune(got)
+		if len(runes) > 0 {
+			firstRune := runes[0]
+			if unicode.Is(unicode.Mn, firstRune) || unicode.Is(unicode.Mc, firstRune) {
+				t.Errorf("sanitizeInviterName(%q) starts with combining mark: %q", input, got)
+			}
+		}
+
+		// Invariant 7: Idempotent
+		got2 := sanitizeInviterName(got)
+		if got != got2 {
+			t.Errorf("sanitizeInviterName not idempotent for input %q: first=%q, second=%q", input, got, got2)
+		}
+	})
+}
+
 // TestAPIClock verifies that api.Server.now is used in createInvite.
 // Note: the API clock (Server.now, time.Time) and the store clock (Store.now, int64)
 // are independent and can disagree; this test only fakes the API clock.
@@ -2382,7 +2906,10 @@ func TestAPIClock(t *testing.T) {
 	}
 	defer st.Close()
 
-	srv := New(st, Config{})
+	srv, err := New(st, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer srv.Stop()
 
 	// Stub the clock and verify non-nil default
