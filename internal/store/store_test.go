@@ -640,7 +640,7 @@ func TestConcurrentPairingRedemption(t *testing.T) {
 	if err := s2.db.QueryRow(`SELECT COUNT(*) FROM peers`).Scan(&peerCount); err != nil {
 		t.Fatal(err)
 	}
-	if peerCount != 3 {
+	if peerCount != 2 {
 		t.Errorf("got %d peers, want 2 (alice + 1 winner)", peerCount)
 	}
 }
@@ -1544,7 +1544,7 @@ func TestV2ToV3Migration(t *testing.T) {
 		}
 		seen[publicID] = true
 	}
-	if count != 3 {
+	if count != 2 {
 		t.Errorf("expected 2 backfilled rows, got %d", count)
 	}
 }

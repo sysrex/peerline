@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS invites (
   bags TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
   used_by TEXT,
-  pairing_token_hash TEXT
+  pairing_token_hash TEXT,
+  public_id TEXT
 );
 -- grants are directional: grantee may act on owner's resources within scopes/bags.
 CREATE TABLE IF NOT EXISTS grants (
