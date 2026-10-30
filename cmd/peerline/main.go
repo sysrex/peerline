@@ -191,6 +191,10 @@ func main() {
 		log.Error("smtp config", "err", err)
 		os.Exit(1)
 	}
+	if err := checkLogBody(log, ml, *addr); err != nil {
+		log.Error("config", "err", err)
+		os.Exit(1)
+	}
 	publicURL := strings.TrimRight(os.Getenv("PEERLINE_PUBLIC_URL"), "/")
 	if ml.Mode() == "log" {
 		log.Warn("PEERLINE_SMTP_HOST unset: transactional emails (invites and message notifications) are logged, not sent (dev mode)")
