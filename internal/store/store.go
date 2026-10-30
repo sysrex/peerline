@@ -21,7 +21,10 @@ var ErrTooManyInvites = errors.New("too many outstanding invites")
 
 var memDBCounter uint64
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db  *sql.DB
+	now func() int64
+}
 
 const schema = `
 PRAGMA journal_mode=WAL;
@@ -72,7 +75,8 @@ CREATE TABLE IF NOT EXISTS bags (
 );
 `
 
-// Open opens (and migrates) the database at path. Use ":memory:" for tests.
+// Open opens the database at path, applies migrations, and returns a Store.
+// Use ":memory:" for tests. It is the only Store constructor; a zero-value Store{} has a nil now func and must not be used directly.
 func Open(path string) (*Store, error) {
 	dsn := buildDSN(path)
 	db, err := sql.Open("sqlite", dsn)
@@ -90,7 +94,7 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, now: func() int64 { return time.Now().Unix() }}, nil
 }
 
 func buildDSN(path string) string {
@@ -287,8 +291,6 @@ func migrateV3InvitePublicID(tx *sql.Tx) error {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-var now = func() int64 { return time.Now().Unix() }
-
 // generatePublicID returns a random 16-byte hex string for invite public_id.
 func generatePublicID() (string, error) {
 	b := make([]byte, 16)
@@ -307,7 +309,7 @@ type Peer struct {
 }
 
 func (s *Store) CreatePeer(ctx context.Context, id, name, keyHash, notifyEmail string) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email) VALUES(?,?,?,?,?)`, id, name, keyHash, now(), notifyEmail)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email) VALUES(?,?,?,?,?)`, id, name, keyHash, s.now(), notifyEmail)
 	return err
 }
 
@@ -431,7 +433,7 @@ func (s *Store) CreateInviteAtomic(ctx context.Context, codeHash, from string, s
 	defer tx.Rollback()
 
 	var count int
-	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`, from, now()).Scan(&count)
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`, from, s.now()).Scan(&count)
 	if err != nil {
 		return "", err
 	}
@@ -467,7 +469,7 @@ func (s *Store) CreateInviteWithPairingAtomic(ctx context.Context, codeHash, pai
 	defer tx.Rollback()
 
 	var count int
-	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`, from, now()).Scan(&count)
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`, from, s.now()).Scan(&count)
 	if err != nil {
 		return "", err
 	}
@@ -508,7 +510,7 @@ func (s *Store) CountOutstandingInvites(ctx context.Context, peerID string) (int
 	var count int
 	err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`,
-		peerID, now()).Scan(&count)
+		peerID, s.now()).Scan(&count)
 	return count, err
 }
 
@@ -525,7 +527,7 @@ func (s *Store) ListInvitesByPeer(ctx context.Context, peerID string, limit, off
 		 WHERE from_peer=? AND expires_at>=? AND public_id IS NOT NULL
 		 ORDER BY ROWID
 		 LIMIT ? OFFSET ?`,
-		peerID, now(), limit, offset)
+		peerID, s.now(), limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -577,7 +579,7 @@ func (s *Store) PurgeExpiredInvites(ctx context.Context, retentionSeconds int64)
 		retentionSeconds = 30 * 24 * 60 * 60 // 30 days default
 	}
 
-	ts := now()
+	ts := s.now()
 	retentionCutoff := ts - retentionSeconds
 
 	// Delete unused expired invites and used invites older than retention window
@@ -613,7 +615,7 @@ func (s *Store) GetInviteByPairingToken(ctx context.Context, pairingTokenHash st
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp < now() {
+	if used.Valid || exp < s.now() {
 		return nil, ErrNotFound
 	}
 	return &InviteInfo{
@@ -638,7 +640,7 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp < now() {
+	if used.Valid || exp < s.now() {
 		return nil, ErrNotFound
 	}
 
@@ -648,7 +650,7 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 	}
 	defer tx.Rollback()
 
-	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags)
+	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags, s.now())
 	if err != nil {
 		return nil, err
 	}
@@ -662,7 +664,7 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 // PairingTokenExists checks if a pairing token exists (is valid and not yet redeemed).
 func (s *Store) PairingTokenExists(ctx context.Context, pairingTokenHash string) (bool, error) {
 	var exists int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM invites WHERE pairing_token_hash=? AND used_by IS NULL AND expires_at >= ?`, pairingTokenHash, time.Now().Unix()).Scan(&exists)
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM invites WHERE pairing_token_hash=? AND used_by IS NULL AND expires_at >= ?`, pairingTokenHash, s.now()).Scan(&exists)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -686,7 +688,7 @@ func (s *Store) AcceptInvite(ctx context.Context, codeHash, accepter string, bac
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp < now() {
+	if used.Valid || exp < s.now() {
 		return nil, ErrNotFound
 	}
 
@@ -696,7 +698,7 @@ func (s *Store) AcceptInvite(ctx context.Context, codeHash, accepter string, bac
 	}
 	defer tx.Rollback()
 
-	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags)
+	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags, s.now())
 	if err != nil {
 		return nil, err
 	}
@@ -722,8 +724,8 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 	if err != nil {
 		return nil, err
 	}
-	ts := now()
-	if used.Valid || exp < ts {
+	preCheckTime := s.now()
+	if used.Valid || exp < preCheckTime {
 		return nil, ErrNotFound
 	}
 
@@ -734,13 +736,16 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 	}
 	defer tx.Rollback()
 
+	// Take timestamp inside tx for expires_at guard and created_at
+	ts := s.now()
+
 	_, err = tx.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email) VALUES(?,?,?,?,?)`,
 		peerID, name, keyHash, ts, notifyEmail)
 	if err != nil {
 		return nil, err
 	}
 
-	grant, err = acceptInviteInTx(ctx, tx, codeHash, peerID, backScopes, backBags)
+	grant, err = acceptInviteInTx(ctx, tx, codeHash, peerID, backScopes, backBags, ts)
 	if err != nil {
 		return nil, err
 	}
@@ -753,7 +758,7 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 
 // acceptInviteInTx is the shared helper that atomically consumes an invite using a guarded
 // update and creates grants. Must be called within a transaction.
-func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string, backScopes, backBags []string) (*Grant, error) {
+func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string, backScopes, backBags []string, now int64) (*Grant, error) {
 	var from, scopes, bags string
 	err := tx.QueryRowContext(ctx, `SELECT from_peer,scopes,bags FROM invites WHERE code_hash=?`, codeHash).
 		Scan(&from, &scopes, &bags)
@@ -768,10 +773,9 @@ func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string
 		return nil, ErrConflict
 	}
 
-	ts := now()
 	res, err := tx.ExecContext(ctx,
 		`UPDATE invites SET used_by=? WHERE code_hash=? AND used_by IS NULL AND expires_at>=?`,
-		accepter, codeHash, ts)
+		accepter, codeHash, now)
 	if err != nil {
 		return nil, err
 	}
@@ -785,11 +789,11 @@ func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string
 
 	up := `INSERT INTO grants(owner,grantee,scopes,bags,created_at) VALUES(?,?,?,?,?)
 	       ON CONFLICT(owner,grantee) DO UPDATE SET scopes=excluded.scopes, bags=excluded.bags, created_at=excluded.created_at`
-	if _, err := tx.ExecContext(ctx, up, from, accepter, scopes, bags, ts); err != nil {
+	if _, err := tx.ExecContext(ctx, up, from, accepter, scopes, bags, now); err != nil {
 		return nil, err
 	}
 	if len(backScopes) > 0 {
-		if _, err := tx.ExecContext(ctx, up, accepter, from, join(backScopes), join(backBags), ts); err != nil {
+		if _, err := tx.ExecContext(ctx, up, accepter, from, join(backScopes), join(backBags), now); err != nil {
 			return nil, err
 		}
 	}
@@ -855,7 +859,7 @@ type Message struct {
 }
 
 func (s *Store) InsertMessage(ctx context.Context, m *Message) error {
-	ts := now()
+	ts := s.now()
 	res, err := s.db.ExecContext(ctx, `INSERT INTO messages(sender,recipient,type,body,reply_to,created_at) VALUES(?,?,?,?,?,?)`,
 		m.From, m.To, m.Type, m.Body, m.ReplyTo, ts)
 	if err != nil {
@@ -943,7 +947,7 @@ func (s *Store) PutBag(ctx context.Context, owner, name string, content []byte, 
 	next := cur + 1
 	_, err = tx.ExecContext(ctx, `INSERT INTO bags(owner,name,content,version,updated_by,updated_at) VALUES(?,?,?,?,?,?)
 		ON CONFLICT(owner,name) DO UPDATE SET content=excluded.content, version=excluded.version,
-		updated_by=excluded.updated_by, updated_at=excluded.updated_at`, owner, name, content, next, by, now())
+		updated_by=excluded.updated_by, updated_at=excluded.updated_at`, owner, name, content, next, by, s.now())
 	if err != nil {
 		return 0, err
 	}
