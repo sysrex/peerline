@@ -615,6 +615,7 @@ func TestPairingLinkWithoutGenerateFlag(t *testing.T) {
 func TestPairingAcceptStatusCodes(t *testing.T) {
 	srv := newServer(t, Config{})
 	a := register(t, srv, "alice")
+	anon := &client{t: t, srv: srv}
 
 	// Create pairing link
 	resp, body := a.do("POST", "/v1/invites", map[string]any{
@@ -631,7 +632,7 @@ func TestPairingAcceptStatusCodes(t *testing.T) {
 	token := strings.Split(inv.PairingURL, "/v1/pairing/")[1]
 
 	// Test 404: Invalid/nonexistent token
-	resp, body = noAuth.do("POST", "/v1/pairing/invalid_token", map[string]any{
+	resp, body = anon.do("POST", "/v1/pairing/invalid_token", map[string]any{
 		"name": "Bob",
 	}, nil)
 	want(t, resp, body, 404)
@@ -641,14 +642,14 @@ func TestPairingAcceptStatusCodes(t *testing.T) {
 
 	// Test 400: Self-accept (alice created the invite, bob tries with alice's id - simulated by bad name logic)
 	// Actually, we'll test missing name for 400
-	resp, body = noAuth.do("POST", "/v1/pairing/"+token, map[string]any{}, nil)
+	resp, body = anon.do("POST", "/v1/pairing/"+token, map[string]any{}, nil)
 	want(t, resp, body, 400)
 	if !strings.Contains(string(body), "name required") {
 		t.Errorf("unexpected 400 body: %s", body)
 	}
 
 	// Test 201: Successful unauthenticated pairing
-	resp, body = noAuth.do("POST", "/v1/pairing/"+token, map[string]any{
+	resp, body = anon.do("POST", "/v1/pairing/"+token, map[string]any{
 		"name": "Bob",
 	}, nil)
 	want(t, resp, body, 201)
@@ -668,7 +669,7 @@ func TestPairingAcceptStatusCodes(t *testing.T) {
 	}
 
 	// Test 404: Token already used
-	resp, body = noAuth.do("POST", "/v1/pairing/"+token, map[string]any{
+	resp, body = anon.do("POST", "/v1/pairing/"+token, map[string]any{
 		"name": "Carol",
 	}, nil)
 	want(t, resp, body, 404)
