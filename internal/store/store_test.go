@@ -224,8 +224,8 @@ func TestV0SchemaMigration(t *testing.T) {
 
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 5 {
-		t.Fatalf("user_version = %d, want 5", version)
+	if version != len(migrations) {
+		t.Fatalf("user_version = %d, want %d", version, len(migrations))
 	}
 
 	email, err := s.NotifyEmail(ctx, "alice")
@@ -292,8 +292,8 @@ func TestV1SchemaMigration(t *testing.T) {
 
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 5 {
-		t.Fatalf("user_version = %d, want 5", version)
+	if version != len(migrations) {
+		t.Fatalf("user_version = %d, want %d", version, len(migrations))
 	}
 
 	email, err := s.NotifyEmail(ctx, "alice")
@@ -511,8 +511,8 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 			// Verify user_version is 2
 			var version int
 			migratedStore.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-			if version != 5 {
-				t.Fatalf("user_version = %d, want 5", version)
+			if version != len(migrations) {
+				t.Fatalf("user_version = %d, want %d", version, len(migrations))
 			}
 
 			// Compare full schema
@@ -1427,8 +1427,8 @@ func TestPR11AlreadyMigrated(t *testing.T) {
 
 	// Verify user_version advanced to 2
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 5 {
-		t.Fatalf("user_version = %d, want 5", version)
+	if version != len(migrations) {
+		t.Fatalf("user_version = %d, want %d", version, len(migrations))
 	}
 
 	// Verify columns still exist
@@ -1484,8 +1484,8 @@ func TestPR11AlreadyMigrated(t *testing.T) {
 
 	// Verify user_version unchanged
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 5 {
-		t.Fatalf("user_version after second migrate = %d, want 5", version)
+	if version != len(migrations) {
+		t.Fatalf("user_version after second migrate = %d, want %d", version, len(migrations))
 	}
 
 	// Verify columns still present
@@ -1686,15 +1686,15 @@ func TestFailClosedVersionGuard(t *testing.T) {
 	if !errors.As(err, &tooNewErr) {
 		t.Errorf("expected ErrSchemaTooNew, got %T: %v", err, err)
 	} else {
-		if tooNewErr.Have != 99 || tooNewErr.Max != 5 {
-			t.Errorf("ErrSchemaTooNew: Have=%d, Max=%d, want Have=99, Max=4", tooNewErr.Have, tooNewErr.Max)
+		if tooNewErr.Have != 99 || tooNewErr.Max != len(migrations) {
+			t.Errorf("ErrSchemaTooNew: Have=%d, Max=%d, want Have=99, Max=%d", tooNewErr.Have, tooNewErr.Max, len(migrations))
 		}
 	}
 
 	// Verify error message mentions both versions
 	errMsg := err.Error()
-	if !strings.Contains(errMsg, "99") || !strings.Contains(errMsg, "5") {
-		t.Errorf("error message should mention both schema versions (99 and 5), got: %s", errMsg)
+	if !strings.Contains(errMsg, "99") || !strings.Contains(errMsg, "6") {
+		t.Errorf("error message should mention both schema versions (99 and 6), got: %s", errMsg)
 	}
 	if !strings.Contains(errMsg, "newer") && !strings.Contains(errMsg, "upgrade") {
 		t.Errorf("error message should mention 'newer' or 'upgrade', got: %s", errMsg)
@@ -1944,7 +1944,7 @@ func TestBackupBeforeMigration(t *testing.T) {
 	}
 	defer s.Close()
 
-	// Verify a backup was created with pattern .pre-v5-from-v2.<timestamp>
+	// Verify a backup was created with pattern .pre-v6-from-v2.<timestamp>
 	files, err := os.ReadDir(tempDir)
 	if err != nil {
 		t.Fatal(err)
@@ -1952,7 +1952,7 @@ func TestBackupBeforeMigration(t *testing.T) {
 
 	var backupPath string
 	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "test.db.pre-v5-from-v") {
+		if strings.HasPrefix(f.Name(), "test.db.pre-v6-from-v") {
 			backupPath = tempDir + "/" + f.Name()
 			break
 		}
@@ -1999,8 +1999,8 @@ func TestBackupBeforeMigration(t *testing.T) {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&mainVersion); err != nil {
 		t.Fatal(err)
 	}
-	if mainVersion != 5 {
-		t.Errorf("main database user_version = %d, want 5 (post-migration)", mainVersion)
+	if mainVersion != len(migrations) {
+		t.Errorf("main database user_version = %d, want %d (post-migration)", mainVersion, len(migrations))
 	}
 
 	// Verify backup has exactly 0600 permissions on Unix
@@ -2061,7 +2061,7 @@ func TestBackupWithQuoteInPath(t *testing.T) {
 
 	foundBackup := false
 	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "test.db.pre-v5-from-v") {
+		if strings.HasPrefix(f.Name(), "test.db.pre-v6-from-v") {
 			foundBackup = true
 			// Verify we can open it
 			backupPath := quotedDir + "/" + f.Name()
@@ -2120,7 +2120,7 @@ func TestBackupRetry(t *testing.T) {
 	}
 	backupCount := 0
 	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "retry.db.pre-v5-from-v") {
+		if strings.HasPrefix(f.Name(), "retry.db.pre-v6-from-v") {
 			backupCount++
 		}
 	}
@@ -2152,7 +2152,7 @@ func TestBackupRetry(t *testing.T) {
 	}
 	backupCount = 0
 	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "retry.db.pre-v5-from-v") {
+		if strings.HasPrefix(f.Name(), "retry.db.pre-v6-from-v") {
 			backupCount++
 		}
 	}
@@ -2299,7 +2299,7 @@ func TestPreExistingBackupNotOverwritten(t *testing.T) {
 
 	var firstBackupPath string
 	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "test.db.pre-v5-from-v") {
+		if strings.HasPrefix(f.Name(), "test.db.pre-v6-from-v") {
 			firstBackupPath = tempDir + "/" + f.Name()
 			break
 		}
@@ -2352,7 +2352,7 @@ func TestPreExistingBackupNotOverwritten(t *testing.T) {
 
 	backupCount := 0
 	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "test.db.pre-v5-from-v") {
+		if strings.HasPrefix(f.Name(), "test.db.pre-v6-from-v") {
 			backupCount++
 		}
 	}
@@ -2398,7 +2398,7 @@ func TestInMemoryExplicitDSN(t *testing.T) {
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 5 {
+	if version != len(migrations) {
 		t.Errorf("version = %d, want 5", version)
 	}
 
@@ -2429,7 +2429,7 @@ func TestNoBackupWhenCurrent(t *testing.T) {
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 5 {
+	if version != len(migrations) {
 		t.Fatalf("setup failed: version = %d, want 5", version)
 	}
 
@@ -2482,8 +2482,8 @@ func TestInMemorySkipsBackup(t *testing.T) {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 5 {
-		t.Errorf("in-memory database user_version = %d, want 5", version)
+	if version != len(migrations) {
+		t.Errorf("in-memory database user_version = %d, want %d", version, len(migrations))
 	}
 
 	// No file should exist (this is a weak test, but we can't easily verify
@@ -2596,8 +2596,8 @@ func TestV2ToV3Migration(t *testing.T) {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 5 {
-		t.Errorf("user_version = %d, want 5", version)
+	if version != len(migrations) {
+		t.Errorf("user_version = %d, want %d", version, len(migrations))
 	}
 
 	// Verify all rows have public_id
@@ -2681,8 +2681,8 @@ func TestV3MigrationIdempotent(t *testing.T) {
 	// Verify user_version is still 3
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 5 {
-		t.Errorf("user_version = %d, want 5", version)
+	if version != len(migrations) {
+		t.Errorf("user_version = %d, want %d", version, len(migrations))
 	}
 }
 
@@ -2852,7 +2852,7 @@ func TestBackupReuseOnRestartLoop(t *testing.T) {
 	db.Close()
 
 	// Manually create a valid backup to simulate a previous crash-loop attempt
-	backupName := "restart.db.pre-v5-from-v2.20260101-120000.000000"
+	backupName := "restart.db.pre-v6-from-v2.20260101-120000.000000"
 	backupPath := tempDir + "/" + backupName
 
 	// Copy the DB to create the backup
@@ -2894,7 +2894,7 @@ func TestBackupReuseOnRestartLoop(t *testing.T) {
 	}
 	backupCount := 0
 	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "restart.db.pre-v5-from-v") {
+		if strings.HasPrefix(f.Name(), "restart.db.pre-v6-from-v") {
 			backupCount++
 		}
 	}
@@ -2927,9 +2927,9 @@ func TestRetentionCoversAllVersions(t *testing.T) {
 			}{
 				{dbBase + ".pre-v2-from-v1.20260101-120000.000000", baseTime},
 				{dbBase + ".pre-v2-from-v1.20260101-130000.000000", baseTime.Add(10 * time.Minute)},
-				{dbBase + ".pre-v5-from-v2.20260101-140000.000000", baseTime.Add(20 * time.Minute)},
-				{dbBase + ".pre-v5-from-v2.20260101-150000.000000", baseTime.Add(30 * time.Minute)},
-				{dbBase + ".pre-v5-from-v2.20260101-160000.000000", baseTime.Add(40 * time.Minute)}, // newest
+				{dbBase + ".pre-v6-from-v2.20260101-140000.000000", baseTime.Add(20 * time.Minute)},
+				{dbBase + ".pre-v6-from-v2.20260101-150000.000000", baseTime.Add(30 * time.Minute)},
+				{dbBase + ".pre-v6-from-v2.20260101-160000.000000", baseTime.Add(40 * time.Minute)}, // newest
 			}
 
 			for _, backup := range backupNames {
@@ -3319,7 +3319,7 @@ func TestBackupCollisionRetry(t *testing.T) {
 	fixedTime := time.Date(2026, 1, 30, 12, 0, 0, 0, time.UTC)
 
 	// Create a pre-existing backup file with that timestamp
-	existingBackup := fmt.Sprintf("%s/collision.db.pre-v5-from-v2.%s", tempDir, fixedTime.Format("20060102-150405.000000"))
+	existingBackup := fmt.Sprintf("%s/collision.db.pre-v6-from-v2.%s", tempDir, fixedTime.Format("20060102-150405.000000"))
 	if err := os.WriteFile(existingBackup, []byte("fake"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -3357,7 +3357,7 @@ func TestBackupCollisionRetry(t *testing.T) {
 	}
 	backupCount := 0
 	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "collision.db.pre-v5-from-v2") {
+		if strings.HasPrefix(f.Name(), "collision.db.pre-v6-from-v2") {
 			backupCount++
 		}
 	}
@@ -3374,8 +3374,8 @@ func TestRetentionIgnoresLookalikeFiles(t *testing.T) {
 	// Create real backups
 	realBackups := []string{
 		dbBase + ".pre-v2-from-v1.20260101-120000.000000",
-		dbBase + ".pre-v5-from-v2.20260101-130000.000000",
-		dbBase + ".pre-v5-from-v2.20260101-140000.000000",
+		dbBase + ".pre-v6-from-v2.20260101-130000.000000",
+		dbBase + ".pre-v6-from-v2.20260101-140000.000000",
 	}
 	for _, name := range realBackups {
 		path := tempDir + "/" + name
@@ -3386,7 +3386,7 @@ func TestRetentionIgnoresLookalikeFiles(t *testing.T) {
 
 	// Create operator-kept lookalike files that should NOT match the strict regex
 	lookalikeFiles := []string{
-		dbBase + ".pre-v5-from-v2.manual-backup",
+		dbBase + ".pre-v6-from-v2.manual-backup",
 		dbBase + ".pre-v99-emergency",
 		dbBase + ".backup",
 	}
@@ -4117,4 +4117,17 @@ func TestBagLimitsByteCapFileDBRace(t *testing.T) {
 func migrate(db *sql.DB) error {
 	_, err := runMigrations(db, 0, OpenOptions{})
 	return err
+}
+
+func TestOpenRefusesDamagedSchema(t *testing.T) {
+	path := t.TempDir() + "/t.db"
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mustExec(t, `DROP INDEX invites_public_id`)
+	s.Close()
+	if _, err := Open(path); err == nil || !strings.Contains(err.Error(), "invites_public_id") {
+		t.Fatalf("want damaged-schema error, got %v", err)
+	}
 }

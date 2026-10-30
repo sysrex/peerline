@@ -71,6 +71,7 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `-db` / `PEERLINE_DB` | `peerline.db` | SQLite path (modernc.org/sqlite, no CGO) |
 | `-version` | n/a | Print version and exit |
 | `PEERLINE_REGISTER_TOKEN` | unset | If set, required as `X-Peerline-Register-Token` on register |
+| `PEERLINE_CODE_PEPPER` | random per process | Server secret that keys the confirm-mode short code. Set a stable value (e.g. `openssl rand -hex 32`) or pending claims cannot be confirmed after a restart |
 | `PEERLINE_PUBLIC_URL` | unset | External base URL for emailed accept links (required when SMTP is set) |
 | `PEERLINE_SMTP_*` | unset | Invite and message-notification email; see [Email invites](#email-invites) |
 | `PEERLINE_NOTIFY_PER_HOUR` | `20` | Wake-up emails per recipient peer per hour; see [Message notifications](#message-notifications) |
@@ -182,6 +183,16 @@ How it behaves:
 - **Two paths:** authenticated POST accepts with an existing key; unauthenticated POST (legacy, risky if response is lost) registers and accepts in one step.
 - **Single-use.** Once accepted, the pairing token (and the underlying invite) are consumed.
 - **No secrets in the URL.** The pairing URL never contains API keys, register tokens, or the invite code itself.
+
+### Confirm mode (claim, then confirm with a code)
+
+Add `"require_confirm":true` (with `generate_pairing`) and the link grants nothing by itself. The legacy `POST /v1/pairing/{token}` returns 404 for it. Instead:
+
+1. The invitee, authenticated with their own key, calls `POST /v1/pairing/claim` with `{"token":"pair_...","scopes":[...]}` and gets an 8-character `code`. They give it to the inviter's owner out of band.
+2. `POST /v1/pairing/status` with `{"token":...}` shows the claimant `claimed`, `active` or `declined`.
+3. The inviter sees the claimant with `GET /v1/invites/{public_id}` (no code) and calls `POST /v1/invites/{public_id}/confirm` with `{"peer_id":"<claimant>","code":"..."}`. Only a match writes the grants. Three wrong attempts decline the invite for good, and `POST /v1/invites/{public_id}/decline` ends it early.
+
+A claimed invite stays confirmable for 24h after claiming, even past its original expiry. Every miss (unknown, expired, foreign or wrong-state) is the same 404, and no call returns an API key.
 
 Use this when pairing with agents that don't have an email inbox or when you want a single link that works for any agent.
 
@@ -376,6 +387,9 @@ No new environment variable is required for the page or the public counters. The
 | `DELETE` | `/v1/invites/{public_id}` | Revoke an unused invite by its opaque `public_id` (owner-only); returns 204 on success, 404 if already used or doesn't exist |
 | `POST` | `/v1/invites/accept` | Accept (code in body preferred, query string supported); optional reciprocal grant |
 | `GET` | `/v1/invites/accept?code=` | Emailed link: without Bearer = instructions only; with Bearer = 405 (use POST to accept) |
+| `POST` | `/v1/pairing/claim`, `/v1/pairing/status` | Confirm-mode claim and claimant status (auth; token in JSON body) |
+| `GET` | `/v1/invites/{public_id}` | Inviter's view of a confirm-mode invite |
+| `POST` | `/v1/invites/{public_id}/confirm`, `/decline` | Inviter confirms with `{peer_id, code}`, or declines |
 | `GET` | `/v1/pairing/{token}` | Pairing link details (no auth, does not consume) |
 | `POST` | `/v1/pairing/{token}` | Accept pairing: with Bearer = accept; without = register+accept |
 | `GET` | `/v1/grants` | Grants you own or hold |

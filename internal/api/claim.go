@@ -13,20 +13,14 @@ import (
 
 // Claim states returned to clients.
 const (
-	claimStateClaimed  = "claimed"
-	claimStateActive   = "active"
-	claimStateDeclined = "declined"
+	claimStateClaimed  = store.ClaimClaimed
+	claimStateActive   = store.ClaimActive
+	claimStateDeclined = store.ClaimDeclined
 	maxCodeFails       = 3
 )
 
 // ClaimInvite is a confirm-mode invite as the claim handlers see it.
-type ClaimInvite struct {
-	PublicID, Inviter, State string
-	Claimant, ClaimantName   string
-	Scopes, Bags             []string
-	BackScopes, BackBags     []string
-	Nonce                    []byte
-}
+type ClaimInvite = store.Claim
 
 // ClaimStore is the persistence the claim/confirm handlers need; the store's
 // confirm-mode layer provides it. Every method returns store.ErrNotFound for

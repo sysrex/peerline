@@ -66,6 +66,7 @@ var migrations = []func(*sql.Tx) error{
 	migrateV3InvitePublicID,
 	migrateV4EmailVerification,
 	migrateV5InviteClaimState,
+	migrateV6ClaimOffer,
 }
 
 // SchemaVersion returns the maximum schema version this binary supports.
@@ -255,6 +256,10 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	if err := checkSchemaShape(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := backfillNullPublicIDs(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("backfill invite public_id: %w", err)
@@ -295,6 +300,41 @@ func backfillNullPublicIDs(db *sql.DB) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// expectedColumns and expectedIndexes are what the code reads and relies on; a database at the
+// current user_version that lacks any of them (partial restore, hand edit) is refused.
+var expectedColumns = map[string][]string{
+	"peers": {"id", "name", "key_hash", "created_at", "notify_email", "notify_email_verified", "notify_email_token", "created_via_invite"},
+	"invites": {"code_hash", "from_peer", "scopes", "bags", "expires_at", "used_by", "pairing_token_hash", "public_id",
+		"require_confirm", "claimed_by", "confirm_by", "declined_at", "nonce", "back_scopes", "back_bags", "code_fails"},
+	"grants": {"owner", "grantee", "scopes", "bags", "created_at"},
+}
+
+var expectedIndexes = []string{"invites_pairing_token_hash", "invites_public_id"}
+
+func checkSchemaShape(db *sql.DB) error {
+	for table, cols := range expectedColumns {
+		for _, c := range cols {
+			var n int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, table, c).Scan(&n); err != nil {
+				return err
+			}
+			if n == 0 {
+				return fmt.Errorf("database schema is damaged: %s.%s is missing", table, c)
+			}
+		}
+	}
+	for _, ix := range expectedIndexes {
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_index_list('invites') WHERE name=? AND "unique"=1`, ix).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("database schema is damaged: unique index %s is missing", ix)
+		}
+	}
+	return nil
 }
 
 // migrate applies ordered, idempotent schema upgrades tracked by PRAGMA user_version.
@@ -864,6 +904,17 @@ ALTER TABLE peers ADD COLUMN created_via_invite INTEGER NOT NULL DEFAULT 0;`)
 	return err
 }
 
+// migrateV6ClaimOffer stores what a claim binds: the per-claim nonce, the claimant's
+// reciprocal offer and the wrong-code counter.
+func migrateV6ClaimOffer(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+ALTER TABLE invites ADD COLUMN nonce BLOB;
+ALTER TABLE invites ADD COLUMN back_scopes TEXT NOT NULL DEFAULT '';
+ALTER TABLE invites ADD COLUMN back_bags TEXT NOT NULL DEFAULT '';
+ALTER TABLE invites ADD COLUMN code_fails INTEGER NOT NULL DEFAULT 0;`)
+	return err
+}
+
 // outstandingInvite is the one definition of an unused invite that can still be acted on
 // (?1 = now): offered rows live until expires_at, claimed rows until confirm_by.
 const outstandingInvite = `(used_by IS NULL AND declined_at IS NULL AND
@@ -1136,6 +1187,16 @@ func (s *Store) CreateInviteAtomic(ctx context.Context, codeHash, from string, s
 // CreateInviteWithPairingAtomic checks the per-peer invite cap and creates a pairing invite atomically within one transaction.
 // Returns ErrTooManyInvites if the cap would be exceeded. Returns the invite's public_id on success.
 func (s *Store) CreateInviteWithPairingAtomic(ctx context.Context, codeHash, pairingTokenHash, from string, scopes, bags []string, expires time.Time, cap int) (string, error) {
+	return s.createPairingInviteAtomic(ctx, codeHash, pairingTokenHash, from, scopes, bags, expires, cap, false)
+}
+
+// CreateConfirmInviteAtomic is CreateInviteWithPairingAtomic for a require_confirm invite:
+// it can only be claimed, and only the inviter's confirm grants.
+func (s *Store) CreateConfirmInviteAtomic(ctx context.Context, codeHash, pairingTokenHash, from string, scopes, bags []string, expires time.Time, cap int) (string, error) {
+	return s.createPairingInviteAtomic(ctx, codeHash, pairingTokenHash, from, scopes, bags, expires, cap, true)
+}
+
+func (s *Store) createPairingInviteAtomic(ctx context.Context, codeHash, pairingTokenHash, from string, scopes, bags []string, expires time.Time, cap int, requireConfirm bool) (string, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return "", err
@@ -1156,8 +1217,8 @@ func (s *Store) CreateInviteWithPairingAtomic(ctx context.Context, codeHash, pai
 		return "", err
 	}
 
-	_, err = tx.ExecContext(ctx, `INSERT INTO invites(code_hash,from_peer,scopes,bags,expires_at,pairing_token_hash,public_id) VALUES(?,?,?,?,?,?,?)`,
-		codeHash, from, join(scopes), join(bags), expires.Unix(), pairingTokenHash, publicID)
+	_, err = tx.ExecContext(ctx, `INSERT INTO invites(code_hash,from_peer,scopes,bags,expires_at,pairing_token_hash,public_id,require_confirm) VALUES(?,?,?,?,?,?,?,?)`,
+		codeHash, from, join(scopes), join(bags), expires.Unix(), pairingTokenHash, publicID, requireConfirm)
 	if err != nil {
 		return "", err
 	}
@@ -1522,18 +1583,27 @@ func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string
 		return nil, ErrNotFound
 	}
 
-	up := `INSERT INTO grants(owner,grantee,scopes,bags,created_at) VALUES(?,?,?,?,?)
-	       ON CONFLICT(owner,grantee) DO UPDATE SET scopes=excluded.scopes, bags=excluded.bags, created_at=excluded.created_at`
-	if _, err := tx.ExecContext(ctx, up, from, accepter, scopes, bags, now); err != nil {
+	if err := writeGrantsInTx(ctx, tx, from, accepter, scopes, bags, backScopes, backBags, now); err != nil {
 		return nil, err
-	}
-	if len(backScopes) > 0 {
-		if _, err := tx.ExecContext(ctx, up, accepter, from, join(backScopes), join(backBags), now); err != nil {
-			return nil, err
-		}
 	}
 
 	return &Grant{Owner: from, Grantee: accepter, Scopes: split(scopes), Bags: split(bags)}, nil
+}
+
+// writeGrantsInTx upserts the inviter->accepter grant and, when backScopes is set, the reciprocal one.
+func writeGrantsInTx(ctx context.Context, tx *sql.Tx, from, accepter, scopes, bags string, backScopes, backBags []string, now int64) error {
+	up := `INSERT INTO grants(owner,grantee,scopes,bags,created_at) VALUES(?,?,?,?,?)
+	       ON CONFLICT(owner,grantee) DO UPDATE SET scopes=excluded.scopes, bags=excluded.bags, created_at=excluded.created_at`
+	if _, err := tx.ExecContext(ctx, up, from, accepter, scopes, bags, now); err != nil {
+		return err
+	}
+	if len(backScopes) > 0 {
+		if _, err := tx.ExecContext(ctx, up, accepter, from, join(backScopes), join(backBags), now); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // GetGrant returns what grantee may do on owner's resources. ErrNotFound = deny.
