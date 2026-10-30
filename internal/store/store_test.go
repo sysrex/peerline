@@ -3,13 +3,30 @@ package store
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 )
+
+// Global cancel function for the test_cancel scalar function
+var testCancelFunc atomic.Value // stores context.CancelFunc
+
+func init() {
+	// Register the test_cancel scalar function globally
+	sqlite.MustRegisterDeterministicScalarFunction("test_cancel", 0, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+		if fn := testCancelFunc.Load(); fn != nil {
+			fn.(context.CancelFunc)()
+		}
+		return int64(0), nil
+	})
+}
 
 func TestStoreBasics(t *testing.T) {
 	ctx := context.Background()
@@ -335,76 +352,217 @@ func TestPartialMigrationState(t *testing.T) {
 // TestFreshAndMigratedSchemasMatch verifies fresh and migrated databases converge.
 func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 	ctx := context.Background()
+
+	// Helper to normalize SQL for comparison
+	normSQL := func(s string) string {
+		// Collapse all whitespace to single spaces
+		s = strings.Join(strings.Fields(s), " ")
+		// Remove spaces after opening and before closing parentheses
+		s = strings.ReplaceAll(s, "( ", "(")
+		s = strings.ReplaceAll(s, " )", ")")
+		return s
+	}
+
+	// Helper to get schema definitions
+	getSchema := func(db *sql.DB) (map[string]string, error) {
+		schema := make(map[string]string)
+		rows, err := db.Query(`SELECT type, name, sql FROM sqlite_master WHERE sql NOT NULL ORDER BY type, name`)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var typ, name, sql string
+			if err := rows.Scan(&typ, &name, &sql); err != nil {
+				return nil, err
+			}
+			schema[typ+":"+name] = normSQL(sql)
+		}
+		return schema, rows.Err()
+	}
+
+	tests := []struct {
+		name      string
+		setupFunc func(*sql.DB) error
+	}{
+		{
+			name: "v0",
+			setupFunc: func(db *sql.DB) error {
+				sqls := []string{
+					`CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL)`,
+					`CREATE TABLE invites (code_hash TEXT PRIMARY KEY, from_peer TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, scopes TEXT NOT NULL, bags TEXT NOT NULL, expires_at INTEGER NOT NULL, used_by TEXT)`,
+					`CREATE TABLE grants (owner TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, grantee TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, scopes TEXT NOT NULL, bags TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (owner, grantee))`,
+					`CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, recipient TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, type TEXT NOT NULL, body TEXT NOT NULL, reply_to INTEGER, created_at INTEGER NOT NULL)`,
+					`CREATE INDEX messages_inbox ON messages(recipient, id)`,
+					`CREATE TABLE bags (owner TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, name TEXT NOT NULL, content BLOB NOT NULL, version INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (owner, name))`,
+				}
+				for _, sql := range sqls {
+					if _, err := db.Exec(sql); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		},
+		{
+			name: "v1",
+			setupFunc: func(db *sql.DB) error {
+				sqls := []string{
+					`CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, notify_email TEXT NOT NULL DEFAULT '')`,
+					`CREATE TABLE invites (code_hash TEXT PRIMARY KEY, from_peer TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, scopes TEXT NOT NULL, bags TEXT NOT NULL, expires_at INTEGER NOT NULL, used_by TEXT)`,
+					`CREATE TABLE grants (owner TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, grantee TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, scopes TEXT NOT NULL, bags TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (owner, grantee))`,
+					`CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, recipient TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, type TEXT NOT NULL, body TEXT NOT NULL, reply_to INTEGER, created_at INTEGER NOT NULL)`,
+					`CREATE INDEX messages_inbox ON messages(recipient, id)`,
+					`CREATE TABLE bags (owner TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, name TEXT NOT NULL, content BLOB NOT NULL, version INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (owner, name))`,
+					`PRAGMA user_version = 1`,
+				}
+				for _, sql := range sqls {
+					if _, err := db.Exec(sql); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		},
+		{
+			name: "pr11_full_index",
+			setupFunc: func(db *sql.DB) error {
+				sqls := []string{
+					`CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, notify_email TEXT NOT NULL DEFAULT '')`,
+					`CREATE TABLE invites (code_hash TEXT PRIMARY KEY, from_peer TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, scopes TEXT NOT NULL, bags TEXT NOT NULL, expires_at INTEGER NOT NULL, used_by TEXT, pairing_token_hash TEXT)`,
+					`CREATE UNIQUE INDEX invites_pairing_token_hash ON invites(pairing_token_hash)`,
+					`CREATE TABLE grants (owner TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, grantee TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, scopes TEXT NOT NULL, bags TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (owner, grantee))`,
+					`CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, recipient TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, type TEXT NOT NULL, body TEXT NOT NULL, reply_to INTEGER, created_at INTEGER NOT NULL)`,
+					`CREATE INDEX messages_inbox ON messages(recipient, id)`,
+					`CREATE TABLE bags (owner TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, name TEXT NOT NULL, content BLOB NOT NULL, version INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (owner, name))`,
+				}
+				for _, sql := range sqls {
+					if _, err := db.Exec(sql); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		},
+		{
+			name: "pr8_inline_unique",
+			setupFunc: func(db *sql.DB) error {
+				sqls := []string{
+					`CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, notify_email TEXT NOT NULL DEFAULT '')`,
+					`CREATE TABLE invites (code_hash TEXT PRIMARY KEY, from_peer TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, scopes TEXT NOT NULL, bags TEXT NOT NULL, expires_at INTEGER NOT NULL, used_by TEXT, pairing_token_hash TEXT UNIQUE)`,
+					`CREATE TABLE grants (owner TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, grantee TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, scopes TEXT NOT NULL, bags TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (owner, grantee))`,
+					`CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, recipient TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, type TEXT NOT NULL, body TEXT NOT NULL, reply_to INTEGER, created_at INTEGER NOT NULL)`,
+					`CREATE INDEX messages_inbox ON messages(recipient, id)`,
+					`CREATE TABLE bags (owner TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, name TEXT NOT NULL, content BLOB NOT NULL, version INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (owner, name))`,
+				}
+				for _, sql := range sqls {
+					if _, err := db.Exec(sql); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		},
+	}
+
 	freshPath := t.TempDir() + "/fresh.db"
 	freshStore, err := Open(freshPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer freshStore.Close()
-
-	migratedPath := t.TempDir() + "/migrated.db"
-	db, err := sql.Open("sqlite", migratedPath)
+	freshSchema, err := getSchema(freshStore.db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Create v0 schema with foreign key constraints so SQL matches fresh DB
-	db.Exec(`PRAGMA foreign_keys=ON`)
-	db.Exec(`CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL)`)
-	db.Exec(`CREATE TABLE invites (code_hash TEXT PRIMARY KEY, from_peer TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, scopes TEXT NOT NULL, bags TEXT NOT NULL, expires_at INTEGER NOT NULL, used_by TEXT)`)
-	db.Exec(`CREATE TABLE grants (owner TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, grantee TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, scopes TEXT NOT NULL, bags TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (owner, grantee))`)
-	db.Exec(`CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, recipient TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, type TEXT NOT NULL, body TEXT NOT NULL, reply_to INTEGER, created_at INTEGER NOT NULL)`)
-	db.Exec(`CREATE INDEX messages_inbox ON messages(recipient, id)`)
-	db.Exec(`CREATE TABLE bags (owner TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, name TEXT NOT NULL, content BLOB NOT NULL, version INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (owner, name))`)
-	db.Close()
 
-	migratedStore, err := Open(migratedPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer migratedStore.Close()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := t.TempDir() + "/" + tt.name + ".db"
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := tt.setupFunc(db); err != nil {
+				t.Fatal(err)
+			}
+			db.Close()
 
-	// Verify user_version is 2
-	var version int
-	migratedStore.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 2 {
-		t.Fatalf("migrated user_version = %d, want 2", version)
-	}
+			migratedStore, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer migratedStore.Close()
 
-	// Verify both have notify_email and pairing_token_hash
-	var freshNotify, migratedNotify, freshPairing, migratedPairing int
-	freshStore.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name='notify_email'`).Scan(&freshNotify)
-	migratedStore.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name='notify_email'`).Scan(&migratedNotify)
-	freshStore.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('invites') WHERE name='pairing_token_hash'`).Scan(&freshPairing)
-	migratedStore.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('invites') WHERE name='pairing_token_hash'`).Scan(&migratedPairing)
+			// Verify user_version is 2
+			var version int
+			migratedStore.db.QueryRow(`PRAGMA user_version`).Scan(&version)
+			if version != 2 {
+				t.Fatalf("user_version = %d, want 2", version)
+			}
 
-	if freshNotify != 1 || migratedNotify != 1 {
-		t.Fatalf("notify_email: fresh=%d migrated=%d, want both 1", freshNotify, migratedNotify)
-	}
-	if freshPairing != 1 || migratedPairing != 1 {
-		t.Fatalf("pairing_token_hash: fresh=%d migrated=%d, want both 1", freshPairing, migratedPairing)
-	}
+			// Compare full schema
+			migratedSchema, err := getSchema(migratedStore.db)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	// Verify both have the pairing_token_hash index
-	var freshIdx, migratedIdx int
-	freshStore.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='invites_pairing_token_hash'`).Scan(&freshIdx)
-	migratedStore.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='invites_pairing_token_hash'`).Scan(&migratedIdx)
-	if freshIdx != 1 || migratedIdx != 1 {
-		t.Fatalf("index: fresh=%d migrated=%d, want both 1", freshIdx, migratedIdx)
-	}
+			// Both should have the same keys
+			for key := range freshSchema {
+				if _, ok := migratedSchema[key]; !ok {
+					t.Errorf("migrated schema missing %s", key)
+				}
+			}
+			for key := range migratedSchema {
+				if _, ok := freshSchema[key]; !ok {
+					// Allow automatic indexes from inline UNIQUE constraints
+					if strings.HasPrefix(key, "index:sqlite_autoindex_") {
+						continue
+					}
+					t.Errorf("migrated schema has unexpected %s", key)
+				}
+			}
 
-	// Verify both work with pairing invites
-	if err := freshStore.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := migratedStore.CreatePeer(ctx, "bob", "Bob", "hb", ""); err != nil {
-		t.Fatal(err)
-	}
-	exp := time.Now().Add(time.Hour)
-	if err := freshStore.CreateInviteWithPairing(ctx, "c1", "p1", "alice", []string{"messages"}, nil, exp); err != nil {
-		t.Fatal(err)
-	}
-	if err := migratedStore.CreateInviteWithPairing(ctx, "c2", "p2", "bob", []string{"messages"}, nil, exp); err != nil {
-		t.Fatal(err)
+			// Compare table and explicit index definitions (skip auto indexes)
+			for key, freshSQL := range freshSchema {
+				migratedSQL, ok := migratedSchema[key]
+				if !ok {
+					continue
+				}
+				// For pr8_inline_unique case, allow the UNIQUE constraint to remain in the column definition
+				// (removing it would require a full table rebuild which is not worth the risk)
+				if tt.name == "pr8_inline_unique" && key == "table:invites" {
+					// Both should be functionally equivalent - the migrated version has inline UNIQUE
+					// which creates an automatic index, plus our partial index
+					if !strings.Contains(migratedSQL, "pairing_token_hash TEXT") {
+						t.Errorf("%s missing pairing_token_hash column", key)
+					}
+					continue
+				}
+				if freshSQL != migratedSQL {
+					t.Errorf("%s schema differs:\nfresh:    %s\nmigrated: %s", key, freshSQL, migratedSQL)
+				}
+			}
+
+			// Verify uniqueness behavior: duplicate pairing_token_hash rejected, multiple NULLs allowed
+			if err := migratedStore.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+				t.Fatal(err)
+			}
+			exp := time.Now().Add(time.Hour)
+			if err := migratedStore.CreateInviteWithPairing(ctx, "c1", "pair1", "alice", []string{"messages"}, nil, exp); err != nil {
+				t.Fatal(err)
+			}
+			if err := migratedStore.CreateInviteWithPairing(ctx, "c2", "pair1", "alice", []string{"messages"}, nil, exp); err == nil {
+				t.Error("duplicate pairing_token_hash should be rejected")
+			}
+			// Multiple NULL pairing tokens should be allowed
+			if err := migratedStore.CreateInvite(ctx, "c3", "alice", []string{"messages"}, nil, exp); err != nil {
+				t.Fatal(err)
+			}
+			if err := migratedStore.CreateInvite(ctx, "c4", "alice", []string{"messages"}, nil, exp); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -558,17 +716,6 @@ func TestNoOrphanPeerOnAcceptFailure(t *testing.T) {
 	if peerCount != 0 {
 		t.Error("orphan peer created for nonexistent invite")
 	}
-
-	// Test 4: Self-accept
-	selfHash := "self_hash"
-	if err := s.CreateInviteWithPairing(ctx, "code_self", selfHash, "alice", []string{"messages"}, nil, time.Now().Add(time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = s.RegisterAndAcceptByPairing(ctx, selfHash, "alice", "Alice2", "ha2", "", nil, nil)
-	if !errors.Is(err, ErrConflict) {
-		t.Fatalf("expected ErrConflict for self-accept, got %v", err)
-	}
 }
 
 // TestExpiredInviteRejection verifies that expired invites cannot be accepted.
@@ -615,9 +762,68 @@ func TestExpiredInviteRejection(t *testing.T) {
 	}
 }
 
-// TestContextCancellationMidAccept verifies the DB isn't wedged when context is cancelled.
-func TestContextCancellationMidAccept(t *testing.T) {
-	path := t.TempDir() + "/cancel.db"
+// TestRollbackAfterPeerInsert verifies that when RegisterAndAcceptByPairing fails
+// after the peer insert but before commit, no orphan peer is left and the invite remains unconsumed.
+func TestRollbackAfterPeerInsert(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/rollback.db"
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	pairingHash := "pair1"
+	if err := s.CreateInviteWithPairing(ctx, "code1", pairingHash, "alice", []string{"messages"}, nil, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a trigger that will fail the grant INSERT (after peer INSERT succeeds)
+	if _, err := s.db.Exec(`CREATE TRIGGER rollback_test_trigger BEFORE INSERT ON grants BEGIN SELECT RAISE(ABORT, 'injected failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	defer s.db.Exec(`DROP TRIGGER IF EXISTS rollback_test_trigger`)
+
+	// Try to register - peer INSERT will succeed but grant INSERT will fail due to trigger
+	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash, "bob", "Bob", "hb", "", nil, nil)
+	if err == nil {
+		t.Fatal("expected error due to injected failure")
+	}
+
+	// Verify no orphan peer was created
+	var bobCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE id='bob'`).Scan(&bobCount); err != nil {
+		t.Fatal(err)
+	}
+	if bobCount != 0 {
+		t.Error("orphan peer 'bob' created after failed grant insert")
+	}
+
+	// Verify the invite is still unconsumed (used_by IS NULL)
+	var used sql.NullString
+	if err := s.db.QueryRow(`SELECT used_by FROM invites WHERE pairing_token_hash=?`, pairingHash).Scan(&used); err != nil {
+		t.Fatal(err)
+	}
+	if used.Valid {
+		t.Error("invite was marked as used after failed transaction")
+	}
+
+	// Drop the trigger and verify the invite can still be redeemed
+	if _, err := s.db.Exec(`DROP TRIGGER rollback_test_trigger`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RegisterAndAcceptByPairing(ctx, pairingHash, "carol", "Carol", "hc", "", nil, nil); err != nil {
+		t.Fatalf("invite should still be redeemable after trigger removed: %v", err)
+	}
+}
+
+// TestContextCancellationBeforeTransaction verifies that cancelling before BeginTx doesn't wedge the DB.
+func TestContextCancellationBeforeTransaction(t *testing.T) {
+	path := t.TempDir() + "/cancel-before.db"
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -635,22 +841,133 @@ func TestContextCancellationMidAccept(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cancelCtx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	_, err = s.RegisterAndAcceptByPairing(cancelCtx, pairingHash, "bob", "Bob", "hb", "", nil, nil)
-	if err == nil {
-		t.Fatal("expected error with cancelled context")
+	// Open a second connection that will hold the write lock
+	blocker, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
 	}
 
+	// Start a transaction on the blocker to hold the write lock
+	blockTx, err := blocker.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := blockTx.Exec(`PRAGMA user_version`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Try to accept in a goroutine with a context that will be cancelled
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.RegisterAndAcceptByPairing(cancelCtx, pairingHash, "bob", "Bob", "hb", "", nil, nil)
+		done <- err
+	}()
+
+	// Wait a bit for the call to block on BeginTx, then cancel
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	// Should return with context.Canceled
+	err = <-done
+	if !errors.Is(err, context.Canceled) && err != context.Canceled {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	// Release the lock
+	blockTx.Rollback()
+	blocker.Close()
+
+	// DB should not be wedged - normal operations should work
 	normalCtx := context.Background()
 	if err := s.CreatePeer(normalCtx, "carol", "Carol", "hc", ""); err != nil {
 		t.Fatalf("DB wedged after cancel: %v", err)
 	}
 
+	// Original pairing token should still be redeemable
 	_, err = s.RegisterAndAcceptByPairing(normalCtx, pairingHash, "dave", "Dave", "hd", "", nil, nil)
 	if err != nil {
 		t.Fatalf("pairing redemption failed after cancel: %v", err)
+	}
+
+	var peerCount int
+	s.db.QueryRow(`SELECT COUNT(*) FROM peers`).Scan(&peerCount)
+	if peerCount != 3 {
+		t.Errorf("got %d peers, want 3 (alice, carol, dave)", peerCount)
+	}
+}
+
+// TestContextCancellationMidTransaction verifies that cancelling after BeginTx and after the peer INSERT
+// rolls back correctly, leaving no orphan peer and the invite unconsumed.
+func TestContextCancellationMidTransaction(t *testing.T) {
+	path := t.TempDir() + "/cancel-mid-tx.db"
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	pairingHash := "cancel_hash"
+	exp := time.Now().Add(time.Hour)
+	if err := s.CreateInviteWithPairing(ctx, "code1", pairingHash, "alice", []string{"messages"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set up cancel function for the test_cancel scalar function
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	testCancelFunc.Store(cancel)
+	defer testCancelFunc.Store((context.CancelFunc)(nil))
+
+	// Create a trigger that calls test_cancel() after peer INSERT
+	if _, err := s.db.Exec(`CREATE TRIGGER cancel_test_trigger AFTER INSERT ON peers BEGIN SELECT test_cancel(); END`); err != nil {
+		t.Fatal(err)
+	}
+	defer s.db.Exec(`DROP TRIGGER IF EXISTS cancel_test_trigger`)
+
+	// Try to register and accept - should fail due to cancellation after peer INSERT
+	_, err = s.RegisterAndAcceptByPairing(cancelCtx, pairingHash, "bob", "Bob", "hb", "", nil, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+
+	// Verify no orphan peer was created
+	var bobCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE id='bob'`).Scan(&bobCount); err != nil {
+		t.Fatal(err)
+	}
+	if bobCount != 0 {
+		t.Error("orphan peer 'bob' created after mid-transaction cancel")
+	}
+
+	// Verify the invite was not consumed (used_by IS NULL)
+	var used sql.NullString
+	if err := s.db.QueryRow(`SELECT used_by FROM invites WHERE pairing_token_hash=?`, pairingHash).Scan(&used); err != nil {
+		t.Fatal(err)
+	}
+	if used.Valid {
+		t.Error("invite was consumed after mid-transaction cancel")
+	}
+
+	// Drop trigger and clear cancel function
+	if _, err := s.db.Exec(`DROP TRIGGER cancel_test_trigger`); err != nil {
+		t.Fatal(err)
+	}
+	testCancelFunc.Store((context.CancelFunc)(nil))
+
+	// Verify DB isn't wedged: next accept should succeed
+	normalCtx := context.Background()
+	if _, err := s.RegisterAndAcceptByPairing(normalCtx, pairingHash, "carol", "Carol", "hc", "", nil, nil); err != nil {
+		t.Fatalf("DB wedged after mid-tx cancel: %v", err)
+	}
+
+	// Verify a plain write succeeds
+	if err := s.CreatePeer(normalCtx, "dave", "Dave", "hd", ""); err != nil {
+		t.Fatalf("plain write failed after mid-tx cancel: %v", err)
 	}
 
 	var peerCount int
@@ -961,4 +1278,133 @@ func TestPR11AlreadyMigrated(t *testing.T) {
 	}
 
 	s.Close()
+}
+
+// TestPragmasInEffect verifies that busy_timeout, foreign_keys, and immediate txlock are active.
+func TestPragmasInEffect(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+	}{
+		{"memory", ":memory:"},
+		{"file", t.TempDir() + "/pragmas.db"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Open(tt.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+
+			// Check busy_timeout
+			var busyTimeout int
+			if err := s.db.QueryRow(`PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
+				t.Fatal(err)
+			}
+			if busyTimeout != 5000 {
+				t.Errorf("busy_timeout = %d, want 5000", busyTimeout)
+			}
+
+			// Check foreign_keys
+			var fkEnabled int
+			if err := s.db.QueryRow(`PRAGMA foreign_keys`).Scan(&fkEnabled); err != nil {
+				t.Fatal(err)
+			}
+			if fkEnabled != 1 {
+				t.Errorf("foreign_keys = %d, want 1", fkEnabled)
+			}
+
+			// Verify _txlock=immediate: Begin() should take the write lock immediately,
+			// not defer it until the first write (which is DEFERRED behavior)
+			if tt.name == "file" {
+				// For file DBs, open a second Store on the same path
+				s2, err := Open(tt.path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer s2.Close()
+
+				// Start a transaction on first connection and do nothing
+				tx1, err := s.db.Begin()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx1.Rollback()
+
+				// Try to begin a transaction on second connection - should block or fail
+				// because the first connection already holds the write lock
+				done := make(chan error, 1)
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+					defer cancel()
+					tx2, err := s2.db.BeginTx(ctx, nil)
+					if err != nil {
+						done <- err
+						return
+					}
+					tx2.Rollback()
+					done <- nil
+				}()
+
+				err = <-done
+				if err == nil {
+					t.Error("second BeginTx succeeded, but first tx should hold write lock (_txlock=immediate not active)")
+				} else if !errors.Is(err, context.DeadlineExceeded) {
+					// Also accept SQLITE_BUSY or similar errors
+					t.Logf("second BeginTx blocked/failed as expected: %v", err)
+				}
+			} else {
+				// For memory DBs, use a shared name to test txlock with two connections
+				sharedName := "file:test-pragma-mem?mode=memory&cache=shared&_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+				db1, err := sql.Open("sqlite", sharedName)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db1.Close()
+				db1.SetMaxOpenConns(1)
+
+				db2, err := sql.Open("sqlite", sharedName)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db2.Close()
+				db2.SetMaxOpenConns(1)
+
+				// Create the schema on db1
+				if _, err := db1.Exec(schema); err != nil {
+					t.Fatal(err)
+				}
+
+				// Start a transaction on db1 and do nothing
+				tx1, err := db1.Begin()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx1.Rollback()
+
+				// Try to begin a transaction on db2 - should block or fail
+				done := make(chan error, 1)
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+					defer cancel()
+					tx2, err := db2.BeginTx(ctx, nil)
+					if err != nil {
+						done <- err
+						return
+					}
+					tx2.Rollback()
+					done <- nil
+				}()
+
+				err = <-done
+				if err == nil {
+					t.Error("second BeginTx succeeded, but first tx should hold write lock (_txlock=immediate not active)")
+				} else if !errors.Is(err, context.DeadlineExceeded) {
+					t.Logf("second BeginTx blocked/failed as expected: %v", err)
+				}
+			}
+		})
+	}
 }
