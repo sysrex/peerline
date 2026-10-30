@@ -511,7 +511,10 @@ func TestRateLimitGetRightmostKeying(t *testing.T) {
 	invReq, _ := http.NewRequest("POST", httpSrv.URL+"/v1/invites", strings.NewReader(`{"scopes":["messages"],"generate_pairing":true}`))
 	invReq.Header.Set("Authorization", "Bearer "+regBody.APIKey)
 	invReq.Header.Set("Content-Type", "application/json")
-	invResp, _ := http.DefaultClient.Do(invReq)
+	invResp, err := http.DefaultClient.Do(invReq)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer invResp.Body.Close()
 	var invBody struct {
 		PairingURL string `json:"pairing_url"`
