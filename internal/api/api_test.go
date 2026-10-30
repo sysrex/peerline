@@ -1324,3 +1324,175 @@ func TestMaintenanceManagerStops(t *testing.T) {
 	// Calling Stop again should not panic
 	mgr.Stop()
 }
+
+// TestRevokePreventsPairing verifies DELETE by public_id causes pairing to fail (#59 partial)
+func TestRevokePreventsPairing(t *testing.T) {
+	cfg := Config{}
+	srv := newServer(t, cfg)
+	alice := register(t, srv, "Alice")
+
+	// Create a pairing invite
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"generate_pairing": true,
+		"scopes":           []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create invite: %d %s", resp.StatusCode, b)
+	}
+	var invResp struct {
+		PublicID   string `json:"public_id"`
+		PairingURL string `json:"pairing_url"`
+	}
+	json.Unmarshal(b, &invResp)
+
+	// Delete the invite by public_id
+	resp, b = alice.do("DELETE", "/v1/invites/"+invResp.PublicID, nil, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete invite: %d %s", resp.StatusCode, b)
+	}
+
+	// Extract pairing token from URL
+	parts := strings.Split(invResp.PairingURL, "/v1/pairing/")
+	pairingToken := parts[len(parts)-1]
+
+	// Attempt pairing (should fail with 404)
+	c := &client{t: t, srv: srv}
+	resp, b = c.do("POST", "/v1/pairing/"+pairingToken, map[string]string{
+		"name": "Bob",
+	}, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("pairing after revoke: status %d, want 404, body %s", resp.StatusCode, b)
+	}
+}
+
+// TestInviteCapBeforeEmailBudget verifies cap check doesn't consume email quota (#53)
+func TestInviteCapBeforeEmailBudget(t *testing.T) {
+	cfg := Config{}
+	cfg.MaxOutstandingInvites = 1
+	srv := newServer(t, cfg)
+	alice := register(t, srv, "Alice")
+
+	// Create first invite (should succeed)
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "bob@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
+	}
+
+	// Attempt second invite (should fail at cap check before email limiter)
+	resp, b = alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "charlie@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("capped invite: status %d, want 429, body %s", resp.StatusCode, b)
+	}
+	if !bytes.Contains(b, []byte("too many outstanding invites")) {
+		t.Errorf("capped error: %s, want cap message", b)
+	}
+}
+
+// TestSingleLogLineUnauthenticatedPairing verifies exactly one log line (#54)
+func TestSingleLogLineUnauthenticatedPairing(t *testing.T) {
+	// Capture log output
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	cfg := Config{}
+	cfg.Logger = logger
+	srv := httptest.NewServer(New(st, cfg).Handler())
+	defer srv.Close()
+
+	alice := register(t, srv, "Alice")
+
+	// Create a pairing invite
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"generate_pairing": true,
+		"scopes":           []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create: %d %s", resp.StatusCode, b)
+	}
+	var invResp struct {
+		PairingURL string `json:"pairing_url"`
+	}
+	json.Unmarshal(b, &invResp)
+
+	parts := strings.Split(invResp.PairingURL, "/v1/pairing/")
+	pairingToken := parts[len(parts)-1]
+
+	// Clear buffer
+	buf.Reset()
+
+	// Redeem pairing link (unauthenticated)
+	c := &client{t: t, srv: srv}
+	resp, b = c.do("POST", "/v1/pairing/"+pairingToken, map[string]string{
+		"name": "Bob",
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("pairing: %d %s", resp.StatusCode, b)
+	}
+
+	// Check log output
+	logs := buf.String()
+	count := strings.Count(logs, "\"msg\":\"peer registered and paired\"")
+	if count != 1 {
+		t.Errorf("log lines with 'peer registered and paired': %d, want 1\nLogs:\n%s", count, logs)
+	}
+
+	// Verify no pairing token in logs
+	if strings.Contains(logs, pairingToken) {
+		t.Errorf("pairing token found in logs")
+	}
+}
+
+// TestSanitizerUnicode verifies Unicode handling in sanitizeInviterName
+func TestSanitizerUnicode(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"ASCII", "Alice Smith", "Alice Smith"},
+		{"Unicode letters", "José García", "José García"},
+		{"Chinese", "李明", "李明"},
+		{"Japanese", "田中太郎", "田中太郎"},
+		{"Arabic", "محمد علي", "محمد علي"},
+		{"Bidi LRE", "Alice\u202AEvil", "AliceEvil"},
+		{"Bidi RLE", "Alice\u202BEvil", "AliceEvil"},
+		{"Bidi PDF", "Alice\u202CEvil", "AliceEvil"},
+		{"Bidi LRO", "Alice\u202DEvil", "AliceEvil"},
+		{"Bidi RLO", "Alice\u202EEvil", "AliceEvil"},
+		{"Bidi LRI", "Alice\u2066Evil", "AliceEvil"},
+		{"Bidi RLI", "Alice\u2067Evil", "AliceEvil"},
+		{"Bidi FSI", "Alice\u2068Evil", "AliceEvil"},
+		{"Bidi PDI", "Alice\u2069Evil", "AliceEvil"},
+		{"Bidi LRM", "Alice\u200EEvil", "AliceEvil"},
+		{"Bidi RLM", "Alice\u200FEvil", "AliceEvil"},
+		{"Tag space", "Alice\U000E0020Evil", "AliceEvil"},
+		{"Tag char", "Alice\U000E0041Evil", "AliceEvil"},
+		{"Zero-width space", "Alice\u200BEvil", "AliceEvil"},
+		{"Zero-width non-joiner", "Alice\u200CEvil", "AliceEvil"},
+		{"Zero-width joiner", "Alice\u200DEvil", "AliceEvil"},
+		{"BOM", "Alice\uFEFFEvil", "AliceEvil"},
+		{"Mixed valid", "Alice-O'Neil, Jr.", "Alice-O'Neil, Jr."},
+		{"Emoji removed", "Alice 😀 Smith", "Alice  Smith"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeInviterName(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeInviterName(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
