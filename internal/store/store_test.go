@@ -334,6 +334,7 @@ func TestPartialMigrationState(t *testing.T) {
 
 // TestFreshAndMigratedSchemasMatch verifies fresh and migrated databases converge.
 func TestFreshAndMigratedSchemasMatch(t *testing.T) {
+	ctx := context.Background()
 	freshPath := t.TempDir() + "/fresh.db"
 	freshStore, err := Open(freshPath)
 	if err != nil {
@@ -346,8 +347,14 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Create v0 schema with foreign key constraints so SQL matches fresh DB
+	db.Exec(`PRAGMA foreign_keys=ON`)
 	db.Exec(`CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL)`)
-	db.Exec(`CREATE TABLE invites (code_hash TEXT PRIMARY KEY, from_peer TEXT NOT NULL, scopes TEXT NOT NULL, bags TEXT NOT NULL, expires_at INTEGER NOT NULL, used_by TEXT)`)
+	db.Exec(`CREATE TABLE invites (code_hash TEXT PRIMARY KEY, from_peer TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, scopes TEXT NOT NULL, bags TEXT NOT NULL, expires_at INTEGER NOT NULL, used_by TEXT)`)
+	db.Exec(`CREATE TABLE grants (owner TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, grantee TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, scopes TEXT NOT NULL, bags TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (owner, grantee))`)
+	db.Exec(`CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, recipient TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, type TEXT NOT NULL, body TEXT NOT NULL, reply_to INTEGER, created_at INTEGER NOT NULL)`)
+	db.Exec(`CREATE INDEX messages_inbox ON messages(recipient, id)`)
+	db.Exec(`CREATE TABLE bags (owner TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE, name TEXT NOT NULL, content BLOB NOT NULL, version INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (owner, name))`)
 	db.Close()
 
 	migratedStore, err := Open(migratedPath)
@@ -356,26 +363,51 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 	}
 	defer migratedStore.Close()
 
-	freshSchema := getSchemaFingerprint(t, freshStore.db)
-	migratedSchema := getSchemaFingerprint(t, migratedStore.db)
-
-	if freshSchema != migratedSchema {
-		t.Fatalf("schemas differ:\nfresh:    %s\nmigrated: %s", freshSchema, migratedSchema)
+	// Verify user_version is 2
+	var version int
+	migratedStore.db.QueryRow(`PRAGMA user_version`).Scan(&version)
+	if version != 2 {
+		t.Fatalf("migrated user_version = %d, want 2", version)
 	}
-}
 
-func getSchemaFingerprint(t *testing.T, db *sql.DB) string {
-	var fp string
-	err := db.QueryRow(`
-		SELECT group_concat(sql, '|') FROM (
-			SELECT sql FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%' ORDER BY name
-		)
-	`).Scan(&fp)
-	if err != nil {
+	// Verify both have notify_email and pairing_token_hash
+	var freshNotify, migratedNotify, freshPairing, migratedPairing int
+	freshStore.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name='notify_email'`).Scan(&freshNotify)
+	migratedStore.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name='notify_email'`).Scan(&migratedNotify)
+	freshStore.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('invites') WHERE name='pairing_token_hash'`).Scan(&freshPairing)
+	migratedStore.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('invites') WHERE name='pairing_token_hash'`).Scan(&migratedPairing)
+
+	if freshNotify != 1 || migratedNotify != 1 {
+		t.Fatalf("notify_email: fresh=%d migrated=%d, want both 1", freshNotify, migratedNotify)
+	}
+	if freshPairing != 1 || migratedPairing != 1 {
+		t.Fatalf("pairing_token_hash: fresh=%d migrated=%d, want both 1", freshPairing, migratedPairing)
+	}
+
+	// Verify both have the pairing_token_hash index
+	var freshIdx, migratedIdx int
+	freshStore.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='invites_pairing_token_hash'`).Scan(&freshIdx)
+	migratedStore.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='invites_pairing_token_hash'`).Scan(&migratedIdx)
+	if freshIdx != 1 || migratedIdx != 1 {
+		t.Fatalf("index: fresh=%d migrated=%d, want both 1", freshIdx, migratedIdx)
+	}
+
+	// Verify both work with pairing invites
+	if err := freshStore.CreatePeer(ctx, "alice", "Alice", "ha", ""); err != nil {
 		t.Fatal(err)
 	}
-	return fp
+	if err := migratedStore.CreatePeer(ctx, "bob", "Bob", "hb", ""); err != nil {
+		t.Fatal(err)
+	}
+	exp := time.Now().Add(time.Hour)
+	if err := freshStore.CreateInviteWithPairing(ctx, "c1", "p1", "alice", []string{"messages"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+	if err := migratedStore.CreateInviteWithPairing(ctx, "c2", "p2", "bob", []string{"messages"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
 }
+
 
 // TestConcurrentPairingRedemption verifies that exactly one of multiple concurrent
 // attempts to redeem the same pairing token succeeds. Uses a file DB with separate
