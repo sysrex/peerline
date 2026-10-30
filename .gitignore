@@ -3,3 +3,8 @@
 *.db-shm
 *.db-wal
 *.db.pre-v*
+
+# Local MCP adapter state and operator configuration
+/peerline-mcp
+/mcp-state/
+/mcp-config.json
