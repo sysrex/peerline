@@ -36,7 +36,7 @@ What it **DOES** contain:
 - Single-use (consumed on first successful accept)
 - Expires after 1h by default (max 7d; `ttl_seconds` above 604800 returns 400). Pairing links cannot use `to_email`, so the 24h default for emailed invite codes does not apply.
 - Cannot be reused after acceptance
-- Unused invites are removed by the hourly maintenance sweep after expiry; used invites are kept for the retention window after expiry
+- Unused invites are removed by the hourly maintenance sweep once `expires_at < now - 300` (fixed 5-minute grace; they are rejected from `expires_at` regardless); used invites are kept for the retention window after expiry
 
 ### 3. What GET /v1/pairing/{token} Exposes
 

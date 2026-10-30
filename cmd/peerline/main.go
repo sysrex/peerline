@@ -52,9 +52,15 @@ func main() {
 	if tp != "" {
 		trustedProxies = strings.Split(tp, ",")
 		// Validate at startup
-		if _, err := api.ParseTrustedProxies(trustedProxies); err != nil {
+		nets, err := api.ParseTrustedProxies(trustedProxies)
+		if err != nil {
 			log.Error("invalid PEERLINE_TRUSTED_PROXIES CIDR", "err", err)
 			os.Exit(1)
+		}
+		if len(nets) == 0 {
+			log.Warn("PEERLINE_TRUSTED_PROXIES set but contains no entries: X-Forwarded-For headers are ignored")
+		} else {
+			log.Info("trusted proxies", "count", len(nets), "cidrs", nets)
 		}
 	}
 
@@ -68,10 +74,16 @@ func main() {
 	publicURL := strings.TrimRight(os.Getenv("PEERLINE_PUBLIC_URL"), "/")
 	if ml.Mode() == "log" {
 		log.Warn("PEERLINE_SMTP_HOST unset: transactional emails (invites and message notifications) are logged, not sent (dev mode)")
-	} else if publicURL == "" {
+	} else if smtpCfg, ok := ml.(*mailer.SMTP); ok && smtpCfg.AllowPlaintext {
+		log.Warn("PEERLINE_SMTP_ALLOW_PLAINTEXT=1: mail may be sent without TLS; use only for a local dev relay")
+	}
+	if ml.Mode() != "log" && publicURL == "" {
 		// Emailed links must not be built from a client-supplied Host header.
 		log.Error("PEERLINE_PUBLIC_URL is required when SMTP is configured (used in emailed accept links)")
 		os.Exit(1)
+	}
+	if publicURL == "" {
+		log.Warn("PEERLINE_PUBLIC_URL unset: pairing links and base_url fall back to the request Host header; set it so clients never send keys to a forged origin")
 	}
 	emailPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_EMAIL_PER_HOUR"))
 	notifyPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_NOTIFY_PER_HOUR"))
@@ -93,6 +105,7 @@ func main() {
 
 	apiServer, err := api.New(st, api.Config{
 		RegisterToken:         regTok,
+		CodePepper:            []byte(os.Getenv("PEERLINE_CODE_PEPPER")),
 		Logger:                log,
 		Mailer:                ml,
 		PublicURL:             publicURL,

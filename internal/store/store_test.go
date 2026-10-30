@@ -7,6 +7,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -211,8 +212,8 @@ func TestV0SchemaMigration(t *testing.T) {
 
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 4 {
-		t.Fatalf("user_version = %d, want 4", version)
+	if version != 5 {
+		t.Fatalf("user_version = %d, want 5", version)
 	}
 
 	email, err := s.NotifyEmail(ctx, "alice")
@@ -279,8 +280,8 @@ func TestV1SchemaMigration(t *testing.T) {
 
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 4 {
-		t.Fatalf("user_version = %d, want 4", version)
+	if version != 5 {
+		t.Fatalf("user_version = %d, want 5", version)
 	}
 
 	email, err := s.NotifyEmail(ctx, "alice")
@@ -498,8 +499,8 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 			// Verify user_version is 2
 			var version int
 			migratedStore.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-			if version != 4 {
-				t.Fatalf("user_version = %d, want 4", version)
+			if version != 5 {
+				t.Fatalf("user_version = %d, want 5", version)
 			}
 
 			// Compare full schema
@@ -540,7 +541,8 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 					}
 					continue
 				}
-				if freshSQL != migratedSQL {
+				// ALTER TABLE ADD COLUMN on the multi-line schema leaves a space before the comma.
+				if strings.ReplaceAll(freshSQL, " ,", ",") != migratedSQL {
 					t.Errorf("%s schema differs:\nfresh:    %s\nmigrated: %s", key, freshSQL, migratedSQL)
 				}
 			}
@@ -791,8 +793,8 @@ func TestRollbackAfterPeerInsert(t *testing.T) {
 
 	// Try to register - peer INSERT will succeed but grant INSERT will fail due to trigger
 	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash, "bob", "Bob", "hb", "", "", nil, nil)
-	if err == nil {
-		t.Fatal("expected error due to injected failure")
+	if err == nil || !strings.Contains(err.Error(), "injected failure") {
+		t.Fatalf("expected the injected grant-insert failure, got %v", err)
 	}
 
 	// Verify no orphan peer was created
@@ -1200,8 +1202,8 @@ func TestPR11AlreadyMigrated(t *testing.T) {
 
 	// Verify user_version advanced to 2
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 4 {
-		t.Fatalf("user_version = %d, want 4", version)
+	if version != 5 {
+		t.Fatalf("user_version = %d, want 5", version)
 	}
 
 	// Verify columns still exist
@@ -1249,8 +1251,8 @@ func TestPR11AlreadyMigrated(t *testing.T) {
 
 	// Verify user_version unchanged
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 4 {
-		t.Fatalf("user_version after second migrate = %d, want 4", version)
+	if version != 5 {
+		t.Fatalf("user_version after second migrate = %d, want 5", version)
 	}
 
 	// Verify columns still present
@@ -1352,9 +1354,8 @@ func TestPragmasInEffect(t *testing.T) {
 				err = <-done
 				if err == nil {
 					t.Error("second BeginTx succeeded, but first tx should hold write lock (_txlock=immediate not active)")
-				} else if !errors.Is(err, context.DeadlineExceeded) {
-					// Also accept SQLITE_BUSY or similar errors
-					t.Logf("second BeginTx blocked/failed as expected: %v", err)
+				} else if !isLockContention(err) {
+					t.Errorf("second BeginTx failed for an unrelated reason: %v", err)
 				}
 			} else {
 				// For memory DBs, use a shared name to test txlock with two connections
@@ -1402,8 +1403,8 @@ func TestPragmasInEffect(t *testing.T) {
 				err = <-done
 				if err == nil {
 					t.Error("second BeginTx succeeded, but first tx should hold write lock (_txlock=immediate not active)")
-				} else if !errors.Is(err, context.DeadlineExceeded) {
-					t.Logf("second BeginTx blocked/failed as expected: %v", err)
+				} else if !isLockContention(err) {
+					t.Errorf("second BeginTx failed for an unrelated reason: %v", err)
 				}
 			}
 		})
@@ -1515,8 +1516,8 @@ func TestV2ToV3Migration(t *testing.T) {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
-		t.Errorf("user_version = %d, want 4", version)
+	if version != 5 {
+		t.Errorf("user_version = %d, want 5", version)
 	}
 
 	// Verify all rows have public_id
@@ -1600,8 +1601,8 @@ func TestV3MigrationIdempotent(t *testing.T) {
 	// Verify user_version is still 3
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 4 {
-		t.Errorf("user_version = %d, want 4", version)
+	if version != 5 {
+		t.Errorf("user_version = %d, want 5", version)
 	}
 }
 
@@ -1693,7 +1694,7 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 	}
 
 	// Purge with 30-day retention (2592000 seconds)
-	purged, err := s.PurgeExpiredInvites(ctx, 30*24*60*60)
+	purged, _, err := s.PurgeExpiredInvites(ctx, 30*24*60*60)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1955,6 +1956,62 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash7, "dan", "Dan", "hdan", "", "", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("RegisterAndAcceptByPairing at expires_at+1 should return ErrNotFound, got %v", err)
+	}
+}
+
+func TestVersionGuardRefusesWithoutWriting(t *testing.T) {
+	for _, v := range []int{99, -1} {
+		path := t.TempDir() + "/v.db"
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(fmt.Sprintf(`CREATE TABLE marker(x); PRAGMA user_version = %d`, v)); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+		before, _ := os.ReadFile(path)
+
+		if _, err := Open(path); err == nil || !strings.Contains(err.Error(), fmt.Sprint(v)) {
+			t.Fatalf("v=%d: Open err = %v, want unsupported-version error", v, err)
+		}
+		after, _ := os.ReadFile(path)
+		if !bytes.Equal(before, after) {
+			t.Fatalf("v=%d: database file modified by refused Open", v)
+		}
+		for _, sfx := range []string{"-wal", "-shm"} {
+			if _, err := os.Stat(path + sfx); err == nil {
+				t.Fatalf("v=%d: %s created by refused Open", v, sfx)
+			}
+		}
+	}
+}
+
+func TestMigrateRechecksVersionInTransaction(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:recheck?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`PRAGMA user_version = 99`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate(db); err == nil {
+		t.Fatal("migrate accepted a database newer than this binary")
+	}
+}
+
+func isLockContention(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "locked") || strings.Contains(msg, "busy")
+}
+
+func TestBuildDSNMemoryKeepsImmediateTxlock(t *testing.T) {
+	if dsn := buildDSN(":memory:"); !strings.Contains(dsn, "_txlock=immediate") {
+		t.Fatalf("memory DSN lacks _txlock=immediate: %s", dsn)
 	}
 }
 
