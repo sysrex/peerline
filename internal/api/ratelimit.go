@@ -232,6 +232,7 @@ type LimiterManager struct {
 	rcptLim       *msg.Limiter
 	notifyLim     *msg.Limiter
 	notifyAddrLim *msg.Limiter // Per-address notification rate limit
+	verifyLim     *msg.Limiter // Per-peer/per-address verification email rate limit
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -252,6 +253,7 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour),
 		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst),
 		notifyAddrLim: msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst), // Same limits, but per-address
+		verifyLim:     msg.NewLimiterPerHour(3, 3),                               // 3 verification emails per peer/address per hour
 		ctx:           ctx,
 		cancel:        cancel,
 	}
@@ -281,7 +283,7 @@ func (lm *LimiterManager) pruneLoop() {
 func (lm *LimiterManager) prune() {
 	pruned := lm.msgLim.Prune() + lm.regLim.Prune() + lm.pairLim.Prune() + lm.failLim.Prune() +
 		lm.getLim.Prune() + lm.authLim.Prune() +
-		lm.mailLim.Prune() + lm.rcptLim.Prune() + lm.notifyLim.Prune() + lm.notifyAddrLim.Prune()
+		lm.mailLim.Prune() + lm.rcptLim.Prune() + lm.notifyLim.Prune() + lm.notifyAddrLim.Prune() + lm.verifyLim.Prune()
 	_ = pruned // Could log if needed
 }
 

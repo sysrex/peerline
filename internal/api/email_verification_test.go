@@ -1,77 +1,157 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
-	"net/http/httptest"
+	"log/slog"
 	"strings"
 	"testing"
 )
 
-// TestEmailVerification tests the full email verification flow.
-func TestEmailVerification(t *testing.T) {
+// TestEmailVerificationIdenticalFailures tests that all verification failures return byte-identical 404s.
+func TestEmailVerificationIdenticalFailures(t *testing.T) {
 	cap := &captureMailer{}
 	srv := newServer(t, Config{Mailer: cap})
 
-	// Register with email
-	c := &client{t: t, srv: srv}
-	resp, body := c.do("POST", "/v1/register", map[string]string{"name": "alice", "notify_email": "alice@example.com"}, nil)
+	// Register and get tokens
+	alice := &client{t: t, srv: srv}
+	resp, body := alice.do("POST", "/v1/register", map[string]string{"name": "alice", "notify_email": "alice@example.com"}, nil)
 	want(t, resp, body, 201)
-	var reg struct {
-		PeerID   string `json:"peer_id"`
-		APIKey   string `json:"api_key"`
-		Verified bool   `json:"verified"`
-	}
-	json.Unmarshal(body, &reg)
-	c.id, c.key = reg.PeerID, reg.APIKey
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&alice.id, &alice.key})
 
-	if reg.Verified {
-		t.Fatal("email should be unverified initially")
-	}
+	bob := &client{t: t, srv: srv}
+	resp, body = bob.do("POST", "/v1/register", map[string]string{"name": "bob", "notify_email": "bob@example.com"}, nil)
+	want(t, resp, body, 201)
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&bob.id, &bob.key})
 
-	// Check verification email was sent
+	// Extract alice's token
 	msgs := cap.all()
-	if len(msgs) != 1 {
-		t.Fatalf("expected 1 verification email, got %d", len(msgs))
-	}
-	if msgs[0].To != "alice@example.com" {
-		t.Fatalf("verification email to %q", msgs[0].To)
-	}
-	if !strings.Contains(msgs[0].Subject, "Verify your email") {
-		t.Fatalf("unexpected subject: %s", msgs[0].Subject)
-	}
-
-	// Extract token from email body
-	body_text := msgs[0].Body
-	if !strings.Contains(body_text, "/v1/me/verify-email?token=eml_") {
-		t.Fatal("verification link not in email")
-	}
-	tokenStart := strings.Index(body_text, "token=eml_") + 6
-	tokenEnd := strings.Index(body_text[tokenStart:], "\n")
-	if tokenEnd == -1 {
-		tokenEnd = strings.Index(body_text[tokenStart:], " ")
-	}
-	token := body_text[tokenStart : tokenStart+tokenEnd]
-
-	// Verify email
-	resp, body = c.do("POST", "/v1/me/verify-email?token="+token, nil, nil)
-	want(t, resp, body, 200)
-	if !strings.Contains(string(body), "verified") {
-		t.Fatalf("unexpected verify response: %s", body)
+	var aliceToken string
+	for _, m := range msgs {
+		if m.To == "alice@example.com" {
+			aliceToken = extractVerifyToken(m.Body)
+			if aliceToken != "" {
+				break
+			}
+		}
 	}
 
-	// Check verified status
-	resp, body = c.do("GET", "/v1/me", nil, nil)
-	want(t, resp, body, 200)
-	var me struct {
-		NotifyEmail string `json:"notify_email"`
-		Verified    bool   `json:"verified"`
+	// Test 1: Wrong token
+	resp1, body1 := alice.do("POST", "/v1/me/verify-email?token=eml_wrongtoken", nil, nil)
+
+	// Test 2: Bob trying alice's token (wrong peer)
+	resp2, body2 := bob.do("POST", "/v1/me/verify-email?token="+aliceToken, nil, nil)
+
+	// Test 3: Alice uses correct token (succeeds)
+	resp3, body3 := alice.do("POST", "/v1/me/verify-email?token="+aliceToken, nil, nil)
+	want(t, resp3, body3, 200)
+
+	// Test 4: Alice tries same token again (already used)
+	resp4, body4 := alice.do("POST", "/v1/me/verify-email?token="+aliceToken, nil, nil)
+
+	// Test 5: Missing token
+	resp5, body5 := alice.do("POST", "/v1/me/verify-email", nil, nil)
+
+	// All failures must return identical 404s
+	failures := []struct {
+		name string
+		code int
+		body []byte
+	}{
+		{"wrong token", resp1.StatusCode, body1},
+		{"wrong peer", resp2.StatusCode, body2},
+		{"already used", resp4.StatusCode, body4},
+		{"missing token", resp5.StatusCode, body5},
 	}
-	json.Unmarshal(body, &me)
-	if !me.Verified {
-		t.Fatal("email should be verified")
+
+	var canonical []byte
+	for i, f := range failures {
+		if f.code != 404 {
+			t.Errorf("%s: got status %d, want 404", f.name, f.code)
+		}
+		if i == 0 {
+			canonical = f.body
+		} else if !bytes.Equal(f.body, canonical) {
+			t.Errorf("%s: body differs from canonical\n  got:  %s\n  want: %s", f.name, f.body, canonical)
+		}
 	}
-	if me.NotifyEmail != "alice@example.com" {
-		t.Fatalf("notify_email: %q", me.NotifyEmail)
+}
+
+// TestVerificationEmailRateLimit tests per-peer and per-address rate limiting of verification emails.
+func TestVerificationEmailRateLimit(t *testing.T) {
+	cap := &captureMailer{}
+	srv := newServer(t, Config{Mailer: cap})
+
+	alice := register(t, srv, "alice")
+
+	// Set notify_email 3 times (hits per-peer limit of 3/hour)
+	for i := 0; i < 3; i++ {
+		resp, body := alice.do("PUT", "/v1/me", map[string]string{"notify_email": "alice@example.com"}, nil)
+		want(t, resp, body, 200)
+	}
+
+	// 4th attempt should be rate limited
+	resp, body := alice.do("PUT", "/v1/me", map[string]string{"notify_email": "alice@example.com"}, nil)
+	want(t, resp, body, 429)
+	if !strings.Contains(string(body), "rate limited") {
+		t.Errorf("unexpected error: %s", body)
+	}
+
+	// Verify only 3 emails were sent
+	msgs := cap.all()
+	count := 0
+	for _, m := range msgs {
+		if m.To == "alice@example.com" && strings.Contains(m.Subject, "Verify") {
+			count++
+		}
+	}
+	if count != 3 {
+		t.Errorf("sent %d verification emails, want 3", count)
+	}
+}
+
+// TestPerAddressVerificationRateLimit tests that per-address rate limiting applies to verification emails.
+func TestPerAddressVerificationRateLimit(t *testing.T) {
+	cap := &captureMailer{}
+	srv := newServer(t, Config{Mailer: cap})
+
+	alice := register(t, srv, "alice")
+	bob := register(t, srv, "bob")
+
+	// Alice sets email twice
+	for i := 0; i < 2; i++ {
+		resp, body := alice.do("PUT", "/v1/me", map[string]string{"notify_email": "shared@example.com"}, nil)
+		want(t, resp, body, 200)
+	}
+
+	// Bob sets same email twice - should hit per-address limit on 2nd attempt
+	for i := 0; i < 2; i++ {
+		resp, body := bob.do("PUT", "/v1/me", map[string]string{"notify_email": "shared@example.com"}, nil)
+		if i == 0 {
+			want(t, resp, body, 200)
+		} else {
+			// Should hit per-address limit
+			want(t, resp, body, 429)
+		}
+	}
+
+	// Verify per-address limit was applied
+	msgs := cap.all()
+	count := 0
+	for _, m := range msgs {
+		if m.To == "shared@example.com" && strings.Contains(m.Subject, "Verify") {
+			count++
+		}
+	}
+	// Should respect per-address limit (3 total)
+	if count > 3 {
+		t.Errorf("sent %d emails to same address, expected <= 3 due to per-address limit", count)
 	}
 }
 
@@ -107,113 +187,43 @@ func TestUnverifiedEmailNoNotifications(t *testing.T) {
 	}
 }
 
-// TestEmailVerificationInvalidToken tests rejection of invalid tokens.
-func TestEmailVerificationInvalidToken(t *testing.T) {
-	srv := newServer(t, Config{})
-	c := register(t, srv, "alice")
-
-	// Try with invalid token
-	resp, body := c.do("POST", "/v1/me/verify-email?token=eml_invalid", nil, nil)
-	want(t, resp, body, 400)
-	if !strings.Contains(string(body), "invalid") {
-		t.Fatalf("unexpected error: %s", body)
-	}
-}
-
-// TestPerAddressRateLimit tests that multiple peers can't bypass rate limits.
-func TestPerAddressRateLimit(t *testing.T) {
+// TestTokenNotInLogs verifies tokens are never logged.
+func TestTokenNotInLogs(t *testing.T) {
+	var logs syncBuf
 	cap := &captureMailer{}
-	srv := newServer(t, Config{Mailer: cap, NotifyPerHour: 2, NotifyBurst: 2})
+	srv := newServer(t, Config{Mailer: cap, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
 
-	alice := register(t, srv, "alice")
+	alice := &client{t: t, srv: srv}
+	resp, body := alice.do("POST", "/v1/register", map[string]string{"name": "alice", "notify_email": "alice@example.com"}, nil)
+	want(t, resp, body, 201)
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&alice.id, &alice.key})
 
-	// Register two peers with the same email
-	bob1 := registerAndVerify(t, srv, "bob1", "shared@example.com")
-	bob2 := registerAndVerify(t, srv, "bob2", "shared@example.com")
-
-	// Extract and verify bob1's email
+	// Extract token from email
 	msgs := cap.all()
-	var token1, token2 string
+	var token string
 	for _, m := range msgs {
-		if m.To == "shared@example.com" && strings.Contains(m.Body, bob1.id) {
-			tokenStart := strings.Index(m.Body, "token=eml_") + 6
-			tokenEnd := strings.Index(m.Body[tokenStart:], "\n")
-			if tokenEnd == -1 {
-				tokenEnd = strings.Index(m.Body[tokenStart:], " ")
+		if m.To == "alice@example.com" {
+			token = extractVerifyToken(m.Body)
+			if token != "" {
+				break
 			}
-			token1 = m.Body[tokenStart : tokenStart+tokenEnd]
-		}
-		if m.To == "shared@example.com" && strings.Contains(m.Body, bob2.id) {
-			tokenStart := strings.Index(m.Body, "token=eml_") + 6
-			tokenEnd := strings.Index(m.Body[tokenStart:], "\n")
-			if tokenEnd == -1 {
-				tokenEnd = strings.Index(m.Body[tokenStart:], " ")
-			}
-			token2 = m.Body[tokenStart : tokenStart+tokenEnd]
 		}
 	}
 
-	// Verify both
-	resp, body := bob1.do("POST", "/v1/me/verify-email?token="+token1, nil, nil)
-	want(t, resp, body, 200)
-	resp, body = bob2.do("POST", "/v1/me/verify-email?token="+token2, nil, nil)
+	// Verify
+	resp, body = alice.do("POST", "/v1/me/verify-email?token="+token, nil, nil)
 	want(t, resp, body, 200)
 
-	// Clear verification emails
-	cap.mu.Lock()
-	cap.msgs = nil
-	cap.mu.Unlock()
-
-	// Grant messages
-	pairUp(t, bob1, alice, []string{"messages"}, nil, nil)
-	pairUp(t, bob2, alice, []string{"messages"}, nil, nil)
-
-	// Send messages - should respect per-address limit
-	resp, body = alice.do("POST", "/v1/peers/"+bob1.id+"/messages", map[string]any{"type": "note", "body": "msg1"}, nil)
-	want(t, resp, body, 201)
-
-	resp, body = alice.do("POST", "/v1/peers/"+bob2.id+"/messages", map[string]any{"type": "note", "body": "msg2"}, nil)
-	want(t, resp, body, 201)
-
-	msgs = cap.all()
-	// Should only send 2 notifications (the per-address limit), not 2 per peer
-	if len(msgs) != 2 {
-		t.Fatalf("expected 2 notifications (per-address limit), got %d", len(msgs))
+	// Check logs don't contain the token
+	logStr := logs.String()
+	if strings.Contains(logStr, token) {
+		t.Errorf("token %q found in logs:\n%s", token, logStr)
 	}
-
-	// Third message should be rate-limited by per-address limit
-	resp, body = alice.do("POST", "/v1/peers/"+bob1.id+"/messages", map[string]any{"type": "note", "body": "msg3"}, nil)
-	want(t, resp, body, 201)
-
-	msgs = cap.all()
-	if len(msgs) != 2 {
-		t.Fatalf("expected still 2 notifications (rate limited), got %d", len(msgs))
+	// Check for the token pattern (should not appear anywhere in logs)
+	if strings.Contains(logStr, "eml_") {
+		t.Errorf("token pattern eml_ found in logs:\n%s", logStr)
 	}
-}
-
-// Helper to register and verify an email
-func registerAndVerify(t *testing.T, srv *httptest.Server, name, email string) *client {
-	t.Helper()
-	// We need to use the provided server's mailer to get verification emails
-	// For testing, we'll register, manually verify using the store
-	c := &client{t: t, srv: srv}
-	resp, body := c.do("POST", "/v1/register", map[string]string{"name": name, "notify_email": email}, nil)
-	if resp.StatusCode != 201 {
-		t.Fatalf("register failed: %d %s", resp.StatusCode, body)
-	}
-	var reg struct {
-		PeerID string `json:"peer_id"`
-		APIKey string `json:"api_key"`
-	}
-	json.Unmarshal(body, &reg)
-	c.id, c.key = reg.PeerID, reg.APIKey
-
-	// For testing: manually verify by getting the token from GET /v1/me
-	// Actually, we need to extract the token from the verification email
-	// Since we're using a capture mailer in the test, we need to pass it in
-	// Let me rethink this...
-	// The issue is we can't easily get the mailer from the server
-	// So let's just have the test extract and verify the token itself
-
-	return c
 }

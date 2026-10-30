@@ -106,6 +106,20 @@ func pairUp(t *testing.T, a, b *client, scopes, bags []string, back []string) {
 	want(t, resp, body, 404)
 }
 
+// extractVerifyToken extracts the verification token from an email body.
+func extractVerifyToken(body string) string {
+	tokenStart := strings.Index(body, "token=eml_")
+	if tokenStart == -1 {
+		return ""
+	}
+	tokenStart += len("token=")
+	tokenEnd := strings.IndexAny(body[tokenStart:], "'\n ")
+	if tokenEnd == -1 {
+		tokenEnd = len(body[tokenStart:])
+	}
+	return body[tokenStart : tokenStart+tokenEnd]
+}
+
 func TestAuthRequired(t *testing.T) {
 	srv := newServer(t, Config{})
 	c := &client{t: t, srv: srv}
