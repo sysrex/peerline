@@ -1908,6 +1908,50 @@ func TestSanitizerHugeInput(t *testing.T) {
 	}
 }
 
+// TestSanitizerInputGuardInvalidUTF8 verifies the input guard doesn't trim back past invalid bytes elsewhere
+func TestSanitizerInputGuardInvalidUTF8(t *testing.T) {
+	// 2000 bytes of 'a' with 0xff (invalid UTF-8) at byte 10
+	// Should give 64 'a' (not fallback), proving we don't trim back to empty
+	input := strings.Repeat("a", 10) + "\xff" + strings.Repeat("a", 1989)
+	got := sanitizeInviterName(input)
+	want := strings.Repeat("a", 64)
+
+	if got != want {
+		t.Errorf("sanitizeInviterName(2000 bytes with invalid at byte 10) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
+}
+
+// TestSanitizerInputGuardRuneBoundary verifies the input guard respects rune boundaries
+func TestSanitizerInputGuardRuneBoundary(t *testing.T) {
+	// Create input that has a 3-byte UTF-8 character (日) right at the 1024-byte cut
+	// Fill up to 1022 bytes with 'a', then add 日 (3 bytes) so it straddles the boundary
+	base := strings.Repeat("a", 1022)
+	input := base + "日" + strings.Repeat("b", 100)
+
+	got := sanitizeInviterName(input)
+
+	// The guard should cut before 日 (not in the middle), then cap at 64 runes
+	// So we should get 64 'a' characters (first 64 of the 1022)
+	want := strings.Repeat("a", 64)
+	if got != want {
+		t.Errorf("sanitizeInviterName(input with 3-byte rune at boundary) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
+}
+
+// TestSanitizerTrailingSpaceTrim verifies trailing spaces are trimmed after 64-rune cut
+func TestSanitizerTrailingSpaceTrim(t *testing.T) {
+	// 64 'a' followed by space and more text
+	// The 64-rune cut will include the space; it should be trimmed
+	input := strings.Repeat("a", 63) + " b" + strings.Repeat("c", 100)
+	got := sanitizeInviterName(input)
+
+	// Should get 63 'a' (no trailing space)
+	want := strings.Repeat("a", 63)
+	if got != want {
+		t.Errorf("sanitizeInviterName(63a + space + text) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
+}
+
 // TestAPIClock verifies that api.Server.now is used in createInvite.
 // Note: the API clock (Server.now, time.Time) and the store clock (Store.now, int64)
 // are independent and can disagree; this test only fakes the API clock.

@@ -648,12 +648,12 @@ func sanitizeInviterName(name string) string {
 		maxInputBytes   = 1024 // Guard against unbounded normalization work
 	)
 
-	// Guard: truncate raw input to maxInputBytes on a UTF-8 boundary
+	// Guard: truncate raw input to maxInputBytes on a UTF-8 rune boundary
 	// to prevent huge stored names from causing unbounded NFKC/NFD work
 	if len(name) > maxInputBytes {
 		name = name[:maxInputBytes]
-		// Back off to a valid UTF-8 boundary
-		for len(name) > 0 && !utf8.ValidString(name) {
+		// Back off to a rune boundary: step back while the last byte is not a rune start
+		for len(name) > 0 && !utf8.RuneStart(name[len(name)-1]) {
 			name = name[:len(name)-1]
 		}
 	}
@@ -784,6 +784,9 @@ func sanitizeInviterName(name string) string {
 		}
 		result = string(truncated)
 	}
+
+	// Trim trailing spaces that may have been left by the 64-rune truncation
+	result = strings.TrimRight(result, " ")
 
 	return result
 }
