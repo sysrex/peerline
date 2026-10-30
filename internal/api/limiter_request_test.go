@@ -42,7 +42,7 @@ var ipKeyedEndpoints = []struct {
 }{
 	{"get", "GET", "/", 20},
 	{"register", "POST", "/v1/register", 5},
-	{"failed pairing lookup", "POST", "/v1/pairing/pair_nosuchtoken0123456789", 10},
+	{"pairing lookup", "POST", "/v1/pairing/pair_nosuchtoken0123456789", 5},
 }
 
 func TestIPKeyingPerEndpoint(t *testing.T) {

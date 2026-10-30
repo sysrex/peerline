@@ -1997,6 +1997,8 @@ func TestMigrateRechecksVersionInTransaction(t *testing.T) {
 	}
 	if err := migrate(db); err == nil {
 		t.Fatal("migrate accepted a database newer than this binary")
+	}
+}
 
 func isLockContention(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
