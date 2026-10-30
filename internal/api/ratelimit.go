@@ -166,56 +166,55 @@ func rateLimitKey(ip string) string {
 }
 
 // ParseTrustedProxies parses a list of CIDR strings (or bare IPs) into IPNets.
-// Rejects overly broad prefixes (0.0.0.0/0, ::/0, and prefixes shorter than
-// /8 for IPv4 or /32 for IPv6) to prevent misconfiguration (#62).
+// IPv4-mapped entries are converted to their IPv4 form; mapped prefixes shorter
+// than /104 are rejected. Overly broad prefixes (/0, below /8 for IPv4, below /32
+// for IPv6) and zone-indexed addresses are rejected (#62, #164, #165).
 func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 	var nets []*net.IPNet
-	for _, cidr := range cidrs {
-		cidr = strings.TrimSpace(cidr)
-		if cidr == "" {
+	for _, s := range cidrs {
+		s = strings.TrimSpace(s)
+		if s == "" {
 			continue
 		}
 
-		// If it doesn't contain a slash, treat it as a single IP
-		if !strings.Contains(cidr, "/") {
-			// Parse as IP and make it a /32 or /128
-			addr, err := netip.ParseAddr(cidr)
+		var p netip.Prefix
+		if strings.Contains(s, "/") {
+			var err error
+			if p, err = netip.ParsePrefix(s); err != nil {
+				return nil, err
+			}
+		} else {
+			addr, err := netip.ParseAddr(s)
 			if err != nil {
 				return nil, err
 			}
-			var ipnet *net.IPNet
-			if addr.Is4() {
-				_, ipnet, _ = net.ParseCIDR(cidr + "/32")
-			} else {
-				_, ipnet, _ = net.ParseCIDR(cidr + "/128")
+			if addr.Zone() != "" {
+				return nil, fmt.Errorf("parsing %q: zone-indexed addresses are not supported", s)
 			}
-			nets = append(nets, ipnet)
-			continue
+			p = netip.PrefixFrom(addr, addr.BitLen())
 		}
 
-		_, ipnet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			return nil, err
+		addr, bits := p.Addr(), p.Bits()
+		if addr.Is4In6() {
+			if bits < 104 {
+				return nil, fmt.Errorf("parsing %q: IPv4-mapped prefix must be at least /104", s)
+			}
+			addr, bits = addr.Unmap(), bits-96
+		}
+		if bits == 0 {
+			return nil, fmt.Errorf("parsing %q: prefix length /0 is too broad", s)
+		}
+		if addr.Is4() && bits < 8 {
+			return nil, fmt.Errorf("parsing %q: IPv4 prefix must be at least /8", s)
+		}
+		if addr.Is6() && bits < 32 {
+			return nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /32", s)
 		}
 
-		// Check prefix length to prevent overly broad trust (#62)
-		ones, bits := ipnet.Mask.Size()
-		isIPv4 := bits == 32
-
-		// Reject /0 for both IPv4 and IPv6
-		if ones == 0 {
-			return nil, fmt.Errorf("parsing %q: prefix length /0 is too broad", cidr)
-		}
-
-		// Enforce minimum prefix length
-		if isIPv4 && ones < 8 {
-			return nil, fmt.Errorf("parsing %q: IPv4 prefix must be at least /8", cidr)
-		}
-		if !isIPv4 && ones < 32 {
-			return nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /32", cidr)
-		}
-
-		nets = append(nets, ipnet)
+		nets = append(nets, &net.IPNet{
+			IP:   netip.PrefixFrom(addr, bits).Masked().Addr().AsSlice(),
+			Mask: net.CIDRMask(bits, addr.BitLen()),
+		})
 	}
 	return nets, nil
 }
@@ -240,16 +239,17 @@ type LimiterManager struct {
 // NewLimiterManager creates and starts a new limiter manager.
 func NewLimiterManager(cfg Config) *LimiterManager {
 	ctx, cancel := context.WithCancel(context.Background())
+	clk := msg.WithClock(cfg.Now)
 	lm := &LimiterManager{
-		msgLim:        msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst),
-		regLim:        msg.NewLimiter(10, 5),
-		pairLim:       msg.NewLimiter(10, 5),
-		getLim:        msg.NewLimiter(60, 20),
-		authLim:       msg.NewLimiter(120, 40), // Higher limit for authenticated polling
-		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst),
-		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour),
-		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst),
-		notifyAddrLim: msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst), // Same limits, but per-address
+		msgLim:        msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst, clk),
+		regLim:        msg.NewLimiter(10, 5, clk),
+		pairLim:       msg.NewLimiter(10, 5, clk),
+		getLim:        msg.NewLimiter(60, 20, clk),
+		authLim:       msg.NewLimiter(120, 40, clk), // Higher limit for authenticated polling
+		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst, clk),
+		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour, clk),
+		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst, clk),
+		notifyAddrLim: msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst, clk), // Same limits, but per-address
 		ctx:           ctx,
 		cancel:        cancel,
 	}

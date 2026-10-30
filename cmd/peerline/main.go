@@ -51,9 +51,15 @@ func main() {
 	if tp != "" {
 		trustedProxies = strings.Split(tp, ",")
 		// Validate at startup
-		if _, err := api.ParseTrustedProxies(trustedProxies); err != nil {
+		nets, err := api.ParseTrustedProxies(trustedProxies)
+		if err != nil {
 			log.Error("invalid PEERLINE_TRUSTED_PROXIES CIDR", "err", err)
 			os.Exit(1)
+		}
+		if len(nets) == 0 {
+			log.Warn("PEERLINE_TRUSTED_PROXIES set but contains no entries: X-Forwarded-For headers are ignored")
+		} else {
+			log.Info("trusted proxies", "count", len(nets), "cidrs", nets)
 		}
 	}
 

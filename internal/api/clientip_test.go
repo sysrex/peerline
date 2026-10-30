@@ -206,6 +206,13 @@ func TestParseTrustedProxiesRejectsOverlyBroad(t *testing.T) {
 			input:     []string{"2001:db8::/31"},
 			wantError: "IPv6 prefix must be at least /32",
 		},
+		{name: "zoned bare", input: []string{"fe80::1%eth0"}, wantError: "zone"},
+		{name: "zoned CIDR", input: []string{"fe80::1%eth0/64"}, wantError: "zone"},
+		{name: "mapped /96", input: []string{"::ffff:0:0/96"}, wantError: "at least /104"},
+		{name: "mapped /80", input: []string{"::ffff:0:0/80"}, wantError: "at least /104"},
+		{name: "mapped /95", input: []string{"::ffff:10.0.0.0/95"}, wantError: "at least /104"},
+		{name: "mapped bare", input: []string{"::ffff:10.0.0.1"}},
+		{name: "mapped /104", input: []string{"::ffff:10.0.0.0/104"}},
 		{
 			name:  "valid IPv4 /8",
 			input: []string{"10.0.0.0/8"},

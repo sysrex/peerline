@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/store"
@@ -266,6 +267,7 @@ func TestMultiLineXForwardedFor(t *testing.T) {
 	cfg := Config{
 		Logger:         slog.Default(),
 		TrustedProxies: []string{"10.0.0.0/8"},
+		Now:            func() time.Time { return time.Unix(1000, 0) },
 	}
 	srv := New(st, cfg)
 	handler := srv.Handler()
@@ -306,6 +308,7 @@ func TestGETLimiterSeparateBuckets(t *testing.T) {
 	cfg := Config{
 		Logger:         slog.Default(),
 		TrustedProxies: []string{"10.0.0.0/8"},
+		Now:            func() time.Time { return time.Unix(1000, 0) },
 	}
 	srv := New(st, cfg)
 	handler := srv.Handler()
