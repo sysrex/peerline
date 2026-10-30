@@ -1625,13 +1625,13 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 	// Mock time
 	origNow := now
 	defer func() { now = origNow }()
-	
+
 	// Start at a base time
 	currentTime := int64(2000000)
 	now = func() int64 { return currentTime }
 
 	// Create and immediately accept invites at different points in time
-	
+
 	// 1. Unused expired invite (expires 100s ago) - should be purged
 	exp1 := time.Unix(currentTime-100, 0)
 	if err := s.CreateInvite(ctx, "code1", "alice", []string{"messages"}, nil, exp1); err != nil {
