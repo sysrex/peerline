@@ -27,8 +27,8 @@ var (
 	infoOnce map[string]string
 )
 
-// releaseVersionRE matches semver-like releases: vX.Y.Z or X.Y.Z with optional prerelease/build
-var releaseVersionRE = regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$`)
+// releaseVersionRE matches strict semver releases: vX.Y.Z or X.Y.Z with no build metadata or git describe suffix
+var releaseVersionRE = regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+$`)
 
 // Info returns version information as a structured map.
 // Computed once on first call.

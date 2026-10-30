@@ -25,7 +25,6 @@ jobs:
     - name: Check out code
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       with:
-        ref: ${{ env.GIT_SHA }}
         fetch-depth: 0
       
     - name: Set up Go
@@ -43,12 +42,8 @@ jobs:
 
     - name: Build with version info
       run: |
-        # Use git describe for version (release tag or dev)
-        VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
-        # On pull_request, use dev instead of the merge ref name
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          VERSION="dev"
-        fi
+        # Use exact tag match or 'dev' (avoid git describe suffixes that leak commit in minimal mode)
+        VERSION="$(git describe --tags --exact-match 2>/dev/null || echo dev)"
         COMMIT="${GIT_SHA}"
         BUILD_TIME="$(git show -s --format=%cI ${GIT_SHA} 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
         
@@ -133,15 +128,11 @@ jobs:
     - name: Check out code
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       with:
-        ref: ${{ env.GIT_SHA }}
         fetch-depth: 0
 
     - name: Build Docker image with version info
       run: |
-        VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          VERSION="dev"
-        fi
+        VERSION="$(git describe --tags --exact-match 2>/dev/null || echo dev)"
         COMMIT="${GIT_SHA}"
         BUILD_TIME="$(git show -s --format=%cI ${GIT_SHA} 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
         
@@ -162,8 +153,20 @@ jobs:
           -e PEERLINE_DB=/data/peerline.db \
           peerline:test
         
-        # Wait for startup
-        sleep 3
+        # Wait for startup with readiness polling (max 30s)
+        echo "Waiting for server to be ready..."
+        for i in $(seq 1 30); do
+          if curl -sf http://localhost:8787/healthz > /dev/null 2>&1; then
+            echo "Server ready after ${i}s"
+            break
+          fi
+          if [ "$i" -eq 30 ]; then
+            echo "ERROR: Server did not become ready within 30s"
+            docker logs peerline-test
+            exit 1
+          fi
+          sleep 1
+        done
         
         # Test /version endpoint
         curl -f http://localhost:8787/version || (docker logs peerline-test && exit 1)

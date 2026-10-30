@@ -44,6 +44,14 @@ func main() {
 	if version.NeedsAttention() {
 		log.Warn("version information incomplete", "commit", version.Info()["commit"])
 	}
+
+	// Validate PEERLINE_VERSION_DETAIL at startup (fail closed on typos)
+	versionDetail := strings.ToLower(strings.TrimSpace(env("PEERLINE_VERSION_DETAIL", "minimal")))
+	if versionDetail != "minimal" && versionDetail != "full" && versionDetail != "off" {
+		log.Error("invalid PEERLINE_VERSION_DETAIL value; must be 'minimal', 'full', or 'off'", "value", versionDetail)
+		os.Exit(1)
+	}
+
 	st, err := store.Open(*dbPath)
 	if err != nil {
 		log.Error("open store", "err", err)
@@ -57,17 +65,16 @@ func main() {
 	}
 
 	// Parse trusted proxy CIDRs
+	tp := os.Getenv("PEERLINE_TRUSTED_PROXIES")
+	warnTrustedProxies(log, tp)
 	var trustedProxies []string
-	if tp := os.Getenv("PEERLINE_TRUSTED_PROXIES"); tp != "" {
+	if tp != "" {
 		trustedProxies = strings.Split(tp, ",")
 		// Validate at startup
 		if _, err := api.ParseTrustedProxies(trustedProxies); err != nil {
 			log.Error("invalid PEERLINE_TRUSTED_PROXIES CIDR", "err", err)
 			os.Exit(1)
 		}
-	} else {
-		// Warn when running without trusted proxies (#52)
-		log.Warn("PEERLINE_TRUSTED_PROXIES unset: X-Forwarded-For headers are ignored; client IPs will be taken from RemoteAddr only")
 	}
 
 	maxOutstandingInvites, _ := strconv.Atoi(os.Getenv("PEERLINE_MAX_OUTSTANDING_INVITES"))
@@ -92,7 +99,6 @@ func main() {
 		retentionDays = 30 // default
 	}
 	retentionSeconds := int64(retentionDays * 24 * 60 * 60)
-	versionDetail := env("PEERLINE_VERSION_DETAIL", "minimal")
 
 	apiServer := api.New(st, api.Config{
 		RegisterToken:         regTok,

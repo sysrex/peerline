@@ -155,7 +155,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/register", s.register)
 	// Registered on the outer mux so it is not behind Bearer auth. The more
 	// specific pattern wins over the /v1/ subtree below.
-	mux.HandleFunc("GET /version", s.rateLimitVersion(s.versionHandler))
+	// Only register /version if not disabled
+	if s.cfg.VersionDetail != "off" {
+		mux.HandleFunc("GET /version", s.rateLimitVersion(s.versionHandler))
+	}
 	mux.HandleFunc("GET /v1/public/stats", s.rateLimitGet(s.publicStats))
 
 	authed := http.NewServeMux()
@@ -1484,21 +1487,14 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 
 // versionHandler serves build version information.
 // This is a public endpoint (no auth) that respects the configured VersionDetail level:
-// "minimal" (default) returns only the version, "full" includes commit and build_time, "off" returns 404.
+// "minimal" (default) returns only the version, "full" includes commit and build_time.
+// "off" is handled by not registering the route at all.
 func (s *Server) versionHandler(w http.ResponseWriter, r *http.Request) {
 	detail := s.cfg.VersionDetail
-	if detail == "" {
+	if detail == "" || detail == "minimal" {
 		detail = "minimal"
-	}
-
-	switch detail {
-	case "minimal":
-	case "full":
-	case "off":
-		writeErr(w, http.StatusNotFound, "not found")
-		return
-	default:
-		s.log.Warn("invalid PEERLINE_VERSION_DETAIL value, using minimal", "value", detail)
+	} else if detail != "full" {
+		// Unknown values fall back to minimal (fail-closed)
 		detail = "minimal"
 	}
 

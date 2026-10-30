@@ -2805,3 +2805,203 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 		t.Errorf("body code: unexpected Link header: %s", resp.Header.Get("Link"))
 	}
 }
+
+func TestVersionEndpoint(t *testing.T) {
+	tests := []struct {
+		name        string
+		detail      string
+		wantStatus  int
+		wantKeys    []string
+		wantMissing []string
+	}{
+		{
+			name:        "minimal (default)",
+			detail:      "",
+			wantStatus:  http.StatusOK,
+			wantKeys:    []string{"version"},
+			wantMissing: []string{"commit", "build_time"},
+		},
+		{
+			name:        "minimal explicit",
+			detail:      "minimal",
+			wantStatus:  http.StatusOK,
+			wantKeys:    []string{"version"},
+			wantMissing: []string{"commit", "build_time"},
+		},
+		{
+			name:       "full",
+			detail:     "full",
+			wantStatus: http.StatusOK,
+			wantKeys:   []string{"version", "commit", "build_time"},
+		},
+		{
+			name:       "off",
+			detail:     "off",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:        "unknown value falls back to minimal",
+			detail:      "invalid",
+			wantStatus:  http.StatusOK,
+			wantKeys:    []string{"version"},
+			wantMissing: []string{"commit", "build_time"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newServer(t, Config{VersionDetail: tt.detail})
+			req, _ := http.NewRequest("GET", srv.URL+"/version", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("expected status %d, got %d", tt.wantStatus, resp.StatusCode)
+			}
+
+			// Check Cache-Control header
+			if cc := resp.Header.Get("Cache-Control"); !strings.Contains(cc, "no-store") {
+				t.Errorf("expected Cache-Control to contain no-store, got %q", cc)
+			}
+
+			if tt.wantStatus == http.StatusOK {
+				var info map[string]string
+				if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+					t.Fatalf("failed to decode response: %v", err)
+				}
+
+				// Check expected keys are present and non-empty
+				for _, key := range tt.wantKeys {
+					val, ok := info[key]
+					if !ok {
+						t.Errorf("missing expected key %q", key)
+					} else if val == "" {
+						t.Errorf("key %q has empty value", key)
+					}
+				}
+
+				// Check unwanted keys are absent
+				for _, key := range tt.wantMissing {
+					if _, ok := info[key]; ok {
+						t.Errorf("unexpected key %q present", key)
+					}
+				}
+
+				// For full mode, commit should be short (<=12 chars or "unknown")
+				if tt.detail == "full" {
+					commit := info["commit"]
+					if commit != "unknown" && len(commit) > 12 {
+						t.Errorf("full mode commit should be <=12 chars, got %d (%q)", len(commit), commit)
+					}
+				}
+
+				// Version should never expose branch names
+				version := info["version"]
+				if strings.Contains(version, "/") || strings.Contains(version, "merge") {
+					t.Errorf("version should not contain branch-like strings, got %q", version)
+				}
+			}
+
+			// Check Content-Type (except for off mode, which returns plain text 404)
+			if tt.detail != "off" {
+				if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+					t.Errorf("expected Content-Type application/json, got %s", ct)
+				}
+			}
+		})
+	}
+}
+
+func TestVersionEndpointNoAuth(t *testing.T) {
+	// Version endpoint should be public (no auth required) even with RegisterToken
+	srv := newServer(t, Config{RegisterToken: "secret"})
+	req, _ := http.NewRequest("GET", srv.URL+"/version", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("version endpoint should not require auth, got status %d", resp.StatusCode)
+	}
+}
+
+func TestVersionEndpointRateLimit(t *testing.T) {
+	srv := newServer(t, Config{})
+	client := http.Client{Timeout: 2 * time.Second}
+	var lastStatus int
+	foundRateLimit := false
+
+	// The version endpoint has a separate limiter with burst of 30
+	for i := 0; i < 50; i++ {
+		req, _ := http.NewRequest("GET", srv.URL+"/version", nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lastStatus = resp.StatusCode
+		resp.Body.Close()
+
+		if lastStatus == http.StatusTooManyRequests {
+			foundRateLimit = true
+			// Check for Retry-After header
+			if ra := resp.Header.Get("Retry-After"); ra == "" {
+				t.Error("429 response should include Retry-After header")
+			}
+			break
+		}
+	}
+
+	if !foundRateLimit {
+		t.Log("Did not hit rate limit in 50 requests (versionLim burst may be high)")
+	}
+}
+
+func TestVersionEndpointHEAD(t *testing.T) {
+	srv := newServer(t, Config{})
+	req, _ := http.NewRequest("HEAD", srv.URL+"/version", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("HEAD /version should return 200, got %d", resp.StatusCode)
+	}
+
+	// Content-Type should still be set
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected Content-Type application/json, got %s", ct)
+	}
+
+	// Body should be empty for HEAD
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) > 0 {
+		t.Errorf("HEAD response should have empty body, got %d bytes", len(body))
+	}
+}
+
+func TestVersionEndpointMethodNotAllowed(t *testing.T) {
+	srv := newServer(t, Config{})
+	methods := []string{"POST", "PUT", "DELETE", "PATCH"}
+
+	for _, method := range methods {
+		t.Run(method, func(t *testing.T) {
+			req, _ := http.NewRequest(method, srv.URL+"/version", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusMethodNotAllowed {
+				t.Errorf("%s /version should return 405, got %d", method, resp.StatusCode)
+			}
+		})
+	}
+}
