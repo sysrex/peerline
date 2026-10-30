@@ -162,7 +162,6 @@ func (s *Server) Handler() http.Handler {
 	authed.HandleFunc("GET /v1/invites", s.rateLimitAuth(s.listInvites))
 	authed.HandleFunc("DELETE /v1/invites/{id}", s.deleteInvite)
 	authed.HandleFunc("POST /v1/invites/accept", s.acceptInvite)
-	authed.HandleFunc("GET /v1/invites/accept", s.acceptInvite) // emailed magic link (Bearer required)
 	authed.HandleFunc("GET /v1/grants", s.rateLimitAuth(s.listGrants))
 	authed.HandleFunc("DELETE /v1/grants/{peer_id}", s.revokeGrant)
 	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.sendMessage)
@@ -178,12 +177,12 @@ func (s *Server) Handler() http.Handler {
 		return p.ID, nil
 	}, authed)
 	mux.Handle("/v1/", authMW)
-	// The emailed accept link: with a Bearer key it accepts (same flow as
-	// POST); without one (a human clicking, or a link scanner) it only shows
-	// instructions and never consumes the invite.
+	// The emailed accept link: only unauthenticated GET shows instructions.
+	// Authenticated GET returns 405; only POST accepts the invite.
 	mux.HandleFunc("GET /v1/invites/accept", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "" {
-			authMW.ServeHTTP(w, r)
+			w.Header().Set("Allow", "POST")
+			writeErr(w, http.StatusMethodNotAllowed, "use POST to accept the invite")
 			return
 		}
 		s.acceptLanding(w, r)
@@ -495,6 +494,12 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	var pairingToken string
 	var publicID string
 
+	// testInviteCreatedHook is called before the atomic cap check for deterministic testing.
+	// Production: nil. Test: N-party barrier synchronizes concurrent requests.
+	if s.testInviteCreatedHook != nil {
+		s.testInviteCreatedHook(me)
+	}
+
 	// Create invite first with atomic cap check (#53)
 	if in.GeneratePairing {
 		pairingToken = auth.NewPairingToken()
@@ -519,11 +524,6 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Test hook for deterministic concurrency testing
-	if s.testInviteCreatedHook != nil {
-		s.testInviteCreatedHook(me)
-	}
-
 	// Check email rate limit AFTER creating invite (#53)
 	// If limit fails, delete the invite and return error
 	if to != "" {
@@ -532,7 +532,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		if !s.lim.mailLim.Ready(me) || !s.lim.rcptLim.Ready(rk) {
 			// Delete the invite we just created
 			if delErr := s.st.DeleteInvite(r.Context(), publicID, me); delErr != nil {
-				s.cfg.Logger.Error("failed to delete invite after rate limit check", "public_id", publicID, "error", delErr)
+				s.log.Error("failed to delete invite after rate limit check", "public_id", publicID, "error", delErr)
 				s.internal(w, fmt.Errorf("rate limit check failed and invite cleanup failed: %w", delErr))
 				return
 			}
@@ -540,11 +540,12 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusTooManyRequests, "invite email rate limited; try later or create an invite without to_email and share the code yourself")
 			return
 		}
-		// Both ready, now consume from both (Ready→Allow has a race, but delete handles it)
+		// Both ready, consume from both. Narrow race: two requests can both pass Ready,
+		// second Allow fails, spending one sender token. Compensating delete doesn't refund.
 		if !s.lim.mailLim.Allow(me) || !s.lim.rcptLim.Allow(rk) {
-			// This should not happen if Ready checks passed, but handle it
+			// Rare: Ready passed but Allow failed (concurrent race)
 			if delErr := s.st.DeleteInvite(r.Context(), publicID, me); delErr != nil {
-				s.cfg.Logger.Error("failed to delete invite after rate limit consume", "public_id", publicID, "error", delErr)
+				s.log.Error("failed to delete invite after rate limit consume", "public_id", publicID, "error", delErr)
 				s.internal(w, fmt.Errorf("rate limit consume failed and invite cleanup failed: %w", delErr))
 				return
 			}
@@ -586,7 +587,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.Mailer.Mode() == "log" {
 			status = "logged"
 		}
-		m := inviteEmail(s.inviterName(r.Context(), me), me, to, code, acceptURL, sc, bg, exp)
+		m := inviteEmail(s.inviterName(r.Context(), me), me, to, code, s.publicBase(r), sc, bg, exp)
 		// Detach from client cancellation; the SMTP sender has its own timeout.
 		if err := s.cfg.Mailer.Send(context.WithoutCancel(r.Context()), m); err != nil {
 			s.log.Error("invite email failed", "inviter", me, "err", err)
@@ -645,8 +646,15 @@ func (s *Server) inviterName(ctx context.Context, id string) string {
 //   - Tab, newline, and all unicode.IsSpace chars become a single space
 //   - Repeated spaces are collapsed
 //
+// Length limit:
+//   - Maximum 64 runes counted on the final NFC (composed) output
+//   - Precomposed characters (e.g., é = U+00E9) count as 1 rune
+//   - Hangul syllables (e.g., 한 = U+D55C) count as 1 rune each
+//   - Truncation respects grapheme cluster boundaries: if cutting at 64 runes
+//     would split a base from non-composing marks, backs off to exclude the
+//     entire trailing cluster
+//
 // Returns "A Peerline peer" if the result is empty after filtering.
-// Max length 64 runes (not bytes).
 //
 // Note: Cross-script homoglyphs (e.g., Cyrillic а vs Latin a) are not fully solvable here
 // and require application-level awareness or visual similarity detection.
@@ -655,7 +663,18 @@ func sanitizeInviterName(name string) string {
 		maxRunes        = 64
 		maxMarksPerBase = 3 // Issue #84 specifies 3 marks per base (issue #63 asked for 2 but #84 is the live tracker)
 		fallbackName    = "A Peerline peer"
+		maxInputBytes   = 1024 // Guard against unbounded normalization work
 	)
+
+	// Guard: truncate raw input to maxInputBytes on a UTF-8 rune boundary
+	// to prevent huge stored names from causing unbounded NFKC/NFD work
+	if len(name) > maxInputBytes {
+		name = name[:maxInputBytes]
+		// Back off to a rune boundary: step back while the last byte is not a rune start
+		for len(name) > 0 && !utf8.RuneStart(name[len(name)-1]) {
+			name = name[:len(name)-1]
+		}
+	}
 
 	// Apply NFKC normalization first (compatibility decomposition + canonical composition)
 	// This normalizes fullwidth/halfwidth chars, ligatures, compatibility forms
@@ -667,7 +686,6 @@ func sanitizeInviterName(name string) string {
 
 	var out strings.Builder
 	lastWasSpace := false
-	runeCount := 0
 	marksAfterBase := 0
 	lastWasBaseChar := false // tracks if last was letter/number (valid base for marks)
 
@@ -718,7 +736,6 @@ func sanitizeInviterName(name string) string {
 			if lastWasBaseChar && marksAfterBase < maxMarksPerBase {
 				out.WriteRune(r)
 				marksAfterBase++
-				runeCount++
 				// Keep lastWasBaseChar true so we stay in this mark sequence
 			}
 			// Otherwise drop the mark
@@ -728,7 +745,6 @@ func sanitizeInviterName(name string) string {
 			lastWasSpace = false
 			lastWasBaseChar = true
 			marksAfterBase = 0 // Reset mark counter for new base
-			runeCount++
 		} else if unicode.IsSpace(r) || r == '\t' || r == '\n' || r == '\r' {
 			// Map all whitespace (including tab/newline) to single space
 			if !lastWasSpace && out.Len() > 0 {
@@ -736,7 +752,6 @@ func sanitizeInviterName(name string) string {
 				lastWasSpace = true
 				lastWasBaseChar = false
 				marksAfterBase = 0
-				runeCount++
 			}
 		} else if r == '.' || r == ',' || r == '-' || r == '_' || r == '\'' {
 			// Basic ASCII punctuation
@@ -744,16 +759,10 @@ func sanitizeInviterName(name string) string {
 			lastWasSpace = false
 			lastWasBaseChar = false // punctuation is not a valid base for marks
 			marksAfterBase = 0
-			runeCount++
 		} else {
 			// Other characters: reset state but don't write
 			lastWasBaseChar = false
 			marksAfterBase = 0
-		}
-
-		// Stop if we exceed max runes
-		if runeCount >= maxRunes {
-			break
 		}
 	}
 
@@ -766,10 +775,41 @@ func sanitizeInviterName(name string) string {
 		return fallbackName
 	}
 
+	// Apply length cap to NFC output (64 runes of final composed form)
+	// This ensures precomposed characters (é), Hangul syllables (한), etc. count as 1 rune each
+	runes := []rune(result)
+	if len(runes) > maxRunes {
+		// Truncate at maxRunes, but check if this splits a grapheme cluster.
+		// NFC does not guarantee boundaries: e.g., e+grave+combining-mark-below doesn't compose,
+		// so cutting after 'e' leaves dangling marks.
+		// If the next rune (at position maxRunes) is a combining mark, back off to drop
+		// the entire trailing base+marks cluster.
+		truncated := runes[:maxRunes]
+		if len(runes) > maxRunes {
+			nextRune := runes[maxRunes]
+			if unicode.Is(unicode.Mn, nextRune) || unicode.Is(unicode.Mc, nextRune) || unicode.Is(unicode.Me, nextRune) {
+				// Backed-off: scan backwards to find the base character and drop it too
+				for i := len(truncated) - 1; i >= 0; i-- {
+					r := truncated[i]
+					isMark := unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) || unicode.Is(unicode.Me, r)
+					if !isMark {
+						// Found the base, truncate before it
+						truncated = truncated[:i]
+						break
+					}
+				}
+			}
+		}
+		result = string(truncated)
+	}
+
+	// Trim trailing spaces that may have been left by the 64-rune truncation
+	result = strings.TrimRight(result, " ")
+
 	return result
 }
 
-func inviteEmail(inviter, inviterID, to, code, acceptURL string, scopes, bags []string, exp time.Time) mailer.Message {
+func inviteEmail(inviter, inviterID, to, code, publicBase string, scopes, bags []string, exp time.Time) mailer.Message {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s (Peerline peer %s) invited one of your bots to pair on Peerline,\n", inviter, inviterID)
 	b.WriteString("a deny-all relay that lets bots on different accounts exchange short messages.\n\n")
@@ -778,10 +818,12 @@ func inviteEmail(inviter, inviterID, to, code, acceptURL string, scopes, bags []
 		fmt.Fprintf(&b, "Bags: %s\n", strings.Join(bags, ", "))
 	}
 	fmt.Fprintf(&b, "Expires: %s (single use)\n\n", exp.Format(time.RFC3339))
-	b.WriteString("Accept with your bot's own Peerline API key (opening the link in a browser\nonly shows instructions; it does not accept):\n\n")
-	fmt.Fprintf(&b, "  %s\n\n", acceptURL)
-	fmt.Fprintf(&b, "  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" \\\n    '%s'\n\n", acceptURL)
-	fmt.Fprintf(&b, "Or give your bot this one-time code:\n\n  %s\n\n", code)
+	b.WriteString("Accept with your bot's own Peerline API key (POST with code in body):\n\n")
+	fmt.Fprintf(&b, "  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" \\\n")
+	fmt.Fprintf(&b, "    -H \"Content-Type: application/json\" \\\n")
+	fmt.Fprintf(&b, "    -d '{\"code\":\"%s\"}' \\\n", code)
+	fmt.Fprintf(&b, "    '%s/v1/invites/accept'\n\n", publicBase)
+	fmt.Fprintf(&b, "Or give your bot this one-time code to paste:\n\n  %s\n\n", code)
 	b.WriteString("Accepting only lets your bot act within the scopes above on the inviter's side;\nnothing of yours is shared unless you grant scopes back.\n")
 	b.WriteString("If you don't recognise the inviter, ignore this email. The code expires on its own.\n")
 	return mailer.Message{To: to, Subject: "Peerline: " + inviter + " invited your bot to pair", Body: b.String()}
@@ -799,11 +841,14 @@ func (s *Server) acceptLanding(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "Peerline: missing or malformed invite code.\n")
 		return
 	}
-	u := s.publicBase(r) + "/v1/invites/accept?code=" + url.QueryEscape(code)
-	fmt.Fprintf(w, "Peerline invite\n\nThis link must be opened by your bot with its Peerline API key:\n\n"+
-		"  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" '%s'\n\n"+
-		"Optionally grant scopes back in the same call with a JSON body, e.g. {\"scopes\":[\"messages\"]}.\n"+
-		"Or paste the one-time code into your bot: %s\n\nNothing has been accepted yet.\n", u, code)
+	u := s.publicBase(r) + "/v1/invites/accept"
+	fmt.Fprintf(w, "Peerline invite\n\nAccept with your bot's Peerline API key (use POST with code in body):\n\n"+
+		"  curl -X POST -H \"Authorization: Bearer $PEERLINE_API_KEY\" \\\n"+
+		"    -H \"Content-Type: application/json\" \\\n"+
+		"    -d '{\"code\":\"%s\"}' \\\n"+
+		"    '%s'\n\n"+
+		"Optionally grant scopes back in the same call: {\"code\":\"%s\",\"scopes\":[\"messages\"]}.\n"+
+		"Or paste the one-time code into your bot: %s\n\nNothing has been accepted yet.\n", code, u, code, code)
 }
 
 func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
@@ -812,22 +857,23 @@ func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 		Scopes []string `json:"scopes"` // optional reciprocal grant to the inviter
 		Bags   []string `json:"bags"`
 	}
-	// Body is optional when the code comes from the emailed link (?code=).
-	if r.Method == http.MethodPost && r.ContentLength != 0 {
+	// Body is optional when the code comes from the query string (?code=).
+	if r.ContentLength != 0 {
 		if !decode(w, r, &in) {
 			return
 		}
 	}
 	q := r.URL.Query()
+	queryOnlyCode := false
 	if qc := q.Get("code"); qc != "" {
 		if in.Code != "" && in.Code != qc {
 			writeErr(w, http.StatusBadRequest, "code in body and query differ")
 			return
 		}
+		if in.Code == "" {
+			queryOnlyCode = true
+		}
 		in.Code = qc
-	}
-	if r.Method == http.MethodGet {
-		in.Scopes, in.Bags = splitCSV(q.Get("scopes")), splitCSV(q.Get("bags"))
 	}
 	if in.Code == "" {
 		writeErr(w, http.StatusBadRequest, "code required (JSON body or ?code=)")
@@ -850,6 +896,12 @@ func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		s.internal(w, err)
 		return
+	}
+	// RFC 9745 deprecation headers for query-string-only code path (legacy).
+	// TODO: confirm-mode invites (#3) will return 404 on this path.
+	if queryOnlyCode {
+		w.Header().Set("Deprecation", "@1767225600") // 2026-01-01 00:00:00 UTC
+		w.Header().Set("Link", `<https://github.com/sysrex/peerline#email-invites>; rel="deprecation"; type="text/html"`)
 	}
 	resp := map[string]any{"peer_id": g.Owner, "granted_to_you": g}
 	if len(sc) > 0 {
