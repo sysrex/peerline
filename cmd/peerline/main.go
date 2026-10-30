@@ -71,6 +71,18 @@ func main() {
 		// Emailed links must not be built from a client-supplied Host header.
 		log.Error("PEERLINE_PUBLIC_URL is required when SMTP is configured (used in emailed accept links)")
 		os.Exit(1)
+	} else if smtp, ok := ml.(*mailer.SMTP); ok {
+		// Log TLS mode at startup
+		var tlsMode string
+		if smtp.Port == 465 {
+			tlsMode = "implicit TLS (port 465)"
+		} else if smtp.AllowPlaintext {
+			tlsMode = "STARTTLS optional (plaintext allowed)"
+			log.Warn("SMTP configured with plaintext allowed; invite codes and message previews are not protected in transit", "host", smtp.Host, "port", smtp.Port)
+		} else {
+			tlsMode = "STARTTLS required"
+		}
+		log.Info("SMTP configured", "host", smtp.Host, "port", smtp.Port, "tls", tlsMode, "authenticated", smtp.User != "")
 	}
 	emailPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_EMAIL_PER_HOUR"))
 	notifyPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_NOTIFY_PER_HOUR"))

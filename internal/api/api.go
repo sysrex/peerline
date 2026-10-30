@@ -982,11 +982,11 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 
 // apiKeyInBody matches Peerline API keys (pl_ + secret). Peer ids are p_ + hex
 // and do not match. Used to keep stored secrets out of notification previews.
-var apiKeyInBody = regexp.MustCompile(`pl_[A-Za-z0-9_-]{8,}`)
+var apiKeyInBody = regexp.MustCompile(regexp.QuoteMeta(auth.KeyPrefix) + `[A-Za-z0-9_-]{16,}`)
 
 // secretTokenInBody matches invite codes (inv_) and pairing tokens (pair_).
-// Both use 24-byte secrets encoded as base64url (32 chars).
-var secretTokenInBody = regexp.MustCompile(`(?:inv|pair)_[A-Za-z0-9_-]{32}`)
+// Uses {16,} to handle generator changes; greedy match captures the whole token.
+var secretTokenInBody = regexp.MustCompile(`(?:` + regexp.QuoteMeta(auth.InvitePrefix[:len(auth.InvitePrefix)-1]) + `|` + regexp.QuoteMeta(auth.PairingPrefix[:len(auth.PairingPrefix)-1]) + `)_[A-Za-z0-9_-]{16,}`)
 
 const notifyPreviewMax = 200
 
@@ -1045,8 +1045,10 @@ func (s *Server) notifyEmail(m *store.Message, to string) mailer.Message {
 }
 
 // bodyPreview is an excerpt of the message body. It drops ASCII controls
-// (except tab and newline), redacts API keys and a register token of at least
-// 8 characters, and stays within max runes.
+// (except tab and newline), redacts API keys (pl_), invite codes (inv_),
+// pairing tokens (pair_), and a register token of at least 8 characters.
+// The redaction is best-effort: it does not strip tokens with embedded format
+// characters or partial matches, and stays within max runes.
 func bodyPreview(body, registerToken string, max int) string {
 	if max < 1 {
 		return ""

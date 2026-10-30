@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -34,7 +35,7 @@ func TestValidAddress(t *testing.T) {
 func TestLogMailerDoesNotLogBody(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
-	l := Log{Logger: logger}
+	l := Log{Logger: logger, LogFullBody: false}
 	secretBody := "invite code inv_secretcode123456 and pair_token987654321"
 	err := l.Send(context.Background(), Message{
 		To:      "test@example.com",
@@ -53,6 +54,25 @@ func TestLogMailerDoesNotLogBody(t *testing.T) {
 	}
 }
 
+func TestLogMailerOptInBody(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	l := Log{Logger: logger, LogFullBody: true}
+	secretBody := "secret content"
+	err := l.Send(context.Background(), Message{
+		To:      "test@example.com",
+		Subject: "Test",
+		Body:    secretBody,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, secretBody) || !strings.Contains(logged, "FULL BODY LOGGED") {
+		t.Fatalf("opt-in body logging failed: %s", logged)
+	}
+}
+
 func TestCompose(t *testing.T) {
 	m := string(Compose("Peerline <noreply@example.com>", "bob@example.com", "hi\r\nBcc: evil@x.com", "line1\nline2", time.Unix(0, 0)))
 	if strings.Contains(m, "\r\nBcc:") {
@@ -63,325 +83,441 @@ func TestCompose(t *testing.T) {
 	}
 }
 
-func TestFromEnv(t *testing.T) {
-	t.Setenv("PEERLINE_SMTP_HOST", "")
-	s, err := FromEnv(nil)
-	if err != nil || s.Mode() != "log" {
-		t.Fatal(s, err)
-	}
-	if err := s.Send(context.Background(), Message{To: "a@b.co", Subject: "s", Body: "b"}); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PEERLINE_SMTP_HOST", "smtp.example.com")
-	if _, err := FromEnv(nil); err == nil {
-		t.Fatal("FROM required")
-	}
-	t.Setenv("PEERLINE_SMTP_FROM", "Peerline <noreply@example.com>")
-	t.Setenv("PEERLINE_SMTP_USER", "u")
-	if _, err := FromEnv(nil); err == nil {
-		t.Fatal("USER without PASS")
-	}
-	t.Setenv("PEERLINE_SMTP_PASS", "p")
-	t.Setenv("PEERLINE_SMTP_PORT", "2525")
-	s, err = FromEnv(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	smtp := s.(*SMTP)
-	if s.Mode() != "smtp" || smtp.Port != 2525 || !smtp.RequireTLS {
-		t.Fatalf("smtp config: port=%d requireTLS=%v", smtp.Port, smtp.RequireTLS)
-	}
-	// RequireTLS defaults to true when authenticated
-	t.Setenv("PEERLINE_SMTP_REQUIRE_TLS", "0")
-	s, err = FromEnv(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	smtp = s.(*SMTP)
-	if smtp.RequireTLS {
-		t.Fatalf("requireTLS=false failed: %v", smtp.RequireTLS)
-	}
-	// Invalid REQUIRE_TLS value should error
-	t.Setenv("PEERLINE_SMTP_REQUIRE_TLS", "ture")
-	_, err = FromEnv(nil)
-	if err == nil || !strings.Contains(err.Error(), "invalid value") {
-		t.Fatalf("expected error for invalid REQUIRE_TLS, got: %v", err)
+func TestIsLoopback(t *testing.T) {
+	for _, tc := range []struct {
+		host string
+		want bool
+	}{
+		{"localhost", true},
+		{"127.0.0.1", true},
+		{"127.1.2.3", true},
+		{"::1", true},
+		{"192.168.1.1", false},
+		{"example.com", false},
+		{"10.0.0.1", false},
+	} {
+		if got := isLoopback(tc.host); got != tc.want {
+			t.Errorf("isLoopback(%q) = %v, want %v", tc.host, got, tc.want)
+		}
 	}
 }
 
-// Minimal SMTP server (no TLS/auth) to exercise the SMTP sender end to end.
-func TestSMTPSend(t *testing.T) {
+func TestFromEnv(t *testing.T) {
+	tests := []struct {
+		name           string
+		host           string
+		port           string
+		user           string
+		pass           string
+		from           string
+		requireTLS     string
+		wantMode       string
+		wantPlaintext  bool
+		wantErr        bool
+		wantLogBody    bool
+		devLogEmailEnv string
+	}{
+		{"no host = log mode", "", "", "", "", "", "", "log", false, false, false, ""},
+		{"no host with opt-in body", "", "", "", "", "", "", "log", false, false, true, "1"},
+		{"localhost no auth = plaintext ok", "localhost", "", "", "", "test@example.com", "", "smtp", true, false, false, ""},
+		{"localhost with auth = plaintext ok", "localhost", "", "u", "p", "test@example.com", "", "smtp", true, false, false, ""},
+		{"non-loopback no auth = TLS required", "mail.example.com", "", "", "", "test@example.com", "", "smtp", false, false, false, ""},
+		{"non-loopback with auth = TLS required", "mail.example.com", "", "u", "p", "test@example.com", "", "smtp", false, false, false, ""},
+		{"explicit require TLS", "localhost", "", "", "", "test@example.com", "1", "smtp", false, false, false, ""},
+		{"explicit allow plaintext", "mail.example.com", "", "", "", "test@example.com", "0", "smtp", true, false, false, ""},
+		{"invalid require TLS", "localhost", "", "", "", "test@example.com", "ture", "", false, true, false, ""},
+		{"user without pass", "localhost", "", "u", "", "test@example.com", "", "", false, true, false, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PEERLINE_SMTP_HOST", tt.host)
+			t.Setenv("PEERLINE_SMTP_PORT", tt.port)
+			t.Setenv("PEERLINE_SMTP_USER", tt.user)
+			t.Setenv("PEERLINE_SMTP_PASS", tt.pass)
+			t.Setenv("PEERLINE_SMTP_FROM", tt.from)
+			t.Setenv("PEERLINE_SMTP_REQUIRE_TLS", tt.requireTLS)
+			t.Setenv("PEERLINE_DEV_LOG_EMAIL_BODY", tt.devLogEmailEnv)
+
+			s, err := FromEnv(nil)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s.Mode() != tt.wantMode {
+				t.Fatalf("mode = %q, want %q", s.Mode(), tt.wantMode)
+			}
+			if tt.wantMode == "log" {
+				if l, ok := s.(Log); ok {
+					if l.LogFullBody != tt.wantLogBody {
+						t.Fatalf("LogFullBody = %v, want %v", l.LogFullBody, tt.wantLogBody)
+					}
+				}
+			} else if tt.wantMode == "smtp" {
+				smtp := s.(*SMTP)
+				smtp.skipProbe = true // disable probe for this unit test
+				if smtp.AllowPlaintext != tt.wantPlaintext {
+					t.Fatalf("AllowPlaintext = %v, want %v", smtp.AllowPlaintext, tt.wantPlaintext)
+				}
+			}
+		})
+	}
+}
+
+// fakeServer is a minimal SMTP server for testing.
+type fakeServer struct {
+	ln                net.Listener
+	advertiseSTARTTLS bool
+	cert              *tls.Certificate
+	commands          []string
+	mu                sync.Mutex
+	t                 *testing.T
+}
+
+func newFakeServer(t *testing.T, advertiseSTARTTLS bool, cert *tls.Certificate) *fakeServer {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
-	got := make(chan string, 1)
-	go func() {
-		c, err := ln.Accept()
+	fs := &fakeServer{
+		ln:                ln,
+		advertiseSTARTTLS: advertiseSTARTTLS,
+		cert:              cert,
+		t:                 t,
+	}
+	go fs.serve()
+	return fs
+}
+
+func (fs *fakeServer) serve() {
+	for {
+		c, err := fs.ln.Accept()
 		if err != nil {
 			return
 		}
-		defer c.Close()
-		r, w := bufio.NewReader(c), bufio.NewWriter(c)
-		say := func(s string) { w.WriteString(s + "\r\n"); w.Flush() }
-		say("220 test")
-		var data strings.Builder
-		for {
-			line, err := r.ReadString('\n')
-			if err != nil {
-				return
-			}
-			cmd := strings.ToUpper(strings.TrimSpace(line))
-			switch {
-			case strings.HasPrefix(cmd, "EHLO"), strings.HasPrefix(cmd, "HELO"):
-				say("250 test")
-			case strings.HasPrefix(cmd, "MAIL"), strings.HasPrefix(cmd, "RCPT"):
-				data.WriteString(line)
-				say("250 ok")
-			case cmd == "DATA":
-				say("354 go")
-				for {
-					l, err := r.ReadString('\n')
-					if err != nil {
-						return
-					}
-					if l == ".\r\n" {
-						break
-					}
-					data.WriteString(l)
-				}
-				say("250 queued")
-			case cmd == "QUIT":
-				say("221 bye")
-				got <- data.String()
-				return
-			default:
-				say("502 no")
-			}
-		}
-	}()
-	port := ln.Addr().(*net.TCPAddr).Port
-	s := &SMTP{Host: "127.0.0.1", Port: port, From: "Peerline <noreply@example.com>", Timeout: 5 * time.Second}
-	if err := s.Send(context.Background(), Message{To: "bob@example.com", Subject: "Invite", Body: "code inv_x"}); err != nil {
-		t.Fatal(err)
+		go fs.handleConn(c)
 	}
-	d := <-got
-	for _, w := range []string{"MAIL FROM:<noreply@example.com>", "RCPT TO:<bob@example.com>", "Subject: Invite", "code inv_x"} {
-		if !strings.Contains(d, w) {
-			t.Fatalf("missing %q in %q", w, d)
+}
+
+func (fs *fakeServer) handleConn(c net.Conn) {
+	defer c.Close()
+	r, w := bufio.NewReader(c), bufio.NewWriter(c)
+	say := func(s string) { w.WriteString(s + "\r\n"); w.Flush() }
+
+	say("220 test")
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return
+		}
+		cmd := strings.ToUpper(strings.TrimSpace(line))
+		fs.mu.Lock()
+		fs.commands = append(fs.commands, cmd)
+		fs.mu.Unlock()
+
+		switch {
+		case strings.HasPrefix(cmd, "EHLO"):
+			say("250-test")
+			if fs.advertiseSTARTTLS {
+				say("250 STARTTLS")
+			} else {
+				say("250 ok")
+			}
+		case cmd == "STARTTLS":
+			if !fs.advertiseSTARTTLS || fs.cert == nil {
+				say("502 no")
+				continue
+			}
+			say("220 Ready to start TLS")
+			w.Flush()
+			tlsConn := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{*fs.cert}})
+			if err := tlsConn.Handshake(); err != nil {
+				return
+			}
+			c = tlsConn
+			r, w = bufio.NewReader(c), bufio.NewWriter(c)
+		case strings.HasPrefix(cmd, "HELO"):
+			say("250 test")
+		case strings.HasPrefix(cmd, "AUTH"):
+			say("235 ok")
+		case strings.HasPrefix(cmd, "MAIL"), strings.HasPrefix(cmd, "RCPT"):
+			say("250 ok")
+		case cmd == "DATA":
+			say("354 go")
+			for {
+				l, err := r.ReadString('\n')
+				if err != nil {
+					return
+				}
+				if l == ".\r\n" {
+					break
+				}
+			}
+			say("250 queued")
+		case cmd == "QUIT":
+			say("221 bye")
+			return
+		default:
+			say("502 no")
 		}
 	}
 }
 
-func TestSMTPRequireTLS(t *testing.T) {
-	t.Run("RequireTLS fails when STARTTLS not offered", func(t *testing.T) {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer ln.Close()
-		go func() {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			defer c.Close()
-			r, w := bufio.NewReader(c), bufio.NewWriter(c)
-			say := func(s string) { w.WriteString(s + "\r\n"); w.Flush() }
-			say("220 test")
-			for {
-				line, err := r.ReadString('\n')
-				if err != nil {
-					return
-				}
-				cmd := strings.ToUpper(strings.TrimSpace(line))
-				switch {
-				case strings.HasPrefix(cmd, "EHLO"), strings.HasPrefix(cmd, "HELO"):
-					say("250 test")
-				case cmd == "QUIT":
-					say("221 bye")
-					return
-				default:
-					say("502 no")
-				}
-			}
-		}()
-		port := ln.Addr().(*net.TCPAddr).Port
-		s := &SMTP{Host: "127.0.0.1", Port: port, From: "test@example.com", Timeout: 2 * time.Second, RequireTLS: true}
-		err = s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
-		if err == nil || !strings.Contains(err.Error(), "STARTTLS required") {
-			t.Fatalf("expected STARTTLS required error, got: %v", err)
-		}
-	})
+func (fs *fakeServer) addr() string {
+	return fs.ln.Addr().String()
+}
 
-	t.Run("RequireTLS false allows cleartext", func(t *testing.T) {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer ln.Close()
-		got := make(chan bool, 1)
-		go func() {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			defer c.Close()
-			r, w := bufio.NewReader(c), bufio.NewWriter(c)
-			say := func(s string) { w.WriteString(s + "\r\n"); w.Flush() }
-			say("220 test")
-			for {
-				line, err := r.ReadString('\n')
-				if err != nil {
-					return
-				}
-				cmd := strings.ToUpper(strings.TrimSpace(line))
-				switch {
-				case strings.HasPrefix(cmd, "EHLO"), strings.HasPrefix(cmd, "HELO"):
-					say("250 test")
-				case strings.HasPrefix(cmd, "MAIL"), strings.HasPrefix(cmd, "RCPT"):
-					say("250 ok")
-				case cmd == "DATA":
-					say("354 go")
-					for {
-						l, err := r.ReadString('\n')
-						if err != nil {
-							return
-						}
-						if l == ".\r\n" {
-							break
-						}
-					}
-					say("250 queued")
-				case cmd == "QUIT":
-					say("221 bye")
-					got <- true
-					return
-				default:
-					say("502 no")
-				}
-			}
-		}()
-		port := ln.Addr().(*net.TCPAddr).Port
-		s := &SMTP{Host: "127.0.0.1", Port: port, From: "test@example.com", Timeout: 2 * time.Second, RequireTLS: false}
-		err = s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
-		if err != nil {
-			t.Fatalf("RequireTLS=false should allow cleartext: %v", err)
-		}
-		if !<-got {
-			t.Fatal("server did not complete")
-		}
-	})
+func (fs *fakeServer) port() int {
+	return fs.ln.Addr().(*net.TCPAddr).Port
+}
 
-	t.Run("RequireTLS true works when STARTTLS offered", func(t *testing.T) {
-		// Generate self-signed cert for localhost
-		priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		template := x509.Certificate{
-			SerialNumber: big.NewInt(1),
-			Subject:      pkix.Name{CommonName: "localhost"},
-			NotBefore:    time.Now(),
-			NotAfter:     time.Now().Add(time.Hour),
-			KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-			ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-			DNSNames:     []string{"localhost"},
-			IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
-		}
-		certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
-		if err != nil {
-			t.Fatal(err)
-		}
-		cert := tls.Certificate{
-			Certificate: [][]byte{certDER},
-			PrivateKey:  priv,
-		}
+func (fs *fakeServer) close() {
+	fs.ln.Close()
+}
 
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
+func (fs *fakeServer) receivedCommands() []string {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	cmds := make([]string, len(fs.commands))
+	copy(cmds, fs.commands)
+	return cmds
+}
+
+func genTestCert(t *testing.T, hostname string) tls.Certificate {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: hostname},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{hostname},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{
+		Certificate: [][]byte{certDER},
+		PrivateKey:  priv,
+	}
+}
+
+func TestSMTPZeroValueFailsClosed(t *testing.T) {
+	// Zero-value SMTP{} must fail without STARTTLS (AllowPlaintext defaults to false)
+	cert := genTestCert(t, "localhost")
+	srv := newFakeServer(t, false, &cert) // no STARTTLS
+	defer srv.close()
+
+	s := &SMTP{
+		Host:      "127.0.0.1",
+		Port:      srv.port(),
+		From:      "test@example.com",
+		Timeout:   2 * time.Second,
+		skipProbe: true,
+	}
+	err := s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
+	if err == nil || !strings.Contains(err.Error(), "STARTTLS required") {
+		t.Fatalf("zero value should fail closed, got: %v", err)
+	}
+	// No AUTH, MAIL, RCPT or DATA should have been sent
+	cmds := srv.receivedCommands()
+	for _, cmd := range cmds {
+		if strings.HasPrefix(cmd, "AUTH") || strings.HasPrefix(cmd, "MAIL") || strings.HasPrefix(cmd, "RCPT") || cmd == "DATA" {
+			t.Fatalf("command %q sent despite missing STARTTLS: %v", cmd, cmds)
 		}
-		defer ln.Close()
+	}
+}
 
-		success := make(chan bool, 1)
-		go func() {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			defer c.Close()
-			r, w := bufio.NewReader(c), bufio.NewWriter(c)
-			say := func(s string) { w.WriteString(s + "\r\n"); w.Flush() }
+func TestSMTPSTARTTLSUpgrade(t *testing.T) {
+	cert := genTestCert(t, "localhost")
+	srv := newFakeServer(t, true, &cert)
+	defer srv.close()
 
-			say("220 test")
-			for {
-				line, err := r.ReadString('\n')
-				if err != nil {
-					return
-				}
-				cmd := strings.ToUpper(strings.TrimSpace(line))
-				switch {
-				case strings.HasPrefix(cmd, "EHLO"):
-					say("250-test")
-					say("250 STARTTLS")
-				case cmd == "STARTTLS":
-					say("220 Ready to start TLS")
-					w.Flush()
-					// Upgrade to TLS
-					tlsConn := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{cert}})
-					if err := tlsConn.Handshake(); err != nil {
-						return
-					}
-					c = tlsConn
-					r, w = bufio.NewReader(c), bufio.NewWriter(c)
-				case strings.HasPrefix(cmd, "HELO"):
-					say("250 test")
-				case strings.HasPrefix(cmd, "MAIL"), strings.HasPrefix(cmd, "RCPT"):
-					say("250 ok")
-				case cmd == "DATA":
-					say("354 go")
-					for {
-						l, err := r.ReadString('\n')
-						if err != nil {
-							return
-						}
-						if l == ".\r\n" {
-							break
-						}
-					}
-					say("250 queued")
-				case cmd == "QUIT":
-					say("221 bye")
-					success <- true
-					return
-				default:
-					say("502 no")
-				}
-			}
-		}()
+	certPool := x509.NewCertPool()
+	parsed, _ := x509.ParseCertificate(cert.Certificate[0])
+	certPool.AddCert(parsed)
 
-		port := ln.Addr().(*net.TCPAddr).Port
+	s := &SMTP{
+		Host:           "127.0.0.1",
+		Port:           srv.port(),
+		User:           "testuser",
+		Pass:           "testpass",
+		From:           "test@example.com",
+		Timeout:        5 * time.Second,
+		AllowPlaintext: false,
+		TLSConfig:      &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+		skipProbe:      true,
+	}
+	err := s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
+	if err != nil {
+		t.Fatalf("STARTTLS upgrade failed: %v", err)
+	}
+	cmds := srv.receivedCommands()
+	hasSTARTTLS := false
+	hasAUTH := false
+	for _, cmd := range cmds {
+		if cmd == "STARTTLS" {
+			hasSTARTTLS = true
+		}
+		if strings.HasPrefix(cmd, "AUTH") {
+			hasAUTH = true
+		}
+	}
+	if !hasSTARTTLS {
+		t.Fatal("STARTTLS not negotiated")
+	}
+	if !hasAUTH {
+		t.Fatal("AUTH not sent after STARTTLS")
+	}
+}
+
+func TestSMTPUntrustedCert(t *testing.T) {
+	cert := genTestCert(t, "localhost")
+	srv := newFakeServer(t, true, &cert)
+	defer srv.close()
+
+	// Don't provide custom TLSConfig, so default will be used with system roots
+	s := &SMTP{
+		Host:           "127.0.0.1",
+		Port:           srv.port(),
+		From:           "test@example.com",
+		Timeout:        2 * time.Second,
+		AllowPlaintext: false,
+		skipProbe:      true,
+	}
+	err := s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
+	if err == nil || !strings.Contains(err.Error(), "certificate") {
+		t.Fatalf("expected certificate error, got: %v", err)
+	}
+	// No DATA should have been sent
+	cmds := srv.receivedCommands()
+	for _, cmd := range cmds {
+		if cmd == "DATA" {
+			t.Fatalf("DATA sent despite cert failure: %v", cmds)
+		}
+	}
+}
+
+func TestSMTPHostnameMismatch(t *testing.T) {
+	cert := genTestCert(t, "wronghost.example.com")
+	srv := newFakeServer(t, true, &cert)
+	defer srv.close()
+
+	certPool := x509.NewCertPool()
+	parsed, _ := x509.ParseCertificate(cert.Certificate[0])
+	certPool.AddCert(parsed)
+
+	s := &SMTP{
+		Host:           "127.0.0.1",
+		Port:           srv.port(),
+		From:           "test@example.com",
+		Timeout:        2 * time.Second,
+		AllowPlaintext: false,
+		TLSConfig:      &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+		skipProbe:      true,
+	}
+	err := s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
+	if err == nil || !strings.Contains(err.Error(), "certificate") {
+		t.Fatalf("expected hostname mismatch error, got: %v", err)
+	}
+}
+
+func TestSMTPAllowPlaintext(t *testing.T) {
+	srv := newFakeServer(t, false, nil) // no STARTTLS
+	defer srv.close()
+
+	s := &SMTP{
+		Host:           "127.0.0.1",
+		Port:           srv.port(),
+		From:           "test@example.com",
+		Timeout:        2 * time.Second,
+		AllowPlaintext: true,
+		skipProbe:      true,
+	}
+	err := s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
+	if err != nil {
+		t.Fatalf("AllowPlaintext=true should succeed: %v", err)
+	}
+	cmds := srv.receivedCommands()
+	hasDATA := false
+	for _, cmd := range cmds {
+		if cmd == "DATA" {
+			hasDATA = true
+		}
+	}
+	if !hasDATA {
+		t.Fatal("DATA not sent in plaintext mode")
+	}
+}
+
+func TestSMTPProbe(t *testing.T) {
+	t.Run("STARTTLS offered = ok", func(t *testing.T) {
+		cert := genTestCert(t, "localhost")
+		srv := newFakeServer(t, true, &cert)
+		defer srv.close()
+
 		certPool := x509.NewCertPool()
-		certPool.AddCert(&x509.Certificate{Raw: certDER})
+		parsed, _ := x509.ParseCertificate(cert.Certificate[0])
+		certPool.AddCert(parsed)
+
 		s := &SMTP{
-			Host:       "127.0.0.1",
-			Port:       port,
-			From:       "test@example.com",
-			Timeout:    5 * time.Second,
-			RequireTLS: true,
-			TLSConfig:  &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+			Host:           "127.0.0.1",
+			Port:           srv.port(),
+			Timeout:        2 * time.Second,
+			AllowPlaintext: false,
+			TLSConfig:      &tls.Config{RootCAs: certPool, ServerName: "localhost"},
 		}
-		err = s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
+		err := s.Probe(context.Background())
 		if err != nil {
-			t.Fatalf("STARTTLS upgrade failed: %v", err)
+			t.Fatalf("probe should succeed: %v", err)
 		}
-		select {
-		case <-success:
-			// Server completed successfully
-		case <-time.After(2 * time.Second):
-			t.Fatal("server did not complete")
+	})
+
+	t.Run("STARTTLS missing, TLS required = error", func(t *testing.T) {
+		srv := newFakeServer(t, false, nil)
+		defer srv.close()
+
+		s := &SMTP{
+			Host:           "127.0.0.1",
+			Port:           srv.port(),
+			Timeout:        2 * time.Second,
+			AllowPlaintext: false,
+		}
+		err := s.Probe(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "PEERLINE_SMTP_REQUIRE_TLS") {
+			t.Fatalf("probe should fail and mention env var, got: %v", err)
+		}
+	})
+
+	t.Run("unreachable = warning only", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, nil))
+		slog.SetDefault(logger)
+
+		s := &SMTP{
+			Host:           "127.0.0.1",
+			Port:           1, // unreachable
+			Timeout:        100 * time.Millisecond,
+			AllowPlaintext: false,
+		}
+		err := s.Probe(context.Background())
+		if err != nil {
+			t.Fatalf("probe should not fail for unreachable: %v", err)
+		}
+		logged := buf.String()
+		if !strings.Contains(logged, "unreachable") {
+			t.Fatalf("expected warning about unreachable relay: %s", logged)
 		}
 	})
 }

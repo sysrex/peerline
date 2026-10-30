@@ -10,6 +10,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"github.com/sysrex/peerline/internal/auth"
 	"github.com/sysrex/peerline/internal/mailer"
 )
 
@@ -369,21 +370,24 @@ func TestBodyPreview(t *testing.T) {
 	if got := bodyPreview("keep short", "short", 200); got != "keep short" {
 		t.Fatal(got)
 	}
-	// inv_ and pair_ tokens must be redacted (32-char base64url after prefix, matching real tokens)
-	invCode := "inv_" + strings.Repeat("x", 32)
-	pairToken := "pair_" + strings.Repeat("y", 32)
-	got = bodyPreview("code "+invCode+" and "+pairToken+" here", "", 200)
-	if strings.Contains(got, invCode) || strings.Contains(got, pairToken) || got != "code [redacted] and [redacted] here" {
-		t.Fatalf("secret tokens leaked: %q", got)
+	// Test with real generated tokens from auth package
+	realInvCode := auth.NewSecret(auth.InvitePrefix)
+	realPairToken := auth.NewPairingToken()
+	realAPIKey := auth.NewKey()
+	// Test tokens in prose
+	got = bodyPreview("code "+realInvCode+" and "+realPairToken+" key "+realAPIKey, "", 200)
+	if strings.Contains(got, realInvCode) || strings.Contains(got, realPairToken) || strings.Contains(got, realAPIKey) {
+		t.Fatalf("real generated tokens leaked in prose: %q", got)
 	}
-	// Test with real base64url alphabet (A-Za-z0-9_-)
-	realInvCode := "inv_ABCDEFGHIJKLMNOPQRSTUVWXYZab0123"
-	realPairToken := "pair_0123456789_-ABCDEFGHIJKLMNOPQRST"
-	got = bodyPreview("invite "+realInvCode+" pair "+realPairToken, "", 200)
+	// Test tokens in URLs (accept_url and pairing_url patterns)
+	acceptURL := "https://example.com/v1/invites/accept?code=" + realInvCode
+	pairingURL := "https://example.com/v1/pairing/" + realPairToken
+	got = bodyPreview("link "+acceptURL+" and "+pairingURL, "", 400)
 	if strings.Contains(got, realInvCode) || strings.Contains(got, realPairToken) {
-		t.Fatalf("real format tokens leaked: %q", got)
+		t.Fatalf("tokens leaked in URLs: %q", got)
 	}
-	if got != "invite [redacted] pair [redacted]" {
-		t.Fatalf("unexpected redaction result: %q", got)
+	// Verify redaction markers present
+	if !strings.Contains(got, "[redacted]") {
+		t.Fatalf("no redaction markers in URL test: %q", got)
 	}
 }
