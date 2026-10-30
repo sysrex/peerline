@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -9,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/store"
@@ -17,6 +17,7 @@ import (
 // TestRevokePreventsPairingGetAndPost verifies that after revoking a pairing
 // invite via DELETE /v1/invites/{id}, both GET and POST on the pairing URL
 // return 404. This closes the gap identified in issue #59 and #66.
+// Positive control: POST after revoke (issue #169).
 func TestRevokePreventsPairingGetAndPost(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/test.db")
 	if err != nil {
@@ -54,9 +55,27 @@ func TestRevokePreventsPairingGetAndPost(t *testing.T) {
 	// URL format: /v1/pairing/{token}
 	pairingPath := invResp.PairingURL[len(srv.URL):]
 
-	// Verify the pairing link is accessible before revoke
+	// Positive control: verify the pairing link is accessible before revoke
 	resp, body = alice.do("GET", pairingPath, nil, nil)
 	want(t, resp, body, 200)
+
+	// Positive control: POST before revoke succeeds (authenticated)
+	bob := register(t, srv, "bob")
+	resp, body = bob.do("POST", pairingPath, map[string]any{
+		"scopes": []string{},
+	}, nil)
+	want(t, resp, body, 200)
+
+	// Create a new pairing invite for the revoke tests
+	resp, body = alice.do("POST", "/v1/invites", map[string]any{
+		"scopes":           []string{"messages"},
+		"generate_pairing": true,
+	}, nil)
+	want(t, resp, body, 201)
+	if err := json.Unmarshal(body, &invResp); err != nil {
+		t.Fatalf("unmarshal second invite response: %v", err)
+	}
+	pairingPath = invResp.PairingURL[len(srv.URL):]
 
 	// Revoke the invite
 	resp, body = alice.do("DELETE", "/v1/invites/"+invResp.PublicID, nil, nil)
@@ -66,8 +85,7 @@ func TestRevokePreventsPairingGetAndPost(t *testing.T) {
 	resp, body = alice.do("GET", pairingPath, nil, nil)
 	want(t, resp, body, 404)
 
-	// After revoke, POST on the pairing URL must also return 404 (authenticated)
-	bob := register(t, srv, "bob")
+	// After revoke, authenticated POST on the pairing URL must also return 404
 	resp, body = bob.do("POST", pairingPath, map[string]any{
 		"scopes": []string{},
 	}, nil)
@@ -255,7 +273,8 @@ func TestCapBeforeEmailBudget(t *testing.T) {
 
 // TestGETLimiterSeparateBuckets verifies that two clients behind a trusted
 // proxy with different X-Forwarded-For headers get separate getLim buckets,
-// and the same client shares one bucket. This closes the gap from issue #31/#129.
+// and the same client shares one bucket. Uses frozen clock for deterministic
+// behavior. Closes issue #168.
 func TestGETLimiterSeparateBuckets(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/test.db")
 	if err != nil {
@@ -268,49 +287,129 @@ func TestGETLimiterSeparateBuckets(t *testing.T) {
 		TrustedProxies: []string{"10.0.0.0/8"},
 	}
 	srv := New(st, cfg)
+
+	// Freeze clock to avoid wall-clock refill
+	clock := time.Unix(1000, 0)
+	srv.lim.SetClock(func() time.Time { return clock })
+
 	handler := srv.Handler()
 
-	// Client 1 with IP 1.2.3.4
-	makeRequest := func(clientIP string) int {
-		req := httptest.NewRequest("GET", "/", nil) // Use "/" which is rate-limited
-		req.RemoteAddr = "10.0.0.1:12345"           // Trusted proxy
+	// Helper to make a rate-limited GET request
+	makeRequest := func(clientIP string) (*httptest.ResponseRecorder, []byte) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = "10.0.0.1:12345" // Trusted proxy
 		req.Header.Set("X-Forwarded-For", clientIP)
 		rr := httptest.NewRecorder()
 		handler.ServeHTTP(rr, req)
-		return rr.Code
+		return rr, rr.Body.Bytes()
 	}
 
-	// Exhaust client 1's bucket (burst=20 for getLim)
-	// Make 21 requests - the 21st should get 429
-	for i := 0; i < 20; i++ {
-		code := makeRequest("1.2.3.4")
-		if code != 200 {
-			t.Fatalf("request %d from client 1: expected 200, got %d", i+1, code)
+	// Exhaust client 1's bucket: GetBurst=20, so 20 requests succeed
+	for i := 0; i < GetBurst; i++ {
+		rr, body := makeRequest("1.2.3.4")
+		if rr.Code != 200 {
+			t.Fatalf("request %d from client 1: expected 200, got %d: %s", i+1, rr.Code, body)
 		}
 	}
 
-	// 21st request should be rate limited
-	code := makeRequest("1.2.3.4")
-	if code != 429 {
-		t.Errorf("request 21 from client 1: expected 429 (rate limited), got %d", code)
+	// Request GetBurst+1 should be rate limited with Retry-After header
+	rr, body := makeRequest("1.2.3.4")
+	if rr.Code != 429 {
+		t.Errorf("request %d from client 1: expected 429 (rate limited), got %d", GetBurst+1, rr.Code)
+	}
+	if ra := rr.Header().Get("Retry-After"); ra != GetRetryAfter {
+		t.Errorf("expected Retry-After: %s, got %q", GetRetryAfter, ra)
+	}
+	var errResp map[string]string
+	if err := json.Unmarshal(body, &errResp); err != nil {
+		t.Errorf("unmarshal 429 body: %v", err)
+	} else if errResp["error"] != "rate limited" {
+		t.Errorf("expected uniform 429 body {\"error\":\"rate limited\"}, got %v", errResp)
 	}
 
-	// Now client 2 with a different IP should have its own bucket and not be blocked
-	code = makeRequest("5.6.7.8")
-	if code != 200 {
-		t.Errorf("client 2 (different IP) should not be rate limited, got %d", code)
+	// Client 2 with a different IP should have its own bucket and not be blocked
+	rr, body = makeRequest("5.6.7.8")
+	if rr.Code != 200 {
+		t.Errorf("client 2 (different IP) should not be rate limited, got %d: %s", rr.Code, body)
 	}
 
 	// Client 1 with the same IP should still be blocked
-	code = makeRequest("1.2.3.4")
-	if code != 429 {
-		t.Errorf("client 1 should still be rate limited, got %d", code)
+	rr, body = makeRequest("1.2.3.4")
+	if rr.Code != 429 {
+		t.Errorf("client 1 should still be rate limited, got %d", rr.Code)
+	}
+	if ra := rr.Header().Get("Retry-After"); ra != GetRetryAfter {
+		t.Errorf("client 1 retry: expected Retry-After: %s, got %q", GetRetryAfter, ra)
+	}
+}
+
+// TestUntrustedClientRotatingXFF verifies that an untrusted client sending
+// spoofed or rotating X-Forwarded-For headers does not get fresh buckets.
+// The limiter must key on the RemoteAddr, not the XFF. Closes issue #169.
+func TestUntrustedClientRotatingXFF(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	cfg := Config{
+		Logger:         slog.Default(),
+		TrustedProxies: []string{"10.0.0.0/8"}, // Only 10.0.0.0/8 is trusted
+	}
+	srv := New(st, cfg)
+
+	// Freeze clock
+	clock := time.Unix(1000, 0)
+	srv.lim.SetClock(func() time.Time { return clock })
+
+	handler := srv.Handler()
+
+	// Untrusted client at 203.0.113.50 (not in 10.0.0.0/8)
+	makeRequest := func(spoofedXFF string) (*httptest.ResponseRecorder, []byte) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = "203.0.113.50:12345" // Untrusted RemoteAddr
+		if spoofedXFF != "" {
+			req.Header.Set("X-Forwarded-For", spoofedXFF)
+		}
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		return rr, rr.Body.Bytes()
+	}
+
+	// Exhaust the bucket with GetBurst requests
+	for i := 0; i < GetBurst; i++ {
+		rr, body := makeRequest("1.1.1.1") // Spoofed XFF
+		if rr.Code != 200 {
+			t.Fatalf("request %d: expected 200, got %d: %s", i+1, rr.Code, body)
+		}
+	}
+
+	// Next request should be rate limited, even with a different spoofed XFF
+	rr, body := makeRequest("2.2.2.2") // Rotate to different spoofed IP
+	if rr.Code != 429 {
+		t.Errorf("untrusted client rotating XFF: expected 429, got %d (bucket should not be fresh)", rr.Code)
+	}
+	if ra := rr.Header().Get("Retry-After"); ra != GetRetryAfter {
+		t.Errorf("expected Retry-After: %s, got %q", GetRetryAfter, ra)
+	}
+	var errResp map[string]string
+	if err := json.Unmarshal(body, &errResp); err != nil {
+		t.Errorf("unmarshal 429 body: %v", err)
+	} else if errResp["error"] != "rate limited" {
+		t.Errorf("expected uniform 429 body, got %v", errResp)
+	}
+
+	// One more rotation attempt
+	rr, body = makeRequest("3.3.3.3")
+	if rr.Code != 429 {
+		t.Errorf("untrusted client with third XFF: expected 429, got %d", rr.Code)
 	}
 }
 
 // TestAnonymousGETDoesNotBlockAuthenticatedInbox verifies that an anonymous
 // client exhausting GET / does not cause 429 for authenticated peers polling
-// /v1/inbox. This closes the gap from issue #31/#129.
+// /v1/inbox. This closes the gap from issue #31/#129. Uses frozen clock.
 func TestAnonymousGETDoesNotBlockAuthenticatedInbox(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/test.db")
 	if err != nil {
@@ -321,7 +420,13 @@ func TestAnonymousGETDoesNotBlockAuthenticatedInbox(t *testing.T) {
 	cfg := Config{
 		Logger: slog.Default(),
 	}
-	srv := httptest.NewServer(New(st, cfg).Handler())
+	s := New(st, cfg)
+
+	// Freeze clock on the server's limiter manager
+	clock := time.Unix(1000, 0)
+	s.lim.SetClock(func() time.Time { return clock })
+
+	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 
 	// Register two peers
@@ -329,13 +434,22 @@ func TestAnonymousGETDoesNotBlockAuthenticatedInbox(t *testing.T) {
 	bob := register(t, srv, "bob")
 
 	// Anonymous client exhausts GET / (public GET limiter)
-	// burst=20, so 21 requests should exhaust it
 	anon := &client{t: t, srv: srv}
 	gotRateLimited := false
-	for i := 0; i < 25; i++ {
-		resp, _ := anon.do("GET", "/", nil, nil)
+	for i := 0; i < GetBurst+5; i++ {
+		resp, body := anon.do("GET", "/", nil, nil)
 		if resp.StatusCode == 429 {
 			gotRateLimited = true
+			// Assert Retry-After header and uniform body
+			if ra := resp.Header.Get("Retry-After"); ra != GetRetryAfter {
+				t.Errorf("anonymous GET: expected Retry-After: %s, got %q", GetRetryAfter, ra)
+			}
+			var errResp map[string]string
+			if err := json.Unmarshal(body, &errResp); err != nil {
+				t.Errorf("unmarshal 429 body: %v", err)
+			} else if errResp["error"] != "rate limited" {
+				t.Errorf("expected uniform 429 body, got %v", errResp)
+			}
 			break
 		}
 	}
@@ -445,9 +559,10 @@ func TestDeleteUsedInviteReturns404(t *testing.T) {
 
 // TestSingleLogRecordUnauthenticatedPairing verifies that exactly one log
 // record is emitted when redeeming a pairing link (unauthenticated), not just
-// that the message string appears once. This closes the gap from issue #54/#129.
+// that the message string appears once. Uses syncBuf for concurrency safety.
+// This closes the gap from issue #54/#129.
 func TestSingleLogRecordUnauthenticatedPairing(t *testing.T) {
-	var buf bytes.Buffer
+	var buf syncBuf
 	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	st, err := store.Open(t.TempDir() + "/test.db")

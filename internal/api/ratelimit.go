@@ -238,6 +238,16 @@ type LimiterManager struct {
 	wg     sync.WaitGroup
 }
 
+// Rate limit constants for public GET endpoints and authenticated endpoints.
+const (
+	GetPerMinute      = 60
+	GetBurst          = 20
+	GetRetryAfter     = "10" // seconds, returned in Retry-After header
+	AuthGetPerMinute  = 120
+	AuthGetBurst      = 40
+	AuthGetRetryAfter = "2" // seconds
+)
+
 // NewLimiterManager creates and starts a new limiter manager.
 func NewLimiterManager(cfg Config) *LimiterManager {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -246,8 +256,8 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 		regLim:        msg.NewLimiter(10, 5),
 		pairLim:       msg.NewLimiter(10, 5),
 		failLim:       msg.NewLimiter(30, 10), // Failed pairing lookups: more lenient per-IP budget
-		getLim:        msg.NewLimiter(60, 20),
-		authLim:       msg.NewLimiter(120, 40), // Higher limit for authenticated polling
+		getLim:        msg.NewLimiter(GetPerMinute, GetBurst),
+		authLim:       msg.NewLimiter(AuthGetPerMinute, AuthGetBurst),
 		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst),
 		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour),
 		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst),
@@ -260,6 +270,20 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 	go lm.pruneLoop()
 
 	return lm
+}
+
+// SetClock sets the clock function for all limiters (for testing).
+func (lm *LimiterManager) SetClock(clock func() time.Time) {
+	lm.msgLim.SetClock(clock)
+	lm.regLim.SetClock(clock)
+	lm.pairLim.SetClock(clock)
+	lm.failLim.SetClock(clock)
+	lm.getLim.SetClock(clock)
+	lm.authLim.SetClock(clock)
+	lm.mailLim.SetClock(clock)
+	lm.rcptLim.SetClock(clock)
+	lm.notifyLim.SetClock(clock)
+	lm.notifyAddrLim.SetClock(clock)
 }
 
 // pruneLoop periodically prunes stale buckets from all limiters.

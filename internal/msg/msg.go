@@ -115,6 +115,11 @@ func NewLimiterPerHour(perHour, burst int) *Limiter {
 	return l
 }
 
+// SetClock sets the clock function for testing. Must be called before any Allow/Ready calls.
+func (l *Limiter) SetClock(clock func() time.Time) {
+	l.now = clock
+}
+
 // Allow consumes one token for key; false means rate limited.
 func (l *Limiter) Allow(key string) bool { return l.take(key, true) }
 
