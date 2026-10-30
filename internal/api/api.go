@@ -620,18 +620,24 @@ func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listInvites(w http.ResponseWriter, r *http.Request) {
 	me := auth.PeerID(r.Context())
 
-	// Parse pagination parameters
+	// Parse and validate pagination parameters (Architect item 7)
 	limit := 50
 	offset := 0
 	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
-		if parsed, err := strconv.Atoi(limitStr); err == nil && parsed > 0 && parsed <= 200 {
-			limit = parsed
+		parsed, err := strconv.Atoi(limitStr)
+		if err != nil || parsed <= 0 || parsed > 200 {
+			writeErr(w, http.StatusBadRequest, "limit must be a positive integer between 1 and 200")
+			return
 		}
+		limit = parsed
 	}
 	if offsetStr := r.URL.Query().Get("offset"); offsetStr != "" {
-		if parsed, err := strconv.Atoi(offsetStr); err == nil && parsed >= 0 {
-			offset = parsed
+		parsed, err := strconv.Atoi(offsetStr)
+		if err != nil || parsed < 0 {
+			writeErr(w, http.StatusBadRequest, "offset must be a non-negative integer")
+			return
 		}
+		offset = parsed
 	}
 
 	invites, err := s.st.ListInvitesByPeer(r.Context(), me, limit, offset)

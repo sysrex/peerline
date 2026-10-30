@@ -648,6 +648,19 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 	return grant, nil
 }
 
+// PairingTokenExists checks if a pairing token exists (is valid and not yet redeemed).
+func (s *Store) PairingTokenExists(ctx context.Context, pairingTokenHash string) (bool, error) {
+	var exists int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM invites WHERE pairing_token_hash=? AND used_by IS NULL AND expires_at >= ?`, pairingTokenHash, time.Now().Unix()).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // AcceptInvite atomically consumes an invite and creates the inviter->accepter grant
 // plus, optionally, a reciprocal accepter->inviter grant. Returns the inviter's grant.
 func (s *Store) AcceptInvite(ctx context.Context, codeHash, accepter string, backScopes, backBags []string) (*Grant, error) {
