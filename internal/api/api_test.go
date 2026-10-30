@@ -3686,6 +3686,39 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 		t.Errorf("body-only POST 401: unexpected Link = %q", got)
 	}
 	assertSecurityHeaders(t, resp.Header, "body-only POST 401")
+
+	// 14. 429 (rate limit) with ?code=: should have deprecation headers
+	// Create a server with very low write rate limit to trigger 429
+	srvLimited := newServer(t, Config{WritePerMinute: 60, WriteBurst: 1})
+	c := register(t, srvLimited, "charlie")
+	d := register(t, srvLimited, "dave")
+	respInv, bodyInv := c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, respInv, bodyInv, 201)
+	var inv4 struct{ Code string }
+	json.Unmarshal(bodyInv, &inv4)
+	// Wait for rate limiter to refill (60/min = 1 token per second)
+	time.Sleep(1100 * time.Millisecond)
+	// Create another invite after bucket refill
+	respInv2, bodyInv2 := c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, respInv2, bodyInv2, 201)
+	var inv5 struct{ Code string }
+	json.Unmarshal(bodyInv2, &inv5)
+	// Exhaust Dave's write rate limit by accepting first invite (uses burst token)
+	resp429, body429 := d.do("POST", "/v1/invites/accept?code="+inv4.Code, nil, nil)
+	want(t, resp429, body429, 200)
+	// Second accept immediately should hit 429 (no tokens left)
+	resp429, body429 = d.do("POST", "/v1/invites/accept?code="+inv5.Code, nil, nil)
+	want(t, resp429, body429, 429)
+	if got := resp429.Header.Get("Deprecation"); got != wantDeprecation {
+		t.Errorf("POST 429 rate limit: Deprecation = %q, want %q", got, wantDeprecation)
+	}
+	if got := resp429.Header.Get("Link"); got != wantLink {
+		t.Errorf("POST 429 rate limit: Link = %q, want %q", got, wantLink)
+	}
+	if got := resp429.Header.Get("Retry-After"); got == "" {
+		t.Error("POST 429 rate limit: missing Retry-After header")
+	}
+	assertSecurityHeaders(t, resp429.Header, "POST 429 rate limit")
 }
 
 func TestPairingLookupsBoundedPerIP(t *testing.T) {

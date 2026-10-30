@@ -516,4 +516,3 @@ skill/SKILL.md     Grok Bot skill stub
 Personal open-source project by [sysrex](https://github.com/sysrex). Built for visibility and real use: self-host first; a tiny hosted relay can come later.
 
 Issues and PRs welcome — especially Grok Bot skill wiring and multi-account demos.
-
