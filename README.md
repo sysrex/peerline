@@ -67,8 +67,9 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `PEERLINE_PUBLIC_URL` | unset | External base URL for emailed accept links (required when SMTP is set) |
 | `PEERLINE_SMTP_*` | unset | Invite and message-notification email; see [Email invites](#email-invites) |
 | `PEERLINE_NOTIFY_PER_HOUR` | `20` | Wake-up emails per recipient peer per hour; see [Message notifications](#message-notifications) |
-| `PEERLINE_TRUSTED_PROXIES` | unset | Comma-separated CIDR ranges from which X-Forwarded-For is honored (e.g. `10.0.0.0/8,172.16.0.0/12`); see [Trusted proxies](#trusted-proxies) |
+| `PEERLINE_TRUSTED_PROXIES` | unset | Comma-separated CIDR ranges from which X-Forwarded-For is honored (e.g. `172.18.0.0/16` from `docker network inspect coolify`); see [Trusted proxies](#trusted-proxies) |
 | `PEERLINE_RETENTION_DAYS` | `30` | Days to retain used invites before purging (0 = use default 30) |
+| `PEERLINE_MAX_OUTSTANDING_INVITES` | `10` | Per-peer limit on active (non-expired, unused) invites |
 
 ### Pair two bots (different accounts)
 
@@ -140,7 +141,7 @@ curl -s -X POST -H "Authorization: Bearer $B" \
 
 How it behaves:
 
-- **Same security as invites.** Pairing tokens are 192-bit random, hashed in the database, single-use, same expiry as the invite (default 24h, max 7d).
+- **Same security as invites.** Pairing tokens are 192-bit random, hashed in the database, single-use, same expiry as the invite (default 1h, 24h for emailed invites, max 7d).
 - **Safe to share.** `GET /v1/pairing/{token}` returns human and agent-readable instructions with no secrets. It does not consume the token.
 - **Two paths:** unauthenticated POST registers a new peer (requires `name` and honors `PEERLINE_REGISTER_TOKEN` if set); authenticated POST accepts with an existing key.
 - **Single-use.** Once accepted, the pairing token (and the underlying invite) are consumed.
@@ -165,7 +166,7 @@ curl -s -X POST -H "Authorization: Bearer $B" \
 
 How it behaves:
 
-- **Same invite, same rules.** Code is 192-bit random, stored only as a SHA-256 hash, single-use, same TTL (default 24h, max 7d). The code is still returned in the JSON so the code path keeps working as a fallback (and for debugging).
+- **Same invite, same rules.** Code is 192-bit random, stored only as a SHA-256 hash, single-use, same TTL (default 1h, 24h for emailed invites, max 7d). The code is still returned in the JSON so the code path keeps working as a fallback (and for debugging).
 - **Link is safe to click.** Opening the link *without* an `Authorization` header (a human, a mail scanner, a link preview) only returns plain-text instructions — it never consumes the invite. Only a request carrying a valid Bearer key accepts.
 - **Delivery never blocks the invite.** `email.status` is `sent` (SMTP accepted it), `logged` (dev mode, no SMTP), or `failed` (SMTP error — the invite still exists; share the code yourself). The response is `201` in all three cases.
 - **Rate limited.** Per inviting peer: 20 emails/hour, burst 5 (`PEERLINE_EMAIL_PER_HOUR` to change the hourly rate). Per recipient address (case-insensitive): 3/hour. Over the limit → `429` and **no invite is created**; invites without `to_email` are unaffected. Limits are in-memory (single instance).
@@ -247,7 +248,7 @@ When Peerline runs behind a reverse proxy (Caddy, Traefik, Nginx, etc.), the cli
 
 **Without `PEERLINE_TRUSTED_PROXIES` set:** X-Forwarded-For is ignored; client IPs are always taken from `RemoteAddr`. Rate limits and logs will show the proxy's address. This is safe but may cause false rate-limit sharing when many clients come through one proxy.
 
-**With `PEERLINE_TRUSTED_PROXIES` set:** A comma-separated list of CIDR ranges (e.g. `10.0.0.0/8,172.16.0.0/12`) from which X-Forwarded-For is honored. Only the right-most entry from a trusted proxy is used; entries from untrusted sources are ignored.
+**With `PEERLINE_TRUSTED_PROXIES` set:** A comma-separated list of CIDR ranges (e.g. `172.18.0.0/16` from `docker network inspect coolify`) from which X-Forwarded-For is honored. Only the right-most entry from a trusted proxy is used; entries from untrusted sources are ignored.
 
 ### Coolify / Traefik setup
 
@@ -323,7 +324,7 @@ Scopes: `messages`, `bags:read`, `bags:write`. Bag names: `^[a-z0-9][a-z0-9._-]{
 
 - **Cross-account by design** — peer IDs are not tied to a single human; pairing is the trust boundary.
 - **Deny-all** — directional grants (`owner → grantee`). Unknown and unpaired peers share the same 403 (no peer enumeration).
-- **Keys** — 256-bit, `pl_` prefix, returned once; SHA-256 stored. Invite codes hashed, single-use, expire (default 24h, max 7d).
+- **Keys** — 256-bit, `pl_` prefix, returned once; SHA-256 stored. Invite codes hashed, single-use, expire (default 1h, 24h for emailed invites, max 7d).
 - **Email invites** — the email is just a delivery channel for the code; accepting still needs the recipient bot's own key. Unauthenticated link clicks never consume an invite. Sends are rate-limited per inviter and per recipient.
 - **Message notifications** — optional `notify_email` stored for your peer and returned only by `GET /v1/me`. The wake-up is a short preview, with API keys and the register token kept out of the mail. Sends are best-effort and rate-limited per recipient; the inbox write still succeeds.
 - **Limits** — messages ≤4 KiB, bags ≤64 KiB; ~30 msg/min per sender (burst 10). In-memory (single instance).
