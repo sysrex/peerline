@@ -1,38 +1,15 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"unicode/utf8"
 
 	"github.com/sysrex/peerline/internal/auth"
-	"github.com/sysrex/peerline/internal/mailer"
 )
-
-type captureMailer struct {
-	mu   sync.Mutex
-	msgs []mailer.Message
-}
-
-func (c *captureMailer) Mode() string { return "smtp" }
-func (c *captureMailer) Send(_ context.Context, m mailer.Message) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.msgs = append(c.msgs, m)
-	return nil
-}
-func (c *captureMailer) all() []mailer.Message {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	out := make([]mailer.Message, len(c.msgs))
-	copy(out, c.msgs)
-	return out
-}
 
 func registerNotify(t *testing.T, srv *httptest.Server, name, email string) *client {
 	t.Helper()
@@ -396,9 +373,13 @@ func TestBodyPreview(t *testing.T) {
 
 func TestNotifyDevModeNoBodyLeakage(t *testing.T) {
 	var logs syncBuf
-	srv := newServer(t, Config{Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	srv := newServer(t, Config{
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+		// No mailer configured = Log mailer (dev mode)
+	})
 	a := register(t, srv, "alice")
 	b := registerNotify(t, srv, "bob", "bob@example.com")
+
 	pairUp(t, b, a, []string{"messages"}, nil, nil)
 	secretBody := "secret content with inv_" + strings.Repeat("x", 20) + " and pair_" + strings.Repeat("y", 20)
 	resp, body := a.do("POST", "/v1/peers/"+b.id+"/messages", map[string]any{"type": "note", "body": secretBody}, nil)

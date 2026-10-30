@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"log/slog"
 	"math/big"
 	"net"
@@ -90,14 +91,15 @@ func TestIsLoopback(t *testing.T) {
 	}{
 		{"localhost", true},
 		{"127.0.0.1", true},
-		{"127.1.2.3", true},
 		{"::1", true},
+		// Only exact matches per net/smtp PlainAuth
+		{"127.1.2.3", false},
 		{"192.168.1.1", false},
 		{"example.com", false},
 		{"10.0.0.1", false},
 	} {
-		if got := isLoopback(tc.host); got != tc.want {
-			t.Errorf("isLoopback(%q) = %v, want %v", tc.host, got, tc.want)
+		if got := IsLoopback(tc.host); got != tc.want {
+			t.Errorf("IsLoopback(%q) = %v, want %v", tc.host, got, tc.want)
 		}
 	}
 }
@@ -498,23 +500,117 @@ func TestSMTPProbe(t *testing.T) {
 		}
 	})
 
-	t.Run("unreachable = warning only", func(t *testing.T) {
-		var buf bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&buf, nil))
+	t.Run("unreachable = ErrRelayUnreachable", func(t *testing.T) {
+		// Use ephemeral port that's closed
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		ln.Close() // close it immediately
 
 		s := &SMTP{
 			Host:           "127.0.0.1",
-			Port:           1, // unreachable
+			Port:           port,
 			Timeout:        100 * time.Millisecond,
 			AllowPlaintext: false,
 		}
-		err := s.Probe(context.Background(), logger)
-		if err != nil {
-			t.Fatalf("probe should not fail for unreachable: %v", err)
+		err = s.Probe(context.Background(), nil)
+		if err == nil {
+			t.Fatal("probe should return error for unreachable")
 		}
-		logged := buf.String()
-		if !strings.Contains(logged, "unreachable") {
-			t.Fatalf("expected warning about unreachable relay: %s", logged)
+		if !errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("expected ErrRelayUnreachable, got: %v", err)
+		}
+	})
+
+	t.Run("STARTTLS with untrusted cert is fatal", func(t *testing.T) {
+		cert := genTestCert(t, "localhost")
+		srv := newFakeServer(t, true, &cert)
+		defer srv.close()
+
+		s := &SMTP{
+			Host:           "127.0.0.1",
+			Port:           srv.port(),
+			Timeout:        2 * time.Second,
+			AllowPlaintext: false,
+			// No custom TLSConfig - will use system roots and fail
+		}
+		err := s.Probe(context.Background(), nil)
+		if err == nil {
+			t.Fatal("probe should fail on untrusted cert")
+		}
+		if errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("untrusted cert should be fatal, not ErrRelayUnreachable: %v", err)
+		}
+		if !strings.Contains(err.Error(), "certificate") {
+			t.Fatalf("expected certificate error, got: %v", err)
+		}
+	})
+
+	t.Run("STARTTLS with trusted cert succeeds", func(t *testing.T) {
+		cert := genTestCert(t, "localhost")
+		srv := newFakeServer(t, true, &cert)
+		defer srv.close()
+
+		certPool := x509.NewCertPool()
+		parsed, _ := x509.ParseCertificate(cert.Certificate[0])
+		certPool.AddCert(parsed)
+
+		s := &SMTP{
+			Host:           "127.0.0.1",
+			Port:           srv.port(),
+			Timeout:        2 * time.Second,
+			AllowPlaintext: false,
+			TLSConfig:      &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+		}
+		err := s.Probe(context.Background(), nil)
+		if err != nil {
+			t.Fatalf("probe should succeed with trusted cert: %v", err)
+		}
+	})
+
+	t.Run("STARTTLS handshake timeout = ErrRelayUnreachable", func(t *testing.T) {
+		// Server that advertises STARTTLS but hangs during handshake
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+					// Send greeting and EHLO response advertising STARTTLS
+					conn.Write([]byte("220 test\r\n"))
+					buf := make([]byte, 1024)
+					conn.Read(buf) // read EHLO
+					conn.Write([]byte("250-test\r\n250 STARTTLS\r\n"))
+					conn.Read(buf) // read STARTTLS
+					conn.Write([]byte("220 Ready to start TLS\r\n"))
+					// Then hang - don't start TLS handshake
+					time.Sleep(2 * time.Second)
+				}(c)
+			}
+		}()
+
+		s := &SMTP{
+			Host:           "127.0.0.1",
+			Port:           ln.Addr().(*net.TCPAddr).Port,
+			Timeout:        500 * time.Millisecond,
+			AllowPlaintext: false,
+		}
+		err = s.Probe(context.Background(), nil)
+		if err == nil {
+			t.Fatal("probe should return error for timeout")
+		}
+		if !errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("timeout should be ErrRelayUnreachable, got: %v", err)
 		}
 	})
 }
@@ -602,17 +698,31 @@ func TestSMTPImplicitTLS(t *testing.T) {
 	})
 
 	t.Run("port 465 probe TLS handshake failure is fatal", func(t *testing.T) {
+		// TLS listener with cert the client won't trust
 		ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer ln.Close()
 
-		// Shorter timeout to fail fast on cert validation
+		// Accept and do real TLS handshake
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				// Just accept and let TLS handshake happen; will fail on client side due to untrusted cert
+				buf := make([]byte, 1024)
+				c.Read(buf) // block until client closes or we're done
+				c.Close()
+			}
+		}()
+
 		s := &SMTP{
 			Host:        "127.0.0.1",
 			Port:        ln.Addr().(*net.TCPAddr).Port,
-			Timeout:     500 * time.Millisecond,
+			Timeout:     2 * time.Second,
 			ImplicitTLS: true,
 			// No custom TLSConfig - will use system roots and fail cert validation
 		}
@@ -620,13 +730,15 @@ func TestSMTPImplicitTLS(t *testing.T) {
 		if err == nil {
 			t.Fatal("probe should fail on port 465 TLS error, got nil")
 		}
-		// Should be a TLS handshake failure, not just an unreachable warning
+		if errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("cert error should be fatal, not ErrRelayUnreachable: %v", err)
+		}
 		if !strings.Contains(err.Error(), "TLS handshake") && !strings.Contains(err.Error(), "certificate") {
-			t.Fatalf("expected TLS error, got: %v", err)
+			t.Fatalf("expected TLS/certificate error, got: %v", err)
 		}
 	})
 
-	t.Run("port 465 probe timeout during handshake is fatal", func(t *testing.T) {
+	t.Run("port 465 probe timeout during handshake = ErrRelayUnreachable", func(t *testing.T) {
 		// TCP listener that accepts but never speaks TLS
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -654,31 +766,34 @@ func TestSMTPImplicitTLS(t *testing.T) {
 		}
 		err = s.Probe(context.Background(), nil)
 		if err == nil {
-			t.Fatal("probe should fail on handshake timeout, got nil")
+			t.Fatal("probe should return error for timeout")
 		}
-		if !strings.Contains(err.Error(), "handshake") {
-			t.Fatalf("expected handshake error, got: %v", err)
+		if !errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("timeout should be ErrRelayUnreachable, got: %v", err)
 		}
 	})
 
-	t.Run("port 465 probe closed port only warns", func(t *testing.T) {
-		var buf bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&buf, nil))
+	t.Run("port 465 probe closed port = ErrRelayUnreachable", func(t *testing.T) {
+		// Use ephemeral port that's closed
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		ln.Close() // close it immediately
 
-		// Use a port that's definitely closed
 		s := &SMTP{
 			Host:        "127.0.0.1",
-			Port:        1, // closed port
+			Port:        port,
 			Timeout:     100 * time.Millisecond,
 			ImplicitTLS: true,
 		}
-		err := s.Probe(context.Background(), logger)
-		if err != nil {
-			t.Fatalf("probe should not fail for closed port, got: %v", err)
+		err = s.Probe(context.Background(), nil)
+		if err == nil {
+			t.Fatal("probe should return error for closed port")
 		}
-		logged := buf.String()
-		if !strings.Contains(logged, "unreachable") {
-			t.Fatalf("expected warning about unreachable relay: %s", logged)
+		if !errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("closed port should be ErrRelayUnreachable, got: %v", err)
 		}
 	})
 }

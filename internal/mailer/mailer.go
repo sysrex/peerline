@@ -9,6 +9,7 @@ package mailer
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -21,6 +22,11 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrRelayUnreachable is returned by Probe when the SMTP server is unreachable
+// (connection refused, timeout, reset, or SMTP-level greeting/EHLO errors).
+// Startup logs a warning and continues; runtime Send will retry.
+var ErrRelayUnreachable = errors.New("smtp relay unreachable")
 
 // Message is a plain-text email.
 type Message struct {
@@ -95,14 +101,11 @@ type SMTP struct {
 
 func (s *SMTP) Mode() string { return "smtp" }
 
-// isLoopback returns true if host is a loopback address: "localhost", 127.0.0.0/8, or ::1.
-// Hostnames are not resolved; only literal "localhost" is recognized as loopback.
-func isLoopback(host string) bool {
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+// IsLoopback returns true if host is a loopback address.
+// Matches net/smtp PlainAuth: "localhost", "127.0.0.1", and "::1".
+// Hostnames are not resolved; only these three literals are recognized as loopback.
+func IsLoopback(host string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 // FromEnv builds a Sender from PEERLINE_SMTP_HOST/PORT/USER/PASS/FROM.
@@ -133,7 +136,7 @@ func FromEnv(lg *slog.Logger) (Sender, error) {
 		return nil, errors.New("PEERLINE_SMTP_USER and PEERLINE_SMTP_PASS must be set together")
 	}
 	// Default: allow plaintext only for loopback, require TLS otherwise
-	allowPlaintext := isLoopback(host)
+	allowPlaintext := IsLoopback(host)
 	if v := os.Getenv("PEERLINE_SMTP_REQUIRE_TLS"); v != "" {
 		switch strings.ToLower(strings.TrimSpace(v)) {
 		case "1", "true", "yes":
@@ -231,8 +234,11 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 }
 
 // Probe connects to the SMTP server, checks for STARTTLS availability, and disconnects.
-// It fails fast if TLS is misconfigured. If the server is unreachable (TCP dial failure),
-// it logs a warning via lg and returns nil. TLS handshake failures on port 465 fail startup.
+// It fails fast (returns a non-nil error) only for provable misconfiguration:
+// x509 or TLS errors (certificate problems, handshake failures) and missing STARTTLS when required.
+// Network errors (timeouts, connection refused, resets), SMTP greeting/EHLO errors, and
+// all other transient failures return an error wrapping ErrRelayUnreachable; the caller
+// should log a warning and continue (Send will retry at runtime).
 func (s *SMTP) Probe(ctx context.Context, lg *slog.Logger) error {
 	if lg == nil {
 		lg = slog.Default()
@@ -258,9 +264,8 @@ func (s *SMTP) Probe(ctx context.Context, lg *slog.Logger) error {
 	d := &net.Dialer{}
 	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		// TCP dial failure - warn but don't fail startup
-		lg.Warn("smtp probe: relay unreachable at startup (will retry on send)", "host", s.Host, "port", s.Port, "err", err)
-		return nil
+		// TCP dial failure: connection refused, timeout, no route, etc. - transient
+		return fmt.Errorf("%w: %v", ErrRelayUnreachable, err)
 	}
 	defer conn.Close()
 
@@ -272,24 +277,62 @@ func (s *SMTP) Probe(ctx context.Context, lg *slog.Logger) error {
 	if s.ImplicitTLS {
 		tlsConn := tls.Client(conn, tlsCfg)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			return fmt.Errorf("smtp probe: TLS handshake failed on port 465: %w", err)
+			// Check if it's a certificate/TLS error (fatal) or a timeout/reset (transient)
+			if isTLSError(err) {
+				return fmt.Errorf("smtp probe: TLS handshake failed on port 465: %w", err)
+			}
+			return fmt.Errorf("%w: TLS handshake timeout/reset on port 465: %v", ErrRelayUnreachable, err)
 		}
 		conn = tlsConn
 	}
 
 	c, err := smtp.NewClient(conn, s.Host)
 	if err != nil {
-		return fmt.Errorf("smtp probe: %w", err)
+		// SMTP greeting or protocol error - transient
+		return fmt.Errorf("%w: SMTP greeting failed: %v", ErrRelayUnreachable, err)
 	}
 	defer c.Quit()
 
 	if !s.ImplicitTLS {
 		hasSTARTTLS, _ := c.Extension("STARTTLS")
 		if !hasSTARTTLS && !s.AllowPlaintext {
+			// Missing STARTTLS when required is a config error
 			return fmt.Errorf("smtp probe: STARTTLS not offered by %s:%d but TLS is required (set PEERLINE_SMTP_REQUIRE_TLS=false to allow cleartext)", s.Host, s.Port)
+		}
+		if hasSTARTTLS {
+			// Actually perform the handshake to verify certs
+			if err := c.StartTLS(tlsCfg); err != nil {
+				if isTLSError(err) {
+					return fmt.Errorf("smtp probe: STARTTLS handshake failed: %w", err)
+				}
+				return fmt.Errorf("%w: STARTTLS timeout/reset: %v", ErrRelayUnreachable, err)
+			}
 		}
 	}
 	return nil
+}
+
+// isTLSError returns true if err is a certificate validation error or TLS protocol error.
+// These are fatal configuration errors, not transient network errors.
+func isTLSError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check for x509 certificate errors
+	var x509Unknown x509.UnknownAuthorityError
+	var x509Hostname x509.HostnameError
+	var x509Invalid x509.CertificateInvalidError
+	if errors.As(err, &x509Unknown) || errors.As(err, &x509Hostname) || errors.As(err, &x509Invalid) {
+		return true
+	}
+	// Check for TLS errors
+	var tlsCertVerify *tls.CertificateVerificationError
+	var tlsRecordHeader tls.RecordHeaderError
+	var tlsAlert tls.AlertError
+	if errors.As(err, &tlsCertVerify) || errors.As(err, &tlsRecordHeader) || errors.As(err, &tlsAlert) {
+		return true
+	}
+	return false
 }
 
 // Compose renders an RFC 5322 plain-text message with CRLF line endings.

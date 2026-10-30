@@ -28,27 +28,68 @@ type inviteResp struct {
 	Email     map[string]string `json:"email"`
 }
 
+type captureMailer struct {
+	mu   sync.Mutex
+	msgs []mailer.Message
+}
+
+func (c *captureMailer) Mode() string { return "smtp" }
+
+func (c *captureMailer) Send(_ context.Context, m mailer.Message) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.msgs = append(c.msgs, m)
+	return nil
+}
+
+func (c *captureMailer) all() []mailer.Message {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]mailer.Message, len(c.msgs))
+	copy(out, c.msgs)
+	return out
+}
+
+func (c *captureMailer) messages() []mailer.Message {
+	return c.all()
+}
+
 // Dev mode: no SMTP configured -> email is logged, invite still created and usable.
 func TestEmailInviteDevMode(t *testing.T) {
 	var logs syncBuf
-	srv := newServer(t, Config{Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	capture := &captureMailer{}
+	srv := newServer(t, Config{
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+		Mailer: capture,
+	})
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
 
 	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "bob@example.com"}, nil)
 	want(t, resp, body, 201)
 	var inv inviteResp
 	json.Unmarshal(body, &inv)
-	if inv.Code == "" || inv.Email["status"] != "logged" || inv.Email["mode"] != "log" || inv.Email["to"] != "bob@example.com" {
+	if inv.Code == "" || inv.Email["status"] != "sent" || inv.Email["mode"] != "smtp" || inv.Email["to"] != "bob@example.com" {
 		t.Fatalf("invite: %s", body)
 	}
 	if !strings.HasPrefix(inv.AcceptURL, srv.URL+"/v1/invites/accept?code=") || !strings.Contains(inv.AcceptURL, inv.Code) {
 		t.Fatalf("accept_url: %s", inv.AcceptURL)
 	}
-	l := logs.String()
-	if !strings.Contains(l, "bob@example.com") || !strings.Contains(l, "dev mode") || !strings.Contains(l, "body_len=") {
-		t.Fatalf("email metadata not logged: %s", l)
+
+	// Check email was sent via capture mailer
+	msgs := capture.messages()
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 email, got %d", len(msgs))
 	}
+	if !strings.Contains(msgs[0].Body, inv.Code) {
+		t.Fatalf("email body should contain invite code %s, got: %s", inv.Code, msgs[0].Body)
+	}
+	// Email should contain the code in the accept URL and as a standalone one-time code
+	if !strings.Contains(msgs[0].Body, "?code="+inv.Code) {
+		t.Fatalf("email body should contain code in URL, got: %s", msgs[0].Body)
+	}
+
 	// Fix #26: invite code must NOT appear in logs
+	l := logs.String()
 	if strings.Contains(l, inv.Code) {
 		t.Fatalf("invite code leaked in dev mode log: %s", l)
 	}

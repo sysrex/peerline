@@ -207,7 +207,10 @@ PEERLINE_SMTP_FROM='Peerline <peerline@example.com>' \
 
 The server refuses to start if the SMTP settings are inconsistent (e.g. host without `FROM` or `PUBLIC_URL`), or if STARTTLS is required but not offered by the relay. Note that dev mode logs email metadata including recipient addresses — don't run it that way on a shared box.
 
-**Upgrade note**: Peerline now requires STARTTLS by default on non-loopback relays (secure by default). If you have an unauthenticated plaintext relay on a private, non-loopback host (e.g. `smtp.internal.corp`), set `PEERLINE_SMTP_REQUIRE_TLS=false` explicitly to allow cleartext.
+**Upgrade notes**:
+- Peerline now requires STARTTLS by default on non-loopback relays (secure by default). Cleartext SMTP is refused to non-loopback hosts unless `PEERLINE_SMTP_REQUIRE_TLS=false` is set. This override has no effect on port 465, which always uses TLS.
+- Startup now performs network I/O (SMTP probe) to fail fast if TLS is misconfigured.
+- Dev mode no longer logs the invite link or email verification token. Set `PEERLINE_DEV_LOG_EMAIL_BODY=1` to see them in dev logs.
 
 The same SMTP settings deliver [message notifications](#message-notifications).
 
