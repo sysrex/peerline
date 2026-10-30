@@ -71,6 +71,7 @@ func TestEmailInviteDevMode(t *testing.T) {
 	if inv.Code == "" || inv.Email["status"] != "sent" || inv.Email["mode"] != "smtp" || inv.Email["to"] != "bob@example.com" {
 		t.Fatalf("invite: %s", body)
 	}
+	// accept_url still has ?code= for the emailed link (unauthenticated GET landing page needs it)
 	if !strings.HasPrefix(inv.AcceptURL, srv.URL+"/v1/invites/accept?code=") || !strings.Contains(inv.AcceptURL, inv.Code) {
 		t.Fatalf("accept_url: %s", inv.AcceptURL)
 	}
@@ -93,6 +94,10 @@ func TestEmailInviteDevMode(t *testing.T) {
 	if strings.Contains(l, inv.Code) {
 		t.Fatalf("invite code leaked in dev mode log: %s", l)
 	}
+	// Email should show code in body format (JSON), not query string
+	if !strings.Contains(l, `'{\"code\":\"`) || !strings.Contains(l, "POST") || !strings.Contains(l, "Content-Type: application/json") {
+		t.Fatalf("email should show POST with code in JSON body: %s", l)
+	}
 
 	// Unauthenticated click (human / mail scanner) shows instructions and does not consume.
 	anon := &client{t: t, srv: srv}
@@ -108,14 +113,14 @@ func TestEmailInviteDevMode(t *testing.T) {
 		t.Fatal("landing echoed bad code")
 	}
 
-	// Bob's bot follows the magic link with its key (GET, reciprocal scopes via query).
-	resp, body = b.do("GET", path+"&scopes=messages", nil, nil)
+	// Bob's bot follows the magic link with its key (POST, reciprocal scopes in body).
+	resp, body = b.do("POST", path, map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 200)
 	if !strings.Contains(string(body), `"granted_by_you"`) {
 		t.Fatalf("accept: %s", body)
 	}
 	// single use
-	resp, body = b.do("GET", path, nil, nil)
+	resp, body = b.do("POST", path, nil, nil)
 	want(t, resp, body, 404)
 	// grant works both ways
 	resp, body = b.do("POST", "/v1/peers/"+a.id+"/messages", map[string]any{"type": "note", "body": "hi"}, nil)
