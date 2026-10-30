@@ -487,33 +487,12 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check per-owner invite cap BEFORE spending email budget (#53)
-	count, err := s.st.CountOutstandingInvites(r.Context(), me)
-	if err != nil {
-		s.internal(w, err)
-		return
-	}
-	if count >= s.cfg.MaxOutstandingInvites {
-		writeErr(w, http.StatusTooManyRequests, fmt.Sprintf("too many outstanding invites (limit %d); revoke or wait for expiry", s.cfg.MaxOutstandingInvites))
-		return
-	}
-
-	// Email rate limit check (after cap check, before creating invite)
-	if to != "" {
-		rk := strings.ToLower(to)
-		if !s.lim.mailLim.Ready(me) || !s.lim.rcptLim.Ready(rk) || !s.lim.mailLim.Allow(me) || !s.lim.rcptLim.Allow(rk) {
-			w.Header().Set("Retry-After", "600")
-			writeErr(w, http.StatusTooManyRequests, "invite email rate limited; try later or create an invite without to_email and share the code yourself")
-			return
-		}
-	}
-
 	code := auth.NewSecret("inv_")
 	exp := s.now().Add(ttl).UTC()
 	var pairingToken string
 	var publicID string
 
-	// Atomically check invite cap and create invite
+	// Create invite first with atomic cap check (#53)
 	if in.GeneratePairing {
 		pairingToken = auth.NewPairingToken()
 		publicID, err = s.st.CreateInviteWithPairingAtomic(r.Context(), auth.Hash(code), auth.Hash(pairingToken), me, sc, bg, exp, s.cfg.MaxOutstandingInvites)
@@ -533,6 +512,21 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			s.internal(w, err)
+			return
+		}
+	}
+
+	// Check email rate limit AFTER creating invite (#53)
+	// If limit fails, delete the invite and return 429
+	if to != "" {
+		rk := strings.ToLower(to)
+		if !s.lim.mailLim.Ready(me) || !s.lim.rcptLim.Ready(rk) || !s.lim.mailLim.Allow(me) || !s.lim.rcptLim.Allow(rk) {
+			// Delete the invite we just created
+			if delErr := s.st.DeleteInvite(r.Context(), publicID, me); delErr != nil {
+				s.cfg.Logger.Warn("failed to delete invite after rate limit", "public_id", publicID, "error", delErr)
+			}
+			w.Header().Set("Retry-After", "600")
+			writeErr(w, http.StatusTooManyRequests, "invite email rate limited; try later or create an invite without to_email and share the code yourself")
 			return
 		}
 	}
