@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -231,6 +232,10 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		return nil, fmt.Errorf("check if database is empty: %w", err)
 	}
 
+	if !isEmpty && currentVersion < SchemaVersion() && opts.SkipMigrationBackup {
+		opts.Logger.Warn("PEERLINE_SKIP_MIGRATION_BACKUP is set: migrating without a backup")
+	}
+
 	var backupPath string
 	var reused bool
 	if currentVersion < SchemaVersion() && !opts.SkipMigrationBackup && !isEmpty {
@@ -239,6 +244,24 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 			db.Close()
 			return nil, fmt.Errorf("migrate: %w", err)
 		}
+	}
+
+	if !isEmpty {
+		var ok string
+		if err := db.QueryRow(`PRAGMA quick_check`).Scan(&ok); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("quick_check: %w", err)
+		}
+		if ok != "ok" {
+			db.Close()
+			return nil, fmt.Errorf("database failed integrity check: quick_check returned %q", ok)
+		}
+	}
+
+	// Re-read right before the schema script so a newer binary that migrated meanwhile is not downgraded over.
+	if _, err := checkSchemaVersion(db); err != nil {
+		db.Close()
+		return nil, err
 	}
 
 	if _, err := db.Exec(schema); err != nil {
@@ -364,21 +387,39 @@ func isDatabaseEmpty(db *sql.DB) (bool, error) {
 	return count == 0, nil
 }
 
-// setupBackupDir ensures the backup directory exists with 0700 permissions and refuses group/world-writable dirs.
+// pathless strips the directory from *fs.PathError / *os.LinkError so errors and logs do not leak the filesystem layout.
+func pathless(err error) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return fmt.Errorf("%s %s: %w", pe.Op, filepath.Base(pe.Path), pe.Err)
+	}
+	var le *os.LinkError
+	if errors.As(err, &le) {
+		return fmt.Errorf("%s %s: %w", le.Op, filepath.Base(le.Old), le.Err)
+	}
+	return err
+}
+
+// setupBackupDir ensures the backup directory exists with 0700 permissions and refuses symlinks,
+// directories owned by another user, and any group or world access.
 func setupBackupDir(dir string, logger *slog.Logger) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("create backup directory: %w", err)
+		return fmt.Errorf("create backup directory: %w", pathless(err))
 	}
 
-	info, err := os.Stat(dir)
+	info, err := os.Lstat(dir)
 	if err != nil {
-		return fmt.Errorf("stat backup directory: %w", err)
+		return fmt.Errorf("stat backup directory: %w", pathless(err))
 	}
-
-	perm := info.Mode().Perm()
-	if perm&0077 != 0 {
-		dirBase := filepath.Base(dir)
-		return fmt.Errorf("backup directory %q is group- or world-writable (mode %04o); fix permissions to 0700", dirBase, perm)
+	dirBase := filepath.Base(dir)
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("backup directory %q must be a real directory, not a symlink", dirBase)
+	}
+	if !ownedByCurrentUser(info) {
+		return fmt.Errorf("backup directory %q is not owned by the user running peerline", dirBase)
+	}
+	if perm := info.Mode().Perm(); perm&0077 != 0 {
+		return fmt.Errorf("backup directory %q allows group or world access (mode %04o); fix permissions to 0700", dirBase, perm)
 	}
 
 	return nil
@@ -437,11 +478,11 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 	pattern := regexp.MustCompile(`^` + regexp.QuoteMeta(dbBase) + `\.pre-v` + fmt.Sprintf("%d", targetVersion) + `-from-v` + fmt.Sprintf("%d", currentVersion) + backupSuffixRE)
 	entries, err := os.ReadDir(backupDir)
 	if err != nil {
-		return "", false, fmt.Errorf("read backup directory: %w", err)
+		return "", false, fmt.Errorf("read backup directory: %w", pathless(err))
 	}
 
 	for _, entry := range entries {
-		if pattern.MatchString(entry.Name()) {
+		if pattern.MatchString(entry.Name()) && entry.Type().IsRegular() {
 			existingBackup := filepath.Join(backupDir, entry.Name())
 
 			// Check if backup is newer than both DB and WAL
@@ -467,7 +508,7 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 			if backupNewer {
 				// Verify backup integrity
 				if err := verifyBackup(existingBackup, currentVersion); err != nil {
-					opts.Logger.Warn("existing backup failed verification, creating new backup", "backup", filepath.Base(existingBackup), "error", err.Error())
+					opts.Logger.Warn("existing backup failed verification, creating new backup", "backup", filepath.Base(existingBackup), "error", pathless(err).Error())
 					continue
 				}
 
@@ -506,17 +547,17 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 	if err := vacuumFunc(db, backupPath); err != nil {
 		// Clean up partial backup
 		os.Remove(backupPath)
-		return "", false, fmt.Errorf("VACUUM INTO backup: %w", err)
+		return "", false, fmt.Errorf("VACUUM INTO backup: %w", pathless(err))
 	}
 
 	if err := os.Chmod(backupPath, 0600); err != nil {
 		os.Remove(backupPath)
-		return "", false, fmt.Errorf("chmod backup: %w", err)
+		return "", false, fmt.Errorf("chmod backup: %w", pathless(err))
 	}
 
 	// Fsync the backup file
 	if err := fsyncFile(backupPath, opts.Logger); err != nil {
-		opts.Logger.Warn("backup fsync failed", "backup", filepath.Base(backupPath), "error", err.Error())
+		opts.Logger.Warn("backup fsync failed", "backup", filepath.Base(backupPath), "error", pathless(err).Error())
 	}
 
 	// Verify backup
@@ -527,7 +568,7 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 
 	// Enforce retention policy
 	if err := enforceBackupRetention(backupDir, dbBase, backupPath, opts.BackupRetentionCount, opts.Logger); err != nil {
-		opts.Logger.Warn("backup retention cleanup failed", "error", err.Error())
+		opts.Logger.Warn("backup retention cleanup failed", "error", pathless(err).Error())
 	}
 
 	return backupPath, false, nil
@@ -580,7 +621,7 @@ func enforceBackupRetention(backupDir, dbBase, excludePath string, keepCount int
 
 	entries, err := os.ReadDir(backupDir)
 	if err != nil {
-		return fmt.Errorf("read backup directory: %w", err)
+		return fmt.Errorf("read backup directory: %w", pathless(err))
 	}
 
 	type backupInfo struct {
@@ -590,7 +631,7 @@ func enforceBackupRetention(backupDir, dbBase, excludePath string, keepCount int
 	var backups []backupInfo
 
 	for _, entry := range entries {
-		if pattern.MatchString(entry.Name()) {
+		if pattern.MatchString(entry.Name()) && entry.Type().IsRegular() {
 			fullPath := filepath.Join(backupDir, entry.Name())
 			if fullPath == excludePath {
 				continue
@@ -616,7 +657,7 @@ func enforceBackupRetention(backupDir, dbBase, excludePath string, keepCount int
 
 	for i := toKeep; i < len(backups); i++ {
 		if err := os.Remove(backups[i].path); err != nil {
-			logger.Warn("failed to delete old backup", "backup", filepath.Base(backups[i].path), "error", err.Error())
+			logger.Warn("failed to delete old backup", "backup", filepath.Base(backups[i].path), "error", pathless(err).Error())
 		}
 	}
 

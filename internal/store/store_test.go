@@ -3228,7 +3228,7 @@ func TestBackupDirPermissionsCheck(t *testing.T) {
 		t.Fatal("expected error for group-writable backup directory")
 	}
 
-	if !strings.Contains(err.Error(), "group- or world-writable") {
+	if !strings.Contains(err.Error(), "allows group or world access") {
 		t.Errorf("error should mention insecure permissions, got: %v", err)
 	}
 }
