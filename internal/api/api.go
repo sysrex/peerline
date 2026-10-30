@@ -784,9 +784,12 @@ func truncateUTF8(s string, max int) string {
 //   - Truncation respects combining-mark cluster boundaries: if cutting at 64
 //     runes would split a base from non-composing marks, backs off to exclude
 //     the entire trailing cluster
-//   - Virama-safe: strips any trailing viramas (CCC 9) after truncation to
-//     prevent dangling half-form conjuncts in Indic scripts (issue #182)
-//   - Archaic Hangul L+V cut (lone leading jamo at boundary) is out of scope
+//   - Virama-safe: backs off when cutting after a virama (CCC 9), then strips
+//     any remaining trailing viramas to prevent dangling half-form conjuncts or
+//     stacked conjuncts in Indic scripts (issues #182, #206)
+//   - Limitation: archaic Hangul sequences that don't compose (e.g., L L V or
+//     trailing jamo) may leave a lone leading jamo at the cut; these sequences
+//     do not occur in real names
 //
 // Returns "A Peerline peer" if the result is empty after filtering.
 //
@@ -954,13 +957,36 @@ func sanitizeInviterName(name string) string {
 			}
 		}
 
-		// Strip any trailing viramas (CCC 9) after truncation to handle chained conjuncts
-		// (e.g., क्ष्म where multiple viramas chain). Keep at least one rune.
-		for len(truncated) > 1 {
+		// Strip any trailing viramas (CCC 9) after truncation to handle stacked conjuncts
+		// (e.g., क्क्ष where multiple viramas chain, issue #206). Keep dropping entire
+		// clusters until no virama remains at the end.
+		dropCluster := func(t []rune) []rune {
+			for i := len(t) - 1; i >= 0; i-- {
+				r := t[i]
+				isMark := unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) || unicode.Is(unicode.Me, r)
+				props := norm.NFC.PropertiesString(string(r))
+				isVirama := props.CCC() == 9
+				if !isMark && !isVirama {
+					// Found the base, truncate before it
+					return t[:i]
+				}
+			}
+			return t
+		}
+
+		for len(truncated) > 0 {
+			if len(truncated) == 0 {
+				break
+			}
 			lastRune := truncated[len(truncated)-1]
 			props := norm.NFC.PropertiesString(string(lastRune))
 			if props.CCC() == 9 {
-				truncated = truncated[:len(truncated)-1]
+				n := len(truncated)
+				truncated = dropCluster(truncated)
+				if len(truncated) == n {
+					// No progress made, stop to avoid infinite loop
+					break
+				}
 			} else {
 				break
 			}

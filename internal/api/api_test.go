@@ -2592,10 +2592,13 @@ func TestSanitizerUnicode(t *testing.T) {
 		// NFKC expansion: U+FDFA (ﷺ) expands to 18 characters in NFKC
 		{"ﷺ×5 NFKC expands", strings.Repeat("\uFDFA", 5), "صلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى الله ع"}, // 5*18=90 -> 64
 
-		// Issue #182: Virama cut (CCC 9) - should not leave dangling virama
-		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62)},             // क + virama + ष cut before the conjunct
-		{"chained virama at 64", strings.Repeat("a", 60) + "क्ष्म" + "bbb", strings.Repeat("a", 60) + "क"}, // क्ष्म (3 consonants, 2 viramas) -> keep only क
-		{"many chained viramas", strings.Repeat("क्", 32) + "का", strings.Repeat("क्", 30) + "क"},          // 32 क् pairs + का -> 61 runes ending in क (no trailing virama)
+		// Issue #182/#206: Virama cut (CCC 9) - should not leave dangling virama
+		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62)},                     // क + virama + ष cut before the conjunct
+		{"chained virama at 64", strings.Repeat("a", 60) + "क्ष्म" + "bbb", strings.Repeat("a", 60)},               // क्ष्म (stacked) -> dropCluster removes all
+		{"many chained viramas", strings.Repeat("क्", 32) + "का", "A Peerline peer"},                                // 32 क् pairs (all viramas) -> drops everything -> fallback
+
+		// Issue #206: Stacked conjunct (C V C V | C) - dropCluster removes entire stacked conjunct
+		{"stacked conjunct at 64", strings.Repeat("a", 60) + "क्क्ष" + "bbb", strings.Repeat("a", 60)}, // 60 a + क्क्ष (stacked) -> 60 a (no trailing virama)
 	}
 
 	for _, tt := range tests {
