@@ -183,11 +183,11 @@ Multi-use links would require per-link rate limiting and a way to revoke them be
 
 ## Reverse Proxy Considerations
 
-When Peerline runs behind a reverse proxy (nginx, Caddy, Envoy), **all clients may share one IP address from the proxy** unless `PEERLINE_TRUSTED_PROXIES` is configured. The server's rate limiters (registration: 10/min burst 5; pairing: 10/min burst 5; public GET: 60/min burst 20; failed auth) key on client IP. When the variable is unset, `clientIP` returns the socket peer (the proxy), so all users share one bucket per limiter. A single client can then exhaust registration, pairing and public GETs for everyone.
+When Peerline runs behind a reverse proxy (nginx, Caddy, Envoy), **all clients may share one IP address from the proxy** unless `PEERLINE_TRUSTED_PROXIES` is configured. The server's rate limiters (registration, pairing, public GET, and failed auth) key on client IP. When the variable is unset, `clientIP` returns the socket peer (the proxy), so all users share one bucket per limiter. A single client can then exhaust registration, pairing and public GETs for everyone.
 
-**Set `PEERLINE_TRUSTED_PROXIES` to the proxy's own address or CIDR range** (e.g., `PEERLINE_TRUSTED_PROXIES=192.0.2.1` or `192.0.2.0/24`). The server will trust `X-Forwarded-For` from those sources and use the rightmost untrusted IP as the client. Do not use broad RFC1918 ranges like `10.0.0.0/8` unless all addresses in that range are actually trusted proxy hops; an attacker inside the range could forge client IPs.
+**Set `PEERLINE_TRUSTED_PROXIES` to the proxy's own address or CIDR range** (e.g., `PEERLINE_TRUSTED_PROXIES=192.0.2.1` or `192.0.2.0/24`). The server will trust `X-Forwarded-For` from those sources and use the rightmost untrusted IP as the client; if a malformed entry is found, it falls back to the nearest trusted hop instead. Do not use broad RFC1918 ranges like `10.0.0.0/8` unless all addresses in that range are actually trusted proxy hops; an attacker inside the range could forge client IPs.
 
-The server logs a warning at startup when the variable is unset, reminding you that limits are keyed on the socket peer only. See the README "Trusted proxies" section (lines 256-285) for configuration details.
+The server logs a warning at startup when the variable is unset, reminding you that limits are keyed on the socket peer only. See the README "Trusted proxies" section for configuration details.
 
 ## Conclusion
 
