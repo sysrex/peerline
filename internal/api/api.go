@@ -433,7 +433,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 			// Per-address budget exhausted: register anyway but skip email
 			tokenWithExpiry = "" // Leave unverified
 		} else {
-			rawToken = auth.NewSecret("eml_")
+			rawToken = auth.NewSecret(auth.EmailVerifyPrefix)
 			issuedAt := s.now().Unix()
 			tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
 		}
@@ -523,7 +523,7 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusTooManyRequests, "verification email rate limited; try later")
 			return
 		} else {
-			rawToken = auth.NewSecret("eml_")
+			rawToken = auth.NewSecret(auth.EmailVerifyPrefix)
 			issuedAt := s.now().Unix()
 			tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
 		}
@@ -1268,9 +1268,11 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, m)
 }
 
-// apiKeyInBody matches Peerline API keys (pl_), invite codes (inv_) and pairing tokens (pair_). Peer ids are p_ + hex
-// and do not match. Used to keep stored secrets out of notification previews.
-var apiKeyInBody = regexp.MustCompile(`(?:pl|inv|pair)_[A-Za-z0-9_-]{8,}`)
+var apiKeyInBody = regexp.MustCompile(regexp.QuoteMeta(auth.KeyPrefix) + `[A-Za-z0-9_-]{8,}`)
+
+// secretTokenInBody matches invite codes (inv_), pairing tokens (pair_), and email verify tokens (eml_).
+// Uses {16,} to handle generator changes; greedy match captures the whole token.
+var secretTokenInBody = regexp.MustCompile(`(?:` + regexp.QuoteMeta(auth.InvitePrefix) + `|` + regexp.QuoteMeta(auth.PairingPrefix) + `|` + regexp.QuoteMeta(auth.EmailVerifyPrefix) + `)[A-Za-z0-9_-]{16,}`)
 
 const notifyPreviewMax = 200
 
@@ -1329,8 +1331,8 @@ func (s *Server) notifyEmail(m *store.Message, to string) mailer.Message {
 }
 
 // bodyPreview is an excerpt of the message body. It drops ASCII controls
-// (except tab and newline), redacts API keys and a register token of at least
-// 8 characters, and stays within max runes.
+// (except tab and newline), redacts API keys, secret tokens (invite/pairing/email verify),
+// and a register token of at least 8 characters, and stays within max runes.
 func bodyPreview(body, registerToken string, max int) string {
 	if max < 1 {
 		return ""
@@ -1349,6 +1351,7 @@ func bodyPreview(body, registerToken string, max int) string {
 		clean = strings.ReplaceAll(clean, registerToken, "[redacted]")
 	}
 	clean = apiKeyInBody.ReplaceAllString(clean, "[redacted]")
+	clean = secretTokenInBody.ReplaceAllString(clean, "[redacted]")
 	if utf8.RuneCountInString(clean) <= max {
 		return clean
 	}

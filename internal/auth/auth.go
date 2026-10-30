@@ -16,7 +16,12 @@ import (
 	"strings"
 )
 
-const KeyPrefix = "pl_"
+const (
+	KeyPrefix         = "pl_"
+	InvitePrefix      = "inv_"
+	PairingPrefix     = "pair_"
+	EmailVerifyPrefix = "eml_"
+)
 
 // NewID returns a random peer id like "p_<16 hex>".
 func NewID() string { return "p_" + randHex(8) }
@@ -28,7 +33,7 @@ func NewKey() string { return KeyPrefix + randB64(32) }
 func NewSecret(prefix string) string { return prefix + randB64(24) }
 
 // NewPairingToken returns a random pairing token.
-func NewPairingToken() string { return "pair_" + randB64(24) }
+func NewPairingToken() string { return PairingPrefix + randB64(24) }
 
 // NewNonce returns 128 random bits.
 func NewNonce() []byte { return randBytes(16) }

@@ -201,6 +201,30 @@ func main() {
 		// Emailed links must not be built from a client-supplied Host header.
 		log.Error("PEERLINE_PUBLIC_URL is required when SMTP is configured (used in emailed accept links)")
 		os.Exit(1)
+	} else if smtp, ok := ml.(*mailer.SMTP); ok {
+		// Probe SMTP server at startup to fail fast if TLS is misconfigured.
+		// Network errors (connection refused, timeout) only warn; Send retries at runtime.
+		if err := smtp.Probe(context.Background(), log); err != nil {
+			if errors.Is(err, mailer.ErrRelayUnreachable) {
+				log.Warn("smtp relay unreachable at startup (will retry on send)", "host", smtp.Host, "port", smtp.Port, "err", err)
+			} else {
+				log.Error("smtp probe failed: TLS misconfiguration", "err", err)
+				os.Exit(1)
+			}
+		}
+		// Log TLS mode at startup
+		var tlsMode string
+		if smtp.ImplicitTLS {
+			tlsMode = "implicit TLS (port 465)"
+		} else if smtp.AllowPlaintext {
+			tlsMode = "STARTTLS optional (plaintext allowed)"
+			if !mailer.IsLoopback(smtp.Host) {
+				log.Warn("SMTP configured with plaintext allowed to non-loopback relay; invite codes and message previews are not protected in transit", "host", smtp.Host, "port", smtp.Port)
+			}
+		} else {
+			tlsMode = "STARTTLS required"
+		}
+		log.Info("SMTP configured", "host", smtp.Host, "port", smtp.Port, "tls", tlsMode, "authenticated", smtp.User != "")
 	}
 	if publicURL == "" {
 		log.Warn("PEERLINE_PUBLIC_URL unset: pairing links and base_url fall back to the request Host header; set it so clients never send keys to a forged origin")

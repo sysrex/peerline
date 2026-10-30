@@ -1,38 +1,16 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"unicode/utf8"
 
 	"github.com/sysrex/peerline/internal/auth"
 	"github.com/sysrex/peerline/internal/mailer"
 )
-
-type captureMailer struct {
-	mu   sync.Mutex
-	msgs []mailer.Message
-}
-
-func (c *captureMailer) Mode() string { return "smtp" }
-func (c *captureMailer) Send(_ context.Context, m mailer.Message) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.msgs = append(c.msgs, m)
-	return nil
-}
-func (c *captureMailer) all() []mailer.Message {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	out := make([]mailer.Message, len(c.msgs))
-	copy(out, c.msgs)
-	return out
-}
 
 func registerNotify(t *testing.T, srv *httptest.Server, name, email string) *client {
 	t.Helper()
@@ -365,6 +343,104 @@ func TestBodyPreview(t *testing.T) {
 	// Short tokens are left alone so a tiny token cannot erase the preview.
 	if got := bodyPreview("keep short", "short", 200); got != "keep short" {
 		t.Fatal(got)
+	}
+	// Test with real generated tokens from auth package
+	realInvCode := auth.NewSecret(auth.InvitePrefix)
+	realPairToken := auth.NewPairingToken()
+	realEmailToken := auth.NewSecret(auth.EmailVerifyPrefix)
+	realAPIKey := auth.NewKey()
+	// Test tokens in prose
+	got = bodyPreview("code "+realInvCode+" and "+realPairToken+" eml "+realEmailToken+" key "+realAPIKey, "", 300)
+	if strings.Contains(got, realInvCode) || strings.Contains(got, realPairToken) || strings.Contains(got, realEmailToken) || strings.Contains(got, realAPIKey) {
+		t.Fatalf("real generated tokens leaked in prose: %q", got)
+	}
+	// Test tokens in URLs (accept_url, pairing_url, and email verify patterns)
+	acceptURL := "https://example.com/v1/invites/accept?code=" + realInvCode
+	pairingURL := "https://example.com/v1/pairing/" + realPairToken
+	verifyURL := "https://example.com/v1/me/verify-email?token=" + realEmailToken
+	got = bodyPreview("links: "+acceptURL+" and "+pairingURL+" verify "+verifyURL, "", 500)
+	if strings.Contains(got, realInvCode) || strings.Contains(got, realPairToken) || strings.Contains(got, realEmailToken) {
+		t.Fatalf("tokens leaked in URLs: %q", got)
+	}
+	// Verify redaction markers present
+	if !strings.Contains(got, "[redacted]") {
+		t.Fatalf("no redaction markers in URL test: %q", got)
+	}
+}
+
+func TestNotifyDevModeNoBodyLeakage(t *testing.T) {
+	var logs syncBuf
+	cap := &captureMailer{}
+	combined := &captureAndLog{
+		capture: cap,
+		log:     mailer.Log{Logger: slog.New(slog.NewTextHandler(&logs, nil))},
+	}
+	srv := newServer(t, Config{
+		Mailer: combined,
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	a := register(t, srv, "alice")
+	b := &client{t: t, srv: srv}
+	resp, body := b.do("POST", "/v1/register", map[string]string{"name": "bob", "notify_email": "bob@example.com"}, nil)
+	want(t, resp, body, 201)
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&b.id, &b.key})
+
+	// Verify bob's email
+	msgs := cap.all()
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 verification email, got %d", len(msgs))
+	}
+	verifyEmail := msgs[0]
+	tokenStart := strings.Index(verifyEmail.Body, "token=") + 6
+	tokenEnd := strings.Index(verifyEmail.Body[tokenStart:], "'")
+	if tokenEnd == -1 {
+		tokenEnd = strings.Index(verifyEmail.Body[tokenStart:], "\n")
+	}
+	if tokenEnd == -1 {
+		tokenEnd = strings.Index(verifyEmail.Body[tokenStart:], " ")
+	}
+	verifyToken := verifyEmail.Body[tokenStart : tokenStart+tokenEnd]
+	resp, body = b.do("POST", "/v1/me/verify-email?token="+verifyToken, nil, nil)
+	want(t, resp, body, 200)
+
+	// Clear emails and logs after verification
+	cap.mu.Lock()
+	cap.msgs = nil
+	cap.mu.Unlock()
+	logs.b.Reset()
+
+	pairUp(t, b, a, []string{"messages"}, nil, nil)
+	secretBody := "secret content with inv_" + strings.Repeat("x", 20) + " and pair_" + strings.Repeat("y", 20)
+	resp, body = a.do("POST", "/v1/peers/"+b.id+"/messages", map[string]any{"type": "note", "body": secretBody}, nil)
+	want(t, resp, body, 201)
+
+	// Verify exactly one notification was sent
+	msgs = cap.all()
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 notification email, got %d", len(msgs))
+	}
+	notification := msgs[0]
+	if notification.To != "bob@example.com" {
+		t.Fatalf("notification not sent to bob@example.com: %s", notification.To)
+	}
+
+	l := logs.String()
+	// Dev mode should log metadata but NOT the body or preview
+	if !strings.Contains(l, "dev mode") {
+		t.Fatalf("log missing dev mode marker: %s", l)
+	}
+	if !strings.Contains(l, "body_len=") {
+		t.Fatalf("log missing body_len: %s", l)
+	}
+	// Body content and preview must not appear in logs
+	if strings.Contains(l, "secret content") || strings.Contains(l, "inv_") || strings.Contains(l, "pair_") {
+		t.Fatalf("dev mode log leaked body content: %s", l)
+	}
+	if strings.Contains(l, "Type: note") || strings.Contains(l, "Preview:") {
+		t.Fatalf("dev mode log leaked email structure: %s", l)
 	}
 }
 
