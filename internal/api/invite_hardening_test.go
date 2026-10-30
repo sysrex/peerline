@@ -286,11 +286,10 @@ func TestGETLimiterSeparateBuckets(t *testing.T) {
 		Logger:         slog.Default(),
 		TrustedProxies: []string{"10.0.0.0/8"},
 	}
-	srv := New(st, cfg)
 
 	// Freeze clock to avoid wall-clock refill
 	clock := time.Unix(1000, 0)
-	srv.lim.testSetClock(func() time.Time { return clock })
+	srv := newTestServer(st, cfg, func() time.Time { return clock })
 
 	handler := srv.Handler()
 
@@ -359,11 +358,11 @@ func TestGETLimiterTokenRefill(t *testing.T) {
 	cfg := Config{
 		Logger: slog.Default(),
 	}
-	srv := New(st, cfg)
 
-	// Freeze clock at epoch
+	// Freeze clock at epoch (use pointer so we can advance it)
 	clock := time.Unix(1000, 0)
-	srv.lim.testSetClock(func() time.Time { return clock })
+	clockPtr := &clock
+	srv := newTestServer(st, cfg, func() time.Time { return *clockPtr })
 
 	handler := srv.Handler()
 
@@ -389,7 +388,7 @@ func TestGETLimiterTokenRefill(t *testing.T) {
 	}
 
 	// Advance clock by 60 seconds (refills 60 tokens at 60/min = 1 token/sec)
-	clock = clock.Add(60 * time.Second)
+	*clockPtr = clockPtr.Add(60 * time.Second)
 
 	// Now requests should succeed again (refilled at least 1 token)
 	if code := makeRequest(); code != 200 {
@@ -411,11 +410,10 @@ func TestUntrustedClientRotatingXFF(t *testing.T) {
 		Logger:         slog.Default(),
 		TrustedProxies: []string{"10.0.0.0/8"}, // Only 10.0.0.0/8 is trusted
 	}
-	srv := New(st, cfg)
 
 	// Freeze clock
 	clock := time.Unix(1000, 0)
-	srv.lim.testSetClock(func() time.Time { return clock })
+	srv := newTestServer(st, cfg, func() time.Time { return clock })
 
 	handler := srv.Handler()
 
@@ -478,11 +476,10 @@ func TestUntrustedClientRotatingXFFDefaultConfig(t *testing.T) {
 		Logger: slog.Default(),
 		// TrustedProxies is empty (default)
 	}
-	srv := New(st, cfg)
 
 	// Freeze clock
 	clock := time.Unix(1000, 0)
-	srv.lim.testSetClock(func() time.Time { return clock })
+	srv := newTestServer(st, cfg, func() time.Time { return clock })
 
 	handler := srv.Handler()
 
@@ -526,11 +523,10 @@ func TestAnonymousGETDoesNotBlockAuthenticatedInbox(t *testing.T) {
 	cfg := Config{
 		Logger: slog.Default(),
 	}
-	s := New(st, cfg)
 
 	// Freeze clock on the server's limiter manager
 	clock := time.Unix(1000, 0)
-	s.lim.testSetClock(func() time.Time { return clock })
+	s := newTestServer(st, cfg, func() time.Time { return clock })
 
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
@@ -589,11 +585,10 @@ func TestAuthenticatedLimiterDoesNotBlockAnonymousGET(t *testing.T) {
 	cfg := Config{
 		Logger: slog.Default(),
 	}
-	s := New(st, cfg)
 
 	// Freeze clock
 	clock := time.Unix(1000, 0)
-	s.lim.testSetClock(func() time.Time { return clock })
+	s := newTestServer(st, cfg, func() time.Time { return clock })
 
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
@@ -635,11 +630,10 @@ func TestAuthenticatedGETLimiter(t *testing.T) {
 	cfg := Config{
 		Logger: slog.Default(),
 	}
-	s := New(st, cfg)
 
 	// Freeze clock
 	clock := time.Unix(1000, 0)
-	s.lim.testSetClock(func() time.Time { return clock })
+	s := newTestServer(st, cfg, func() time.Time { return clock })
 
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
