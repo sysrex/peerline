@@ -67,6 +67,12 @@ type Config struct {
 	RetentionSeconds int64
 	// VersionDetail controls /version response: "minimal" (version only, default), "full" (+ commit + build_time), "off" (404).
 	VersionDetail string
+	// MaxBagsPerPeer is the maximum number of bags a peer can own.
+	// <= 0 uses the default (100).
+	MaxBagsPerPeer int
+	// MaxBagBytesPerPeer is the maximum total bytes across all bags for a peer.
+	// <= 0 uses the default (1 MiB).
+	MaxBagBytesPerPeer int64
 }
 
 type Server struct {
@@ -82,7 +88,7 @@ type Server struct {
 	testInviteCreatedHook func(peerID string)
 }
 
-func New(st *store.Store, cfg Config) *Server {
+func New(st *store.Store, cfg Config) (*Server, error) {
 	if cfg.MsgPerMinute <= 0 {
 		cfg.MsgPerMinute = 30
 	}
@@ -113,13 +119,28 @@ func New(st *store.Store, cfg Config) *Server {
 	if cfg.MaxOutstandingInvites <= 0 {
 		cfg.MaxOutstandingInvites = 10
 	}
+	if cfg.MaxBagsPerPeer <= 0 {
+		cfg.MaxBagsPerPeer = 100
+	}
+	if cfg.MaxBagBytesPerPeer <= 0 {
+		cfg.MaxBagBytesPerPeer = 1048576 // 1 MiB
+	}
 	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
 
 	trustedNets, err := ParseTrustedProxies(cfg.TrustedProxies)
 	if err != nil {
-		// This should have been caught at startup, log and continue with empty list
-		cfg.Logger.Warn("invalid trusted proxy CIDR, ignoring", "err", err)
-		trustedNets = nil
+		return nil, fmt.Errorf("invalid trusted proxy configuration: %w", err)
+	}
+
+	// Log parsed trusted networks at startup
+	if len(trustedNets) > 0 {
+		var prefixes []string
+		for _, n := range trustedNets {
+			prefixes = append(prefixes, n.String())
+		}
+		cfg.Logger.Info("trusted proxy networks configured", "prefixes", strings.Join(prefixes, ", "))
+	} else if len(cfg.TrustedProxies) == 0 {
+		cfg.Logger.Warn("no trusted proxies configured: X-Forwarded-For will be ignored")
 	}
 
 	s := &Server{
@@ -134,7 +155,12 @@ func New(st *store.Store, cfg Config) *Server {
 	// Start maintenance tasks
 	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, cfg.RetentionSeconds)
 
-	return s
+	return s, nil
+}
+
+// BagLimits returns the effective bag storage caps for this server.
+func (s *Server) BagLimits() (maxBags int, maxBytes int64) {
+	return s.cfg.MaxBagsPerPeer, s.cfg.MaxBagBytesPerPeer
 }
 
 // Stop gracefully stops background tasks.
@@ -174,7 +200,7 @@ func (s *Server) Handler() http.Handler {
 	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.sendMessage)
 	authed.HandleFunc("GET /v1/inbox", s.rateLimitAuth(s.inbox)) // polling-friendly rate limit
 	authed.HandleFunc("GET /v1/bags/{name}", s.rateLimitAuth(s.getBag))
-	authed.HandleFunc("PUT /v1/bags/{name}", s.putBag)
+	authed.HandleFunc("PUT /v1/bags/{name}", s.rateLimitBagWrite(s.putBag))
 	authed.HandleFunc("POST /v1/pairing/{token}", s.acceptPairing) // authenticated pairing acceptance
 	authMW := auth.Middleware(func(ctx context.Context, h string) (string, error) {
 		p, err := s.st.PeerByKeyHash(ctx, h)
@@ -1241,6 +1267,15 @@ func (s *Server) getBag(w http.ResponseWriter, r *http.Request) {
 	w.Write(b.Content)
 }
 
+// quotaMsg gives only the owner the detailed reason; grantees get one generic
+// message so they cannot probe which of the owner's caps is near.
+func quotaMsg(isOwner bool, detail string) string {
+	if isOwner {
+		return detail
+	}
+	return "storage limit reached"
+}
+
 func (s *Server) putBag(w http.ResponseWriter, r *http.Request) {
 	owner, name, ok := s.bagTarget(w, r, pair.ScopeBagsWrite)
 	if !ok {
@@ -1262,12 +1297,20 @@ func (s *Server) putBag(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusRequestEntityTooLarge, "bag exceeds 64KiB")
 		return
 	}
-	v, err := s.st.PutBag(r.Context(), owner, name, body, auth.PeerID(r.Context()), ifVersion)
+	v, err := s.st.PutBag(r.Context(), owner, name, body, auth.PeerID(r.Context()), ifVersion, s.cfg.MaxBagsPerPeer, s.cfg.MaxBagBytesPerPeer)
 	if errors.Is(err, store.ErrConflict) {
 		if v > 0 {
 			w.Header().Set("ETag", etag(v))
 		}
 		writeErr(w, http.StatusPreconditionFailed, "version mismatch")
+		return
+	}
+	if errors.Is(err, store.ErrBagLimitExceeded) {
+		writeErr(w, http.StatusRequestEntityTooLarge, quotaMsg(owner == auth.PeerID(r.Context()), "bag count limit reached"))
+		return
+	}
+	if errors.Is(err, store.ErrStorageQuotaExceeded) {
+		writeErr(w, http.StatusRequestEntityTooLarge, quotaMsg(owner == auth.PeerID(r.Context()), "storage quota exceeded"))
 		return
 	}
 	if err != nil {

@@ -94,13 +94,23 @@ func main() {
 	}
 	emailPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_EMAIL_PER_HOUR"))
 	notifyPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_NOTIFY_PER_HOUR"))
+
+	maxBagsPerPeer, maxBagBytesPerPeer, err := parseBagLimits(
+		os.Getenv("PEERLINE_MAX_BAGS_PER_PEER"),
+		os.Getenv("PEERLINE_MAX_BAG_BYTES_PER_PEER"),
+	)
+	if err != nil {
+		log.Error("invalid bag limit configuration", "err", err)
+		os.Exit(1)
+	}
+
 	retentionDays, _ := strconv.Atoi(os.Getenv("PEERLINE_RETENTION_DAYS"))
 	if retentionDays <= 0 {
 		retentionDays = 30 // default
 	}
 	retentionSeconds := int64(retentionDays * 24 * 60 * 60)
 
-	apiServer := api.New(st, api.Config{
+	apiServer, err := api.New(st, api.Config{
 		RegisterToken:         regTok,
 		Logger:                log,
 		Mailer:                ml,
@@ -111,7 +121,16 @@ func main() {
 		MaxOutstandingInvites: maxOutstandingInvites,
 		RetentionSeconds:      retentionSeconds,
 		VersionDetail:         versionDetail,
+		MaxBagsPerPeer:        maxBagsPerPeer,
+		MaxBagBytesPerPeer:    maxBagBytesPerPeer,
 	})
+	if err != nil {
+		log.Error("failed to create API server", "err", err)
+		os.Exit(1)
+	}
+
+	maxBags, maxBytes := apiServer.BagLimits()
+	log.Info("bag storage caps", "max_bags_per_peer", maxBags, "max_bag_bytes_per_peer", maxBytes)
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -141,4 +160,44 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(shutCtx)
 	log.Info("peerline stopped")
+}
+
+func parseBagLimits(bagsStr, bytesStr string) (int, int64, error) {
+	maxBags, err := parseNonNegativeInt(bagsStr)
+	if err != nil {
+		return 0, 0, fmt.Errorf("PEERLINE_MAX_BAGS_PER_PEER: %w", err)
+	}
+	maxBytes, err := parseNonNegativeInt64(bytesStr)
+	if err != nil {
+		return 0, 0, fmt.Errorf("PEERLINE_MAX_BAG_BYTES_PER_PEER: %w", err)
+	}
+	return maxBags, maxBytes, nil
+}
+
+func parseNonNegativeInt(s string) (int, error) {
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, err
+	}
+	if v < 0 {
+		return 0, errors.New("must be non-negative")
+	}
+	return v, nil
+}
+
+func parseNonNegativeInt64(s string) (int64, error) {
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if v < 0 {
+		return 0, errors.New("must be non-negative")
+	}
+	return v, nil
 }
