@@ -48,6 +48,12 @@ If Alice’s bot and Bob’s bot both register on the same Peerline, Alice can i
 
 ---
 
+## Upgrading
+
+See [UPGRADING.md](UPGRADING.md) for schema migration, backup, and rollback procedures.
+
+---
+
 ## Quickstart
 
 ```sh
@@ -65,15 +71,30 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `-db` / `PEERLINE_DB` | `peerline.db` | SQLite path (modernc.org/sqlite, no CGO) |
 | `-version` | n/a | Print version and exit |
 | `PEERLINE_REGISTER_TOKEN` | unset | If set, required as `X-Peerline-Register-Token` on register |
+| `PEERLINE_CODE_PEPPER` | random per process | Server secret that keys the confirm-mode short code. Set a stable value (e.g. `openssl rand -hex 32`) or pending claims cannot be confirmed after a restart |
 | `PEERLINE_PUBLIC_URL` | unset | External base URL for `accept_url` in invite responses (required when SMTP is set) |
 | `PEERLINE_SMTP_*` | unset | Invite and message-notification email; see [Email invites](#email-invites) |
 | `PEERLINE_NOTIFY_PER_HOUR` | `20` | Wake-up emails per recipient peer per hour; see [Message notifications](#message-notifications) |
 | `PEERLINE_TRUSTED_PROXIES` | unset | Comma-separated CIDR ranges from which X-Forwarded-For is honored (e.g. `172.18.0.0/16` from `docker network inspect coolify`); see [Trusted proxies](#trusted-proxies) |
 | `PEERLINE_RETENTION_DAYS` | `30` | Days to keep used invites, counted from the invite's `expires_at` (not from use). 0 or unset = 30. |
 | `PEERLINE_MAX_OUTSTANDING_INVITES` | `10` | Per-peer limit on active (non-expired, unused) invites. 0 or negative = 10 (no unlimited). Breach returns 429. |
+| `PEERLINE_AUTH_FAIL_PER_MINUTE` | `30` | Per-IP rate limit for authentication failures (invalid Bearer tokens), per minute |
+| `PEERLINE_AUTH_FAIL_BURST` | `10` | Burst allowance for authentication failures |
+| `PEERLINE_WRITE_PER_MINUTE` | `10` | Per-peer rate limit for authenticated write operations, per minute |
+| `PEERLINE_WRITE_BURST` | `3` | Burst allowance for write operations |
+| `PEERLINE_KEY_INDEX_WARN` | `1000000` | Log a warning if the key index size exceeds this threshold at startup |
+| `PEERLINE_KEY_INDEX_REBUILD_HOURS` | `6` | Hours between full key index rebuilds (maintenance also rebuilds on count mismatch) |
 | `PEERLINE_VERSION_DETAIL` | unset | Controls `/version` endpoint disclosure. Unset or `minimal` (default): version only. `full`: includes short commit (12 chars) and build time. `off`: endpoint returns 404. Invalid values cause startup failure. Leave unset on public instances to avoid version fingerprinting. |
 | `PEERLINE_MAX_BAGS_PER_PEER` | `100` | Maximum number of bags a peer can own. Unset or 0 = default. Negative or non-numeric = startup error. Breach returns 413. |
 | `PEERLINE_MAX_BAG_BYTES_PER_PEER` | `1048576` (1 MiB) | Maximum total bag content bytes per peer. Unset or 0 = default. Negative or non-numeric = startup error. Counts content only. Overwriting with smaller content frees quota. Breach returns 413. |
+
+**Failed auth.** A missing, non-Bearer or non-`pl_` token always returns `401` and is never charged. A well-formed `pl_` key that is not in the in-memory key index returns `401` and is charged to the client IP; once that IP's budget is spent, further unknown keys get `429` with `Retry-After: 60`. Valid keys are never refused by this limiter.
+
+**Writes.** `PUT /v1/me`, `POST /v1/me/verify-email`, `POST /v1/invites`, `DELETE /v1/invites/{id}`, `POST /v1/invites/accept`, `DELETE /v1/grants/{peer_id}`, `POST /v1/peers/{peer_id}/messages` and the authenticated `POST /v1/pairing/{token}` share one per-peer bucket (`PEERLINE_WRITE_*`); `PUT /v1/bags/{name}` is not in that bucket; it has its own per-caller limiter (30/minute, burst 10, `Retry-After: 10`). Over budget returns `429` with a fixed `Retry-After: 2`, a retry hint that is shorter than the real refill time (6 s per token at the default 10/minute).
+
+**Messages.** Every message send is also subject to the per-peer message limiter (30/minute, burst 10, not configurable by env), so the effective message rate is the lower of that and the write limit. With the default write limit (10/minute, burst 3) the write limit is the binding one.
+
+**Behind a proxy.** Set `PEERLINE_TRUSTED_PROXIES` to your proxy's CIDR. If it is unset, every client shares the proxy's IP and therefore one failed-auth bucket (see [Trusted proxies](#trusted-proxies)).
 
 ### Pair two bots (different accounts)
 
@@ -162,6 +183,16 @@ How it behaves:
 - **Two paths:** authenticated POST accepts with an existing key; unauthenticated POST (legacy, risky if response is lost) registers and accepts in one step.
 - **Single-use.** Once accepted, the pairing token (and the underlying invite) are consumed.
 - **No secrets in the URL.** The pairing URL never contains API keys, register tokens, or the invite code itself.
+
+### Confirm mode (claim, then confirm with a code)
+
+Add `"require_confirm":true` (with `generate_pairing`) and the link grants nothing by itself. The legacy `POST /v1/pairing/{token}` returns 404 for it. Instead:
+
+1. The invitee, authenticated with their own key, calls `POST /v1/pairing/claim` with `{"token":"pair_...","scopes":[...]}` and gets an 8-character `code`. They give it to the inviter's owner out of band.
+2. `POST /v1/pairing/status` with `{"token":...}` shows the claimant `claimed`, `active` or `declined`.
+3. The inviter sees the claimant with `GET /v1/invites/{public_id}` (no code) and calls `POST /v1/invites/{public_id}/confirm` with `{"peer_id":"<claimant>","code":"..."}`. Only a match writes the grants. Three wrong attempts decline the invite for good, and `POST /v1/invites/{public_id}/decline` ends it early.
+
+A claimed invite stays confirmable for 24h after claiming, even past its original expiry. Every miss (unknown, expired, foreign or wrong-state) is the same 404, and no call returns an API key.
 
 Use this when pairing with agents that don't have an email inbox or when you want a single link that works for any agent.
 
@@ -338,7 +369,7 @@ IPv4-mapped IPv6 prefixes meeting the floor (e.g., `::ffff:10.0.0.0/104`) are au
 
 **Only X-Forwarded-For is honored.** Peerline does not read `X-Real-IP` or `Forwarded` (RFC 7239). Use a proxy that sets X-Forwarded-For, or leave `PEERLINE_TRUSTED_PROXIES` unset and accept that all clients share the proxy's RemoteAddr for rate limiting.
 
-**Multiple X-Forwarded-For entries:** Peerline walks the header right-to-left and uses the first address that is not in a trusted CIDR. If a malformed entry is encountered, the walk stops and falls back to the last trusted hop.
+**Multiple X-Forwarded-For entries:** Peerline walks the header right-to-left and uses the first address that is not in a trusted CIDR. Entries that do not parse are skipped (known issue #61).
 
 ---
 
@@ -378,6 +409,9 @@ No new environment variable is required for the page or the public counters. The
 | `DELETE` | `/v1/invites/{public_id}` | Revoke an unused invite by its opaque `public_id` (owner-only); returns 204 on success, 404 if already used or doesn't exist |
 | `POST` | `/v1/invites/accept` | Accept (code in body preferred, query string supported); optional reciprocal grant |
 | `GET` | `/v1/invites/accept?code=` | Deprecated (code in query string): without Bearer = instructions only; with Bearer = 405 (use POST to accept) |
+| `POST` | `/v1/pairing/claim`, `/v1/pairing/status` | Confirm-mode claim and claimant status (auth; token in JSON body) |
+| `GET` | `/v1/invites/{public_id}` | Inviter's view of a confirm-mode invite |
+| `POST` | `/v1/invites/{public_id}/confirm`, `/decline` | Inviter confirms with `{peer_id, code}`, or declines |
 | `GET` | `/v1/pairing/{token}` | Pairing link details (no auth, does not consume) |
 | `POST` | `/v1/pairing/{token}` | Accept pairing: with Bearer = accept; without = register+accept |
 | `GET` | `/v1/grants` | Grants you own or hold |

@@ -73,6 +73,16 @@ type Config struct {
 	// RetentionSeconds is how long (in seconds) to keep used invites before purging.
 	// Default is 30 days (2592000 seconds). Set to 0 for the default.
 	RetentionSeconds int64
+	// AuthFailPerMinute and AuthFailBurst control the per-IP rate limit for
+	// authentication failures (invalid Bearer tokens). Default: 30/min, burst 10.
+	AuthFailPerMinute int
+	AuthFailBurst     int
+	// WritePerMinute and WriteBurst control the per-peer rate limit for
+	// authenticated write operations. Default: 10/min, burst 3.
+	WritePerMinute int
+	WriteBurst     int
+	// KeyIndexRebuildHours is how often to do a full key index rebuild (default: 6).
+	KeyIndexRebuildHours int
 	// VersionDetail controls /version response: "minimal" (version only, default), "full" (+ commit + build_time), "off" (404).
 	VersionDetail string
 	// CodePepper keys the claim short code. Empty = random per process, so codes
@@ -106,6 +116,11 @@ type Server struct {
 }
 
 func New(st *store.Store, cfg Config) (*Server, error) {
+	// Require loaded key index (#112)
+	if !st.KeyIndexLoaded() {
+		return nil, errors.New("key index not loaded; call LoadKeyIndex before New")
+	}
+
 	if cfg.MsgPerMinute <= 0 {
 		cfg.MsgPerMinute = 30
 	}
@@ -135,6 +150,21 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 	}
 	if cfg.MaxOutstandingInvites <= 0 {
 		cfg.MaxOutstandingInvites = 10
+	}
+	if cfg.AuthFailPerMinute <= 0 {
+		cfg.AuthFailPerMinute = 30
+	}
+	if cfg.AuthFailBurst <= 0 {
+		cfg.AuthFailBurst = 10
+	}
+	if cfg.WritePerMinute <= 0 {
+		cfg.WritePerMinute = 10
+	}
+	if cfg.WriteBurst <= 0 {
+		cfg.WriteBurst = 3
+	}
+	if cfg.KeyIndexRebuildHours <= 0 {
+		cfg.KeyIndexRebuildHours = 6
 	}
 	if len(cfg.CodePepper) == 0 {
 		cfg.CodePepper = []byte(auth.NewSecret("pep_"))
@@ -182,7 +212,7 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 	go s.pruneVerifyLoop()
 
 	// Start maintenance tasks
-	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, cfg.RetentionSeconds)
+	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, cfg.RetentionSeconds, cfg.KeyIndexRebuildHours)
 
 	return s, nil
 }
@@ -236,29 +266,22 @@ func (s *Server) Handler() http.Handler {
 
 	authed := http.NewServeMux()
 	authed.HandleFunc("GET /v1/me", s.rateLimitAuth(s.me))
-	authed.HandleFunc("PUT /v1/me", s.updateMe)
-	authed.HandleFunc("POST /v1/me/verify-email", s.verifyEmail)
-	authed.HandleFunc("POST /v1/invites", s.createInvite)
+	authed.HandleFunc("PUT /v1/me", s.rateLimitWrite(s.updateMe))
+	authed.HandleFunc("POST /v1/me/verify-email", s.rateLimitWrite(s.verifyEmail))
+	authed.HandleFunc("POST /v1/invites", s.rateLimitWrite(s.createInvite))
 	authed.HandleFunc("GET /v1/invites", s.rateLimitAuth(s.listInvites))
-	authed.HandleFunc("DELETE /v1/invites/{id}", s.deleteInvite)
-	authed.HandleFunc("POST /v1/invites/accept", s.acceptInvite)
+	authed.HandleFunc("DELETE /v1/invites/{id}", s.rateLimitWrite(s.deleteInvite))
+	authed.HandleFunc("POST /v1/invites/accept", s.rateLimitWrite(s.acceptInvite))
 	authed.HandleFunc("GET /v1/grants", s.rateLimitAuth(s.listGrants))
-	authed.HandleFunc("DELETE /v1/grants/{peer_id}", s.revokeGrant)
-	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.sendMessage)
+	authed.HandleFunc("DELETE /v1/grants/{peer_id}", s.rateLimitWrite(s.revokeGrant))
+	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.rateLimitWrite(s.sendMessage))
 	authed.HandleFunc("GET /v1/inbox", s.rateLimitAuth(s.inbox)) // polling-friendly rate limit
 	authed.HandleFunc("GET /v1/bags/{name}", s.rateLimitAuth(s.getBag))
 	authed.HandleFunc("PUT /v1/bags/{name}", s.rateLimitBagWrite(s.putBag))
-	authed.HandleFunc("POST /v1/pairing/{token}", s.acceptPairing) // authenticated pairing acceptance
-	lookup := func(ctx context.Context, h string) (string, error) {
-		p, err := s.st.PeerByKeyHash(ctx, h)
-		if err != nil {
-			return "", err
-		}
-		return p.ID, nil
-	}
-	authMW := auth.Middleware(lookup, authed)
+	authed.HandleFunc("POST /v1/pairing/{token}", s.rateLimitWrite(s.acceptPairing)) // authenticated pairing acceptance
+	authMW := s.authMiddleware(authed)
 	mux.Handle("/v1/", authMW)
-	s.claimRoutes(mux, func(h http.Handler) http.Handler { return auth.Middleware(lookup, h) })
+	s.claimRoutes(mux, func(h http.Handler) http.Handler { return s.authMiddleware(h) })
 	// The landing page for accept_url: only unauthenticated GET shows instructions.
 	// Authenticated GET returns 405; only POST accepts the invite.
 	mux.HandleFunc("GET /v1/invites/accept", func(w http.ResponseWriter, r *http.Request) {
@@ -279,6 +302,52 @@ func (s *Server) Handler() http.Handler {
 		s.acceptPairingUnauthenticated(w, r)
 	})
 	return deprecateQueryCodeOnAccept(deprecationDate, deprecationLink)(securityHeaders(mux))
+}
+
+// ---- auth middleware ----
+
+// authMiddleware enforces Bearer auth via the in-memory key index (#112).
+// Malformed Bearer headers get 401 and are never charged.
+// Valid-format keys are looked up in the index:
+//   - Hit: request gets peer_id and proceeds to per-peer rate limits.
+//   - Miss: charges per-IP failLim and returns 401, or 429 with Retry-After if over limit.
+//
+// No store lookup happens for a miss.
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok, ok := auth.BearerToken(r)
+		if !ok || !strings.HasPrefix(tok, auth.KeyPrefix) {
+			// Malformed Bearer: 401, no rate limit charge
+			unauthorized(w)
+			return
+		}
+
+		// Lookup in key index
+		keyHash := auth.Hash(tok)
+		peerID, found := s.st.KeyIndexLookup(keyHash)
+		if found {
+			// Hit: proceed with peer_id
+			next.ServeHTTP(w, r.WithContext(auth.WithPeer(r.Context(), peerID)))
+			return
+		}
+
+		// Miss: charge per-IP fail limiter
+		ip := clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets)
+		key := rateLimitKey(ip)
+		if !s.lim.failLim.Allow(key) {
+			w.Header().Set("Retry-After", "60")
+			writeErr(w, http.StatusTooManyRequests, "rate limited")
+			return
+		}
+		unauthorized(w)
+	})
+}
+
+func unauthorized(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Bearer realm="peerline"`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	w.Write([]byte(`{"error":"unauthorized"}`))
 }
 
 // ---- helpers ----
@@ -361,7 +430,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 			// Per-address budget exhausted: register anyway but skip email
 			tokenWithExpiry = "" // Leave unverified
 		} else {
-			rawToken = auth.NewSecret("eml_")
+			rawToken = auth.NewSecret(auth.EmailVerifyPrefix)
 			issuedAt := s.now().Unix()
 			tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
 		}
@@ -451,7 +520,7 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusTooManyRequests, "verification email rate limited; try later")
 			return
 		} else {
-			rawToken = auth.NewSecret("eml_")
+			rawToken = auth.NewSecret(auth.EmailVerifyPrefix)
 			issuedAt := s.now().Unix()
 			tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
 		}
@@ -556,6 +625,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		TTLSeconds      int      `json:"ttl_seconds"`
 		ToEmail         string   `json:"to_email"`         // optional: email the accept link + code
 		GeneratePairing bool     `json:"generate_pairing"` // optional: generate shareable pairing link
+		RequireConfirm  bool     `json:"require_confirm"`  // optional: pairing link must be claimed, then confirmed by you with a code
 	}
 	if !decode(w, r, &in) {
 		return
@@ -602,6 +672,11 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if in.RequireConfirm && (!in.GeneratePairing || s.claims == nil) {
+		writeErr(w, http.StatusBadRequest, "require_confirm needs generate_pairing and a server with claim support")
+		return
+	}
+
 	code := auth.NewSecret("inv_")
 	exp := s.now().Add(ttl).UTC()
 	var pairingToken string
@@ -616,7 +691,11 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	// Create invite first with atomic cap check (#53)
 	if in.GeneratePairing {
 		pairingToken = auth.NewPairingToken()
-		publicID, err = s.st.CreateInviteWithPairingAtomic(r.Context(), auth.Hash(code), auth.Hash(pairingToken), me, sc, bg, exp, s.cfg.MaxOutstandingInvites)
+		create := s.st.CreateInviteWithPairingAtomic
+		if in.RequireConfirm {
+			create = s.st.CreateConfirmInviteAtomic
+		}
+		publicID, err = create(r.Context(), auth.Hash(code), auth.Hash(pairingToken), me, sc, bg, exp, s.cfg.MaxOutstandingInvites)
 		if errors.Is(err, store.ErrTooManyInvites) {
 			writeErr(w, http.StatusTooManyRequests, fmt.Sprintf("too many outstanding invites (limit %d); revoke or wait for expiry", s.cfg.MaxOutstandingInvites))
 			return
@@ -779,8 +858,14 @@ func truncateUTF8(s string, max int) string {
 //   - Precomposed characters (e.g., é = U+00E9) count as 1 rune
 //   - Hangul syllables (e.g., 한 = U+D55C) count as 1 rune each
 //   - Truncation respects combining-mark cluster boundaries: if cutting at 64
-//     runes would split a base from non-composing marks or leave a dangling
-//     virama (CCC 9), backs off to exclude the entire trailing cluster
+//     runes would split a base from non-composing marks, backs off to exclude
+//     the entire trailing cluster
+//   - Virama-safe: backs off when cutting after a virama (CCC 9), then strips
+//     any remaining trailing viramas to prevent dangling half-form conjuncts or
+//     stacked conjuncts in Indic scripts (issues #182, #206)
+//   - Limitation: archaic Hangul sequences that don't compose (e.g., L L V or
+//     trailing jamo) may leave a lone leading jamo at the cut; these sequences
+//     do not occur in real names
 //
 // Returns "A Peerline peer" if the result is empty after filtering.
 //
@@ -947,11 +1032,52 @@ func sanitizeInviterName(name string) string {
 				}
 			}
 		}
+
+		// Strip any trailing viramas (CCC 9) after truncation to handle stacked conjuncts
+		// (e.g., क्क्ष where multiple viramas chain, issue #206). Keep dropping entire
+		// clusters until no virama remains at the end.
+		dropCluster := func(t []rune) []rune {
+			for i := len(t) - 1; i >= 0; i-- {
+				r := t[i]
+				isMark := unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) || unicode.Is(unicode.Me, r)
+				props := norm.NFC.PropertiesString(string(r))
+				isVirama := props.CCC() == 9
+				if !isMark && !isVirama {
+					// Found the base, truncate before it
+					return t[:i]
+				}
+			}
+			return t
+		}
+
+		for len(truncated) > 0 {
+			if len(truncated) == 0 {
+				break
+			}
+			lastRune := truncated[len(truncated)-1]
+			props := norm.NFC.PropertiesString(string(lastRune))
+			if props.CCC() == 9 {
+				n := len(truncated)
+				truncated = dropCluster(truncated)
+				if len(truncated) == n {
+					// No progress made, stop to avoid infinite loop
+					break
+				}
+			} else {
+				break
+			}
+		}
+
 		result = string(truncated)
 	}
 
 	// Trim trailing spaces that may have been left by the 64-rune truncation
 	result = strings.TrimRight(result, " ")
+
+	// Return fallback if result is now empty after trimming
+	if result == "" {
+		return fallbackName
+	}
 
 	return result
 }
@@ -1189,9 +1315,11 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, m)
 }
 
-// apiKeyInBody matches Peerline API keys (pl_), invite codes (inv_) and pairing tokens (pair_). Peer ids are p_ + hex
-// and do not match. Used to keep stored secrets out of notification previews.
-var apiKeyInBody = regexp.MustCompile(`(?:pl|inv|pair)_[A-Za-z0-9_-]{8,}`)
+var apiKeyInBody = regexp.MustCompile(regexp.QuoteMeta(auth.KeyPrefix) + `[A-Za-z0-9_-]{8,}`)
+
+// secretTokenInBody matches invite codes (inv_), pairing tokens (pair_), and email verify tokens (eml_).
+// Uses {16,} to handle generator changes; greedy match captures the whole token.
+var secretTokenInBody = regexp.MustCompile(`(?:` + regexp.QuoteMeta(auth.InvitePrefix) + `|` + regexp.QuoteMeta(auth.PairingPrefix) + `|` + regexp.QuoteMeta(auth.EmailVerifyPrefix) + `)[A-Za-z0-9_-]{16,}`)
 
 const notifyPreviewMax = 200
 
@@ -1250,8 +1378,8 @@ func (s *Server) notifyEmail(m *store.Message, to string) mailer.Message {
 }
 
 // bodyPreview is an excerpt of the message body. It drops ASCII controls
-// (except tab and newline), redacts API keys and a register token of at least
-// 8 characters, and stays within max runes.
+// (except tab and newline), redacts API keys, secret tokens (invite/pairing/email verify),
+// and a register token of at least 8 characters, and stays within max runes.
 func bodyPreview(body, registerToken string, max int) string {
 	if max < 1 {
 		return ""
@@ -1270,6 +1398,7 @@ func bodyPreview(body, registerToken string, max int) string {
 		clean = strings.ReplaceAll(clean, registerToken, "[redacted]")
 	}
 	clean = apiKeyInBody.ReplaceAllString(clean, "[redacted]")
+	clean = secretTokenInBody.ReplaceAllString(clean, "[redacted]")
 	if utf8.RuneCountInString(clean) <= max {
 		return clean
 	}
