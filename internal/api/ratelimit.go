@@ -227,6 +227,7 @@ type LimiterManager struct {
 	pairLim       *msg.Limiter
 	failLim       *msg.Limiter // Failed pairing token lookups (per-IP)
 	getLim        *msg.Limiter
+	versionLim    *msg.Limiter // Dedicated limiter for /version
 	authLim       *msg.Limiter
 	mailLim       *msg.Limiter
 	rcptLim       *msg.Limiter
@@ -247,6 +248,7 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 		pairLim:       msg.NewLimiter(10, 5),
 		failLim:       msg.NewLimiter(30, 10), // Failed pairing lookups: more lenient per-IP budget
 		getLim:        msg.NewLimiter(60, 20),
+		versionLim:    msg.NewLimiter(120, 30), // Separate limiter for /version to avoid monitor conflicts
 		authLim:       msg.NewLimiter(120, 40), // Higher limit for authenticated polling
 		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst),
 		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour),
@@ -280,7 +282,7 @@ func (lm *LimiterManager) pruneLoop() {
 
 func (lm *LimiterManager) prune() {
 	pruned := lm.msgLim.Prune() + lm.regLim.Prune() + lm.pairLim.Prune() + lm.failLim.Prune() +
-		lm.getLim.Prune() + lm.authLim.Prune() +
+		lm.getLim.Prune() + lm.versionLim.Prune() + lm.authLim.Prune() +
 		lm.mailLim.Prune() + lm.rcptLim.Prune() + lm.notifyLim.Prune() + lm.notifyAddrLim.Prune()
 	_ = pruned // Could log if needed
 }

@@ -63,6 +63,7 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 |---|---|---|
 | `-addr` / `PEERLINE_ADDR` | `127.0.0.1:8787` | Listen address |
 | `-db` / `PEERLINE_DB` | `peerline.db` | SQLite path (modernc.org/sqlite, no CGO) |
+| `-version` | n/a | Print version and exit |
 | `PEERLINE_REGISTER_TOKEN` | unset | If set, required as `X-Peerline-Register-Token` on register |
 | `PEERLINE_PUBLIC_URL` | unset | External base URL for emailed accept links (required when SMTP is set) |
 | `PEERLINE_SMTP_*` | unset | Invite and message-notification email; see [Email invites](#email-invites) |
@@ -70,6 +71,7 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `PEERLINE_TRUSTED_PROXIES` | unset | Comma-separated CIDR ranges from which X-Forwarded-For is honored (e.g. `172.18.0.0/16` from `docker network inspect coolify`); see [Trusted proxies](#trusted-proxies) |
 | `PEERLINE_RETENTION_DAYS` | `30` | Days to keep used invites, counted from the invite's `expires_at` (not from use). 0 or unset = 30. |
 | `PEERLINE_MAX_OUTSTANDING_INVITES` | `10` | Per-peer limit on active (non-expired, unused) invites. 0 or negative = 10 (no unlimited). Breach returns 429. |
+| `PEERLINE_VERSION_DETAIL` | unset | Controls `/version` endpoint disclosure. Unset or `minimal` (default): version only. `full`: includes short commit (12 chars) and build time. `off`: endpoint returns 404. Unknown values fall back to `minimal` with a warning. Leave unset on public instances to avoid version fingerprinting. |
 
 ### Pair two bots (different accounts)
 
@@ -280,11 +282,9 @@ This trusts only requests from that Docker network (where Traefik runs). Peerlin
 
 **⚠️ Warning:** Do NOT blindly trust all RFC1918 private ranges (`10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`) unless you control every host in those ranges. Trusting a range means any host in it can spoof X-Forwarded-For. Only trust the specific network where your reverse proxy resides.
 
-**Prefix length restrictions:** To prevent misconfiguration, Peerline enforces minimum prefix lengths: `/8` for IPv4 and `/32` for IPv6. Overly broad prefixes such as `0.0.0.0/0` or `::/0` are rejected at startup.
-
 **Only X-Forwarded-For is honored.** Peerline does not read `X-Real-IP` or `Forwarded` (RFC 7239). Use a proxy that sets X-Forwarded-For, or leave `PEERLINE_TRUSTED_PROXIES` unset and accept that all clients share the proxy's RemoteAddr for rate limiting.
 
-**Multiple X-Forwarded-For entries:** Peerline walks the header right-to-left and uses the first address that is not in a trusted CIDR. If a malformed entry is encountered, the walk stops and falls back to the last trusted hop.
+**Multiple X-Forwarded-For entries:** Peerline walks the header right-to-left and uses the first address that is not in a trusted CIDR. Entries that do not parse are skipped (known issue #61).
 
 ---
 
@@ -306,7 +306,7 @@ The maintenance task starts immediately on server boot and then runs hourly. Pur
 
 ## API (v0)
 
-`GET /` is an HTML landing page (human how-to, agent how-to, live counters). `GET /healthz` and `GET /v1/public/stats` are public. `POST /v1/register` is unauthenticated aside from the optional register token. Every other `/v1/*` route needs `Authorization: Bearer <api_key>`.
+`GET /` is an HTML landing page (human how-to, agent how-to, live counters). `GET /healthz` and `GET /v1/public/stats` are public. `GET /version` is a public operational endpoint (no stability guarantee). `POST /v1/register` is unauthenticated aside from the optional register token. Every other `/v1/*` route needs `Authorization: Bearer <api_key>`.
 
 No new environment variable is required for the page or the public counters. They are served by the same process as the API.
 
@@ -314,6 +314,7 @@ No new environment variable is required for the page or the public counters. The
 |---|---|---|
 | `GET` | `/` | HTML landing page (`text/html`). Exact path only |
 | `GET` | `/healthz` | Liveness |
+| `GET` | `/version` | **Public ops endpoint (no auth, no API compatibility promise).** Returns `{"version":"<release or dev>"}` by default (minimal mode). With `PEERLINE_VERSION_DETAIL=full`: also returns short commit (12 chars) and build time. With `PEERLINE_VERSION_DETAIL=off`: returns 404. **Security note:** the exact commit reveals which security fixes are applied; leave in minimal mode on public instances. Use for deployment verification and monitoring. |
 | `GET` | `/v1/public/stats` | `{"peers","messages","grants","bags"}` totals, no auth |
 | `POST` | `/v1/register` | `{"name", "notify_email"?}` → `{peer_id, api_key, notify_email}` once |
 | `GET` | `/v1/me` | `peer_id` and your own `notify_email` |
@@ -358,6 +359,40 @@ docker run -p 8787:8787 -v peerline-data:/data \
 ```
 
 Static binary on distroless; data in `/data`. See `Dockerfile`.
+
+To build with version info:
+
+```sh
+docker build \
+  --build-arg VERSION=v1.2.3 \
+  --build-arg COMMIT=$(git rev-parse HEAD) \
+  --build-arg BUILD_TIME=$(git show -s --format=%cI HEAD) \
+  -t peerline .
+```
+
+Deployment platforms like Coolify may pass `SOURCE_COMMIT` automatically; the Dockerfile uses `COMMIT` or `SOURCE_COMMIT` (whichever is set). Build args are validated (alphanumeric, `.`, `_`, `+`, `:`, `/`, `-` only) and empty args fall back to `runtime/debug.ReadBuildInfo` or sensible defaults (`version=dev`, `commit=unknown`).
+
+Check the running version:
+
+```sh
+# Default: version only (minimal mode)
+curl http://localhost:8787/version
+# → {"version":"v1.2.3"} or {"version":"dev"}
+
+# With full detail mode:
+docker run -p 8787:8787 -v peerline-data:/data \
+  -e PEERLINE_VERSION_DETAIL=full peerline
+curl http://localhost:8787/version
+# → {"version":"v1.2.3","commit":"abc123def456","build_time":"2024-01-15T10:30:00Z"}
+
+# Endpoint disabled:
+docker run -p 8787:8787 -v peerline-data:/data \
+  -e PEERLINE_VERSION_DETAIL=off peerline
+curl http://localhost:8787/version
+# → 404
+```
+
+**Security note:** `PEERLINE_VERSION_DETAIL=full` exposes the exact commit and build time, which can fingerprint unpatched instances. Leave it off (`minimal` or unset) on public instances; use the CLI flag or logs for internal verification.
 
 ---
 
