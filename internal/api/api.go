@@ -517,13 +517,28 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check email rate limit AFTER creating invite (#53)
-	// If limit fails, delete the invite and return 429
+	// If limit fails, delete the invite and return error
 	if to != "" {
 		rk := strings.ToLower(to)
-		if !s.lim.mailLim.Ready(me) || !s.lim.rcptLim.Ready(rk) || !s.lim.mailLim.Allow(me) || !s.lim.rcptLim.Allow(rk) {
+		// Check both limiters are ready before consuming from either (avoid partial spend)
+		if !s.lim.mailLim.Ready(me) || !s.lim.rcptLim.Ready(rk) {
 			// Delete the invite we just created
 			if delErr := s.st.DeleteInvite(r.Context(), publicID, me); delErr != nil {
-				s.cfg.Logger.Warn("failed to delete invite after rate limit", "public_id", publicID, "error", delErr)
+				s.cfg.Logger.Error("failed to delete invite after rate limit check", "public_id", publicID, "error", delErr)
+				s.internal(w, fmt.Errorf("rate limit check failed and invite cleanup failed: %w", delErr))
+				return
+			}
+			w.Header().Set("Retry-After", "600")
+			writeErr(w, http.StatusTooManyRequests, "invite email rate limited; try later or create an invite without to_email and share the code yourself")
+			return
+		}
+		// Both ready, now consume from both atomically
+		if !s.lim.mailLim.Allow(me) || !s.lim.rcptLim.Allow(rk) {
+			// This should not happen if Ready checks passed, but handle it
+			if delErr := s.st.DeleteInvite(r.Context(), publicID, me); delErr != nil {
+				s.cfg.Logger.Error("failed to delete invite after rate limit consume", "public_id", publicID, "error", delErr)
+				s.internal(w, fmt.Errorf("rate limit consume failed and invite cleanup failed: %w", delErr))
+				return
 			}
 			w.Header().Set("Retry-After", "600")
 			writeErr(w, http.StatusTooManyRequests, "invite email rate limited; try later or create an invite without to_email and share the code yourself")
