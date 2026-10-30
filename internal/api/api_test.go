@@ -4103,3 +4103,49 @@ func TestBagGranteeWriteUsesOwnerQuota(t *testing.T) {
 	resp, body = c.do("PUT", "/v1/bags/notes?owner="+a.id, []byte("z"), nil)
 	want(t, resp, body, 403)
 }
+
+// The accept landing echoes the invite code, so every response on the accept
+// routes must be uncacheable, referrer-free and non-sniffable (#174).
+func TestAcceptRoutesSecurityHeaders(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &inv); err != nil || inv.Code == "" {
+		t.Fatalf("invite response: %v %s", err, body)
+	}
+
+	cases := []struct {
+		name   string
+		client *client
+		method string
+		path   string
+		body   any
+		status int
+	}{
+		{"landing", &client{t: t, srv: srv}, "GET", "/v1/invites/accept?code=" + inv.Code, nil, 200},
+		{"405 authenticated GET", a, "GET", "/v1/invites/accept", nil, 405},
+		{"400 bad body", a, "POST", "/v1/invites/accept", map[string]any{"code": ""}, 400},
+		{"404 unknown code", a, "POST", "/v1/invites/accept", map[string]any{"code": "inv_doesnotexist"}, 404},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, body := tc.client.do(tc.method, tc.path, tc.body, nil)
+			if resp.StatusCode != tc.status {
+				t.Fatalf("status %d, want %d: %s", resp.StatusCode, tc.status, body)
+			}
+			for h, want := range map[string]string{
+				"Cache-Control":          "no-store",
+				"Referrer-Policy":        "no-referrer",
+				"X-Content-Type-Options": "nosniff",
+			} {
+				if got := resp.Header.Get(h); got != want {
+					t.Errorf("%s = %q, want %q", h, got, want)
+				}
+			}
+		})
+	}
+}
