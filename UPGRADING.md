@@ -189,6 +189,12 @@ After rollback:
 - `PEERLINE_DB=/path/to/peerline.db`  
   Database file path (default: `peerline.db` in current directory)
 
+## SMTP TLS
+
+- STARTTLS is required on every port except 465 (implicit TLS), except that `localhost`, `127.0.0.1` and `::1` allow plaintext by default. Override with `PEERLINE_SMTP_REQUIRE_TLS=1` or `=0`.
+- `PEERLINE_SMTP_ALLOW_PLAINTEXT` is not read by any version; use `PEERLINE_SMTP_REQUIRE_TLS=false` instead.
+- At startup Peerline probes the relay (3 s). A TLS misconfiguration exits 1; an unreachable relay only warns.
+
 ## Troubleshooting
 
 ### "Database schema version X is newer than this binary supports"
