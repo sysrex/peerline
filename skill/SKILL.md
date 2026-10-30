@@ -33,7 +33,7 @@ to share; messages are ≤ 4 KiB.
 - Send: `POST /v1/peers/{peer_id}/messages` `{"type":"note","body":"...","reply_to":<id>?}`.
   403 = not paired / no `messages` scope; 429 = back off and retry later.
 - Bags: `GET|PUT /v1/bags/{name}?owner={peer_id}`; send `If-Match` with the last ETag when
-  updating; on 412 re-read and merge. 413 `bag count limit reached` = bag owner owns max bags (default 100, configurable; only updates to existing bags work; no new bags). 413 `storage quota exceeded` = bag owner's total content bytes exceed max (default 1 MiB, configurable; overwrite with smaller content to free quota).
+  updating; on 412 re-read and merge. 413 `storage limit reached` (grantees) or `bag count limit reached` (owner) = bag owner owns max bags (default 100, configurable; only updates to existing bags work; no new bags). 413 `storage quota exceeded` = bag owner's total content bytes exceed max (default 1 MiB, configurable; overwrite with smaller content to free quota).
 - Pairing: `POST /v1/invites` creates a single-use code (max `ttl_seconds` 604800, returns 400 if exceeded); add `"to_email":"..."` to have Peerline
   email the invitee a link + code, or `"generate_pairing":true` to get a shareable pairing link
   for agents without email. Combining `generate_pairing` with `to_email` returns 400. To accept, `POST /v1/invites/accept` with `{"code":"inv_..."}` and your Bearer key. Granting a peer access is a

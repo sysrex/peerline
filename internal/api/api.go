@@ -184,7 +184,7 @@ func (s *Server) Handler() http.Handler {
 	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.sendMessage)
 	authed.HandleFunc("GET /v1/inbox", s.rateLimitAuth(s.inbox)) // polling-friendly rate limit
 	authed.HandleFunc("GET /v1/bags/{name}", s.rateLimitAuth(s.getBag))
-	authed.HandleFunc("PUT /v1/bags/{name}", s.putBag)
+	authed.HandleFunc("PUT /v1/bags/{name}", s.rateLimitBagWrite(s.putBag))
 	authed.HandleFunc("POST /v1/pairing/{token}", s.acceptPairing) // authenticated pairing acceptance
 	authMW := auth.Middleware(func(ctx context.Context, h string) (string, error) {
 		p, err := s.st.PeerByKeyHash(ctx, h)
@@ -1251,6 +1251,15 @@ func (s *Server) getBag(w http.ResponseWriter, r *http.Request) {
 	w.Write(b.Content)
 }
 
+// quotaMsg gives only the owner the detailed reason; grantees get one generic
+// message so they cannot probe which of the owner's caps is near.
+func quotaMsg(isOwner bool, detail string) string {
+	if isOwner {
+		return detail
+	}
+	return "storage limit reached"
+}
+
 func (s *Server) putBag(w http.ResponseWriter, r *http.Request) {
 	owner, name, ok := s.bagTarget(w, r, pair.ScopeBagsWrite)
 	if !ok {
@@ -1281,11 +1290,11 @@ func (s *Server) putBag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if errors.Is(err, store.ErrBagLimitExceeded) {
-		writeErr(w, http.StatusRequestEntityTooLarge, "bag count limit reached")
+		writeErr(w, http.StatusRequestEntityTooLarge, quotaMsg(owner == auth.PeerID(r.Context()), "bag count limit reached"))
 		return
 	}
 	if errors.Is(err, store.ErrStorageQuotaExceeded) {
-		writeErr(w, http.StatusRequestEntityTooLarge, "storage quota exceeded")
+		writeErr(w, http.StatusRequestEntityTooLarge, quotaMsg(owner == auth.PeerID(r.Context()), "storage quota exceeded"))
 		return
 	}
 	if err != nil {

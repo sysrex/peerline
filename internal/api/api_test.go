@@ -386,8 +386,8 @@ func TestBagLimitsGranteeChargedToOwner(t *testing.T) {
 	// Owner now at 3-bag limit. Grantee's 4th bag should fail with owner's count limit
 	resp, body = grantee.do("PUT", "/v1/bags/data2?owner="+owner.id, []byte("test"), nil)
 	want(t, resp, body, 413)
-	if !strings.Contains(string(body), "bag count limit reached") {
-		t.Errorf("expected bag count limit, got: %s", body)
+	if !strings.Contains(string(body), "storage limit reached") {
+		t.Errorf("expected generic limit for grantee, got: %s", body)
 	}
 
 	// Grantee can still create in their own namespace (their quota is separate)
@@ -404,9 +404,33 @@ func TestBagLimitsGranteeChargedToOwner(t *testing.T) {
 	// Grantee tries to write 30 more bytes (would total 120, over 100 limit)
 	resp, body = grantee.do("PUT", "/v1/bags/data?owner="+owner.id, bytes.Repeat([]byte("z"), 30), nil)
 	want(t, resp, body, 413)
-	if !strings.Contains(string(body), "storage quota exceeded") {
-		t.Errorf("expected storage quota exceeded, got: %s", body)
+	if !strings.Contains(string(body), "storage limit reached") {
+		t.Errorf("expected generic limit for grantee, got: %s", body)
 	}
+}
+
+func TestBagWriteRateLimitPerCaller(t *testing.T) {
+	srv := newServer(t, Config{})
+	owner := register(t, srv, "owner")
+	grantee := register(t, srv, "grantee")
+	pairUp(t, owner, grantee, []string{"bags:write"}, []string{"data"}, nil)
+
+	limited := false
+	for i := 0; i < 40; i++ {
+		resp, _ := grantee.do("PUT", "/v1/bags/data?owner="+owner.id, []byte("x"), nil)
+		if resp.StatusCode == 429 {
+			if resp.Header.Get("Retry-After") == "" {
+				t.Error("429 without Retry-After")
+			}
+			limited = true
+			break
+		}
+	}
+	if !limited {
+		t.Fatal("bag PUT burst was never rate limited")
+	}
+	resp, body := owner.do("PUT", "/v1/bags/mine", []byte("ok"), nil)
+	want(t, resp, body, 201)
 }
 
 func TestBagLimitsNonGrantee403(t *testing.T) {
