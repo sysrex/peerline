@@ -202,12 +202,12 @@ func (s *Server) Handler() http.Handler {
 	authed.HandleFunc("POST /v1/pairing/{token}", s.rateLimitWrite(s.acceptPairing)) // authenticated pairing acceptance
 	authMW := s.authMiddleware(authed)
 	mux.Handle("/v1/", authMW)
-	// The emailed accept link: with a Bearer key it accepts (same flow as
-	// POST); without one (a human clicking, or a link scanner) it only shows
-	// instructions and never consumes the invite.
+	// The emailed accept link: only unauthenticated GET shows instructions.
+	// Authenticated GET returns 405; only POST accepts the invite.
 	mux.HandleFunc("GET /v1/invites/accept", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "" {
-			authMW.ServeHTTP(w, r)
+			w.Header().Set("Allow", "POST")
+			writeErr(w, http.StatusMethodNotAllowed, "use POST to accept the invite")
 			return
 		}
 		s.acceptLanding(w, r)

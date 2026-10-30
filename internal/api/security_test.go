@@ -157,7 +157,7 @@ func TestChargeFirstOnUnauthenticated(t *testing.T) {
 	}
 }
 
-// authenticatedWriteRoutes lists all Bearer-authenticated non-GET routes that must be protected
+// authenticatedWriteRoutes lists all Bearer-authenticated write routes that must be protected
 // by rateLimitWrite. This list is used by both TestAllAuthenticatedWriteRoutesLimited and
 // TestWriteRoutesGuard to ensure coverage and protection.
 var authenticatedWriteRoutes = []string{
@@ -166,7 +166,6 @@ var authenticatedWriteRoutes = []string{
 	"POST /v1/invites",
 	"DELETE /v1/invites/{id}",
 	"POST /v1/invites/accept",
-	"GET /v1/invites/accept", // GET but mutates state (accepts invite)
 	"DELETE /v1/grants/{peer_id}",
 	"POST /v1/peers/{peer_id}/messages",
 	"PUT /v1/bags/{name}",
@@ -184,7 +183,7 @@ func TestWriteRoutesGuard(t *testing.T) {
 	// 1. Add it to authenticatedWriteRoutes
 	// 2. Wire it with rateLimitWrite in api.go
 	// 3. Add a test case to TestAllAuthenticatedWriteRoutesLimited
-	expectedCount := 10
+	expectedCount := 9
 	if len(authenticatedWriteRoutes) != expectedCount {
 		t.Errorf("expected %d authenticated write routes, found %d", expectedCount, len(authenticatedWriteRoutes))
 		t.Errorf("routes: %v", authenticatedWriteRoutes)
@@ -201,7 +200,6 @@ func TestWriteRoutesGuard(t *testing.T) {
 // - POST /v1/invites
 // - DELETE /v1/invites/{id}
 // - POST /v1/invites/accept
-// - GET /v1/invites/accept (with Bearer)
 // - DELETE /v1/grants/{peer_id}
 // - POST /v1/peers/{peer_id}/messages
 // - PUT /v1/bags/{name}
@@ -259,12 +257,6 @@ func TestAllAuthenticatedWriteRoutesLimited(t *testing.T) {
 			method: "POST",
 			body:   map[string]any{"code": "inv_1234567890123456789012345678901234567890"},
 			setup:  func(_, bob *client) string { return "/v1/invites/accept" },
-		},
-		{
-			name:   "GET /v1/invites/accept",
-			method: "GET",
-			body:   nil,
-			setup:  func(alice, _ *client) string { return "/v1/invites/accept?code=inv_1234567890123456789012345678901234567890" },
 		},
 		{
 			name:   "DELETE /v1/grants/{peer_id}",
