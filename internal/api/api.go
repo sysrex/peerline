@@ -168,7 +168,7 @@ func (s *Server) Handler() http.Handler {
 	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.sendMessage)
 	authed.HandleFunc("GET /v1/inbox", s.rateLimitAuth(s.inbox)) // polling-friendly rate limit
 	authed.HandleFunc("GET /v1/bags/{name}", s.rateLimitAuth(s.getBag))
-	authed.HandleFunc("PUT /v1/bags/{name}", s.putBag)
+	authed.HandleFunc("PUT /v1/bags/{name}", s.rateLimitBagWrite(s.putBag))
 	authed.HandleFunc("POST /v1/pairing/{token}", s.acceptPairing) // authenticated pairing acceptance
 	authMW := auth.Middleware(func(ctx context.Context, h string) (string, error) {
 		p, err := s.st.PeerByKeyHash(ctx, h)
@@ -282,7 +282,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	if notify != "" && token != "" {
 		verifyURL := s.publicBase(r) + "/v1/me/verify-email?token=" + url.QueryEscape(token)
 		msg := s.verificationEmail(id, notify, verifyURL)
-		ctx := context.WithoutCancel(r.Context())
+		ctx := r.Context()
 		if err := s.cfg.Mailer.Send(ctx, msg); err != nil {
 			s.log.Error("verification email failed", "peer", id, "err", err)
 			// Continue - verification can be resent
@@ -362,7 +362,7 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 		verifyURL := s.publicBase(r) + "/v1/me/verify-email?token=" + url.QueryEscape(token)
 		msg := s.verificationEmail(me, email, verifyURL)
 		// Detach from client cancellation
-		ctx := context.WithoutCancel(r.Context())
+		ctx := r.Context()
 		if err := s.cfg.Mailer.Send(ctx, msg); err != nil {
 			s.log.Error("verification email failed", "peer", me, "err", err)
 			// Continue - verification can be resent
@@ -528,28 +528,15 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	// If limit fails, delete the invite and return error
 	if to != "" {
 		rk := strings.ToLower(to)
-		// Check both limiters are ready before consuming from either (avoid partial spend)
-		if !s.lim.mailLim.Ready(me) || !s.lim.rcptLim.Ready(rk) {
-			// Delete the invite we just created
-			if delErr := s.st.DeleteInvite(r.Context(), publicID, me); delErr != nil {
-				s.cfg.Logger.Error("failed to delete invite after rate limit check", "public_id", publicID, "error", delErr)
-				s.internal(w, fmt.Errorf("rate limit check failed and invite cleanup failed: %w", delErr))
-				return
-			}
-			w.Header().Set("Retry-After", "600")
-			writeErr(w, http.StatusTooManyRequests, "invite email rate limited; try later or create an invite without to_email and share the code yourself")
+		// Ready does not consume, so concurrent requests can pass it together; the
+		// sender token taken first is refunded if the recipient token is then gone.
+		if !s.lim.mailLim.Ready(me) || !s.lim.rcptLim.Ready(rk) || !s.lim.mailLim.Allow(me) {
+			s.rejectEmailRateLimited(w, r, publicID, me)
 			return
 		}
-		// Both ready, now consume from both (Ready→Allow has a race, but delete handles it)
-		if !s.lim.mailLim.Allow(me) || !s.lim.rcptLim.Allow(rk) {
-			// This should not happen if Ready checks passed, but handle it
-			if delErr := s.st.DeleteInvite(r.Context(), publicID, me); delErr != nil {
-				s.cfg.Logger.Error("failed to delete invite after rate limit consume", "public_id", publicID, "error", delErr)
-				s.internal(w, fmt.Errorf("rate limit consume failed and invite cleanup failed: %w", delErr))
-				return
-			}
-			w.Header().Set("Retry-After", "600")
-			writeErr(w, http.StatusTooManyRequests, "invite email rate limited; try later or create an invite without to_email and share the code yourself")
+		if !s.lim.rcptLim.Allow(rk) {
+			s.lim.mailLim.Refund(me)
+			s.rejectEmailRateLimited(w, r, publicID, me)
 			return
 		}
 	}
@@ -588,7 +575,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		}
 		m := inviteEmail(s.inviterName(r.Context(), me), me, to, code, s.publicBase(r), sc, bg, exp)
 		// Detach from client cancellation; the SMTP sender has its own timeout.
-		if err := s.cfg.Mailer.Send(context.WithoutCancel(r.Context()), m); err != nil {
+		if err := s.cfg.Mailer.Send(r.Context(), m); err != nil {
 			s.log.Error("invite email failed", "inviter", me, "err", err)
 			status = "failed"
 		} else {
@@ -612,6 +599,19 @@ func (s *Server) publicBase(r *http.Request) string {
 		scheme = "https"
 	}
 	return scheme + "://" + r.Host
+}
+
+// rejectEmailRateLimited rolls back the just-created invite and answers 429.
+// The delete must outlive a client disconnect, or the orphan keeps holding a cap slot.
+func (s *Server) rejectEmailRateLimited(w http.ResponseWriter, r *http.Request, publicID, me string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+	defer cancel()
+	if err := s.st.DeleteInvite(ctx, publicID, me); err != nil {
+		s.internal(w, fmt.Errorf("rate limited and invite cleanup failed: %w", err))
+		return
+	}
+	w.Header().Set("Retry-After", "600")
+	writeErr(w, http.StatusTooManyRequests, "invite email rate limited; try later or create an invite without to_email and share the code yourself")
 }
 
 func (s *Server) inviterName(ctx context.Context, id string) string {

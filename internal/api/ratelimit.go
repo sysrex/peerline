@@ -227,6 +227,7 @@ type LimiterManager struct {
 	pairLim       *msg.Limiter
 	getLim        *msg.Limiter
 	authLim       *msg.Limiter
+	bagLim        *msg.Limiter // Bag writes, per authenticated caller
 	mailLim       *msg.Limiter
 	rcptLim       *msg.Limiter
 	notifyLim     *msg.Limiter
@@ -246,6 +247,7 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 		pairLim:       msg.NewLimiter(10, 5),
 		getLim:        msg.NewLimiter(60, 20),
 		authLim:       msg.NewLimiter(120, 40), // Higher limit for authenticated polling
+		bagLim:        msg.NewLimiter(10, 5),
 		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst),
 		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour),
 		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst),
@@ -278,7 +280,7 @@ func (lm *LimiterManager) pruneLoop() {
 
 func (lm *LimiterManager) prune() {
 	pruned := lm.msgLim.Prune() + lm.regLim.Prune() + lm.pairLim.Prune() +
-		lm.getLim.Prune() + lm.authLim.Prune() +
+		lm.getLim.Prune() + lm.authLim.Prune() + lm.bagLim.Prune() +
 		lm.mailLim.Prune() + lm.rcptLim.Prune() + lm.notifyLim.Prune() + lm.notifyAddrLim.Prune()
 	_ = pruned // Could log if needed
 }

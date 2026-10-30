@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS bags (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (owner, name)
 );
+CREATE INDEX IF NOT EXISTS invites_expires_at ON invites(expires_at);
 `
 
 // Open opens the database at path, applies migrations, and returns a Store.
@@ -104,6 +105,10 @@ func Open(path string) (*Store, error) {
 	if err := migrate(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	if err := backfillNullPublicIDs(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("backfill invite public_id: %w", err)
 	}
 	return &Store{db: db, now: func() int64 { return time.Now().Unix() }}, nil
 }
@@ -136,6 +141,18 @@ func checkVersion(v int) error {
 		return fmt.Errorf("database schema version %d is not supported (this binary supports 0-%d)", v, len(migrations))
 	}
 	return nil
+}
+
+func backfillNullPublicIDs(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := backfillInvitePublicIDs(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // migrate applies ordered, idempotent schema upgrades tracked by PRAGMA user_version.
@@ -268,7 +285,28 @@ func migrateV3InvitePublicID(tx *sql.Tx) error {
 		}
 	}
 
-	// Backfill existing rows with random public_id
+	if err := backfillInvitePublicIDs(tx); err != nil {
+		return err
+	}
+
+	// Create unique index if it doesn't exist
+	var hasIndex int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='invites_public_id'`).Scan(&hasIndex); err != nil {
+		return err
+	}
+	if hasIndex == 0 {
+		if _, err := tx.Exec(`CREATE UNIQUE INDEX invites_public_id ON invites(public_id) WHERE public_id IS NOT NULL`); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// backfillInvitePublicIDs gives every invite row without a public_id a random one.
+// It runs on every Open, not only in the v3 step, because an older binary can still
+// insert NULL rows after the migration.
+func backfillInvitePublicIDs(tx *sql.Tx) error {
 	rows, err := tx.Query(`SELECT ROWID FROM invites WHERE public_id IS NULL`)
 	if err != nil {
 		return err
@@ -286,8 +324,8 @@ func migrateV3InvitePublicID(tx *sql.Tx) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	rows.Close()
 
-	// Update each row with a unique public_id
 	for _, rowid := range rowids {
 		publicID, err := generatePublicID()
 		if err != nil {
@@ -297,18 +335,6 @@ func migrateV3InvitePublicID(tx *sql.Tx) error {
 			return err
 		}
 	}
-
-	// Create unique index if it doesn't exist
-	var hasIndex int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='invites_public_id'`).Scan(&hasIndex); err != nil {
-		return err
-	}
-	if hasIndex == 0 {
-		if _, err := tx.Exec(`CREATE UNIQUE INDEX invites_public_id ON invites(public_id) WHERE public_id IS NOT NULL`); err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 
@@ -677,28 +703,41 @@ func (s *Store) DeleteInvite(ctx context.Context, publicID, ownerID string) erro
 	return nil
 }
 
+const purgeBatchSize = 500
+
+// purgeMaxBatches bounds how long one run holds the single connection.
+var purgeMaxBatches = 100
+
+// purgeYield is the pause after each full batch so request handlers get the connection.
+var purgeYield = 25 * time.Millisecond
+
 // PurgeExpiredInvites removes expired unused invites and old used invites.
 // Unused invites: deleted when expires_at < now - 300 (5-minute grace).
 // Used invites: deleted when expires_at < now - retentionSeconds (default 30 days).
-func (s *Store) PurgeExpiredInvites(ctx context.Context, retentionSeconds int64) (int, error) {
+// It stops after purgeMaxBatches batches and reports more=true so the caller can continue soon.
+// On error (including cancellation) the count deleted so far is still returned.
+func (s *Store) PurgeExpiredInvites(ctx context.Context, retentionSeconds int64) (deleted int, more bool, err error) {
 	if retentionSeconds <= 0 {
 		retentionSeconds = 30 * 24 * 60 * 60 // 30 days default
 	}
 
 	ts := s.now()
-	graceCutoff := ts - 300 // 5-minute grace window
+	// The grace does not guard an in-flight accept: acceptInviteInTx re-checks
+	// expires_at inside an IMMEDIATE transaction, so accept and purge are serialised
+	// and an expired row is rejected whether or not it was purged. It also does not
+	// extend validity. It keeps the row briefly after expiry for audit/"expired" status.
+	// v5: the predicate must exclude claimed rows, which outlive expires_at (#70).
+	graceCutoff := ts - 300
 	retentionCutoff := ts - retentionSeconds
 
-	totalDeleted := 0
-	batchSize := 500
-
-	for {
-		// Check context before each batch
+	for batches := 0; ; batches++ {
 		if err := ctx.Err(); err != nil {
-			return totalDeleted, err
+			return deleted, false, err
+		}
+		if batches == purgeMaxBatches {
+			return deleted, true, nil
 		}
 
-		// Delete in batches using rowid
 		res, err := s.db.ExecContext(ctx,
 			`DELETE FROM invites WHERE rowid IN (
 				SELECT rowid FROM invites 
@@ -706,24 +745,25 @@ func (s *Store) PurgeExpiredInvites(ctx context.Context, retentionSeconds int64)
 				   OR (used_by IS NOT NULL AND expires_at < ?)
 				LIMIT ?
 			)`,
-			graceCutoff, retentionCutoff, batchSize)
+			graceCutoff, retentionCutoff, purgeBatchSize)
 		if err != nil {
-			return totalDeleted, err
+			return deleted, false, err
 		}
-
 		n, err := res.RowsAffected()
 		if err != nil {
-			return totalDeleted, err
+			return deleted, false, err
 		}
-		totalDeleted += int(n)
+		deleted += int(n)
+		if int(n) < purgeBatchSize {
+			return deleted, false, nil
+		}
 
-		// Stop if we deleted fewer than batchSize
-		if int(n) < batchSize {
-			break
+		select {
+		case <-ctx.Done():
+			return deleted, false, ctx.Err()
+		case <-time.After(purgeYield):
 		}
 	}
-
-	return totalDeleted, nil
 }
 
 type InviteInfo struct {

@@ -1694,7 +1694,7 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 	}
 
 	// Purge with 30-day retention (2592000 seconds)
-	purged, err := s.PurgeExpiredInvites(ctx, 30*24*60*60)
+	purged, _, err := s.PurgeExpiredInvites(ctx, 30*24*60*60)
 	if err != nil {
 		t.Fatal(err)
 	}
