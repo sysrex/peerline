@@ -408,7 +408,6 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 	}
 }
 
-
 // TestConcurrentPairingRedemption verifies that exactly one of multiple concurrent
 // attempts to redeem the same pairing token succeeds. Uses a file DB with separate
 // Store instances to test real lock contention.
