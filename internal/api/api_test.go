@@ -1308,6 +1308,43 @@ func TestCSPHomePageNonce(t *testing.T) {
 	if !strings.Contains(csp, "connect-src 'self'") {
 		t.Errorf("CSP missing connect-src 'self': %s", csp)
 	}
+
+	// Verify the style body starts with :root and script body starts with (function
+	styleStart := strings.Index(html, `<style nonce="`+nonce+`">`)
+	if styleStart == -1 {
+		t.Fatal("style tag not found")
+	}
+	styleEnd := strings.Index(html[styleStart:], `</style>`)
+	if styleEnd == -1 {
+		t.Fatal("style closing tag not found")
+	}
+	styleBody := html[styleStart+len(`<style nonce="`+nonce+`">`) : styleStart+styleEnd]
+	styleBody = strings.TrimSpace(styleBody)
+	if !strings.HasPrefix(styleBody, ":root") {
+		previewLen := 50
+		if len(styleBody) < previewLen {
+			previewLen = len(styleBody)
+		}
+		t.Errorf("style body should start with ':root', got: %q", styleBody[:previewLen])
+	}
+
+	scriptStart := strings.Index(html, `<script nonce="`+nonce+`">`)
+	if scriptStart == -1 {
+		t.Fatal("script tag not found")
+	}
+	scriptEnd := strings.Index(html[scriptStart:], `</script>`)
+	if scriptEnd == -1 {
+		t.Fatal("script closing tag not found")
+	}
+	scriptBody := html[scriptStart+len(`<script nonce="`+nonce+`">`) : scriptStart+scriptEnd]
+	scriptBody = strings.TrimSpace(scriptBody)
+	if !strings.HasPrefix(scriptBody, "(function") {
+		previewLen := 50
+		if len(scriptBody) < previewLen {
+			previewLen = len(scriptBody)
+		}
+		t.Errorf("script body should start with '(function', got: %q", scriptBody[:previewLen])
+	}
 }
 
 func TestCSPAPIRoutesStrict(t *testing.T) {
