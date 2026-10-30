@@ -108,6 +108,12 @@ func IsLoopback(host string) bool {
 	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
+// isLoopbackAddr reports whether a connection's remote address is a loopback IP.
+func isLoopbackAddr(a net.Addr) bool {
+	tcp, ok := a.(*net.TCPAddr)
+	return ok && tcp.IP.IsLoopback()
+}
+
 // FromEnv builds a Sender from PEERLINE_SMTP_HOST/PORT/USER/PASS/FROM.
 // If PEERLINE_SMTP_HOST is unset it returns a dev-mode Log sender.
 func FromEnv(lg *slog.Logger) (Sender, error) {
@@ -193,6 +199,10 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 	}
 	if err != nil {
 		return fmt.Errorf("smtp dial: %w", err)
+	}
+	if IsLoopback(s.Host) && !isLoopbackAddr(conn.RemoteAddr()) {
+		conn.Close()
+		return fmt.Errorf("smtp dial: %s resolved to non-loopback %s", s.Host, conn.RemoteAddr())
 	}
 	if dl, ok := ctx.Deadline(); ok {
 		conn.SetDeadline(dl)
