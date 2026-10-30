@@ -153,7 +153,7 @@ func main() {
 		WriteBurst:            writeBurst,
 	})
 	if err != nil {
-		log.Error("create api server", "err", err)
+		log.Error("api.New failed", "err", err)
 		os.Exit(1)
 	}
 

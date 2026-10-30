@@ -64,6 +64,14 @@ type Config struct {
 	// RetentionSeconds is how long (in seconds) to keep used invites before purging.
 	// Default is 30 days (2592000 seconds). Set to 0 for the default.
 	RetentionSeconds int64
+	// AuthFailPerMinute and AuthFailBurst control the per-IP rate limit for
+	// authentication failures (invalid Bearer tokens). Default: 30/min, burst 10.
+	AuthFailPerMinute int
+	AuthFailBurst     int
+	// WritePerMinute and WriteBurst control the per-peer rate limit for
+	// authenticated write operations. Default: 10/min, burst 3.
+	WritePerMinute int
+	WriteBurst     int
 }
 
 type Server struct {
@@ -76,7 +84,12 @@ type Server struct {
 	now         func() time.Time // clock for invite expiry; defaults to time.Now
 }
 
-func New(st *store.Store, cfg Config) *Server {
+func New(st *store.Store, cfg Config) (*Server, error) {
+	// Require loaded key index (#112)
+	if !st.KeyIndexLoaded() {
+		return nil, errors.New("key index not loaded; call LoadKeyIndex before New")
+	}
+
 	if cfg.MsgPerMinute <= 0 {
 		cfg.MsgPerMinute = 30
 	}
@@ -107,6 +120,18 @@ func New(st *store.Store, cfg Config) *Server {
 	if cfg.MaxOutstandingInvites <= 0 {
 		cfg.MaxOutstandingInvites = 10
 	}
+	if cfg.AuthFailPerMinute <= 0 {
+		cfg.AuthFailPerMinute = 30
+	}
+	if cfg.AuthFailBurst <= 0 {
+		cfg.AuthFailBurst = 10
+	}
+	if cfg.WritePerMinute <= 0 {
+		cfg.WritePerMinute = 10
+	}
+	if cfg.WriteBurst <= 0 {
+		cfg.WriteBurst = 3
+	}
 	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
 
 	trustedNets, err := ParseTrustedProxies(cfg.TrustedProxies)
@@ -128,7 +153,7 @@ func New(st *store.Store, cfg Config) *Server {
 	// Start maintenance tasks
 	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, cfg.RetentionSeconds)
 
-	return s
+	return s, nil
 }
 
 // Stop gracefully stops background tasks.
@@ -167,13 +192,7 @@ func (s *Server) Handler() http.Handler {
 	authed.HandleFunc("GET /v1/bags/{name}", s.rateLimitAuth(s.getBag))
 	authed.HandleFunc("PUT /v1/bags/{name}", s.putBag)
 	authed.HandleFunc("POST /v1/pairing/{token}", s.acceptPairing) // authenticated pairing acceptance
-	authMW := auth.Middleware(func(ctx context.Context, h string) (string, error) {
-		p, err := s.st.PeerByKeyHash(ctx, h)
-		if err != nil {
-			return "", err
-		}
-		return p.ID, nil
-	}, authed)
+	authMW := s.authMiddleware(authed)
 	mux.Handle("/v1/", authMW)
 	// The emailed accept link: with a Bearer key it accepts (same flow as
 	// POST); without one (a human clicking, or a link scanner) it only shows
@@ -185,7 +204,7 @@ func (s *Server) Handler() http.Handler {
 		}
 		s.acceptLanding(w, r)
 	})
-	// Pairing endpoints: GET shows details, POST accepts (optionally creating a new peer)
+	// Pairing endpoints: GET shows details (no auth), POST accepts (optionally creating a new peer)
 	mux.HandleFunc("GET /v1/pairing/{token}", s.rateLimitGet(s.getPairing))
 	mux.HandleFunc("POST /v1/pairing/{token}", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "" {
@@ -195,6 +214,51 @@ func (s *Server) Handler() http.Handler {
 		s.acceptPairingUnauthenticated(w, r)
 	})
 	return securityHeaders(mux)
+}
+
+// ---- auth middleware ----
+
+// authMiddleware enforces Bearer auth via the in-memory key index (#112).
+// Malformed Bearer headers get 401 and are never charged.
+// Valid-format keys are looked up in the index:
+//   - Hit: request gets peer_id and proceeds to per-peer rate limits.
+//   - Miss: charges per-IP failLim and returns 401, or 429 with Retry-After if over limit.
+// No store lookup happens for a miss.
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok, ok := auth.BearerToken(r)
+		if !ok || !strings.HasPrefix(tok, auth.KeyPrefix) {
+			// Malformed Bearer: 401, no rate limit charge
+			unauthorized(w)
+			return
+		}
+
+		// Lookup in key index
+		keyHash := auth.Hash(tok)
+		peerID, found := s.st.KeyIndexLookup(keyHash)
+		if found {
+			// Hit: proceed with peer_id
+			next.ServeHTTP(w, r.WithContext(auth.WithPeer(r.Context(), peerID)))
+			return
+		}
+
+		// Miss: charge per-IP fail limiter
+		ip := clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets)
+		key := rateLimitKey(ip)
+		if !s.lim.failLim.Allow(key) {
+			w.Header().Set("Retry-After", "60")
+			writeErr(w, http.StatusTooManyRequests, "rate limited")
+			return
+		}
+		unauthorized(w)
+	})
+}
+
+func unauthorized(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Bearer realm="peerline"`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	w.Write([]byte(`{"error":"unauthorized"}`))
 }
 
 // ---- helpers ----
