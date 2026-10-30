@@ -792,8 +792,8 @@ func TestRollbackAfterPeerInsert(t *testing.T) {
 
 	// Try to register - peer INSERT will succeed but grant INSERT will fail due to trigger
 	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash, "bob", "Bob", "hb", "", "", nil, nil)
-	if err == nil {
-		t.Fatal("expected error due to injected failure")
+	if err == nil || !strings.Contains(err.Error(), "injected failure") {
+		t.Fatalf("expected the injected grant-insert failure, got %v", err)
 	}
 
 	// Verify no orphan peer was created
@@ -1353,9 +1353,8 @@ func TestPragmasInEffect(t *testing.T) {
 				err = <-done
 				if err == nil {
 					t.Error("second BeginTx succeeded, but first tx should hold write lock (_txlock=immediate not active)")
-				} else if !errors.Is(err, context.DeadlineExceeded) {
-					// Also accept SQLITE_BUSY or similar errors
-					t.Logf("second BeginTx blocked/failed as expected: %v", err)
+				} else if !isLockContention(err) {
+					t.Errorf("second BeginTx failed for an unrelated reason: %v", err)
 				}
 			} else {
 				// For memory DBs, use a shared name to test txlock with two connections
@@ -1403,8 +1402,8 @@ func TestPragmasInEffect(t *testing.T) {
 				err = <-done
 				if err == nil {
 					t.Error("second BeginTx succeeded, but first tx should hold write lock (_txlock=immediate not active)")
-				} else if !errors.Is(err, context.DeadlineExceeded) {
-					t.Logf("second BeginTx blocked/failed as expected: %v", err)
+				} else if !isLockContention(err) {
+					t.Errorf("second BeginTx failed for an unrelated reason: %v", err)
 				}
 			}
 		})
@@ -1998,5 +1997,17 @@ func TestMigrateRechecksVersionInTransaction(t *testing.T) {
 	}
 	if err := migrate(db); err == nil {
 		t.Fatal("migrate accepted a database newer than this binary")
+
+func isLockContention(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "locked") || strings.Contains(msg, "busy")
+}
+
+func TestBuildDSNMemoryKeepsImmediateTxlock(t *testing.T) {
+	if dsn := buildDSN(":memory:"); !strings.Contains(dsn, "_txlock=immediate") {
+		t.Fatalf("memory DSN lacks _txlock=immediate: %s", dsn)
 	}
 }
