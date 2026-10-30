@@ -58,7 +58,7 @@ func (s *Server) home(w http.ResponseWriter, r *http.Request) {
 	nonce := base64.StdEncoding.EncodeToString(nonceBytes)
 
 	// Set CSP with nonce for the home page
-	csp := "default-src 'none'; script-src 'nonce-" + nonce + "'; style-src 'nonce-" + nonce + "'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+	csp := "default-src 'none'; script-src 'nonce-" + nonce + "'; style-src 'nonce-" + nonce + "'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
 	w.Header().Set("Content-Security-Policy", csp)
 
 	var buf bytes.Buffer

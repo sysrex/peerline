@@ -1301,6 +1301,10 @@ func TestCSPHomePageNonce(t *testing.T) {
 	if !strings.Contains(csp, "form-action 'none'") {
 		t.Errorf("CSP missing form-action 'none': %s", csp)
 	}
+	// Verify CSP includes connect-src for fetch() calls
+	if !strings.Contains(csp, "connect-src 'self'") {
+		t.Errorf("CSP missing connect-src 'self': %s", csp)
+	}
 }
 
 func TestCSPAPIRoutesStrict(t *testing.T) {
@@ -1355,6 +1359,10 @@ func TestCSPAPIRoutesStrict(t *testing.T) {
 			}
 			if strings.Contains(csp, "style-src") {
 				t.Errorf("API route should not have style-src: %s", csp)
+			}
+			// Should not have connect-src (API routes don't need it)
+			if strings.Contains(csp, "connect-src") {
+				t.Errorf("API route should not have connect-src: %s", csp)
 			}
 		})
 	}
