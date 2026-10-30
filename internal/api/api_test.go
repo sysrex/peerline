@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,12 +13,15 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
+	"github.com/sysrex/peerline/internal/auth"
 	"github.com/sysrex/peerline/internal/store"
 	"golang.org/x/text/unicode/norm"
 )
@@ -27,6 +31,16 @@ type client struct {
 	srv *httptest.Server
 	key string
 	id  string
+}
+
+func mustNew(t *testing.T, st *store.Store, cfg Config) *Server {
+	t.Helper()
+	prepareTestConfig(t, st, &cfg)
+	s, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
 }
 
 func newServer(t *testing.T, cfg Config) *httptest.Server {
@@ -136,6 +150,9 @@ func (c *client) do(method, path string, body any, hdr map[string]string) (*http
 		r = bytes.NewReader(j)
 	}
 	req, _ := http.NewRequest(method, c.srv.URL+path, r)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	if c.key != "" {
 		req.Header.Set("Authorization", "Bearer "+c.key)
 	}
@@ -412,7 +429,7 @@ func TestBagStorageShrinkOverQuota(t *testing.T) {
 	defer st.Close()
 
 	// Server with large cap
-	srv1 := httptest.NewServer(newTestServer(st, Config{MaxBagBytesPerPeer: 1000}, time.Now).Handler())
+	srv1 := httptest.NewServer(mustNew(t, st, Config{MaxBagBytesPerPeer: 1000}).Handler())
 	defer srv1.Close()
 	a1 := &client{t: t, srv: srv1}
 
@@ -436,7 +453,7 @@ func TestBagStorageShrinkOverQuota(t *testing.T) {
 	want(t, resp, body, 201)
 
 	// Now create a server with 50-byte cap (alice is over quota)
-	srv2 := httptest.NewServer(newTestServer(st, Config{MaxBagBytesPerPeer: 50}, time.Now).Handler())
+	srv2 := httptest.NewServer(mustNew(t, st, Config{MaxBagBytesPerPeer: 50}).Handler())
 	defer srv2.Close()
 	a2 := &client{t: t, srv: srv2, key: a1.key, id: a1.id}
 
@@ -535,7 +552,7 @@ func TestBagLimitsNonGrantee403(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st1.Close()
-	srv1 := httptest.NewServer(newTestServer(st1, Config{MaxBagsPerPeer: 2, MaxBagBytesPerPeer: 100}, time.Now).Handler())
+	srv1 := httptest.NewServer(mustNew(t, st1, Config{MaxBagsPerPeer: 2, MaxBagBytesPerPeer: 100}).Handler())
 	defer srv1.Close()
 
 	owner1 := register(t, srv1, "owner")
@@ -567,7 +584,7 @@ func TestBagLimitsNonGrantee403(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st2.Close()
-	srv2 := httptest.NewServer(newTestServer(st2, Config{MaxBagsPerPeer: 10, MaxBagBytesPerPeer: 50}, time.Now).Handler())
+	srv2 := httptest.NewServer(mustNew(t, st2, Config{MaxBagsPerPeer: 10, MaxBagBytesPerPeer: 50}).Handler())
 	defer srv2.Close()
 
 	owner2 := register(t, srv2, "owner2")
@@ -600,7 +617,7 @@ func TestBagStorageDefaults(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	srv := newTestServer(st, Config{}, time.Now)
+	srv := mustNew(t, st, Config{})
 	if srv.cfg.MaxBagsPerPeer != 100 {
 		t.Errorf("got MaxBagsPerPeer %d, want 100", srv.cfg.MaxBagsPerPeer)
 	}
@@ -1636,7 +1653,7 @@ func TestCSPHomePageNonce(t *testing.T) {
 	}
 
 	// Verify the nonce appears in both the style and script tags
-	html := string(body)
+	html := strings.NewReplacer("&#43;", "+", "&#61;", "=").Replace(string(body)) // html/template escapes base64 + and =
 	expectedStyle := `<style nonce="` + nonce + `">`
 	expectedScript := `<script nonce="` + nonce + `">`
 
@@ -2488,6 +2505,28 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"30 CJK chars under byte limit", strings.Repeat("日", 30), strings.Repeat("日", 30)},
 		// 64 runes (not bytes): "日" is 3 bytes, 64 copies = 192 bytes, should keep exactly 64 runes
 		{"Long multibyte truncated at 64 runes", strings.Repeat("日", 70), strings.Repeat("日", 64)},
+		// Precomposed characters: é (U+00E9) is 1 rune in NFC
+		{"70 precomposed é gives 64", strings.Repeat("é", 70), strings.Repeat("é", 64)},
+		// Hangul syllables: 한 (U+D55C) is 1 rune in NFC, decomposes to 3 jamo in NFD
+		{"70 Hangul syllables gives 64", strings.Repeat("한", 70), strings.Repeat("한", 64)},
+		// a+acute recomposes to á in NFC, 70 gives 64
+		{"70 a+acute recomposes to 64 á", strings.Repeat("a\u0301", 70), strings.Repeat("á", 64)},
+
+		// Issue #181: Edge cases for combining-mark cluster boundaries
+		{"cluster ending at rune 64 kept whole", strings.Repeat("a", 63) + "e\u0300", strings.Repeat("a", 63) + "è"},
+		{"cluster + trailing space at cut", strings.Repeat("a", 63) + "e\u0300 zzz", strings.Repeat("a", 63) + "è"},
+		{"4 marks on one base capped at 3", "a\u0300\u0301\u0302\u0303", "\u00e0\u0301\u0302"}, // 4 marks -> 3 marks
+
+		// Emoji with ZWJ, flags, skin tone modifiers (all filtered: ZWJ is Cf, regional indicators and modifiers are So/Sk)
+		{"ZWJ emoji filtered", "Alice👨‍👩‍👧Smith", "AliceSmith"},
+		{"Flag emoji filtered", "Alice🇺🇸Smith", "AliceSmith"},
+		{"Skin tone modifier filtered", "Alice👍🏻Smith", "AliceSmith"},
+
+		// NFKC expansion: U+FDFA (ﷺ) expands to 18 characters in NFKC
+		{"ﷺ×5 NFKC expands", strings.Repeat("\uFDFA", 5), "صلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى الله ع"}, // 5*18=90 -> 64
+
+		// Issue #182: Virama cut (CCC 9) - should not leave dangling virama
+		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62)}, // क + virama + ष cut before the conjunct
 	}
 
 	for _, tt := range tests {
@@ -2521,6 +2560,269 @@ func TestSanitizerUnicode(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTruncateUTF8 verifies the UTF-8 truncation helper
+func TestTruncateUTF8(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		max     int
+		wantLen int
+	}{
+		{"empty", "", 10, 0},
+		{"shorter than max", "abc", 10, 3},
+		{"exact max", "abcde", 5, 5},
+		{"max 0", "abc", 0, 0},
+
+		// Cut inside multibyte runes (lead byte should be excluded)
+		{"2-byte rune at cut", "aaa" + "é", 4, 3},       // é is c3 a9, cut at c3
+		{"3-byte rune at cut byte 1", "aa" + "日", 3, 2}, // 日 is e6 97 a5, cut at e6
+		{"3-byte rune at cut byte 2", "aa" + "日", 4, 2}, // cut at 97
+		{"4-byte rune at cut byte 1", "aa" + "😀", 3, 2}, // 😀 is f0 9f 98 80, cut at f0
+		{"4-byte rune at cut byte 2", "aa" + "😀", 4, 2}, // cut at 9f
+		{"4-byte rune at cut byte 3", "aa" + "😀", 5, 2}, // cut at 98
+
+		// Multiple multibyte runes
+		{"multiple 3-byte", strings.Repeat("日", 10), 10, 9}, // 9 bytes = 3 runes
+
+		// Continuation byte runs (exercises backoff loop)
+		{"continuation bytes at cut", "aaa" + string([]byte{0x80, 0x80, 0x80}), 4, 2}, // backs off past 0x80 at position 3
+		{"many continuation bytes", string([]byte{0x80, 0x80, 0x80, 0x80, 0x80}), 3, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncateUTF8(tt.input, tt.max)
+
+			// Check length
+			if len(got) != tt.wantLen {
+				t.Errorf("truncateUTF8(%q, %d) len = %d, want %d", tt.input, tt.max, len(got), tt.wantLen)
+			}
+
+			// Check valid UTF-8
+			if !utf8.ValidString(got) {
+				t.Errorf("truncateUTF8(%q, %d) returned invalid UTF-8: %q", tt.input, tt.max, got)
+			}
+
+			// Check it's a prefix
+			if !strings.HasPrefix(tt.input, got) {
+				t.Errorf("truncateUTF8(%q, %d) = %q, not a prefix", tt.input, tt.max, got)
+			}
+		})
+	}
+}
+
+// TestSanitizerPropertyBeforeFix is a property test that SHOULD FAIL on main (dcc099a)
+// before the guard fix, demonstrating the bugs in issue #181.
+// After the fix (truncateUTF8 + ToValidUTF8), all these properties hold.
+func TestSanitizerPropertyBeforeFix(t *testing.T) {
+	// Test cases that fail on main before the guard fix:
+	// 1. Input over 1024 bytes with multibyte rune at boundary -> invalid UTF-8 in guarded string
+	// 2. Invalid byte mid-string -> non-idempotent (e.g., "\xf0\u00b2" -> "\u00b2" -> "2")
+	testCases := []struct {
+		name  string
+		input string
+	}{
+		{"1022a + 日 at 1024", strings.Repeat("a", 1022) + "日"},
+		{"1021a + 😀 at 1024", strings.Repeat("a", 1021) + "😀"},
+		{"invalid byte disables NFKC", "\xf0\u00b2"}, // should become "2", not "\u00b2"
+		{"0x80 runs near cut", strings.Repeat("a", 1020) + string([]byte{0x80, 0x80, 0x80, 0x80})},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeInviterName(tc.input)
+
+			// Property 1: Output is valid UTF-8
+			if !utf8.ValidString(got) {
+				t.Errorf("sanitizeInviterName(%q) returned invalid UTF-8", tc.name)
+			}
+
+			// Property 2: Idempotent
+			got2 := sanitizeInviterName(got)
+			if got != got2 {
+				t.Errorf("sanitizeInviterName not idempotent for %q: first=%q, second=%q", tc.name, got, got2)
+			}
+		})
+	}
+}
+
+// TestSanitizerSplitCluster verifies that truncation respects grapheme cluster boundaries
+func TestSanitizerSplitCluster(t *testing.T) {
+	// 63 'a' + e+grave+combining-mark-below (doesn't compose in NFC) + "zzz"
+	// Should give 63 'a' without the partial cluster
+	input := strings.Repeat("a", 63) + "e\u0300\u0316" + "zzz"
+	got := sanitizeInviterName(input)
+	want := strings.Repeat("a", 63)
+
+	if got != want {
+		t.Errorf("sanitizeInviterName split cluster = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
+
+	// Verify UTF-8 validity
+	if !utf8.ValidString(got) {
+		t.Errorf("sanitizeInviterName returned invalid UTF-8")
+	}
+
+	// Verify result is NFC
+	if !norm.NFC.IsNormalString(got) {
+		t.Errorf("sanitizeInviterName result is not NFC normalized")
+	}
+
+	// Verify no trailing combining marks
+	runes := []rune(got)
+	if len(runes) > 0 {
+		lastRune := runes[len(runes)-1]
+		if unicode.Is(unicode.Mn, lastRune) || unicode.Is(unicode.Mc, lastRune) || unicode.Is(unicode.Me, lastRune) {
+			t.Errorf("sanitizeInviterName has trailing combining mark U+%04X", lastRune)
+		}
+	}
+}
+
+// TestSanitizerHugeInput verifies the input guard prevents unbounded normalization work
+func TestSanitizerHugeInput(t *testing.T) {
+	// 100 KB of 'a' characters
+	input := strings.Repeat("a", 100*1024)
+	got := sanitizeInviterName(input)
+
+	// Should return 64 'a' characters (truncated at input guard, then at 64 runes)
+	want := strings.Repeat("a", 64)
+	if got != want {
+		t.Errorf("sanitizeInviterName(100KB input) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
+}
+
+// TestSanitizerInputGuardInvalidUTF8 verifies the input guard doesn't trim back past invalid bytes elsewhere
+func TestSanitizerInputGuardInvalidUTF8(t *testing.T) {
+	// 2000 bytes of 'a' with 0xff (invalid UTF-8) at byte 10
+	// Should give 64 'a' (not fallback), proving we don't trim back to empty
+	input := strings.Repeat("a", 10) + "\xff" + strings.Repeat("a", 1989)
+	got := sanitizeInviterName(input)
+	want := strings.Repeat("a", 64)
+
+	if got != want {
+		t.Errorf("sanitizeInviterName(2000 bytes with invalid at byte 10) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
+}
+
+// TestSanitizerInputGuardContinuationBytes verifies the guard handles continuation byte runs
+func TestSanitizerInputGuardContinuationBytes(t *testing.T) {
+	// Place runs of 0x80 (continuation bytes) near the 1024-byte cut
+	// These are invalid UTF-8 and should be replaced by U+FFFD, then filtered
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			"continuation bytes at 1020-1024",
+			strings.Repeat("a", 1020) + string([]byte{0x80, 0x80, 0x80, 0x80}) + strings.Repeat("b", 100),
+			strings.Repeat("a", 64),
+		},
+		{
+			"continuation bytes before cut",
+			strings.Repeat("a", 1010) + string([]byte{0x80, 0x80}) + strings.Repeat("a", 12) + strings.Repeat("b", 100),
+			strings.Repeat("a", 64), // 0x80 replaced by U+FFFD (category So), filtered out, so we get 1022 'a' -> 64 'a'
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeInviterName(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeInviterName(%s) = %q (len %d), want %q (len %d)", tt.name, got, len([]rune(got)), tt.want, len([]rune(tt.want)))
+			}
+		})
+	}
+}
+
+// TestSanitizerInputGuardRuneBoundary verifies the input guard respects rune boundaries
+func TestSanitizerInputGuardRuneBoundary(t *testing.T) {
+	// Create input that has a 3-byte UTF-8 character (日) right at the 1024-byte cut
+	// Fill up to 1022 bytes with 'a', then add 日 (3 bytes) so it straddles the boundary
+	base := strings.Repeat("a", 1022)
+	input := base + "日" + strings.Repeat("b", 100)
+
+	got := sanitizeInviterName(input)
+
+	// The guard should cut before 日 (not in the middle), then cap at 64 runes
+	// So we should get 64 'a' characters (first 64 of the 1022)
+	want := strings.Repeat("a", 64)
+	if got != want {
+		t.Errorf("sanitizeInviterName(input with 3-byte rune at boundary) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
+}
+
+// TestSanitizerTrailingSpaceTrim verifies trailing spaces are trimmed after 64-rune cut
+func TestSanitizerTrailingSpaceTrim(t *testing.T) {
+	// 64 'a' followed by space and more text
+	// The 64-rune cut will include the space; it should be trimmed
+	input := strings.Repeat("a", 63) + " b" + strings.Repeat("c", 100)
+	got := sanitizeInviterName(input)
+
+	// Should get 63 'a' (no trailing space)
+	want := strings.Repeat("a", 63)
+	if got != want {
+		t.Errorf("sanitizeInviterName(63a + space + text) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
+}
+
+// FuzzSanitizeInviterName verifies invariants over random inputs
+func FuzzSanitizeInviterName(f *testing.F) {
+	// Seed corpus with edge cases
+	f.Add("Alice")
+	f.Add(strings.Repeat("a", 70))
+	f.Add("e\u0300\u0316")                 // non-composing marks
+	f.Add("\uFDFA")                        // NFKC expands
+	f.Add("\xf0\u00b2")                    // invalid byte + NFKC char
+	f.Add(strings.Repeat("a", 1022) + "日") // 3-byte rune at 1024
+	f.Add("क्ष")                           // Indic conjunct (virama)
+
+	f.Fuzz(func(t *testing.T, input string) {
+		got := sanitizeInviterName(input)
+
+		// Invariant 1: Output is valid UTF-8
+		if !utf8.ValidString(got) {
+			t.Errorf("sanitizeInviterName(%q) returned invalid UTF-8: %q", input, got)
+		}
+
+		// Invariant 2: Output is NFC normalized
+		if !norm.NFC.IsNormalString(got) {
+			t.Errorf("sanitizeInviterName(%q) returned non-NFC string: %q", input, got)
+		}
+
+		// Invariant 3: At most 64 runes
+		runeCount := utf8.RuneCountInString(got)
+		if runeCount > 64 {
+			t.Errorf("sanitizeInviterName(%q) returned %d runes (> 64): %q", input, runeCount, got)
+		}
+
+		// Invariant 4: Non-empty (fallback applied if needed)
+		if got == "" {
+			t.Errorf("sanitizeInviterName(%q) returned empty string", input)
+		}
+
+		// Invariant 5: No leading/trailing space
+		if strings.TrimSpace(got) != got {
+			t.Errorf("sanitizeInviterName(%q) has leading/trailing space: %q", input, got)
+		}
+
+		// Invariant 6: No leading combining mark
+		runes := []rune(got)
+		if len(runes) > 0 {
+			firstRune := runes[0]
+			if unicode.Is(unicode.Mn, firstRune) || unicode.Is(unicode.Mc, firstRune) {
+				t.Errorf("sanitizeInviterName(%q) starts with combining mark: %q", input, got)
+			}
+		}
+
+		// Invariant 7: Idempotent
+		got2 := sanitizeInviterName(got)
+		if got != got2 {
+			t.Errorf("sanitizeInviterName not idempotent for input %q: first=%q, second=%q", input, got, got2)
+		}
+	})
 }
 
 // TestAPIClock verifies that api.Server.now is used in createInvite.
@@ -2670,5 +2972,64 @@ func TestNewRequiresLoadedKeyIndex(t *testing.T) {
 	_, err = New(st, cfg)
 	if err != nil {
 		t.Fatalf("api.New failed after LoadKeyIndex: %v", err)
+	}
+}
+
+func TestPairingLookupsBoundedPerIP(t *testing.T) {
+	srv := newServer(t, Config{})
+	anon := &client{t: t, srv: srv}
+	notFound, limited := 0, 0
+	for i := 0; i < 100; i++ {
+		resp, _ := anon.do("POST", "/v1/pairing/"+auth.NewPairingToken(), map[string]any{"name": "x"}, nil)
+		switch resp.StatusCode {
+		case http.StatusNotFound:
+			notFound++
+		case http.StatusTooManyRequests:
+			limited++
+		default:
+			t.Fatalf("unexpected status %d", resp.StatusCode)
+		}
+	}
+	if notFound > 5 || limited < 95 {
+		t.Fatalf("lookups not bounded: 404=%d 429=%d", notFound, limited)
+	}
+}
+
+func TestCSPNonceUniqueAndErrorResponsesStrict(t *testing.T) {
+	srv := newServer(t, Config{})
+	nonce := func() string {
+		resp, err := http.Get(srv.URL + "/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		v := resp.Header.Values("Content-Security-Policy")
+		if len(v) != 1 {
+			t.Fatalf("want one CSP header, got %v", v)
+		}
+		m := regexp.MustCompile(`script-src 'nonce-([^']+)'`).FindStringSubmatch(v[0])
+		if m == nil {
+			t.Fatalf("no nonce in %q", v[0])
+		}
+		raw, err := base64.StdEncoding.DecodeString(m[1])
+		if err != nil || len(raw) < 16 {
+			t.Fatalf("bad nonce %q: %v", m[1], err)
+		}
+		return m[1]
+	}
+	if nonce() == nonce() {
+		t.Fatal("nonce reused across requests")
+	}
+	const strict = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+	for _, c := range []struct{ method, path string }{{"GET", "/v1/me"}, {"GET", "/nope"}, {"POST", "/"}, {"POST", "/healthz"}} {
+		req, _ := http.NewRequest(c.method, srv.URL+c.path, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if got := resp.Header.Get("Content-Security-Policy"); got != strict {
+			t.Errorf("%s %s (%d): CSP %q", c.method, c.path, resp.StatusCode, got)
+		}
 	}
 }

@@ -318,6 +318,7 @@ func TestAllAuthenticatedWriteRoutesLimited(t *testing.T) {
 		{
 			name:   "POST /v1/pairing/accept/{token} (authenticated)",
 			method: "POST",
+			retry:  "none", // the per-IP pairing limiter answers first, without Retry-After
 			body:   map[string]any{"scopes": []string{"messages"}},
 			setup: func(alice, bob *client) string {
 				// Create a pairing link that bob will use
@@ -391,6 +392,9 @@ func TestAllAuthenticatedWriteRoutesLimited(t *testing.T) {
 			wantRetry := tt.retry
 			if wantRetry == "" {
 				wantRetry = "2"
+			}
+			if wantRetry == "none" {
+				wantRetry = ""
 			}
 			if retryAfter != wantRetry {
 				t.Errorf("want Retry-After=%s, got %q (status: %d, body: %s)", wantRetry, retryAfter, resp.StatusCode, respBody)

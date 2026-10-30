@@ -138,6 +138,17 @@ func (l *Limiter) Allow(key string) bool { return l.take(key, true) }
 // Use it to check several limiters before consuming from any of them.
 func (l *Limiter) Ready(key string) bool { return l.take(key, false) }
 
+// Refund returns one token to key, capped at burst. Use it to undo an Allow whose
+// operation was abandoned. A missing bucket is already full, so nothing to do.
+func (l *Limiter) Refund(key string) {
+	s := l.shards[l.shardIndex(key)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if b, ok := s.buckets[key]; ok {
+		b.tokens = min(l.burst, b.tokens+1)
+	}
+}
+
 // Prune removes buckets that haven't been touched in pruneAfter duration.
 // Call periodically to prevent unbounded memory growth.
 func (l *Limiter) Prune() int {
@@ -169,13 +180,14 @@ func (l *Limiter) take(key string, consume bool) bool {
 	t := l.now()
 	b, ok := s.buckets[key]
 	if !ok {
-		// Ready is a peek: if no bucket exists, return true without creating one
+		// An absent bucket is a full bucket; a check alone must not create one.
 		if !consume {
-			return true
+			return l.burst >= 1
 		}
-		// Evict oldest idle bucket if at capacity
-		if len(s.buckets) >= bucketsPerShard {
-			l.evictOneLocked(s, t)
+		// At capacity, only an idle bucket may be evicted; evicting a throttled
+		// one would hand its key a fresh burst. With none idle, deny the new key.
+		if len(s.buckets) >= bucketsPerShard && !l.evictIdleLocked(s) {
+			return false
 		}
 		b = &bucket{tokens: l.burst, last: t}
 		s.buckets[key] = b
@@ -191,49 +203,28 @@ func (l *Limiter) take(key string, consume bool) bool {
 	return true
 }
 
-// evictOneLocked removes the oldest idle bucket from the shard.
-// Must be called with s.mu held.
-// Samples evictionSamples random buckets and picks the oldest idle one (tokens == burst).
-// If none are idle, picks the oldest overall.
-// Tradeoff: The limiter fails open on eviction (an evicted key restarts with full burst).
-// Idleness is judged without applying refill, so recently active buckets survive.
-// An attacker can still evict hot buckets by spraying unique keys to fill a shard,
-// but IPv6 clients are keyed by /64 prefix in the API layer, making this much harder.
-func (l *Limiter) evictOneLocked(s *shard, now time.Time) {
-	if len(s.buckets) == 0 {
-		return
-	}
-	var oldestKey string
-	var oldestTime time.Time
-	var oldestIdleKey string
-	var oldestIdleTime time.Time
-
-	// Sample random buckets
+// evictIdleLocked removes the oldest idle bucket (tokens == burst) among
+// evictionSamples random buckets and reports whether it removed one.
+// Must be called with s.mu held. Idleness is judged without applying refill,
+// so recently active buckets survive.
+func (l *Limiter) evictIdleLocked(s *shard) bool {
+	var key string
+	var last time.Time
 	samples := 0
 	for k, b := range s.buckets {
 		if samples >= evictionSamples {
 			break
 		}
 		samples++
-		// Prefer idle buckets (full tokens = not recently used)
-		if b.tokens >= l.burst-0.001 { // floating point tolerance
-			if oldestIdleKey == "" || b.last.Before(oldestIdleTime) {
-				oldestIdleKey = k
-				oldestIdleTime = b.last
-			}
-		}
-		if oldestKey == "" || b.last.Before(oldestTime) {
-			oldestKey = k
-			oldestTime = b.last
+		if b.tokens >= l.burst-0.001 && (key == "" || b.last.Before(last)) {
+			key, last = k, b.last
 		}
 	}
-
-	// Prefer evicting idle buckets
-	if oldestIdleKey != "" {
-		delete(s.buckets, oldestIdleKey)
-	} else if oldestKey != "" {
-		delete(s.buckets, oldestKey)
+	if key == "" {
+		return false
 	}
+	delete(s.buckets, key)
+	return true
 }
 
 func (l *Limiter) shardIndex(key string) uint32 {

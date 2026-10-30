@@ -2,45 +2,28 @@ package api
 
 import (
 	"context"
+	"testing"
 	"time"
 
-	"github.com/sysrex/peerline/internal/msg"
 	"github.com/sysrex/peerline/internal/store"
 )
 
-// newTestLimiterManager creates a LimiterManager with a custom clock for testing.
-func newTestLimiterManager(cfg Config, clock func() time.Time) *LimiterManager {
-	ctx, cancel := context.WithCancel(context.Background())
-	opts := []msg.LimiterOption{msg.WithClock(clock)}
-
-	lm := &LimiterManager{
-		msgLim:        msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst, opts...),
-		regLim:        msg.NewLimiter(10, 5, opts...),
-		pairLim:       msg.NewLimiter(10, 5, opts...),
-		failLim:       msg.NewLimiter(cfg.AuthFailPerMinute, cfg.AuthFailBurst, opts...),
-		getLim:        msg.NewLimiter(getPerMinute, getBurst, opts...),
-		authLim:       msg.NewLimiter(authGetPerMinute, authGetBurst, opts...),
-		writeLim:      msg.NewLimiter(cfg.WritePerMinute, cfg.WriteBurst, opts...),
-		bagWriteLim:   msg.NewLimiter(30, 10, opts...),
-		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst, opts...),
-		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour, opts...),
-		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst, opts...),
-		notifyAddrLim: msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst, opts...),
-		ctx:           ctx,
-		cancel:        cancel,
-	}
-
-	lm.wg.Add(1)
-	go lm.pruneLoop()
-
-	return lm
-}
-
-// newTestServer creates a Server with a custom clock for rate limiters (testing only).
+// newTestServer creates a Server whose rate limiters use a custom clock (testing only).
 func newTestServer(st *store.Store, cfg Config, clock func() time.Time) *Server {
+	cfg.Now = clock
 	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
 		panic(err)
 	}
+	applyTestLimitDefaults(&cfg)
+	srv, err := New(st, cfg)
+	if err != nil {
+		panic(err)
+	}
+	return srv
+}
+
+// applyTestLimitDefaults sets high write and auth-failure limits unless a test configures them.
+func applyTestLimitDefaults(cfg *Config) {
 	if cfg.WritePerMinute == 0 {
 		cfg.WritePerMinute = 1000
 		cfg.WriteBurst = 100
@@ -49,11 +32,12 @@ func newTestServer(st *store.Store, cfg Config, clock func() time.Time) *Server 
 		cfg.AuthFailPerMinute = 1000
 		cfg.AuthFailBurst = 100
 	}
-	srv, err := New(st, cfg)
-	if err != nil {
-		panic(err)
+}
+
+func prepareTestConfig(t testing.TB, st *store.Store, cfg *Config) {
+	t.Helper()
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	srv.lim.Stop()
-	srv.lim = newTestLimiterManager(srv.cfg, clock)
-	return srv
+	applyTestLimitDefaults(cfg)
 }

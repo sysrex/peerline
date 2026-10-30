@@ -292,19 +292,20 @@ const (
 // NewLimiterManager creates and starts a new limiter manager.
 func NewLimiterManager(cfg Config) *LimiterManager {
 	ctx, cancel := context.WithCancel(context.Background())
+	clk := msg.WithClock(cfg.Now)
 	lm := &LimiterManager{
-		msgLim:        msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst),
-		regLim:        msg.NewLimiter(10, 5),
-		pairLim:       msg.NewLimiter(10, 5),
-		failLim:       msg.NewLimiter(cfg.AuthFailPerMinute, cfg.AuthFailBurst),
-		getLim:        msg.NewLimiter(getPerMinute, getBurst),
-		authLim:       msg.NewLimiter(authGetPerMinute, authGetBurst),
-		writeLim:      msg.NewLimiter(cfg.WritePerMinute, cfg.WriteBurst),
-		bagWriteLim:   msg.NewLimiter(30, 10),
-		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst),
-		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour),
-		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst),
-		notifyAddrLim: msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst), // Same limits, but per-address
+		msgLim:        msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst, clk),
+		regLim:        msg.NewLimiter(10, 5, clk),
+		pairLim:       msg.NewLimiter(10, 5, clk),
+		failLim:       msg.NewLimiter(cfg.AuthFailPerMinute, cfg.AuthFailBurst, clk),
+		getLim:        msg.NewLimiter(getPerMinute, getBurst, clk),
+		authLim:       msg.NewLimiter(authGetPerMinute, authGetBurst, clk),
+		writeLim:      msg.NewLimiter(cfg.WritePerMinute, cfg.WriteBurst, clk),
+		bagWriteLim:   msg.NewLimiter(30, 10, clk),
+		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst, clk),
+		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour, clk),
+		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst, clk),
+		notifyAddrLim: msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst, clk), // Same limits, but per-address
 		ctx:           ctx,
 		cancel:        cancel,
 	}
