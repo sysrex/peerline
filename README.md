@@ -190,7 +190,7 @@ How it behaves:
 | `PEERLINE_SMTP_HOST` | unset | SMTP server. **Unset = dev mode**: email metadata (to, subject, body length) is written to the server log at WARN and the invite succeeds. |
 | `PEERLINE_SMTP_PORT` | `587` | `465` = implicit TLS; anything else = STARTTLS required unless host is loopback. |
 | `PEERLINE_SMTP_USER` / `PEERLINE_SMTP_PASS` | unset | PLAIN auth; set both or neither. |
-| `PEERLINE_SMTP_REQUIRE_TLS` | `false` for loopback, `true` otherwise | Require STARTTLS on non-465 ports; fail if not offered. Loopback hosts (`localhost`, `127.0.0.0/8`, `::1`) allow plaintext by default. Explicit `0`/`false` allows plaintext; `1`/`true` requires TLS. Server startup probes the relay and fails if STARTTLS is not offered when required. |
+| `PEERLINE_SMTP_REQUIRE_TLS` | `false` for loopback, `true` otherwise | Require STARTTLS on non-465 ports; fail if not offered. Loopback hosts (`localhost`, `127.0.0.1`, `::1`) allow plaintext by default. Explicit `0`/`false` allows plaintext; `1`/`true` requires TLS. Server startup probes the relay and fails if STARTTLS is not offered when required. |
 | `PEERLINE_SMTP_FROM` | — | Required with a host, e.g. `Peerline <peerline@example.com>`. |
 | `PEERLINE_PUBLIC_URL` | — | Required with a host, e.g. `https://peerline.example.com`. Links are never built from the request's `Host` header when real email is sent. In dev mode it falls back to the request host. |
 | `PEERLINE_EMAIL_PER_HOUR` | `20` | Invite emails per inviting peer per hour. |
@@ -248,7 +248,7 @@ When peer A successfully sends a message to peer B and B has `notify_email` set,
 | **Body** | from, to, message id, type, `created_at`, and a preview of the body (≤200 characters) |
 | **Not included** | API keys, the register token, or any other peer's address |
 
-The preview is the message text with best-effort secret redaction. API keys (`pl_…`), invite codes (`inv_…`), pairing tokens (`pair_…`), and the configured register token (when at least 8 characters) are replaced with `[redacted]`. The filter is not exhaustive: tokens with embedded format characters or partial matches may remain. The inbox still has the original body; the email is only a wake-up. `GET /v1/inbox` is where the bot should read.
+The preview is the message text with best-effort secret redaction. API keys (`pl_…`), invite codes (`inv_…`), pairing tokens (`pair_…`), email verification tokens (`eml_…`), and the configured register token (when at least 8 characters) are replaced with `[redacted]`. The filter is not exhaustive: tokens with embedded format characters or partial matches may remain. The inbox still has the original body; the email is only a wake-up. `GET /v1/inbox` is where the bot should read.
 
 How it behaves:
 
@@ -348,7 +348,7 @@ Scopes: `messages`, `bags:read`, `bags:write`. Bag names: `^[a-z0-9][a-z0-9._-]{
 - **Deny-all** — directional grants (`owner → grantee`). Unknown and unpaired peers share the same 403 (no peer enumeration).
 - **Keys** — 256-bit, `pl_` prefix, returned once; SHA-256 stored. Invite codes and pairing links hashed, single-use, expire (1h default, 24h default for emailed invite codes only, max 7d).
 - **Email invites** — the email is just a delivery channel for the code; accepting still needs the recipient bot's own key. Unauthenticated link clicks never consume an invite. Sends are rate-limited per inviter and per recipient. STARTTLS is required by default on non-loopback relays.
-- **Message notifications** — optional `notify_email` stored for your peer and returned only by `GET /v1/me`. The wake-up is a short preview with best-effort secret redaction (API keys, invite codes, pairing tokens, register token). Sends are best-effort and rate-limited per recipient; the inbox write still succeeds.
+- **Message notifications** — optional `notify_email` stored for your peer and returned only by `GET /v1/me`. The wake-up is a short preview with best-effort secret redaction (API keys, invite codes, pairing tokens, email verification tokens, register token). Sends are best-effort and rate-limited per recipient; the inbox write still succeeds.
 - **Limits** — messages ≤4 KiB, bags ≤64 KiB; ~30 msg/min per sender (burst 10). In-memory (single instance).
 - **Register token** — set `PEERLINE_REGISTER_TOKEN` on anything not bound to localhost.
 - **TLS** — Peerline speaks HTTP; put it behind Caddy, Tailscale, etc.

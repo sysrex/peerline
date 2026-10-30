@@ -129,6 +129,8 @@ func TestFromEnv(t *testing.T) {
 		{"explicit require TLS", "localhost", "", "", "", "test@example.com", "1", "smtp", false, false, false, false, ""},
 		{"explicit allow plaintext", "192.168.1.1", "", "", "", "test@example.com", "0", "smtp", true, false, false, false, ""},
 		{"port 465 = implicit TLS", "192.168.1.1", "465", "", "", "test@example.com", "", "smtp", false, true, false, false, ""},
+		{"port 2525", "mail.example.com", "2525", "", "", "test@example.com", "", "smtp", false, false, false, false, ""},
+		{"host set without FROM is error", "mail.example.com", "", "", "", "", "", "", false, false, true, false, ""},
 		{"invalid require TLS", "localhost", "", "", "", "test@example.com", "ture", "", false, false, true, false, ""},
 		{"user without pass", "localhost", "", "u", "", "test@example.com", "", "", false, false, true, false, ""},
 	}
@@ -461,6 +463,84 @@ func TestSMTPAllowPlaintext(t *testing.T) {
 	}
 }
 
+func TestSMTPSend(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	got := make(chan string, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		r, w := bufio.NewReader(c), bufio.NewWriter(c)
+		say := func(s string) { w.WriteString(s + "\r\n"); w.Flush() }
+		say("220 test")
+		var data strings.Builder
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				return
+			}
+			cmd := strings.ToUpper(strings.TrimSpace(line))
+			switch {
+			case strings.HasPrefix(cmd, "EHLO"), strings.HasPrefix(cmd, "HELO"):
+				say("250 test")
+			case strings.HasPrefix(cmd, "MAIL"), strings.HasPrefix(cmd, "RCPT"):
+				data.WriteString(line)
+				say("250 ok")
+			case cmd == "DATA":
+				say("354 go")
+				for {
+					l, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if l == ".\r\n" {
+						break
+					}
+					data.WriteString(l)
+				}
+				say("250 queued")
+			case cmd == "QUIT":
+				say("221 bye")
+				got <- data.String()
+				return
+			default:
+				say("502 no")
+			}
+		}
+	}()
+
+	s := &SMTP{
+		Host:           "127.0.0.1",
+		Port:           ln.Addr().(*net.TCPAddr).Port,
+		From:           "alice@example.com",
+		Timeout:        2 * time.Second,
+		AllowPlaintext: true,
+	}
+	err = s.Send(context.Background(), Message{To: "bob@example.com", Subject: "Hello", Body: "test body"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := <-got
+	if !strings.Contains(data, "MAIL FROM:") {
+		t.Errorf("missing MAIL FROM in %q", data)
+	}
+	if !strings.Contains(data, "RCPT TO:") {
+		t.Errorf("missing RCPT TO in %q", data)
+	}
+	if !strings.Contains(data, "Subject: Hello") {
+		t.Errorf("missing Subject in %q", data)
+	}
+	if !strings.Contains(data, "test body") {
+		t.Errorf("missing body in %q", data)
+	}
+}
+
 func TestSMTPProbe(t *testing.T) {
 	t.Run("STARTTLS offered = ok", func(t *testing.T) {
 		cert := genTestCert(t, "localhost")
@@ -611,6 +691,77 @@ func TestSMTPProbe(t *testing.T) {
 		}
 		if !errors.Is(err, ErrRelayUnreachable) {
 			t.Fatalf("timeout should be ErrRelayUnreachable, got: %v", err)
+		}
+	})
+
+	t.Run("4xx greeting = ErrRelayUnreachable", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				c.Write([]byte("421 Service not available\r\n"))
+				c.Close()
+			}
+		}()
+
+		s := &SMTP{
+			Host:           "127.0.0.1",
+			Port:           ln.Addr().(*net.TCPAddr).Port,
+			Timeout:        500 * time.Millisecond,
+			AllowPlaintext: false,
+		}
+		err = s.Probe(context.Background(), nil)
+		if err == nil {
+			t.Fatal("probe should return error for 4xx greeting")
+		}
+		if !errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("4xx greeting should be ErrRelayUnreachable, got: %v", err)
+		}
+	})
+
+	t.Run("EHLO failure = ErrRelayUnreachable", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+					conn.Write([]byte("220 test\r\n"))
+					buf := make([]byte, 1024)
+					conn.Read(buf) // read EHLO
+					conn.Write([]byte("550 EHLO rejected\r\n"))
+				}(c)
+			}
+		}()
+
+		s := &SMTP{
+			Host:           "127.0.0.1",
+			Port:           ln.Addr().(*net.TCPAddr).Port,
+			Timeout:        500 * time.Millisecond,
+			AllowPlaintext: false,
+		}
+		err = s.Probe(context.Background(), nil)
+		if err == nil {
+			t.Fatal("probe should return error for EHLO failure")
+		}
+		if !errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("EHLO failure should be ErrRelayUnreachable, got: %v", err)
 		}
 	})
 }

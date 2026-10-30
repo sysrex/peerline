@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/sysrex/peerline/internal/auth"
+	"github.com/sysrex/peerline/internal/mailer"
 )
 
 func registerNotify(t *testing.T, srv *httptest.Server, name, email string) *client {
@@ -373,17 +374,59 @@ func TestBodyPreview(t *testing.T) {
 
 func TestNotifyDevModeNoBodyLeakage(t *testing.T) {
 	var logs syncBuf
+	cap := &captureMailer{}
+	combined := &captureAndLog{
+		capture: cap,
+		log:     mailer.Log{Logger: slog.New(slog.NewTextHandler(&logs, nil))},
+	}
 	srv := newServer(t, Config{
+		Mailer: combined,
 		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
-		// No mailer configured = Log mailer (dev mode)
 	})
 	a := register(t, srv, "alice")
-	b := registerNotify(t, srv, "bob", "bob@example.com")
+	b := &client{t: t, srv: srv}
+	resp, body := b.do("POST", "/v1/register", map[string]string{"name": "bob", "notify_email": "bob@example.com"}, nil)
+	want(t, resp, body, 201)
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&b.id, &b.key})
+
+	// Verify bob's email
+	msgs := cap.all()
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 verification email, got %d", len(msgs))
+	}
+	verifyEmail := msgs[0]
+	tokenStart := strings.Index(verifyEmail.Body, "token=eml_") + 6
+	tokenEnd := strings.Index(verifyEmail.Body[tokenStart:], "\n")
+	if tokenEnd == -1 {
+		tokenEnd = strings.Index(verifyEmail.Body[tokenStart:], " ")
+	}
+	verifyToken := verifyEmail.Body[tokenStart : tokenStart+tokenEnd]
+	resp, body = b.do("POST", "/v1/me/verify-email?token="+verifyToken, nil, nil)
+	want(t, resp, body, 200)
+
+	// Clear emails and logs after verification
+	cap.mu.Lock()
+	cap.msgs = nil
+	cap.mu.Unlock()
+	logs.b.Reset()
 
 	pairUp(t, b, a, []string{"messages"}, nil, nil)
 	secretBody := "secret content with inv_" + strings.Repeat("x", 20) + " and pair_" + strings.Repeat("y", 20)
-	resp, body := a.do("POST", "/v1/peers/"+b.id+"/messages", map[string]any{"type": "note", "body": secretBody}, nil)
+	resp, body = a.do("POST", "/v1/peers/"+b.id+"/messages", map[string]any{"type": "note", "body": secretBody}, nil)
 	want(t, resp, body, 201)
+
+	// Verify exactly one notification was sent
+	msgs = cap.all()
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 notification email, got %d", len(msgs))
+	}
+	notification := msgs[0]
+	if notification.To != "bob@example.com" {
+		t.Fatalf("notification not sent to bob@example.com: %s", notification.To)
+	}
 
 	l := logs.String()
 	// Dev mode should log metadata but NOT the body or preview

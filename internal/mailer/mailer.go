@@ -293,6 +293,12 @@ func (s *SMTP) Probe(ctx context.Context, lg *slog.Logger) error {
 	}
 	defer c.Quit()
 
+	// Explicitly call EHLO/HELO to catch EHLO failures
+	if err := c.Hello("localhost"); err != nil {
+		// EHLO/HELO failure (4xx/5xx response, timeout, reset) - transient
+		return fmt.Errorf("%w: EHLO failed: %v", ErrRelayUnreachable, err)
+	}
+
 	if !s.ImplicitTLS {
 		hasSTARTTLS, _ := c.Extension("STARTTLS")
 		if !hasSTARTTLS && !s.AllowPlaintext {

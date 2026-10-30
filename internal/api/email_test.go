@@ -54,13 +54,32 @@ func (c *captureMailer) messages() []mailer.Message {
 	return c.all()
 }
 
+// captureAndLog wraps a capture mailer and also forwards to Log for dev-mode testing
+type captureAndLog struct {
+	capture *captureMailer
+	log     mailer.Log
+}
+
+func (c *captureAndLog) Mode() string { return "smtp" }
+
+func (c *captureAndLog) Send(ctx context.Context, m mailer.Message) error {
+	if err := c.capture.Send(ctx, m); err != nil {
+		return err
+	}
+	return c.log.Send(ctx, m)
+}
+
 // Dev mode: no SMTP configured -> email is logged, invite still created and usable.
 func TestEmailInviteDevMode(t *testing.T) {
 	var logs syncBuf
 	capture := &captureMailer{}
+	combined := &captureAndLog{
+		capture: capture,
+		log:     mailer.Log{Logger: slog.New(slog.NewTextHandler(&logs, nil))},
+	}
 	srv := newServer(t, Config{
 		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
-		Mailer: capture,
+		Mailer: combined,
 	})
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
 
@@ -80,15 +99,12 @@ func TestEmailInviteDevMode(t *testing.T) {
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 email, got %d", len(msgs))
 	}
+	// After #128, email has JSON body format and plain code line (no ?code= URL)
 	if !strings.Contains(msgs[0].Body, inv.Code) {
 		t.Fatalf("email body should contain invite code %s", inv.Code)
 	}
-	// Email should contain the code in the accept URL
-	if !strings.Contains(msgs[0].Body, "?code="+inv.Code) {
-		t.Fatalf("email body should contain code in URL query string")
-	}
 
-	// Fix #26: invite code must NOT appear in logs
+	// Fix #26: invite code must NOT appear in logs (Log mailer path is exercised by captureAndLog)
 	l := logs.String()
 	if strings.Contains(l, inv.Code) {
 		t.Fatalf("invite code leaked in dev mode log: %s", l)
