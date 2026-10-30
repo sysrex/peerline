@@ -1610,25 +1610,23 @@ func TestInviteCapBeforeEmailBudget(t *testing.T) {
 	srv := newServer(t, cfg)
 	alice := register(t, srv, "Alice")
 
-	// Create first invite (should succeed, 1/2)
+	// Create first invite without email (should succeed, 1/2)
 	resp, b := alice.do("POST", "/v1/invites", map[string]any{
-		"to_email": "bob@example.com",
-		"scopes":   []string{"messages"},
+		"scopes": []string{"messages"},
 	}, nil)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
 	}
 
-	// Create second invite (should succeed, 2/2 - at cap)
+	// Create second invite without email (should succeed, 2/2 - at cap)
 	resp, b = alice.do("POST", "/v1/invites", map[string]any{
-		"to_email": "carol@example.com",
-		"scopes":   []string{"messages"},
+		"scopes": []string{"messages"},
 	}, nil)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("second invite (at cap): %d %s", resp.StatusCode, b)
 	}
 
-	// Attempt third invite (one over cap, should fail without spending email budget)
+	// Attempt third invite with to_email (should fail with 429, no budget consumed)
 	resp, b = alice.do("POST", "/v1/invites", map[string]any{
 		"to_email": "dave@example.com",
 		"scopes":   []string{"messages"},
@@ -1641,6 +1639,96 @@ func TestInviteCapBeforeEmailBudget(t *testing.T) {
 	}
 	if !bytes.Contains(b, []byte("limit 2")) {
 		t.Errorf("over-cap error: should mention limit 2")
+	}
+
+	// Revoke one invite to make room
+	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites: %d %s", resp.StatusCode, b)
+	}
+	var listResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(listResp.Invites) < 1 {
+		t.Fatal("no invites to revoke")
+	}
+	revokeID := listResp.Invites[0]["public_id"].(string)
+	resp, b = alice.do("DELETE", "/v1/invites/"+revokeID, nil, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("revoke: %d %s", resp.StatusCode, b)
+	}
+
+	// Now create an invite with to_email (should succeed, proving budget wasn't consumed)
+	resp, b = alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "dave@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("invite after cap rejection: status %d, want 201, body %s", resp.StatusCode, b)
+		t.Errorf("this proves email budget WAS consumed during the cap rejection")
+	}
+}
+
+// TestEmailLimitDeletesInvite verifies invite is deleted when email limit fails (#53)
+func TestEmailLimitDeletesInvite(t *testing.T) {
+	cfg := Config{}
+	cfg.EmailPerHour = 3
+	cfg.EmailBurst = 3
+	srv := newServer(t, cfg)
+	alice := register(t, srv, "Alice")
+
+	// Exhaust sender's email budget (3 burst)
+	for i := 0; i < 3; i++ {
+		resp, b := alice.do("POST", "/v1/invites", map[string]any{
+			"to_email": fmt.Sprintf("user%d@example.com", i),
+			"scopes":   []string{"messages"},
+		}, nil)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("invite %d: %d %s", i, resp.StatusCode, b)
+		}
+	}
+
+	// List invites before next attempt
+	resp, b := alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites: %d %s", resp.StatusCode, b)
+	}
+	var beforeResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &beforeResp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Next invite should fail with rate limit
+	resp, b = alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "ratelimited@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("rate limited invite: status %d, want 429, body %s", resp.StatusCode, b)
+	}
+	if !bytes.Contains(b, []byte("rate limited")) {
+		t.Errorf("rate limit error: %s, want rate limit message", b)
+	}
+
+	// List invites after - count should be the same (invite was deleted)
+	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites after: %d %s", resp.StatusCode, b)
+	}
+	var afterResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &afterResp); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(afterResp.Invites) != len(beforeResp.Invites) {
+		t.Errorf("invite count changed: before=%d, after=%d (invite should have been deleted)", len(beforeResp.Invites), len(afterResp.Invites))
 	}
 }
 
