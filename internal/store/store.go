@@ -124,6 +124,7 @@ func migrate(db *sql.DB) error {
 		migrateV1NotifyEmail,
 		migrateV2PairingTokenHash,
 		migrateV3InvitePublicID,
+		migrateV4ConfirmMode,
 	}
 
 	maxKnownVersion := len(migrations)
@@ -331,6 +332,134 @@ func migrateV3InvitePublicID(tx *sql.Tx) error {
 			return err
 		}
 	}
+
+	return nil
+}
+
+// migrateV4ConfirmMode adds confirm-mode columns and CHECK constraints via table rebuild.
+// Follows SQLite's 12-step table rebuild procedure.
+// Adds: confirm_required, claimed_by, claimed_at, confirm_by, back_scopes, back_bags, declined_at,
+// code_nonce, code_failures. Makes public_id NOT NULL with DEFAULT. Adds CHECK constraints.
+func migrateV4ConfirmMode(tx *sql.Tx) error {
+	// Get the underlying connection to manipulate foreign_keys pragma.
+	// PRAGMA foreign_keys is a no-op inside a transaction, so we need to work around this.
+	// Since we're in a transaction already, we can't turn off foreign_keys here directly.
+	// Instead, we rely on the fact that the rebuild preserves referential integrity.
+	
+	// Step 1-2: Create new table with v4 schema
+	_, err := tx.Exec(`
+		CREATE TABLE invites_new (
+			code_hash TEXT PRIMARY KEY,
+			from_peer TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
+			scopes TEXT NOT NULL,
+			bags TEXT NOT NULL,
+			expires_at INTEGER NOT NULL,
+			used_by TEXT,
+			pairing_token_hash TEXT,
+			public_id TEXT NOT NULL DEFAULT (lower(hex(randomblob(16)))),
+			confirm_required INTEGER NOT NULL DEFAULT 0,
+			claimed_by TEXT,
+			claimed_at INTEGER,
+			confirm_by INTEGER,
+			back_scopes TEXT,
+			back_bags TEXT,
+			declined_at INTEGER,
+			code_nonce TEXT,
+			code_failures INTEGER NOT NULL DEFAULT 0,
+			CHECK (confirm_required IN (0, 1)),
+			CHECK (confirm_required = 0 OR used_by IS NULL OR used_by = claimed_by),
+			CHECK (NOT (declined_at IS NOT NULL AND used_by IS NOT NULL)),
+			CHECK (claimed_by IS NULL OR (claimed_at IS NOT NULL AND confirm_by IS NOT NULL))
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("create invites_new: %w", err)
+	}
+
+	// Step 3-4: Copy data from old table, backfilling public_id where NULL
+	_, err = tx.Exec(`
+		INSERT INTO invites_new (
+			code_hash, from_peer, scopes, bags, expires_at, used_by, pairing_token_hash,
+			public_id, confirm_required
+		)
+		SELECT 
+			code_hash, from_peer, scopes, bags, expires_at, used_by, pairing_token_hash,
+			COALESCE(public_id, lower(hex(randomblob(16)))),
+			0
+		FROM invites
+	`)
+	if err != nil {
+		return fmt.Errorf("copy data to invites_new: %w", err)
+	}
+
+	// Step 5: Drop old table
+	if _, err := tx.Exec(`DROP TABLE invites`); err != nil {
+		return fmt.Errorf("drop old invites: %w", err)
+	}
+
+	// Step 6: Rename new table
+	if _, err := tx.Exec(`ALTER TABLE invites_new RENAME TO invites`); err != nil {
+		return fmt.Errorf("rename invites_new: %w", err)
+	}
+
+	// Step 7-10: Recreate indexes and triggers (no triggers in our schema)
+	// Unique partial index on pairing_token_hash (WHERE NOT NULL)
+	_, err = tx.Exec(`
+		CREATE UNIQUE INDEX invites_pairing_token_hash 
+		ON invites(pairing_token_hash) 
+		WHERE pairing_token_hash IS NOT NULL
+	`)
+	if err != nil {
+		return fmt.Errorf("create pairing_token_hash index: %w", err)
+	}
+
+	// Unique partial index on public_id (WHERE NOT NULL, though now it's always NOT NULL)
+	_, err = tx.Exec(`
+		CREATE UNIQUE INDEX invites_public_id 
+		ON invites(public_id) 
+		WHERE public_id IS NOT NULL
+	`)
+	if err != nil {
+		return fmt.Errorf("create public_id index: %w", err)
+	}
+
+	// Index on claimed_by for lookup by claimant
+	_, err = tx.Exec(`
+		CREATE INDEX invites_claimed_by 
+		ON invites(claimed_by) 
+		WHERE claimed_by IS NOT NULL
+	`)
+	if err != nil {
+		return fmt.Errorf("create claimed_by index: %w", err)
+	}
+
+	// Partial index on confirm_by for purge queries (WHERE claimed and not yet confirmed or declined)
+	_, err = tx.Exec(`
+		CREATE INDEX invites_confirm_by 
+		ON invites(confirm_by) 
+		WHERE claimed_by IS NOT NULL AND used_by IS NULL
+	`)
+	if err != nil {
+		return fmt.Errorf("create confirm_by index: %w", err)
+	}
+
+	// Step 11: Foreign key check (verify referential integrity)
+	rows, err := tx.Query(`PRAGMA foreign_key_check`)
+	if err != nil {
+		return fmt.Errorf("foreign_key_check query: %w", err)
+	}
+	defer rows.Close()
+
+	// If any rows are returned, foreign key constraints are violated
+	if rows.Next() {
+		var table, rowid, parent, fkid string
+		if err := rows.Scan(&table, &rowid, &parent, &fkid); err != nil {
+			return fmt.Errorf("read foreign_key_check result: %w", err)
+		}
+		return fmt.Errorf("foreign key violation after rebuild: table=%s rowid=%s parent=%s fkid=%s", table, rowid, parent, fkid)
+	}
+
+	// Step 12: Re-enable foreign key enforcement (will be done after commit by runMigrationStep)
 
 	return nil
 }
