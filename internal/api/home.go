@@ -21,7 +21,7 @@ const (
 type homeData struct {
 	BaseURL      string
 	RegisterOpen bool
-	Nonce        string
+	Nonce        template.HTMLAttr
 	// StatsJSON is the same counters as Stats, pre-encoded so the embedded
 	// script stays valid JSON. template.JS is safe here: the bytes are
 	// json.Marshal of int64 fields only.
@@ -65,7 +65,7 @@ func (s *Server) home(w http.ResponseWriter, r *http.Request) {
 	if err := homeTmpl.Execute(&buf, homeData{
 		BaseURL:      s.publicBase(r),
 		RegisterOpen: s.cfg.RegisterToken == "",
-		Nonce:        nonce,
+		Nonce:        template.HTMLAttr(nonce),
 		StatsJSON:    template.JS(raw),
 		Stats:        st,
 	}); err != nil {
