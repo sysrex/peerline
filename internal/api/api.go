@@ -948,7 +948,7 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 	}
 	// Register the new peer
 	id, key := auth.NewID(), auth.NewKey()
-	if err := s.st.CreatePeer(r.Context(), id, in.Name, auth.Hash(key)); err != nil {
+	if err := s.st.CreatePeer(r.Context(), id, in.Name, auth.Hash(key), ""); err != nil {
 		s.internal(w, err)
 		return
 	}
