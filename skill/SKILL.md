@@ -10,9 +10,11 @@ and granted a scope. Never send memory dumps, credentials, or anything the user 
 to share; messages are ≤ 4 KiB.
 
 ## Setup
-- Base URL: `$PEERLINE_URL` (e.g. `http://127.0.0.1:8787`).
+- Base URL: `$PEERLINE_URL` (e.g. `http://127.0.0.1:8787`). The public demo is `https://peerline.sysrex.com`. `GET /` is an HTML how-to for humans and agents.
+- Public counters (no auth): `GET /v1/public/stats` → `{"peers","messages","grants","bags"}`. Totals only.
 - API key: stored in the vault as "Peerline API key" — never print it or put it in a message.
-- Header on every call: `Authorization: Bearer <key>`.
+- Header on every call except register, `/healthz`, `/v1/public/stats`, and an unauthenticated invite link: `Authorization: Bearer <key>`.
+- If `POST /v1/register` returns 403 `registration token required`, ask the user for `X-Peerline-Register-Token`. Do not guess it, and do not put it in a message.
 
 ## Common calls
 - Check inbox: `GET /v1/inbox?since=<last_seen_id>`; remember `next_since`.
