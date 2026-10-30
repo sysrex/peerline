@@ -40,6 +40,17 @@ func newServer(t *testing.T, cfg Config) *httptest.Server {
 		t.Fatal(err)
 	}
 
+	// Set high write limits for tests unless explicitly configured
+	if cfg.WritePerMinute == 0 {
+		cfg.WritePerMinute = 1000
+		cfg.WriteBurst = 100
+	}
+	// Set high auth fail limits for tests unless explicitly configured  
+	if cfg.AuthFailPerMinute == 0 {
+		cfg.AuthFailPerMinute = 1000
+		cfg.AuthFailBurst = 100
+	}
+
 	apiServer, err := New(st, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -1815,7 +1826,14 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 	}
 	defer st.Close()
 
-	rawSrv := New(st, cfg)
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := httptest.NewServer(rawSrv.Handler())
 	defer srv.Close()
 

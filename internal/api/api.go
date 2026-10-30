@@ -186,20 +186,20 @@ func (s *Server) Handler() http.Handler {
 
 	authed := http.NewServeMux()
 	authed.HandleFunc("GET /v1/me", s.rateLimitAuth(s.me))
-	authed.HandleFunc("PUT /v1/me", s.updateMe)
-	authed.HandleFunc("POST /v1/me/verify-email", s.verifyEmail)
-	authed.HandleFunc("POST /v1/invites", s.createInvite)
+	authed.HandleFunc("PUT /v1/me", s.rateLimitWrite(s.updateMe))
+	authed.HandleFunc("POST /v1/me/verify-email", s.rateLimitWrite(s.verifyEmail))
+	authed.HandleFunc("POST /v1/invites", s.rateLimitWrite(s.createInvite))
 	authed.HandleFunc("GET /v1/invites", s.rateLimitAuth(s.listInvites))
-	authed.HandleFunc("DELETE /v1/invites/{id}", s.deleteInvite)
-	authed.HandleFunc("POST /v1/invites/accept", s.acceptInvite)
-	authed.HandleFunc("GET /v1/invites/accept", s.acceptInvite) // emailed magic link (Bearer required)
+	authed.HandleFunc("DELETE /v1/invites/{id}", s.rateLimitWrite(s.deleteInvite))
+	authed.HandleFunc("POST /v1/invites/accept", s.rateLimitWrite(s.acceptInvite))
+	authed.HandleFunc("GET /v1/invites/accept", s.rateLimitWrite(s.acceptInvite)) // emailed magic link (Bearer required)
 	authed.HandleFunc("GET /v1/grants", s.rateLimitAuth(s.listGrants))
-	authed.HandleFunc("DELETE /v1/grants/{peer_id}", s.revokeGrant)
-	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.sendMessage)
+	authed.HandleFunc("DELETE /v1/grants/{peer_id}", s.rateLimitWrite(s.revokeGrant))
+	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.rateLimitWrite(s.sendMessage))
 	authed.HandleFunc("GET /v1/inbox", s.rateLimitAuth(s.inbox)) // polling-friendly rate limit
 	authed.HandleFunc("GET /v1/bags/{name}", s.rateLimitAuth(s.getBag))
-	authed.HandleFunc("PUT /v1/bags/{name}", s.putBag)
-	authed.HandleFunc("POST /v1/pairing/{token}", s.acceptPairing) // authenticated pairing acceptance
+	authed.HandleFunc("PUT /v1/bags/{name}", s.rateLimitWrite(s.putBag))
+	authed.HandleFunc("POST /v1/pairing/{token}", s.rateLimitWrite(s.acceptPairing)) // authenticated pairing acceptance
 	authMW := s.authMiddleware(authed)
 	mux.Handle("/v1/", authMW)
 	// The emailed accept link: with a Bearer key it accepts (same flow as

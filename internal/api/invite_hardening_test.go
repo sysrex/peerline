@@ -24,11 +24,19 @@ func TestRevokePreventsPairingGetAndPost(t *testing.T) {
 	}
 	defer st.Close()
 
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
 	cfg := Config{
 		Logger:                slog.Default(),
 		MaxOutstandingInvites: 10,
 	}
-	srv := httptest.NewServer(New(st, cfg).Handler())
+	apiServer, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(apiServer.Handler())
 	defer srv.Close()
 
 	// Register a peer and create a pairing invite
@@ -92,6 +100,10 @@ func TestConcurrentInviteCapAtAPILevel(t *testing.T) {
 	}
 	defer st.Close()
 
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
 	const cap = 3
 	const concurrency = 10
 
@@ -99,7 +111,11 @@ func TestConcurrentInviteCapAtAPILevel(t *testing.T) {
 		Logger:                slog.Default(),
 		MaxOutstandingInvites: cap,
 	}
-	srv := httptest.NewServer(New(st, cfg).Handler())
+	apiServer, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(apiServer.Handler())
 	defer srv.Close()
 
 	alice := register(t, srv, "alice")
@@ -180,6 +196,10 @@ func TestCapBeforeEmailBudget(t *testing.T) {
 	}
 	defer st.Close()
 
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
 	capturer := &capturingMailer{}
 	cfg := Config{
 		Logger:                slog.Default(),
@@ -189,7 +209,11 @@ func TestCapBeforeEmailBudget(t *testing.T) {
 		EmailRcptPerHour:      10,
 		Mailer:                capturer,
 	}
-	srv := httptest.NewServer(New(st, cfg).Handler())
+	apiServer, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(apiServer.Handler())
 	defer srv.Close()
 
 	alice := register(t, srv, "alice")
@@ -263,11 +287,19 @@ func TestMultiLineXForwardedFor(t *testing.T) {
 	}
 	defer st.Close()
 
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
 	cfg := Config{
 		Logger:         slog.Default(),
 		TrustedProxies: []string{"10.0.0.0/8"},
 	}
-	srv := New(st, cfg)
+	apiServer, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := apiServer
 	handler := srv.Handler()
 
 	// Create a test request with multiple X-Forwarded-For headers
@@ -303,11 +335,19 @@ func TestGETLimiterSeparateBuckets(t *testing.T) {
 	}
 	defer st.Close()
 
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
 	cfg := Config{
 		Logger:         slog.Default(),
 		TrustedProxies: []string{"10.0.0.0/8"},
 	}
-	srv := New(st, cfg)
+	apiServer, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := apiServer
 	handler := srv.Handler()
 
 	// Client 1 with IP 1.2.3.4
@@ -358,10 +398,18 @@ func TestAnonymousGETDoesNotBlockAuthenticatedInbox(t *testing.T) {
 	}
 	defer st.Close()
 
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
 	cfg := Config{
 		Logger: slog.Default(),
 	}
-	srv := httptest.NewServer(New(st, cfg).Handler())
+	apiServer, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(apiServer.Handler())
 	defer srv.Close()
 
 	// Register two peers
@@ -394,11 +442,19 @@ func TestAcceptByCodeAfterRevoke(t *testing.T) {
 	}
 	defer st.Close()
 
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
 	cfg := Config{
 		Logger:                slog.Default(),
 		MaxOutstandingInvites: 10,
 	}
-	srv := httptest.NewServer(New(st, cfg).Handler())
+	apiServer, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(apiServer.Handler())
 	defer srv.Close()
 
 	// Register peers
@@ -439,11 +495,19 @@ func TestDeleteUsedInviteReturns404(t *testing.T) {
 	}
 	defer st.Close()
 
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
 	cfg := Config{
 		Logger:                slog.Default(),
 		MaxOutstandingInvites: 10,
 	}
-	srv := httptest.NewServer(New(st, cfg).Handler())
+	apiServer, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(apiServer.Handler())
 	defer srv.Close()
 
 	// Register peers
@@ -488,11 +552,19 @@ func TestSingleLogRecordUnauthenticatedPairing(t *testing.T) {
 	}
 	defer st.Close()
 
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
 	cfg := Config{
 		Logger:                logger,
 		MaxOutstandingInvites: 10,
 	}
-	srv := httptest.NewServer(New(st, cfg).Handler())
+	apiServer, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(apiServer.Handler())
 	defer srv.Close()
 
 	// Register a peer and create a pairing invite
