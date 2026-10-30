@@ -2254,11 +2254,9 @@ func TestDeletedInviteCannotBeAccepted(t *testing.T) {
 
 // TestConcurrentInviteCapRace verifies the concurrent cap check race is fixed (#53).
 //
-// Verified on a scratch branch with the OLD ordering (hook after create, budget check before create):
-// Test FAILS with output: 'budget check: 0 email invites succeeded, want 4'
-// All 5 requests consume budget, leaving 0 tokens available.
-//
-// With NEW ordering (hook before create, create before budget check): PASSES with 4 tokens available.
+// The barrier holds all requests before the atomic cap check. The created count
+// (> 1) catches a count-then-insert regression in CreateInviteAtomic, and the final
+// email budget assertion (4 of 6 left) catches charging the limiter before the create.
 func TestConcurrentInviteCapRace(t *testing.T) {
 	cfg := Config{}
 	cfg.MaxOutstandingInvites = 2
@@ -2315,8 +2313,7 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 
 	// Launch concurrent requests at the cap with to_email
 	// One should succeed (2/2), others should fail at atomic cap check
-	// BUG on main: all 5 consume budget before atomic check (5 tokens consumed)
-	// FIX here: only the 1 successful request consumes budget (1 token consumed)
+	// Only the 1 successful request may consume email budget (1 token consumed).
 	results := make(chan int, concurrent)
 	var wg sync.WaitGroup
 	for i := 0; i < concurrent; i++ {

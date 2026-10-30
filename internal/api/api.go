@@ -111,7 +111,7 @@ type Server struct {
 	pruneDone chan struct{}
 	pruneOnce sync.Once
 
-	// Test-only hook: called after invite creation, before email limit check
+	// Test-only hook: called before the atomic invite cap check and the email limit check
 	testInviteCreatedHook func(peerID string)
 }
 
