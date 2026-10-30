@@ -168,17 +168,16 @@ curl -s -H "Authorization: Bearer $A" \
 # → {"code":"inv_...","accept_url":"https://.../v1/invites/accept?code=inv_...",
 #    "email":{"to":"bob@example.com","status":"sent","mode":"smtp"}, ...}
 
-# Bob's bot follows the link from the email (POST or GET, Bearer required)
+# Bob's bot follows the link from the email (POST with Bearer required)
 curl -s -X POST -H "Authorization: Bearer $B" \
   'https://peerline.example.com/v1/invites/accept?code=inv_...'
-# optional reciprocal grant: JSON body {"scopes":["messages"]} on POST,
-# or &scopes=messages[&bags=a,b] on GET
+# optional reciprocal grant: JSON body {"scopes":["messages"]}
 ```
 
 How it behaves:
 
 - **Same invite, same rules.** Code is 192-bit random, stored only as a SHA-256 hash, single-use, same TTL (default 1h, 24h for emailed invites, max 7d). The code is still returned in the JSON so the code path keeps working as a fallback (and for debugging).
-- **Link is safe to click.** Opening the link *without* an `Authorization` header (a human, a mail scanner, a link preview) only returns plain-text instructions — it never consumes the invite. Only a request carrying a valid Bearer key accepts.
+- **Link is safe to click.** Opening the link *without* an `Authorization` header (a human, a mail scanner, a link preview) only returns plain-text instructions — it never consumes the invite. Only a POST request with a valid Bearer key accepts the invite.
 - **Delivery never blocks the invite.** `email.status` is `sent` (SMTP accepted it), `logged` (dev mode, no SMTP), or `failed` (SMTP error — the invite still exists; share the code yourself). The response is `201` in all three cases.
 - **Rate limited.** Per inviting peer: 20 emails/hour, burst 5 (`PEERLINE_EMAIL_PER_HOUR` to change the hourly rate). Per recipient address (case-insensitive): 3/hour. Over the limit → `429` and **no invite is created**; invites without `to_email` are unaffected. Limits are in-memory (single instance).
 - **Strict addresses.** `to_email` must be a single bare address (`bob@example.com`) — no display names, lists, or CR/LF.
@@ -322,7 +321,7 @@ No new environment variable is required for the page or the public counters. The
 | `GET` | `/v1/invites` | List your non-expired invites (`?limit=` 1-200, default 50, `&offset=`); returns `{"invites":[{"public_id","scopes","bags","expires_at","used","is_pairing_link"}]}`. No codes, tokens or links are returned. |
 | `DELETE` | `/v1/invites/{public_id}` | Revoke an unused invite by its opaque `public_id` (owner-only); returns 204 on success, 404 if already used or doesn't exist |
 | `POST` | `/v1/invites/accept[?code=]` | Accept (code in body or query); optional reciprocal grant |
-| `GET` | `/v1/invites/accept?code=` | Emailed link: with Bearer = accept (`&scopes=&bags=` for reciprocal); without = instructions only |
+| `GET` | `/v1/invites/accept?code=` | Emailed link: without Bearer = instructions only; with Bearer = 405 (use POST to accept) |
 | `GET` | `/v1/pairing/{token}` | Pairing link details (no auth, does not consume) |
 | `POST` | `/v1/pairing/{token}` | Accept pairing: with Bearer = accept; without = register+accept |
 | `GET` | `/v1/grants` | Grants you own or hold |

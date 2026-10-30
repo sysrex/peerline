@@ -1930,6 +1930,7 @@ func TestAPIClock(t *testing.T) {
 	}
 }
 
+<<<<<<< HEAD
 // TestRateLimitWithMultipleXFFHeaders verifies that multiple X-Forwarded-For
 // header lines are properly combined when the RemoteAddr is trusted (#61).
 func TestRateLimitWithMultipleXFFHeaders(t *testing.T) {
@@ -1963,4 +1964,74 @@ func TestRateLimitWithMultipleXFFHeaders(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Errorf("expected 200, got %d", resp.StatusCode)
 	}
+}
+
+// TestInviteAcceptGETDoesNotChangeState verifies that authenticated GET
+// /v1/invites/accept returns 405 and does not consume the invite (issue #28).
+func TestInviteAcceptGETDoesNotChangeState(t *testing.T) {
+	srv := newServer(t, Config{})
+	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+
+	// Alice creates an invite for Bob
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv struct {
+		Code      string `json:"code"`
+		AcceptURL string `json:"accept_url"`
+	}
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
+	}
+
+	// Authenticated GET returns 405 and does not accept the invite
+	resp, body = b.do("GET", "/v1/invites/accept?code="+inv.Code, nil, nil)
+	want(t, resp, body, 405)
+	if !strings.Contains(string(body), "use POST to accept") {
+		t.Errorf("expected 405 error message, got: %s", body)
+	}
+	if resp.Header.Get("Allow") != "POST" {
+		t.Errorf("expected Allow: POST header, got: %s", resp.Header.Get("Allow"))
+	}
+
+	// Verify invite is still pending: Bob can still accept with POST
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv.Code}, nil)
+	want(t, resp, body, 200)
+
+	// Verify pairing succeeded: Bob can now message Alice
+	resp, body = b.do("POST", "/v1/peers/"+a.id+"/messages", map[string]any{"type": "note", "body": "test"}, nil)
+	want(t, resp, body, 201)
+}
+
+// TestInviteAcceptUnauthenticatedGETShowsLanding verifies that unauthenticated
+// GET /v1/invites/accept shows the landing page and does not consume the invite.
+func TestInviteAcceptUnauthenticatedGETShowsLanding(t *testing.T) {
+	srv := newServer(t, Config{})
+	a, b := register(t, srv, "alice"), register(t, srv, "bob")
+
+	// Alice creates an invite
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+	var inv struct{ Code string }
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unauthenticated GET shows landing page (no key)
+	bNoAuth := &client{t: t, srv: srv, key: ""}
+	resp, body = bNoAuth.do("GET", "/v1/invites/accept?code="+inv.Code, nil, nil)
+	want(t, resp, body, 200)
+	if resp.Header.Get("Content-Type") != "text/plain; charset=utf-8" {
+		t.Errorf("expected text/plain content type, got: %s", resp.Header.Get("Content-Type"))
+	}
+	if !strings.Contains(string(body), "Peerline invite") {
+		t.Errorf("expected landing page content, got: %s", body)
+	}
+	if !strings.Contains(string(body), "curl -X POST") {
+		t.Errorf("expected POST instruction in landing page, got: %s", body)
+	}
+
+	// Verify invite is still pending: Bob can accept with POST
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv.Code}, nil)
+	want(t, resp, body, 200)
+>>>>>>> 0a1dfec (Fix #28: Prevent authenticated GET /v1/invites/accept from changing state)
 }

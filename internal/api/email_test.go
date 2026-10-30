@@ -63,14 +63,14 @@ func TestEmailInviteDevMode(t *testing.T) {
 		t.Fatal("landing echoed bad code")
 	}
 
-	// Bob's bot follows the magic link with its key (GET, reciprocal scopes via query).
-	resp, body = b.do("GET", path+"&scopes=messages", nil, nil)
+	// Bob's bot follows the magic link with its key (POST, reciprocal scopes in body).
+	resp, body = b.do("POST", path, map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 200)
 	if !strings.Contains(string(body), `"granted_by_you"`) {
 		t.Fatalf("accept: %s", body)
 	}
 	// single use
-	resp, body = b.do("GET", path, nil, nil)
+	resp, body = b.do("POST", path, nil, nil)
 	want(t, resp, body, 404)
 	// grant works both ways
 	resp, body = b.do("POST", "/v1/peers/"+a.id+"/messages", map[string]any{"type": "note", "body": "hi"}, nil)
