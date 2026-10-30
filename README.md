@@ -141,9 +141,9 @@ curl -s -X POST -H "Authorization: Bearer $B" \
 
 How it behaves:
 
-- **Same security as invites.** Pairing tokens are 192-bit random, hashed in the database, single-use, same expiry as the invite (default 1h, 24h for emailed invites, max 7d).
-- **Safe to share.** `GET /v1/pairing/{token}` returns human and agent-readable instructions with no secrets. It does not consume the token.
-- **Two paths:** unauthenticated POST registers a new peer (requires `name` and honors `PEERLINE_REGISTER_TOKEN` if set); authenticated POST accepts with an existing key.
+- **Same security as invites.** Pairing tokens are 192-bit random, hashed in the database, single-use, expire after 1h by default (max 7d). The inviter name in the GET response is untrusted text.
+- **Safe to share.** `GET /v1/pairing/{token}` returns human and agent-readable instructions with no secrets. The inviter name is untrusted text. It does not consume the token.
+- **Two paths:** authenticated POST accepts with an existing key; unauthenticated POST (legacy, risky if response is lost) registers and accepts in one step.
 - **Single-use.** Once accepted, the pairing token (and the underlying invite) are consumed.
 - **No secrets in the URL.** The pairing URL never contains API keys, register tokens, or the invite code itself.
 
@@ -326,7 +326,7 @@ Scopes: `messages`, `bags:read`, `bags:write`. Bag names: `^[a-z0-9][a-z0-9._-]{
 
 - **Cross-account by design** — peer IDs are not tied to a single human; pairing is the trust boundary.
 - **Deny-all** — directional grants (`owner → grantee`). Unknown and unpaired peers share the same 403 (no peer enumeration).
-- **Keys** — 256-bit, `pl_` prefix, returned once; SHA-256 stored. Invite codes hashed, single-use, expire (default 1h, 24h for emailed invites, max 7d).
+- **Keys** — 256-bit, `pl_` prefix, returned once; SHA-256 stored. Invite codes and pairing links hashed, single-use, expire (1h default, 24h default for emailed invite codes only, max 7d).
 - **Email invites** — the email is just a delivery channel for the code; accepting still needs the recipient bot's own key. Unauthenticated link clicks never consume an invite. Sends are rate-limited per inviter and per recipient.
 - **Message notifications** — optional `notify_email` stored for your peer and returned only by `GET /v1/me`. The wake-up is a short preview, with API keys and the register token kept out of the mail. Sends are best-effort and rate-limited per recipient; the inbox write still succeeds.
 - **Limits** — messages ≤4 KiB, bags ≤64 KiB; ~30 msg/min per sender (burst 10). In-memory (single instance).

@@ -1631,3 +1631,48 @@ func TestSanitizerUnicode(t *testing.T) {
 		})
 	}
 }
+
+// TestAPIClock verifies that api.Server.now is used in createInvite
+func TestAPIClock(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	srv := New(st, Config{})
+
+	// Stub the clock
+	fixedTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	srv.now = func() time.Time { return fixedTime }
+
+	// Create test server and client
+	testSrv := httptest.NewServer(srv.Handler())
+	defer testSrv.Close()
+
+	// Register a peer
+	c := &client{t: t, srv: testSrv}
+	resp, body := c.do("POST", "/v1/register", map[string]string{"name": "alice"}, nil)
+	want(t, resp, body, 201)
+	var reg struct{ PeerID, APIKey string }
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&reg.PeerID, &reg.APIKey})
+	c.id, c.key = reg.PeerID, reg.APIKey
+
+	// Create an invite
+	resp, body = c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
+
+	var inv struct {
+		ExpiresAt string `json:"expires_at"`
+	}
+	json.Unmarshal(body, &inv)
+
+	expTime, _ := time.Parse(time.RFC3339, inv.ExpiresAt)
+	expected := fixedTime.Add(time.Hour).UTC()
+	if !expTime.Equal(expected) {
+		t.Errorf("expires_at = %v, want %v", expTime, expected)
+	}
+}

@@ -18,6 +18,7 @@ What it **DOES NOT** contain:
 
 What it **DOES** contain:
 - ✅ A random pairing token (192 bits, hashed in database)
+- ✅ The inviter name in the GET response (untrusted text)
 
 ### 2. Token Properties
 
@@ -33,7 +34,7 @@ What it **DOES** contain:
 
 **Lifecycle:**
 - Single-use (consumed on first successful accept)
-- Expires with the underlying invite (default 1h, 24h for emailed invites, max 7d; `ttl_seconds` above 604800 returns 400)
+- Expires after 1h by default (max 7d; `ttl_seconds` above 604800 returns 400). Pairing links cannot use `to_email`, so the 24h default for emailed invite codes does not apply.
 - Cannot be reused after acceptance
 - Unused invites are removed by the hourly maintenance sweep after expiry; used invites are kept for the retention window after expiry
 

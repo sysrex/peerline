@@ -73,6 +73,7 @@ type Server struct {
 	maint       *MaintenanceManager
 	log         *slog.Logger
 	trustedNets []*net.IPNet
+	now         func() time.Time // clock for invite expiry; defaults to time.Now
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -121,6 +122,7 @@ func New(st *store.Store, cfg Config) *Server {
 		log:         cfg.Logger,
 		lim:         NewLimiterManager(cfg),
 		trustedNets: trustedNets,
+		now:         time.Now,
 	}
 
 	// Start maintenance tasks
@@ -400,8 +402,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	code := auth.NewSecret("inv_")
-	// API layer is not clock-injected yet; uses wall time directly
-	exp := time.Now().Add(ttl).UTC()
+	exp := s.now().Add(ttl).UTC()
 	var pairingToken string
 	var publicID string
 
