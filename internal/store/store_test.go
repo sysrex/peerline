@@ -1686,14 +1686,14 @@ func TestFailClosedVersionGuard(t *testing.T) {
 		t.Errorf("expected ErrSchemaTooNew, got %T: %v", err, err)
 	} else {
 		if tooNewErr.Have != 99 || tooNewErr.Max != 3 {
-			t.Errorf("ErrSchemaTooNew: Have=%d, Max=%d, want Have=99, Max=3", tooNewErr.Have, tooNewErr.Max)
+			t.Errorf("ErrSchemaTooNew: Have=%d, Max=%d, want Have=99, Max=4", tooNewErr.Have, tooNewErr.Max)
 		}
 	}
 
 	// Verify error message mentions both versions
 	errMsg := err.Error()
 	if !strings.Contains(errMsg, "99") || !strings.Contains(errMsg, "3") {
-		t.Errorf("error message should mention both schema versions (99 and 3), got: %s", errMsg)
+		t.Errorf("error message should mention both schema versions (99 and 4), got: %s", errMsg)
 	}
 	if !strings.Contains(errMsg, "newer") && !strings.Contains(errMsg, "upgrade") {
 		t.Errorf("error message should mention 'newer' or 'upgrade', got: %s", errMsg)
