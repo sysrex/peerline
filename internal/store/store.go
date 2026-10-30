@@ -605,7 +605,10 @@ func (s *Store) PurgeExpiredInvites(ctx context.Context, retentionSeconds int64)
 			return totalDeleted, err
 		}
 
-		n, _ := res.RowsAffected()
+		n, err := res.RowsAffected()
+		if err != nil {
+			return totalDeleted, err
+		}
 		totalDeleted += int(n)
 
 		// Stop if we deleted fewer than batchSize
