@@ -208,6 +208,8 @@ func TestCapBeforeEmailBudget(t *testing.T) {
 		EmailBurst:            1,
 		EmailRcptPerHour:      10,
 		Mailer:                capturer,
+		WritePerMinute:        1000, // High limit for test
+		WriteBurst:            100,
 	}
 	apiServer, err := New(st, cfg)
 	if err != nil {

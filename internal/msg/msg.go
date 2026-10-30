@@ -122,23 +122,6 @@ func (l *Limiter) Allow(key string) bool { return l.take(key, true) }
 // Use it to check several limiters before consuming from any of them.
 func (l *Limiter) Ready(key string) bool { return l.take(key, false) }
 
-// Refund returns one token for key (capped at burst). Use after a charged
-// operation that later succeeded, so the charge can be refunded.
-func (l *Limiter) Refund(key string) {
-	s := l.shards[l.shardIndex(key)]
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	b, ok := s.buckets[key]
-	if !ok {
-		return
-	}
-	t := l.now()
-	b.tokens = min(l.burst, b.tokens+t.Sub(b.last).Seconds()*l.rate)
-	b.last = t
-	// Refund one token, capped at burst
-	b.tokens = min(l.burst, b.tokens+1)
-}
-
 // Prune removes buckets that haven't been touched in pruneAfter duration.
 // Call periodically to prevent unbounded memory growth.
 func (l *Limiter) Prune() int {

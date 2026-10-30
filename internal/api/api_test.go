@@ -50,6 +50,10 @@ func newServer(t *testing.T, cfg Config) *httptest.Server {
 		cfg.AuthFailPerMinute = 1000
 		cfg.AuthFailBurst = 100
 	}
+	// Set high invite cap for tests unless explicitly configured
+	if cfg.MaxOutstandingInvites == 0 {
+		cfg.MaxOutstandingInvites = 100
+	}
 
 	apiServer, err := New(st, cfg)
 	if err != nil {
@@ -1819,6 +1823,8 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 	cfg.EmailPerHour = 10
 	cfg.EmailBurst = 5 // 5 tokens available
 	cfg.EmailRcptPerHour = 20
+	cfg.WritePerMinute = 1000 // High limit for test
+	cfg.WriteBurst = 100
 
 	st, err := store.Open(t.TempDir() + "/t.db")
 	if err != nil {
