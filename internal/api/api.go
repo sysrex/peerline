@@ -267,10 +267,9 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	var tokenWithExpiry string
 	var rawToken string
 	if notify != "" {
-		// Rate limit verification emails per-peer and per-address
+		// Rate limit verification emails per-address only
 		normalizedAddr := strings.ToLower(notify)
-		ipKey := rateLimitKey(clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets))
-		if !s.lim.regLim.Allow(ipKey) || !s.lim.verifyLim.Allow(normalizedAddr) {
+		if !s.lim.verifyLim.Allow(normalizedAddr) {
 			writeErr(w, http.StatusTooManyRequests, "rate limited")
 			return
 		}
@@ -436,9 +435,15 @@ func (s *Server) verifyEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	me := auth.PeerID(r.Context())
-	if err := s.st.VerifyNotifyEmail(r.Context(), me, token); err != nil {
-		// All failures return identical 404: wrong token, expired, already used, wrong peer, malformed
-		writeErr(w, http.StatusNotFound, "not found")
+	tokenHash := auth.Hash(token)
+	if err := s.st.VerifyNotifyEmail(r.Context(), me, tokenHash); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// All token validation failures return identical 404
+			writeErr(w, http.StatusNotFound, "not found")
+			return
+		}
+		// Real DB errors are internal server errors, not token oracles
+		s.internal(w, err)
 		return
 	}
 	s.log.Info("email verified", "peer_id", me)

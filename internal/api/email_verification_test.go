@@ -2,16 +2,30 @@ package api
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/sysrex/peerline/internal/auth"
 )
 
 // TestEmailVerificationIdenticalFailures tests that all verification failures return byte-identical 404s.
 func TestEmailVerificationIdenticalFailures(t *testing.T) {
 	cap := &captureMailer{}
-	srv := newServer(t, Config{Mailer: cap})
+	srv, _, st := newServerWithAccess(t, Config{Mailer: cap})
+
+	// Helper to write token directly to DB
+	writeToken := func(peerID, token string) {
+		_, err := st.DB().Exec(`UPDATE peers SET notify_email_token=? WHERE id=?`, token, peerID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	// Register and get tokens
 	alice := &client{t: t, srv: srv}
@@ -29,6 +43,22 @@ func TestEmailVerificationIdenticalFailures(t *testing.T) {
 		PeerID *string `json:"peer_id"`
 		APIKey *string `json:"api_key"`
 	}{&bob.id, &bob.key})
+
+	carol := &client{t: t, srv: srv}
+	resp, body = carol.do("POST", "/v1/register", map[string]string{"name": "carol", "notify_email": "carol@example.com"}, nil)
+	want(t, resp, body, 201)
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&carol.id, &carol.key})
+
+	dave := &client{t: t, srv: srv}
+	resp, body = dave.do("POST", "/v1/register", map[string]string{"name": "dave", "notify_email": "dave@example.com"}, nil)
+	want(t, resp, body, 201)
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&dave.id, &dave.key})
 
 	// Extract alice's token
 	msgs := cap.all()
@@ -58,6 +88,14 @@ func TestEmailVerificationIdenticalFailures(t *testing.T) {
 	// Test 5: Missing token
 	resp5, body5 := alice.do("POST", "/v1/me/verify-email", nil, nil)
 
+	// Test 6: Legacy plaintext token
+	writeToken(carol.id, "eml_plaintext_legacy")
+	resp6, body6 := carol.do("POST", "/v1/me/verify-email?token=eml_plaintext_legacy", nil, nil)
+
+	// Test 7: Malformed token (not timestamp:hash)
+	writeToken(dave.id, "malformed:value")
+	resp7, body7 := dave.do("POST", "/v1/me/verify-email?token=anything", nil, nil)
+
 	// All failures must return identical 404s
 	failures := []struct {
 		name string
@@ -68,6 +106,8 @@ func TestEmailVerificationIdenticalFailures(t *testing.T) {
 		{"wrong peer", resp2.StatusCode, body2},
 		{"already used", resp4.StatusCode, body4},
 		{"missing token", resp5.StatusCode, body5},
+		{"legacy plaintext", resp6.StatusCode, body6},
+		{"malformed", resp7.StatusCode, body7},
 	}
 
 	var canonical []byte
@@ -83,21 +123,22 @@ func TestEmailVerificationIdenticalFailures(t *testing.T) {
 	}
 }
 
-// TestVerificationEmailRateLimit tests per-peer and per-address rate limiting of verification emails.
+// TestVerificationEmailRateLimit tests per-peer rate limiting of verification emails.
 func TestVerificationEmailRateLimit(t *testing.T) {
 	cap := &captureMailer{}
 	srv := newServer(t, Config{Mailer: cap})
 
 	alice := register(t, srv, "alice")
 
-	// Set notify_email 3 times (hits per-peer limit of 3/hour)
+	// Set notify_email 3 times with different addresses (hits per-peer limit of 3/hour)
 	for i := 0; i < 3; i++ {
-		resp, body := alice.do("PUT", "/v1/me", map[string]string{"notify_email": "alice@example.com"}, nil)
+		addr := fmt.Sprintf("alice%d@example.com", i)
+		resp, body := alice.do("PUT", "/v1/me", map[string]string{"notify_email": addr}, nil)
 		want(t, resp, body, 200)
 	}
 
-	// 4th attempt should be rate limited
-	resp, body := alice.do("PUT", "/v1/me", map[string]string{"notify_email": "alice@example.com"}, nil)
+	// 4th attempt should be rate limited (per-peer, even with a new address)
+	resp, body := alice.do("PUT", "/v1/me", map[string]string{"notify_email": "alice3@example.com"}, nil)
 	want(t, resp, body, 429)
 	if !strings.Contains(string(body), "rate limited") {
 		t.Errorf("unexpected error: %s", body)
@@ -107,7 +148,7 @@ func TestVerificationEmailRateLimit(t *testing.T) {
 	msgs := cap.all()
 	count := 0
 	for _, m := range msgs {
-		if m.To == "alice@example.com" && strings.Contains(m.Subject, "Verify") {
+		if strings.Contains(m.Subject, "Verify") {
 			count++
 		}
 	}
@@ -225,5 +266,297 @@ func TestTokenNotInLogs(t *testing.T) {
 	// Check for the token pattern (should not appear anywhere in logs)
 	if strings.Contains(logStr, "eml_") {
 		t.Errorf("token pattern eml_ found in logs:\n%s", logStr)
+	}
+}
+
+// TestEmailVerificationExpiry tests that tokens expire after 24 hours.
+func TestEmailVerificationExpiry(t *testing.T) {
+	cap := &captureMailer{}
+	srv, _, st := newServerWithAccess(t, Config{Mailer: cap})
+
+	alice := &client{t: t, srv: srv}
+	resp, body := alice.do("POST", "/v1/register", map[string]string{"name": "alice", "notify_email": "alice@example.com"}, nil)
+	want(t, resp, body, 201)
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&alice.id, &alice.key})
+
+	// Extract token
+	msgs := cap.all()
+	token := extractVerifyToken(msgs[0].Body)
+
+	// Test 1: Write a token that's still valid (issued 23 hours 59 minutes ago)
+	now := time.Now().Unix()
+	validIssuedTime := now - 86399
+	validTokenValue := fmt.Sprintf("%d:%s", validIssuedTime, auth.Hash(token))
+	_, err := st.DB().Exec(`UPDATE peers SET notify_email_token=? WHERE id=?`, validTokenValue, alice.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, body = alice.do("POST", "/v1/me/verify-email?token="+token, nil, nil)
+	want(t, resp, body, 200)
+
+	// Test 2: Register bob and test expired token
+	bob := &client{t: t, srv: srv}
+	resp, body = bob.do("POST", "/v1/register", map[string]string{"name": "bob", "notify_email": "bob@example.com"}, nil)
+	want(t, resp, body, 201)
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&bob.id, &bob.key})
+
+	msgs = cap.all()
+	bobToken := extractVerifyToken(msgs[len(msgs)-1].Body)
+
+	// Write a token that's expired (issued exactly 24 hours ago)
+	expiredIssuedTime := now - 86400
+	expiredTokenValue := fmt.Sprintf("%d:%s", expiredIssuedTime, auth.Hash(bobToken))
+	_, err = st.DB().Exec(`UPDATE peers SET notify_email_token=? WHERE id=?`, expiredTokenValue, bob.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, body = bob.do("POST", "/v1/me/verify-email?token="+bobToken, nil, nil)
+	want(t, resp, body, 404)
+	if !strings.Contains(string(body), "not found") {
+		t.Errorf("unexpected error: %s", body)
+	}
+}
+
+// TestEmailVerificationLegacyAndMalformed tests that legacy plaintext and malformed tokens fail.
+func TestEmailVerificationLegacyAndMalformed(t *testing.T) {
+	cap := &captureMailer{}
+	srv, _, st := newServerWithAccess(t, Config{Mailer: cap})
+
+	// Helper to write token directly to DB
+	writeToken := func(peerID, token string) {
+		_, err := st.DB().Exec(`UPDATE peers SET notify_email_token=? WHERE id=?`, token, peerID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Test legacy plaintext token (from #138)
+	alice := &client{t: t, srv: srv}
+	resp, body := alice.do("POST", "/v1/register", map[string]string{"name": "alice", "notify_email": "alice@example.com"}, nil)
+	want(t, resp, body, 201)
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&alice.id, &alice.key})
+
+	writeToken(alice.id, "eml_plaintext_from_138")
+	resp1, body1 := alice.do("POST", "/v1/me/verify-email?token=eml_plaintext_from_138", nil, nil)
+
+	// Test malformed: "abc:def" (not a valid timestamp)
+	bob := &client{t: t, srv: srv}
+	resp, body = bob.do("POST", "/v1/register", map[string]string{"name": "bob", "notify_email": "bob@example.com"}, nil)
+	want(t, resp, body, 201)
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&bob.id, &bob.key})
+
+	writeToken(bob.id, "abc:def")
+	resp2, body2 := bob.do("POST", "/v1/me/verify-email?token=anything", nil, nil)
+
+	// Test malformed: ":" only
+	carol := &client{t: t, srv: srv}
+	resp, body = carol.do("POST", "/v1/register", map[string]string{"name": "carol", "notify_email": "carol@example.com"}, nil)
+	want(t, resp, body, 201)
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&carol.id, &carol.key})
+
+	writeToken(carol.id, ":")
+	resp3, body3 := carol.do("POST", "/v1/me/verify-email?token=anything", nil, nil)
+
+	// All should return 404
+	for i, test := range []struct {
+		name string
+		code int
+		body []byte
+	}{
+		{"legacy plaintext", resp1.StatusCode, body1},
+		{"malformed abc:def", resp2.StatusCode, body2},
+		{"malformed colon-only", resp3.StatusCode, body3},
+	} {
+		if test.code != 404 {
+			t.Errorf("%s: got status %d, want 404", test.name, test.code)
+		}
+		if i == 0 {
+			// Store canonical for comparison
+		} else if !bytes.Equal(test.body, body1) {
+			t.Errorf("%s: body differs from canonical\n  got:  %s\n  want: %s", test.name, test.body, body1)
+		}
+	}
+}
+
+// TestTokenHashedInDB verifies the DB never stores the raw token.
+func TestTokenHashedInDB(t *testing.T) {
+	cap := &captureMailer{}
+	srv, _, st := newServerWithAccess(t, Config{Mailer: cap})
+
+	alice := &client{t: t, srv: srv}
+	resp, body := alice.do("POST", "/v1/register", map[string]string{"name": "alice", "notify_email": "alice@example.com"}, nil)
+	want(t, resp, body, 201)
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&alice.id, &alice.key})
+
+	// Extract token from email
+	msgs := cap.all()
+	token := extractVerifyToken(msgs[0].Body)
+
+	// Read token from DB
+	var dbToken sql.NullString
+	err := st.DB().QueryRow(`SELECT notify_email_token FROM peers WHERE id=?`, alice.id).Scan(&dbToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dbToken.Valid {
+		t.Fatal("token is NULL in DB")
+	}
+
+	// DB should not contain raw token
+	if strings.Contains(dbToken.String, token) {
+		t.Errorf("DB contains raw token: %s", dbToken.String)
+	}
+
+	// DB should contain the hash
+	expectedHash := auth.Hash(token)
+	if !strings.Contains(dbToken.String, expectedHash) {
+		t.Errorf("DB doesn't contain hash. DB value: %s", dbToken.String)
+	}
+
+	// Format should be <timestamp>:<hash>
+	parts := strings.Split(dbToken.String, ":")
+	if len(parts) != 2 {
+		t.Errorf("DB token format invalid: %s", dbToken.String)
+	}
+}
+
+// TestEmailVerificationHappyPath tests the full verification flow.
+func TestEmailVerificationHappyPath(t *testing.T) {
+	cap := &captureMailer{}
+	srv := newServer(t, Config{Mailer: cap})
+
+	alice := &client{t: t, srv: srv}
+	resp, body := alice.do("POST", "/v1/register", map[string]string{"name": "alice", "notify_email": "alice@example.com"}, nil)
+	want(t, resp, body, 201)
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&alice.id, &alice.key})
+
+	// Check initial status
+	resp, body = alice.do("GET", "/v1/me", nil, nil)
+	want(t, resp, body, 200)
+	var status struct {
+		NotifyEmail string `json:"notify_email"`
+		Verified    bool   `json:"verified"`
+	}
+	json.Unmarshal(body, &status)
+	if status.NotifyEmail != "alice@example.com" || status.Verified {
+		t.Fatalf("initial status: email=%q verified=%v, want alice@example.com verified=false", status.NotifyEmail, status.Verified)
+	}
+
+	// Extract and verify token
+	msgs := cap.all()
+	token := extractVerifyToken(msgs[0].Body)
+	resp, body = alice.do("POST", "/v1/me/verify-email?token="+token, nil, nil)
+	want(t, resp, body, 200)
+
+	// Check verified status
+	resp, body = alice.do("GET", "/v1/me", nil, nil)
+	want(t, resp, body, 200)
+	json.Unmarshal(body, &status)
+	if status.NotifyEmail != "alice@example.com" || !status.Verified {
+		t.Fatalf("after verify: email=%q verified=%v, want alice@example.com verified=true", status.NotifyEmail, status.Verified)
+	}
+}
+
+// registerAndVerify is a helper that registers a peer, verifies the email, and returns the client.
+func registerAndVerify(t *testing.T, srv *httptest.Server, cap *captureMailer, name, email string) *client {
+	t.Helper()
+	c := &client{t: t, srv: srv}
+
+	// Store count of messages before registration
+	beforeCount := len(cap.all())
+
+	resp, body := c.do("POST", "/v1/register", map[string]string{"name": name, "notify_email": email}, nil)
+	if resp.StatusCode != 201 {
+		t.Fatalf("register %s: %d %s", name, resp.StatusCode, body)
+	}
+	json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&c.id, &c.key})
+
+	// Find the NEW verification email sent after this registration
+	msgs := cap.all()
+	var token string
+	for i := beforeCount; i < len(msgs); i++ {
+		m := msgs[i]
+		if m.To == email && strings.Contains(m.Subject, "Verify") {
+			token = extractVerifyToken(m.Body)
+			if token != "" {
+				break
+			}
+		}
+	}
+	if token == "" {
+		t.Fatalf("no verification token found for %s", email)
+	}
+
+	resp, body = c.do("POST", "/v1/me/verify-email?token="+token, nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("verify %s: %d %s", name, resp.StatusCode, body)
+	}
+
+	return c
+}
+
+// TestPerAddressNotificationRateLimit tests that notification rate limiting is per-address.
+func TestPerAddressNotificationRateLimit(t *testing.T) {
+	cap := &captureMailer{}
+	srv := newServer(t, Config{Mailer: cap, NotifyPerHour: 2, NotifyBurst: 2})
+
+	alice := register(t, srv, "alice")
+
+	// Register and verify two peers with the same email
+	bob1 := registerAndVerify(t, srv, cap, "bob1", "shared@example.com")
+	bob2 := registerAndVerify(t, srv, cap, "bob2", "shared@example.com")
+
+	// Clear verification emails
+	cap.mu.Lock()
+	cap.msgs = nil
+	cap.mu.Unlock()
+
+	// Grant messages
+	pairUp(t, bob1, alice, []string{"messages"}, nil, nil)
+	pairUp(t, bob2, alice, []string{"messages"}, nil, nil)
+
+	// Send 2 messages - should get 2 notifications (within per-address limit)
+	resp, body := alice.do("POST", "/v1/peers/"+bob1.id+"/messages", map[string]any{"type": "note", "body": "msg1"}, nil)
+	want(t, resp, body, 201)
+
+	resp, body = alice.do("POST", "/v1/peers/"+bob2.id+"/messages", map[string]any{"type": "note", "body": "msg2"}, nil)
+	want(t, resp, body, 201)
+
+	msgs := cap.all()
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 notifications, got %d", len(msgs))
+	}
+
+	// Third message should be rate-limited by per-address limit
+	resp, body = alice.do("POST", "/v1/peers/"+bob1.id+"/messages", map[string]any{"type": "note", "body": "msg3"}, nil)
+	want(t, resp, body, 201)
+
+	msgs = cap.all()
+	if len(msgs) != 2 {
+		t.Fatalf("expected still 2 notifications (rate limited), got %d", len(msgs))
 	}
 }

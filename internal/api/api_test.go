@@ -38,6 +38,20 @@ func newServer(t *testing.T, cfg Config) *httptest.Server {
 	return srv
 }
 
+// newServerWithAccess returns a test server along with the underlying Server and Store for tests that need internal access.
+func newServerWithAccess(t *testing.T, cfg Config) (*httptest.Server, *Server, *store.Store) {
+	t.Helper()
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	s := New(st, cfg)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	return srv, s, st
+}
+
 func (c *client) do(method, path string, body any, hdr map[string]string) (*http.Response, []byte) {
 	c.t.Helper()
 	var r io.Reader

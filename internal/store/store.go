@@ -13,7 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sysrex/peerline/internal/auth"
 	_ "modernc.org/sqlite"
 )
 
@@ -323,6 +322,12 @@ func migrateV4EmailVerification(tx *sql.Tx) error {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// DB exposes the underlying database for testing.
+func (s *Store) DB() *sql.DB { return s.db }
+
+// SetNow allows tests to control time.
+func (s *Store) SetNow(fn func() int64) { s.now = fn }
+
 // generatePublicID returns a random 16-byte hex string for invite public_id.
 func generatePublicID() (string, error) {
 	b := make([]byte, 16)
@@ -397,10 +402,10 @@ func (s *Store) GetNotifyEmailStatus(ctx context.Context, id string) (email stri
 	return email, verified, nil
 }
 
-// VerifyNotifyEmail marks the email as verified if the token matches and hasn't expired.
-// Token is single-use: cleared on success. Returns ErrNotFound for any failure.
+// VerifyNotifyEmail marks the email as verified if the tokenHash matches and hasn't expired.
+// Token is single-use: cleared on success. Returns ErrNotFound for invalid/expired/used tokens.
 // tokenWithExpiry format: "<unix_issued>:<hash>". Legacy plaintext or malformed values are treated as invalid.
-func (s *Store) VerifyNotifyEmail(ctx context.Context, id, submittedToken string) error {
+func (s *Store) VerifyNotifyEmail(ctx context.Context, id, tokenHash string) error {
 	// Fetch stored token
 	var storedToken sql.NullString
 	err := s.db.QueryRowContext(ctx, `SELECT notify_email_token FROM peers WHERE id=?`, id).Scan(&storedToken)
@@ -423,14 +428,13 @@ func (s *Store) VerifyNotifyEmail(ctx context.Context, id, submittedToken string
 	}
 	storedHash := parts[1]
 
-	// Check expiry (24 hours)
-	if s.now() > issuedUnix+24*3600 {
+	// Check expiry (24 hours, exclusive: issued + 86400 is the first expired second)
+	if s.now() >= issuedUnix+24*3600 {
 		return ErrNotFound
 	}
 
 	// Verify hash matches
-	submittedHash := auth.Hash(submittedToken)
-	if submittedHash != storedHash {
+	if tokenHash != storedHash {
 		return ErrNotFound
 	}
 

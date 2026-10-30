@@ -244,6 +244,8 @@ curl -X POST -H "Authorization: Bearer $A" \
 
 **Upgrading from v3 to v4**: existing `notify_email` addresses will be marked as unverified and will **not receive notifications** until re-verified. Set the address again with `PUT /v1/me` to trigger a new verification email.
 
+**Token security hardening**: Verification tokens issued before commit `1ca253c` (including those from the initial v4 merge) no longer work due to a change in storage format. If you have a pending verification token, `PUT /v1/me` with your email address again to receive a new one.
+
 When peer A successfully sends a message to peer B and B has `notify_email` set **and verified**, Peerline sends one transactional email:
 
 | | |
