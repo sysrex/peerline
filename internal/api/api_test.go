@@ -1562,6 +1562,8 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Mixed valid", "Alice-O'Neil, Jr.", "Alice-O'Neil, Jr."},
 		{"Hindi with combining marks", "राजेश कुमार", "राजेश कुमार"},
 		{"Thai with combining marks", "สมชาย ใจดี", "สมชาย ใจดี"},
+		// Issue #68: Devanagari test
+		{"Devanagari", "हिन्दी", "हिन्दी"},
 
 		// Bidi controls (Cf category) - all filtered
 		{"Bidi LRE", "Alice\u202AEvil", "AliceEvil"},
@@ -1597,6 +1599,45 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Variation selector FE0F", "Alice\uFE0FEvil", "AliceEvil"},
 		{"Variation selector E0100", "Alice\U000E0100Evil", "AliceEvil"},
 
+		// Issue #35: Additional Cf characters and Zl/Zp
+		{"U+061C Arabic letter mark", "Alice\u061CEvil", "AliceEvil"},
+		{"U+2060 Word joiner", "Alice\u2060Evil", "AliceEvil"},
+		{"U+00AD Soft hyphen", "Alice\u00ADEvil", "AliceEvil"},
+		{"U+2028 Line separator", "Alice\u2028Evil", "AliceEvil"},
+		{"U+2029 Paragraph separator", "Alice\u2029Evil", "AliceEvil"},
+
+		// Issue #63 & #84: Invisible Mn characters
+		{"U+034F COMBINING GRAPHEME JOINER", "a\u034Fb", "ab"},
+		{"U+0334 Combining tilde overlay", "a\u0334b", "a\u0334b"},
+		{"U+180B Mongolian FVS1", "a\u180Bb", "ab"},
+		{"U+180C Mongolian FVS2", "a\u180Cb", "ab"},
+		{"U+180D Mongolian FVS3", "a\u180Db", "ab"},
+		{"U+180F Mongolian FVS4", "a\u180Fb", "ab"},
+		{"U+17B4 Khmer inherent vowel", "a\u17B4b", "ab"},
+		{"U+17B5 Khmer inherent vowel", "a\u17B5b", "ab"},
+
+		// Issue #84: Combining marks constraints
+		// Note: NFKC normalizes "a\u0301" to "á" (U+00E1), so test expectations must account for this
+		{"3 marks allowed", "a\u0301\u0302\u0303", "á\u0302\u0303"}, // NFKC: a+mark1 -> á, then 2 more marks
+		{"20 marks capped at 3", "a" + strings.Repeat("\u0301", 20), "á" + strings.Repeat("\u0301", 3)}, // NFKC: á + 19 marks -> á + 3 marks
+		{"64 marks alone becomes fallback", strings.Repeat("\u0301", 64), "A Peerline peer"},
+		{"100 marks capped at 3", "a" + strings.Repeat("\u0301", 100), "á" + strings.Repeat("\u0301", 3)},
+		{"Mark after space dropped", "a \u0301b", "a b"},
+		{"Mark at start dropped", "\u0301abc", "abc"},
+		{"Mark after punctuation dropped", "a.\u0301b", "a.b"},
+		{"Mark after letter then punctuation", "a\u0301.b", "á.b"}, // NFKC: a+mark -> á
+
+		// Issue #68: Tab and newline handling
+		{"Tab becomes space", "Alice\tSmith", "Alice Smith"},
+		{"Newline becomes space", "Alice\nSmith", "Alice Smith"},
+		{"Carriage return becomes space", "Alice\rSmith", "Alice Smith"},
+		{"Tab with spaces", "Alice  \t  Smith", "Alice Smith"},
+
+		// Issue #68: Empty result fallback
+		{"Only symbols becomes fallback", "★★★", "A Peerline peer"},
+		{"Only filtered chars", "\u200B\u200C\uFEFF", "A Peerline peer"},
+		{"Only marks becomes fallback", "\u0301\u0302\u0303", "A Peerline peer"},
+
 		// NFKC normalization
 		{"Fullwidth ASCII", "Ａｌｉｃｅ", "Alice"},  // Fullwidth → ASCII
 		{"Superscript", "Alice²", "Alice2"},    // ² → 2
@@ -1608,16 +1649,18 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Multiple spaces", "Alice   Smith", "Alice Smith"},
 		{"Leading spaces", "   Alice", "Alice"},
 		{"Trailing spaces", "Alice   ", "Alice"},
-		{"Mixed whitespace", "Alice  \t  Smith", "Alice Smith"}, // Tab becomes space, then collapsed
 
 		// Emoji and symbols (filtered out)
 		{"Emoji removed", "Alice 😀 Smith", "Alice Smith"},
 		{"Symbol removed", "Alice ★ Smith", "Alice Smith"},
 
 		// Edge cases
-		{"Empty string", "", ""},
-		{"Only spaces", "   ", ""},
-		{"Only filtered chars", "\u200B\u200C\uFEFF", ""},
+		{"Empty string", "", "A Peerline peer"},
+		{"Only spaces", "   ", "A Peerline peer"},
+
+		// Issue #68: Length tests (64 runes max)
+		{"70 ASCII letters", strings.Repeat("a", 70), strings.Repeat("a", 64)},
+		{"30 CJK chars under byte limit", strings.Repeat("日", 30), strings.Repeat("日", 30)},
 		// 64 runes (not bytes): "日" is 3 bytes, 64 copies = 192 bytes, should keep exactly 64 runes
 		{"Long multibyte truncated at 64 runes", strings.Repeat("日", 70), strings.Repeat("日", 64)},
 	}

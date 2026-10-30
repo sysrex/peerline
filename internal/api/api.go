@@ -500,15 +500,37 @@ func (s *Server) inviterName(ctx context.Context, id string) string {
 
 // sanitizeInviterName applies NFKC normalization and filters characters that can be used
 // for prompt injection or homoglyph attacks. Allows Unicode letters (L*), numbers (N*),
-// combining marks (Mn, Mc), spaces, and basic ASCII punctuation (. , - _ ').
-// Filters all Cf format characters (including zero-width and bidi controls), variation selectors,
-// Hangul fillers, and tag characters. Collapses repeated spaces and trims the result.
+// combining marks (Mn, Mc) with constraints, spaces (including tab/newline mapped to space),
+// and basic ASCII punctuation (. , - _ ').
+//
+// Filters:
+//   - All Cf format characters (including zero-width and bidi controls)
+//   - Variation selectors (both standard and extended ranges, plus unicode property)
+//   - Hangul fillers (U+115F, U+1160, U+3164, U+FFA0)
+//   - Tag characters (U+E0000–U+E007F)
+//   - Invisible Mn characters (U+034F, U+180B-180D, U+180F, U+17B4-17B5)
+//   - Other_Default_Ignorable_Code_Point property
+//
+// Combining mark constraints:
+//   - Only allowed directly after a letter, number, or another mark
+//   - Maximum 3 consecutive marks
+//   - Marks after space, punctuation, or at start are dropped
+//
+// Whitespace handling:
+//   - Tab, newline, and all unicode.IsSpace chars become a single space
+//   - Repeated spaces are collapsed
+//
+// Returns "A Peerline peer" if the result is empty after filtering.
 // Max length 64 runes (not bytes).
 //
 // Note: Cross-script homoglyphs (e.g., Cyrillic а vs Latin a) are not fully solvable here
 // and require application-level awareness or visual similarity detection.
 func sanitizeInviterName(name string) string {
-	const maxRunes = 64
+	const (
+		maxRunes              = 64
+		maxConsecutiveMarks   = 3
+		fallbackName          = "A Peerline peer"
+	)
 
 	// Apply NFKC normalization (compatibility decomposition + canonical composition)
 	// This normalizes fullwidth/halfwidth chars, ligatures, compatibility forms
@@ -517,6 +539,8 @@ func sanitizeInviterName(name string) string {
 	var out strings.Builder
 	lastWasSpace := false
 	runeCount := 0
+	consecutiveMarks := 0
+	lastWasBaseChar := false // tracks if last was letter/number (valid base for marks)
 
 	for _, r := range normalized {
 		// Filter Hangul fillers: U+115F, U+1160, U+3164, U+FFA0
@@ -525,7 +549,8 @@ func sanitizeInviterName(name string) string {
 		}
 
 		// Filter variation selectors: U+FE00–U+FE0F (standard), U+E0100–U+E01EF (extended)
-		if (r >= 0xFE00 && r <= 0xFE0F) || (r >= 0xE0100 && r <= 0xE01EF) {
+		// Also filter via unicode property for completeness
+		if (r >= 0xFE00 && r <= 0xFE0F) || (r >= 0xE0100 && r <= 0xE01EF) || unicode.Is(unicode.Variation_Selector, r) {
 			continue
 		}
 
@@ -534,28 +559,66 @@ func sanitizeInviterName(name string) string {
 			continue
 		}
 
+		// Filter Zl (line separator) and Zp (paragraph separator): U+2028, U+2029
+		if unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
+			continue
+		}
+
 		// Filter tag characters: U+E0000–U+E007F
 		if r >= 0xE0000 && r <= 0xE007F {
 			continue
 		}
 
-		// Allow: Unicode letters (L*), numbers (N*), combining marks (Mn, Mc), space, and basic ASCII punctuation
-		if unicode.IsLetter(r) || unicode.IsNumber(r) || unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) {
+		// Filter invisible Mn characters and default ignorables
+		// U+034F COMBINING GRAPHEME JOINER, U+180B-180D Mongolian free variation selectors,
+		// U+180F, U+17B4-17B5 Khmer inherent vowels
+		if r == 0x034F || (r >= 0x180B && r <= 0x180D) || r == 0x180F || r == 0x17B4 || r == 0x17B5 {
+			continue
+		}
+		if unicode.Is(unicode.Other_Default_Ignorable_Code_Point, r) {
+			continue
+		}
+
+		// Check if this is a combining mark (Mn or Mc)
+		isMark := unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r)
+
+		if isMark {
+			// Only allow marks after a base character (letter/number or previous mark)
+			// and limit consecutive marks to maxConsecutiveMarks
+			if lastWasBaseChar && consecutiveMarks < maxConsecutiveMarks {
+				out.WriteRune(r)
+				consecutiveMarks++
+				runeCount++
+				// Keep lastWasBaseChar true so next mark can attach
+			}
+			// Otherwise drop the mark
+		} else if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			// Base character: letter or number
 			out.WriteRune(r)
 			lastWasSpace = false
+			lastWasBaseChar = true
+			consecutiveMarks = 0
 			runeCount++
-		} else if r == ' ' {
-			// Collapse repeated spaces
+		} else if unicode.IsSpace(r) || r == '\t' || r == '\n' || r == '\r' {
+			// Map all whitespace (including tab/newline) to single space
 			if !lastWasSpace && out.Len() > 0 {
 				out.WriteRune(' ')
 				lastWasSpace = true
+				lastWasBaseChar = false
+				consecutiveMarks = 0
 				runeCount++
 			}
 		} else if r == '.' || r == ',' || r == '-' || r == '_' || r == '\'' {
 			// Basic ASCII punctuation
 			out.WriteRune(r)
 			lastWasSpace = false
+			lastWasBaseChar = false // punctuation is not a valid base for marks
+			consecutiveMarks = 0
 			runeCount++
+		} else {
+			// Other characters: reset state but don't write
+			lastWasBaseChar = false
+			consecutiveMarks = 0
 		}
 
 		// Stop if we exceed max runes
@@ -564,7 +627,14 @@ func sanitizeInviterName(name string) string {
 		}
 	}
 
-	return strings.TrimSpace(out.String())
+	result := strings.TrimSpace(out.String())
+	
+	// Return fallback if result is empty
+	if result == "" {
+		return fallbackName
+	}
+	
+	return result
 }
 
 func inviteEmail(inviter, inviterID, to, code, acceptURL string, scopes, bags []string, exp time.Time) mailer.Message {
