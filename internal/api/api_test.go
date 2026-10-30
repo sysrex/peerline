@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,11 @@ type client struct {
 	id  string
 }
 
+type testServer struct {
+	http *httptest.Server
+	api  *Server
+}
+
 func newServer(t *testing.T, cfg Config) *httptest.Server {
 	t.Helper()
 	st, err := store.Open(t.TempDir() + "/t.db")
@@ -31,9 +37,37 @@ func newServer(t *testing.T, cfg Config) *httptest.Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	srv := httptest.NewServer(New(st, cfg).Handler())
+	// Load key index before creating server
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	apiSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(apiSrv.Handler())
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+func newServerWithAPI(t *testing.T, cfg Config) *testServer {
+	t.Helper()
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	// Load key index before creating server
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	apiSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpSrv := httptest.NewServer(apiSrv.Handler())
+	t.Cleanup(httpSrv.Close)
+	return &testServer{http: httpSrv, api: apiSrv}
 }
 
 func (c *client) do(method, path string, body any, hdr map[string]string) (*http.Response, []byte) {
@@ -1331,15 +1365,51 @@ func doAnon(t *testing.T, srv *httptest.Server, method, path string, body any, h
 
 // Lifecycle tests for LimiterManager and MaintenanceManager
 
+func TestNewRequiresLoadedKeyIndex(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	cfg := Config{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	// Attempt to create server without loading key index should fail
+	_, err = New(st, cfg)
+	if err == nil {
+		t.Fatal("expected error when key index not loaded, got nil")
+	}
+	if !strings.Contains(err.Error(), "key index not loaded") {
+		t.Fatalf("expected 'key index not loaded' error, got: %v", err)
+	}
+
+	// Load key index
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now it should succeed
+	_, err = New(st, cfg)
+	if err != nil {
+		t.Fatalf("expected success after loading key index, got: %v", err)
+	}
+}
+
 func TestLimiterManagerStops(t *testing.T) {
 	cfg := Config{
-		MsgPerMinute:     60,
-		MsgBurst:         10,
-		EmailPerHour:     10,
-		EmailBurst:       5,
-		EmailRcptPerHour: 10,
-		NotifyPerHour:    10,
-		NotifyBurst:      5,
+		MsgPerMinute:      60,
+		MsgBurst:          10,
+		EmailPerHour:      10,
+		EmailBurst:        5,
+		EmailRcptPerHour:  10,
+		NotifyPerHour:     10,
+		NotifyBurst:       5,
+		AuthFailPerMinute: 30,
+		AuthFailBurst:     10,
+		WritePerMinute:    30,
+		WriteBurst:        10,
 	}
 	mgr := NewLimiterManager(cfg)
 
@@ -1497,10 +1567,18 @@ func TestSingleLogLineUnauthenticatedPairing(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	// Load key index
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 
 	cfg := Config{}
 	cfg.Logger = logger
-	srv := httptest.NewServer(New(st, cfg).Handler())
+	apiSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(apiSrv.Handler())
 	defer srv.Close()
 
 	alice := register(t, srv, "Alice")
@@ -1632,76 +1710,230 @@ func TestSanitizerUnicode(t *testing.T) {
 	}
 }
 
-// TestAPIClock verifies that api.Server.now is used in createInvite.
-// Note: the API clock (Server.now, time.Time) and the store clock (Store.now, int64)
-// are independent and can disagree; this test only fakes the API clock.
-func TestAPIClock(t *testing.T) {
-	st, err := store.Open(t.TempDir() + "/t.db")
-	if err != nil {
-		t.Fatal(err)
+// TestAuthFailRateLimit tests that failed Bearer token lookups are rate-limited per IP (#55).
+// With the cache, valid keys that have been used before continue to work even when IP is rate-limited.
+func TestAuthFailRateLimit(t *testing.T) {
+	cfg := Config{
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AuthFailPerMinute: 5,
+		AuthFailBurst:     2,
 	}
-	defer st.Close()
+	srv := newServer(t, cfg)
+	c := &client{t: t, srv: srv}
 
-	srv := New(st, Config{})
-	defer srv.Stop()
+	// Register a valid peer
+	alice := register(t, srv, "alice")
 
-	// Stub the clock and verify non-nil default
-	if srv.now == nil {
-		t.Fatal("New() should set non-nil default clock")
-	}
-	fixedTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return fixedTime }
-
-	// Create test server and client
-	testSrv := httptest.NewServer(srv.Handler())
-	defer testSrv.Close()
-
-	// Register a peer
-	c := &client{t: t, srv: testSrv}
-	resp, body := c.do("POST", "/v1/register", map[string]string{"name": "alice"}, nil)
-	want(t, resp, body, 201)
-	var reg struct{ PeerID, APIKey string }
-	if err := json.Unmarshal(body, &struct {
-		PeerID *string `json:"peer_id"`
-		APIKey *string `json:"api_key"`
-	}{&reg.PeerID, &reg.APIKey}); err != nil {
-		t.Fatal(err)
-	}
-	c.id, c.key = reg.PeerID, reg.APIKey
-
-	// Create an invite with default TTL (1h)
-	resp, body = c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
-	want(t, resp, body, 201)
-
-	var inv struct {
-		ExpiresAt string `json:"expires_at"`
-	}
-	if err := json.Unmarshal(body, &inv); err != nil {
-		t.Fatal(err)
+	// Valid key works (index hit, no failed-auth charge)
+	resp, _ := alice.do("GET", "/v1/me", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("valid key: want 200, got %d", resp.StatusCode)
 	}
 
-	expTime, err := time.Parse(time.RFC3339, inv.ExpiresAt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	expected := fixedTime.Add(time.Hour).UTC()
-	if !expTime.Equal(expected) {
-		t.Errorf("expires_at = %v, want %v", expTime, expected)
+	// Exhaust the rate limiter with invalid keys (burst=2)
+	for i := 0; i < 2; i++ {
+		resp, _ := c.do("GET", "/v1/me", nil, map[string]string{"Authorization": "Bearer pl_invalid_key_" + strconv.Itoa(i)})
+		if resp.StatusCode != 401 {
+			t.Fatalf("invalid key %d: want 401, got %d", i, resp.StatusCode)
+		}
 	}
 
-	// Boundary test: advance clock by 100 seconds and create another invite
-	srv.now = func() time.Time { return fixedTime.Add(100 * time.Second) }
-	resp, body = c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
-	want(t, resp, body, 201)
-	if err := json.Unmarshal(body, &inv); err != nil {
-		t.Fatal(err)
+	// Next invalid request is over budget: 429
+	resp, _ = c.do("GET", "/v1/me", nil, map[string]string{"Authorization": "Bearer pl_invalid_key_exceeded"})
+	if resp.StatusCode != 429 {
+		t.Fatalf("over-budget invalid key: want 429, got %d", resp.StatusCode)
 	}
-	expTime, err = time.Parse(time.RFC3339, inv.ExpiresAt)
-	if err != nil {
-		t.Fatal(err)
+	if resp.Header.Get("Retry-After") == "" {
+		t.Fatal("429 response must have Retry-After header")
 	}
-	expected = fixedTime.Add(100*time.Second + time.Hour).UTC()
-	if !expTime.Equal(expected) {
-		t.Errorf("expires_at after +100s = %v, want %v", expTime, expected)
+
+	// Valid key from the same over-budget IP still works (index hit, no failed-auth charge)
+	resp, _ = alice.do("GET", "/v1/me", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("valid key from over-budget IP: want 200, got %d", resp.StatusCode)
 	}
 }
+
+// TestWriteRateLimit tests that authenticated write operations are rate-limited per peer (#55).
+func TestWriteRateLimit(t *testing.T) {
+	cfg := Config{
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WritePerMinute: 10,
+		WriteBurst:     5, // Higher burst to account for pairing setup + test operations
+	}
+	srv := newServer(t, cfg)
+	alice := register(t, srv, "alice")
+	bob := register(t, srv, "bob")
+
+	// Pair alice and bob for message sending (uses 1 write for alice: create invite; bob's accept is his write)
+	pairUp(t, alice, bob, []string{"messages"}, nil, []string{"messages"})
+
+	// Alice sends 4 messages - should all succeed (alice has used 1 + 4 = 5 writes, exactly the burst)
+	for i := 0; i < 4; i++ {
+		resp, _ := alice.do("POST", "/v1/peers/"+bob.id+"/messages", map[string]string{
+			"type": "note",
+			"body": "message " + strconv.Itoa(i),
+		}, nil)
+		if resp.StatusCode != 201 {
+			t.Fatalf("message %d: want 201, got %d", i, resp.StatusCode)
+		}
+	}
+
+	// 6th write should be rate-limited (alice: 1 invite create + 4 messages = 5, next exceeds burst)
+	resp, _ := alice.do("POST", "/v1/peers/"+bob.id+"/messages", map[string]string{
+		"type": "note",
+		"body": "message exceeded",
+	}, nil)
+	if resp.StatusCode != 429 {
+		t.Fatalf("rate-limited write: want 429, got %d", resp.StatusCode)
+	}
+
+	// Bob should still be able to send (different peer, has used 1 accept + 0 messages = 1)
+	resp, _ = bob.do("POST", "/v1/peers/"+alice.id+"/messages", map[string]string{
+		"type": "note",
+		"body": "bob message",
+	}, nil)
+	if resp.StatusCode != 201 {
+		t.Fatalf("bob's message: want 201, got %d", resp.StatusCode)
+	}
+
+	// Alice's reads should still work (not rate-limited)
+	resp, _ = alice.do("GET", "/v1/inbox", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("alice read after write limit: want 200, got %d", resp.StatusCode)
+	}
+}
+
+// TestWriteRateLimitInvites tests that invite operations are rate-limited (#55).
+func TestWriteRateLimitInvites(t *testing.T) {
+	cfg := Config{
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WritePerMinute: 5,
+		WriteBurst:     2,
+	}
+	srv := newServer(t, cfg)
+	alice := register(t, srv, "alice")
+
+	// Create 2 invites (burst allowance)
+	for i := 0; i < 2; i++ {
+		resp, _ := alice.do("POST", "/v1/invites", map[string]any{
+			"scopes": []string{"messages"},
+		}, nil)
+		if resp.StatusCode != 201 {
+			t.Fatalf("invite %d: want 201, got %d", i, resp.StatusCode)
+		}
+	}
+
+	// 3rd invite should be rate-limited
+	resp, _ := alice.do("POST", "/v1/invites", map[string]any{
+		"scopes": []string{"messages"},
+	}, nil)
+	if resp.StatusCode != 429 {
+		t.Fatalf("rate-limited invite: want 429, got %d", resp.StatusCode)
+	}
+}
+
+// TestWriteRateLimitBags tests that PUT /v1/bags is rate-limited (#55).
+func TestWriteRateLimitBags(t *testing.T) {
+	cfg := Config{
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WritePerMinute: 5,
+		WriteBurst:     2,
+	}
+	srv := newServer(t, cfg)
+	alice := register(t, srv, "alice")
+
+	// Put 2 bags (burst allowance)
+	for i := 0; i < 2; i++ {
+		resp, _ := alice.do("PUT", "/v1/bags/test"+strconv.Itoa(i), []byte("data"), nil)
+		if resp.StatusCode != 201 {
+			t.Fatalf("bag %d: want 201, got %d", i, resp.StatusCode)
+		}
+	}
+
+	// 3rd put should be rate-limited
+	resp, _ := alice.do("PUT", "/v1/bags/test3", []byte("data"), nil)
+	if resp.StatusCode != 429 {
+		t.Fatalf("rate-limited bag put: want 429, got %d", resp.StatusCode)
+	}
+
+	// GET should still work (not rate-limited by write limiter)
+	resp, _ = alice.do("GET", "/v1/bags/test0", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("bag get after write limit: want 200, got %d", resp.StatusCode)
+	}
+}
+
+// TestAuthFailDoesNotLeakKeyExistence tests that rate-limited and non-existent keys
+// return identical responses (#55).
+func TestAuthFailDoesNotLeakKeyExistence(t *testing.T) {
+	cfg := Config{
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AuthFailPerMinute: 5,
+		AuthFailBurst:     2,
+	}
+	srv := newServer(t, cfg)
+	c := &client{t: t, srv: srv}
+
+	// First two requests: non-existent keys (both should be 401)
+	resp1, body1 := c.do("GET", "/v1/me", nil, map[string]string{"Authorization": "Bearer pl_nonexistent_key_abc123"})
+	if resp1.StatusCode != 401 {
+		t.Fatalf("first non-existent key: want 401, got %d", resp1.StatusCode)
+	}
+
+	resp2, body2 := c.do("GET", "/v1/me", nil, map[string]string{"Authorization": "Bearer pl_another_invalid_key"})
+	if resp2.StatusCode != 401 {
+		t.Fatalf("second non-existent key: want 401, got %d", resp2.StatusCode)
+	}
+
+	// Both 401 responses should have identical body
+	if string(body1) != string(body2) {
+		t.Fatalf("401 responses differ:\n1: %s\n2: %s", body1, body2)
+	}
+
+	// Third request: over budget, should get 429
+	resp3, body3 := c.do("GET", "/v1/me", nil, map[string]string{"Authorization": "Bearer pl_over_budget_key"})
+	if resp3.StatusCode != 429 {
+		t.Fatalf("over-budget key: want 429, got %d", resp3.StatusCode)
+	}
+
+	// 429 response should have Retry-After header
+	if resp3.Header.Get("Retry-After") == "" {
+		t.Fatal("429 response missing Retry-After header")
+	}
+
+	// 401 and 429 should have different bodies (429 says "rate limited")
+	if string(body1) == string(body3) {
+		t.Fatal("401 and 429 should have different messages")
+	}
+}
+
+// TestAuthFailPerIPNotPerKey tests that the failed-auth limiter is keyed by IP, not by key.
+func TestAuthFailPerIPNotPerKey(t *testing.T) {
+	cfg := Config{
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AuthFailPerMinute: 5,
+		AuthFailBurst:     2,
+	}
+	srv := newServer(t, cfg)
+	c := &client{t: t, srv: srv}
+
+	// Try different invalid keys from the same IP (exhaust burst)
+	for i := 0; i < 2; i++ {
+		resp, _ := c.do("GET", "/v1/me", nil, map[string]string{"Authorization": "Bearer pl_different_key_" + strconv.Itoa(i)})
+		if resp.StatusCode != 401 {
+			t.Fatalf("request %d: want 401, got %d", i, resp.StatusCode)
+		}
+	}
+
+	// Third different key should be over budget -> 429
+	resp, _ := c.do("GET", "/v1/me", nil, map[string]string{"Authorization": "Bearer pl_yet_another_key"})
+	if resp.StatusCode != 429 {
+		t.Fatalf("rate-limited request: want 429, got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Fatal("429 response missing Retry-After header")
+	}
+}
+
+// TestAuthFailCacheAllowsKnownKeys tests that cached valid keys work even when IP is over budget (#55).

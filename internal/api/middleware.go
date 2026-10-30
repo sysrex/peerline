@@ -44,3 +44,16 @@ func (s *Server) rateLimitAuth(h http.HandlerFunc) http.HandlerFunc {
 		h(w, r)
 	}
 }
+
+// rateLimitWrite wraps an authenticated write handler with rate limiting per peer ID.
+func (s *Server) rateLimitWrite(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		peerID := auth.PeerID(r.Context())
+		if !s.lim.writeLim.Allow(peerID) {
+			w.Header().Set("Retry-After", "2")
+			writeErr(w, http.StatusTooManyRequests, "rate limited")
+			return
+		}
+		h(w, r)
+	}
+}

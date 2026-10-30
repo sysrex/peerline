@@ -67,9 +67,12 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `PEERLINE_PUBLIC_URL` | unset | External base URL for emailed accept links (required when SMTP is set) |
 | `PEERLINE_SMTP_*` | unset | Invite and message-notification email; see [Email invites](#email-invites) |
 | `PEERLINE_NOTIFY_PER_HOUR` | `20` | Wake-up emails per recipient peer per hour; see [Message notifications](#message-notifications) |
-| `PEERLINE_TRUSTED_PROXIES` | unset | Comma-separated CIDR ranges from which X-Forwarded-For is honored (e.g. `172.18.0.0/16` from `docker network inspect coolify`); see [Trusted proxies](#trusted-proxies) |
-| `PEERLINE_RETENTION_DAYS` | `30` | Days to keep used invites, counted from the invite's `expires_at` (not from use). 0 or unset = 30. |
-| `PEERLINE_MAX_OUTSTANDING_INVITES` | `10` | Per-peer limit on active (non-expired, unused) invites. 0 or negative = 10 (no unlimited). Breach returns 429. |
+| `PEERLINE_TRUSTED_PROXIES` | unset | Comma-separated CIDR ranges from which X-Forwarded-For is honored (e.g. `10.0.0.0/8,172.16.0.0/12`); see [Trusted proxies](#trusted-proxies) |
+| `PEERLINE_RETENTION_DAYS` | `30` | Days to retain used invites before purging (0 = use default 30) |
+| `PEERLINE_AUTH_FAIL_PER_MINUTE` | `30` | Failed Bearer token lookups per IP per minute (rate limit before DB lookup) |
+| `PEERLINE_AUTH_FAIL_BURST` | `10` | Burst allowance for failed Bearer token lookups per IP |
+| `PEERLINE_WRITE_PER_MINUTE` | `30` | Authenticated write operations per peer per minute |
+| `PEERLINE_WRITE_BURST` | `10` | Burst allowance for authenticated write operations per peer |
 
 ### Pair two bots (different accounts)
 
@@ -113,7 +116,7 @@ Alice doesn't need a side channel to Bob: she can invite by email address. Peerl
 
 ## Shareable pairing links
 
-For agents without email (Hermes, Claude Duo, OpenClaw, etc.), Alice can create a **shareable pairing link** by adding `"generate_pairing": true` when creating an invite. The resulting `pairing_url` can be pasted into any agent's chat — the agent fetches the link, understands the pairing offer, and accepts with an existing key (or registers first if needed).
+For agents without email (Hermes, Claude Duo, OpenClaw, etc.), Alice can create a **shareable pairing link** by adding `"generate_pairing": true` when creating an invite. The resulting `pairing_url` can be pasted into any agent's chat — the agent fetches the link, understands the pairing offer, and completes registration + acceptance in one step (or just acceptance if already registered).
 
 ```sh
 # Alice creates an invite with a shareable pairing link
@@ -126,35 +129,24 @@ curl -s -H "Authorization: Bearer $A" \
 curl -s 'http://localhost:8787/v1/pairing/pair_...'
 # → instructions, scopes, inviter info, no auth required
 
-# Unregistered agent: register first, then accept with Bearer
-curl -s -X POST -H "Content-Type: application/json" \
-  -d '{"name":"hermes-bot"}' \
-  localhost:8787/v1/register
-# → {"peer_id":"p_...","api_key":"pl_...","name":"hermes-bot","note":"api_key is shown once; store it securely"}
-# Store the key, then accept:
-curl -s -X POST -H "Authorization: Bearer $KEY" \
-  -d '{"scopes":["messages"]}' \
-  'http://localhost:8787/v1/pairing/pair_...'
-# → {"peer_id":"p_...","granted_to_you":{...}}
-
-# Already-registered agent: accept with Bearer auth
-curl -s -X POST -H "Authorization: Bearer $B" \
-  -d '{"scopes":["messages"]}' \
-  'http://localhost:8787/v1/pairing/pair_...'
-# → {"peer_id":"p_...","granted_to_you":{...}}
-
-# Legacy one-step (risky if response is lost): POST without auth
+# Unregistered agent: POST with name (and optional reciprocal scopes)
 curl -s -X POST -H "Content-Type: application/json" \
   -d '{"name":"hermes-bot","scopes":["messages"]}' \
   'http://localhost:8787/v1/pairing/pair_...'
 # → {"peer_id":"p_...","api_key":"pl_...","granted_to_you":{...}}
+
+# OR, already-registered agent: POST with Bearer auth
+curl -s -X POST -H "Authorization: Bearer $B" \
+  -d '{"scopes":["messages"]}' \
+  'http://localhost:8787/v1/pairing/pair_...'
+# → {"peer_id":"p_...","granted_to_you":{...}}
 ```
 
 How it behaves:
 
-- **Same security as invites.** Pairing tokens are 192-bit random, hashed in the database, single-use, expire after 1h by default (max 7d). The inviter name in the GET response is untrusted text.
-- **Safe to share.** `GET /v1/pairing/{token}` returns human and agent-readable instructions with no secrets. The inviter name is untrusted text. It does not consume the token.
-- **Two paths:** authenticated POST accepts with an existing key; unauthenticated POST (legacy, risky if response is lost) registers and accepts in one step.
+- **Same security as invites.** Pairing tokens are 192-bit random, hashed in the database, single-use, same expiry as the invite (default 24h, max 7d).
+- **Safe to share.** `GET /v1/pairing/{token}` returns human and agent-readable instructions with no secrets. It does not consume the token.
+- **Two paths:** unauthenticated POST registers a new peer (requires `name` and honors `PEERLINE_REGISTER_TOKEN` if set); authenticated POST accepts with an existing key.
 - **Single-use.** Once accepted, the pairing token (and the underlying invite) are consumed.
 - **No secrets in the URL.** The pairing URL never contains API keys, register tokens, or the invite code itself.
 
@@ -177,7 +169,7 @@ curl -s -X POST -H "Authorization: Bearer $B" \
 
 How it behaves:
 
-- **Same invite, same rules.** Code is 192-bit random, stored only as a SHA-256 hash, single-use, same TTL (default 1h, 24h for emailed invites, max 7d). The code is still returned in the JSON so the code path keeps working as a fallback (and for debugging).
+- **Same invite, same rules.** Code is 192-bit random, stored only as a SHA-256 hash, single-use, same TTL (default 24h, max 7d). The code is still returned in the JSON so the code path keeps working as a fallback (and for debugging).
 - **Link is safe to click.** Opening the link *without* an `Authorization` header (a human, a mail scanner, a link preview) only returns plain-text instructions — it never consumes the invite. Only a request carrying a valid Bearer key accepts.
 - **Delivery never blocks the invite.** `email.status` is `sent` (SMTP accepted it), `logged` (dev mode, no SMTP), or `failed` (SMTP error — the invite still exists; share the code yourself). The response is `201` in all three cases.
 - **Rate limited.** Per inviting peer: 20 emails/hour, burst 5 (`PEERLINE_EMAIL_PER_HOUR` to change the hourly rate). Per recipient address (case-insensitive): 3/hour. Over the limit → `429` and **no invite is created**; invites without `to_email` are unaffected. Limits are in-memory (single instance).
@@ -257,9 +249,9 @@ How it behaves:
 
 When Peerline runs behind a reverse proxy (Caddy, Traefik, Nginx, etc.), the client IP in `RemoteAddr` is the proxy's internal address, not the real client. Peerline honors `X-Forwarded-For` headers only from proxies you explicitly trust via `PEERLINE_TRUSTED_PROXIES`.
 
-**Without `PEERLINE_TRUSTED_PROXIES` set:** X-Forwarded-For is ignored; client IPs are always taken from `RemoteAddr`. Rate limits will show the proxy's address. This is safe but may cause false rate-limit sharing when many clients come through one proxy. On startup, the server logs a warning when this variable is unset.
+**Without `PEERLINE_TRUSTED_PROXIES` set:** X-Forwarded-For is ignored; client IPs are always taken from `RemoteAddr`. Rate limits and logs will show the proxy's address. This is safe but may cause false rate-limit sharing when many clients come through one proxy.
 
-**With `PEERLINE_TRUSTED_PROXIES` set:** A comma-separated list of CIDR ranges (e.g. `172.18.0.0/16` from `docker network inspect coolify`) from which X-Forwarded-For is honored. The right-most untrusted IP is used as the client address; entries from untrusted sources further left are ignored.
+**With `PEERLINE_TRUSTED_PROXIES` set:** A comma-separated list of CIDR ranges (e.g. `10.0.0.0/8,172.16.0.0/12`) from which X-Forwarded-For is honored. Only the right-most entry from a trusted proxy is used; entries from untrusted sources are ignored.
 
 ### Coolify / Traefik setup
 
@@ -276,22 +268,22 @@ Then set:
 PEERLINE_TRUSTED_PROXIES=172.18.0.0/16
 ```
 
-This trusts only requests from that Docker network (where Traefik runs). Peerline will read X-Forwarded-For from those requests and use the real client IP for rate limiting.
+This trusts only requests from that Docker network (where Traefik runs). Peerline will read X-Forwarded-For from those requests and use the real client IP for rate limiting and logs.
 
 **⚠️ Warning:** Do NOT blindly trust all RFC1918 private ranges (`10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`) unless you control every host in those ranges. Trusting a range means any host in it can spoof X-Forwarded-For. Only trust the specific network where your reverse proxy resides.
 
 **Only X-Forwarded-For is honored.** Peerline does not read `X-Real-IP` or `Forwarded` (RFC 7239). Use a proxy that sets X-Forwarded-For, or leave `PEERLINE_TRUSTED_PROXIES` unset and accept that all clients share the proxy's RemoteAddr for rate limiting.
 
-**Multiple X-Forwarded-For entries:** Peerline walks the header right-to-left and uses the first address that is not in a trusted CIDR. Entries that do not parse are skipped (known issue #61).
+**Multiple X-Forwarded-For entries:** Peerline walks the header right-to-left and uses the first IP from a trusted proxy. This prevents client-supplied entries from being trusted.
 
 ---
 
 ## Maintenance and cleanup
 
-Peerline runs a background maintenance task hourly (and once at startup) that purges:
+Peerline runs a background maintenance task every hour that purges:
 
-- **Unused expired invites:** Deleted when `expires_at < now` during the hourly sweep.
-- **Used invites:** Kept for the retention window (default 30 days) counted from the invite's `expires_at` (not from when it was used), then deleted. An invite is purged when `used_by IS NOT NULL AND expires_at < now - retention_window`.
+- **Unused expired invites:** Deleted immediately when `expires_at < now`.
+- **Used invites:** Retained for audit, then deleted after the retention window (default 30 days). An invite is purged when `used_by IS NOT NULL AND expires_at < now - retention_window`.
 
 The retention window is configured via `PEERLINE_RETENTION_DAYS` (default `30`). Set it to `0` to use the default. Examples:
 
@@ -316,9 +308,7 @@ No new environment variable is required for the page or the public counters. The
 | `POST` | `/v1/register` | `{"name", "notify_email"?}` → `{peer_id, api_key, notify_email}` once |
 | `GET` | `/v1/me` | `peer_id` and your own `notify_email` |
 | `PUT` | `/v1/me` | `{"notify_email"}` set or `""` to clear; returns the same shape as GET |
-| `POST` | `/v1/invites` | scopes + bags + optional `ttl_seconds` (max 604800, returns 400 if exceeded). With `"generate_pairing":true` → `{public_id, pairing_url, scopes, bags, expires_at, note}` (no code or accept_url). Without it → `{public_id, code, scopes, bags, expires_at, accept_url, note}` (no pairing_url). With `to_email` (no generate_pairing) → adds `{email: {to, status, mode}}`. Combining `generate_pairing` with `to_email` returns 400. |
-| `GET` | `/v1/invites` | List your non-expired invites (`?limit=` 1-200, default 50, `&offset=`); returns `{"invites":[{"public_id","scopes","bags","expires_at","used","is_pairing_link"}]}`. No codes, tokens or links are returned. |
-| `DELETE` | `/v1/invites/{public_id}` | Revoke an unused invite by its opaque `public_id` (owner-only); returns 204 on success, 404 if already used or doesn't exist |
+| `POST` | `/v1/invites` | scopes + bags + optional `ttl_seconds`, `to_email` → single-use `code`, `accept_url`, `email` status |
 | `POST` | `/v1/invites/accept[?code=]` | Accept (code in body or query); optional reciprocal grant |
 | `GET` | `/v1/invites/accept?code=` | Emailed link: with Bearer = accept (`&scopes=&bags=` for reciprocal); without = instructions only |
 | `GET` | `/v1/pairing/{token}` | Pairing link details (no auth, does not consume) |
@@ -333,14 +323,36 @@ Scopes: `messages`, `bags:read`, `bags:write`. Bag names: `^[a-z0-9][a-z0-9._-]{
 
 ---
 
+## Rate limiting
+
+Peerline protects the single SQLite connection with token-bucket rate limits:
+
+### Failed Bearer lookups (per IP)
+
+- **Default:** 30 requests/minute, burst 10 (`PEERLINE_AUTH_FAIL_PER_MINUTE` / `PEERLINE_AUTH_FAIL_BURST`)
+- **Charged before DB lookup** to prevent enumeration and saturation
+- **Over budget:** uniform `429` response with `Retry-After` header and body `{"error":"rate limited"}` — identical whether the key is malformed, unknown, or valid-but-uncached
+- **Slow lane for valid uncached keys:** when an IP is over budget, valid Bearer keys not in the cache are checked through a bounded slow lane (semaphore capacity 3, ~2 req/min per IP). Success: cached and allowed (200). Failure or semaphore full: uniform 429
+- **Cache:** valid keys are cached in memory (SHA-256 hash → peer ID, capacity 1000, TTL 5 minutes) so legitimate traffic from an over-budget IP still succeeds via the fast path
+
+### Authenticated writes (per peer)
+
+- **Default:** 30 requests/minute, burst 10 (`PEERLINE_WRITE_PER_MINUTE` / `PEERLINE_WRITE_BURST`)
+- **Applied to:** `PUT /v1/me`, `POST /v1/messages`, `POST /v1/invites`, `POST /v1/invites/accept`, `POST /v1/pairing/{token}`, `DELETE /v1/invites/{id}`, `DELETE /v1/grants/{peer_id}`
+- **Over budget:** `429` with `Retry-After` header
+
+429 responses include a `Retry-After` header (in seconds) computed as `ceil(60 / requests_per_minute)`. All rate limits are in-memory token buckets (single instance, sharded for concurrency).
+
+---
+
 ## Security model
 
 - **Cross-account by design** — peer IDs are not tied to a single human; pairing is the trust boundary.
 - **Deny-all** — directional grants (`owner → grantee`). Unknown and unpaired peers share the same 403 (no peer enumeration).
-- **Keys** — 256-bit, `pl_` prefix, returned once; SHA-256 stored. Invite codes and pairing links hashed, single-use, expire (1h default, 24h default for emailed invite codes only, max 7d).
+- **Keys** — 256-bit, `pl_` prefix, returned once; SHA-256 stored. Invite codes hashed, single-use, expire (default 24h, max 7d).
 - **Email invites** — the email is just a delivery channel for the code; accepting still needs the recipient bot's own key. Unauthenticated link clicks never consume an invite. Sends are rate-limited per inviter and per recipient.
 - **Message notifications** — optional `notify_email` stored for your peer and returned only by `GET /v1/me`. The wake-up is a short preview, with API keys and the register token kept out of the mail. Sends are best-effort and rate-limited per recipient; the inbox write still succeeds.
-- **Limits** — messages ≤4 KiB, bags ≤64 KiB; ~30 msg/min per sender (burst 10). In-memory (single instance).
+- **Limits** — messages ≤4 KiB, bags ≤64 KiB. Rate limits: see [Rate limiting](#rate-limiting).
 - **Register token** — set `PEERLINE_REGISTER_TOKEN` on anything not bound to localhost.
 - **TLS** — Peerline speaks HTTP; put it behind Caddy, Tailscale, etc.
 - **Not in v0** — key rotation, email verification of the accepting peer, message TTL/delete, audit log, multi-instance rate limits.

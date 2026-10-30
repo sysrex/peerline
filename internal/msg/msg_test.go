@@ -266,3 +266,28 @@ func BenchmarkShardedLimiterParallel(b *testing.B) {
 		}
 	})
 }
+
+// TestLimiterReadyIsPeek verifies that Ready doesn't create buckets.
+func TestLimiterReadyIsPeek(t *testing.T) {
+	lim := NewLimiter(10, 5)
+
+	// Check Ready on N fresh keys
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("key%d", i)
+		if !lim.Ready(key) {
+			t.Fatalf("Ready(%s) should return true for fresh key", key)
+		}
+	}
+
+	// Verify shards are still empty (no buckets created)
+	totalBuckets := 0
+	for i := range lim.shards {
+		lim.shards[i].mu.Lock()
+		totalBuckets += len(lim.shards[i].buckets)
+		lim.shards[i].mu.Unlock()
+	}
+
+	if totalBuckets != 0 {
+		t.Fatalf("Ready should not create buckets; found %d", totalBuckets)
+	}
+}

@@ -27,11 +27,13 @@ import (
 )
 
 const (
-	MaxBagBytes      = 64 << 10
-	maxJSONBytes     = 16 << 10
-	defaultInviteTTL = 1 * time.Hour
-	maxInviteTTL     = 7 * 24 * time.Hour
-	maxInviteTTLSec  = 604800 // 7 days in seconds, checked before multiplication
+	MaxBagBytes       = 64 << 10
+	authLookupTimeout = 2 * time.Second // #100: bounded auth lookup
+	defaultRetryAfter = 2               // seconds
+	maxJSONBytes      = 16 << 10
+	defaultInviteTTL  = 1 * time.Hour
+	maxInviteTTL      = 7 * 24 * time.Hour
+	maxInviteTTLSec   = 604800 // 7 days in seconds, checked before multiplication
 )
 
 type Config struct {
@@ -64,6 +66,12 @@ type Config struct {
 	// RetentionSeconds is how long (in seconds) to keep used invites before purging.
 	// Default is 30 days (2592000 seconds). Set to 0 for the default.
 	RetentionSeconds int64
+	// AuthFailPerMinute / AuthFailBurst limit failed Bearer token lookups per IP.
+	AuthFailPerMinute int
+	AuthFailBurst     int
+	// WritePerMinute / WriteBurst limit authenticated write operations per peer.
+	WritePerMinute int
+	WriteBurst     int
 }
 
 type Server struct {
@@ -73,10 +81,14 @@ type Server struct {
 	maint       *MaintenanceManager
 	log         *slog.Logger
 	trustedNets []*net.IPNet
-	now         func() time.Time // clock for invite expiry; defaults to time.Now
 }
 
-func New(st *store.Store, cfg Config) *Server {
+func New(st *store.Store, cfg Config) (*Server, error) {
+	// Ensure key index has been loaded before serving (#112)
+	if !st.KeyIndexLoaded() {
+		return nil, fmt.Errorf("key index not loaded: call Store.LoadKeyIndex before api.New")
+	}
+
 	if cfg.MsgPerMinute <= 0 {
 		cfg.MsgPerMinute = 30
 	}
@@ -107,6 +119,18 @@ func New(st *store.Store, cfg Config) *Server {
 	if cfg.MaxOutstandingInvites <= 0 {
 		cfg.MaxOutstandingInvites = 10
 	}
+	if cfg.AuthFailPerMinute <= 0 {
+		cfg.AuthFailPerMinute = 30
+	}
+	if cfg.AuthFailBurst <= 0 {
+		cfg.AuthFailBurst = 10
+	}
+	if cfg.WritePerMinute <= 0 {
+		cfg.WritePerMinute = 30
+	}
+	if cfg.WriteBurst <= 0 {
+		cfg.WriteBurst = 10
+	}
 	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
 
 	trustedNets, err := ParseTrustedProxies(cfg.TrustedProxies)
@@ -122,13 +146,12 @@ func New(st *store.Store, cfg Config) *Server {
 		log:         cfg.Logger,
 		lim:         NewLimiterManager(cfg),
 		trustedNets: trustedNets,
-		now:         time.Now,
 	}
 
 	// Start maintenance tasks
 	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, cfg.RetentionSeconds)
 
-	return s
+	return s, nil
 }
 
 // Stop gracefully stops background tasks.
@@ -153,26 +176,20 @@ func (s *Server) Handler() http.Handler {
 
 	authed := http.NewServeMux()
 	authed.HandleFunc("GET /v1/me", s.rateLimitAuth(s.me))
-	authed.HandleFunc("PUT /v1/me", s.updateMe)
-	authed.HandleFunc("POST /v1/invites", s.createInvite)
+	authed.HandleFunc("PUT /v1/me", s.rateLimitWrite(s.updateMe))
+	authed.HandleFunc("POST /v1/invites", s.rateLimitWrite(s.createInvite))
 	authed.HandleFunc("GET /v1/invites", s.rateLimitAuth(s.listInvites))
-	authed.HandleFunc("DELETE /v1/invites/{id}", s.deleteInvite)
-	authed.HandleFunc("POST /v1/invites/accept", s.acceptInvite)
-	authed.HandleFunc("GET /v1/invites/accept", s.acceptInvite) // emailed magic link (Bearer required)
+	authed.HandleFunc("DELETE /v1/invites/{id}", s.rateLimitWrite(s.deleteInvite))
+	authed.HandleFunc("POST /v1/invites/accept", s.rateLimitWrite(s.acceptInvite))
+	authed.HandleFunc("GET /v1/invites/accept", s.rateLimitWrite(s.acceptInvite)) // emailed magic link (Bearer required)
 	authed.HandleFunc("GET /v1/grants", s.rateLimitAuth(s.listGrants))
-	authed.HandleFunc("DELETE /v1/grants/{peer_id}", s.revokeGrant)
-	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.sendMessage)
+	authed.HandleFunc("DELETE /v1/grants/{peer_id}", s.rateLimitWrite(s.revokeGrant))
+	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.rateLimitWrite(s.sendMessage))
 	authed.HandleFunc("GET /v1/inbox", s.rateLimitAuth(s.inbox)) // polling-friendly rate limit
 	authed.HandleFunc("GET /v1/bags/{name}", s.rateLimitAuth(s.getBag))
-	authed.HandleFunc("PUT /v1/bags/{name}", s.putBag)
-	authed.HandleFunc("POST /v1/pairing/{token}", s.acceptPairing) // authenticated pairing acceptance
-	authMW := auth.Middleware(func(ctx context.Context, h string) (string, error) {
-		p, err := s.st.PeerByKeyHash(ctx, h)
-		if err != nil {
-			return "", err
-		}
-		return p.ID, nil
-	}, authed)
+	authed.HandleFunc("PUT /v1/bags/{name}", s.rateLimitWrite(s.putBag))
+	authed.HandleFunc("POST /v1/pairing/{token}", s.rateLimitWrite(s.acceptPairing)) // authenticated pairing acceptance
+	authMW := s.authMiddleware(authed)
 	mux.Handle("/v1/", authMW)
 	// The emailed accept link: with a Bearer key it accepts (same flow as
 	// POST); without one (a human clicking, or a link scanner) it only shows
@@ -230,6 +247,137 @@ func (s *Server) internal(w http.ResponseWriter, err error) {
 }
 
 // ---- auth ----
+
+// authMiddleware wraps Bearer authentication with rate limiting for failed lookups (#55, #92, #93).
+// authMiddleware requires a valid Bearer token and uses an in-memory key index (#112).
+// Missing or malformed headers return identical 401 with no charge.
+// The key index maps key hashes to peer IDs and is loaded once at startup.
+// On index hit, the request proceeds with per-peer write limits (no failed-auth charge).
+// On index miss, the failed-auth limiter (per-IP) is charged and returns identical 401.
+// Over-budget IPs get uniform 429 with Retry-After. No store lookup on miss.
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok, ok := auth.BearerToken(r)
+		ip := clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets)
+		ipKey := rateLimitKey(ip)
+
+		// Missing or malformed Bearer token: identical 401 with no charge
+		if !ok || !strings.HasPrefix(tok, auth.KeyPrefix) {
+			s.unauthorized(w)
+			return
+		}
+
+		keyHash := auth.Hash(tok)
+
+		// Look up key hash in the index
+		peerID, hit := s.st.KeyIndexLookup(keyHash)
+		if hit {
+			// Index hit: proceed with per-peer limits, no failed-auth charge
+			// Verify the peer still exists in the store (#100: bounded timeout)
+			lookupCtx, cancel := context.WithTimeout(r.Context(), authLookupTimeout)
+			defer cancel()
+
+			p, err := s.st.PeerByKeyHash(lookupCtx, keyHash)
+			if errors.Is(err, store.ErrNotFound) {
+				// Peer was deleted but index is stale: remove from index, warn, return 401
+				s.st.InvalidatePeerCache(peerID)
+				s.log.Warn("key index stale: peer not found", "peer_id", peerID)
+				s.unauthorized(w)
+				return
+			}
+			if err != nil {
+				// #96: classify store errors
+				s.handleAuthStoreError(w, r, err, ip)
+				return
+			}
+			if p == nil || p.ID == "" {
+				// Shouldn't happen: return 401
+				s.unauthorized(w)
+				return
+			}
+
+			// Success: authenticate with peer ID from index
+			next.ServeHTTP(w, r.WithContext(auth.WithPeer(r.Context(), p.ID)))
+			return
+		}
+
+		// Index miss: charge failed-auth limiter per IP
+		charged := s.lim.authFailLim.Allow(ipKey)
+		if !charged {
+			// Over budget: uniform 429
+			s.rateLimitedUniform(w, s.cfg.AuthFailPerMinute)
+			return
+		}
+
+		// Within budget: return identical 401 (no store lookup on miss)
+		s.unauthorized(w)
+	})
+}
+
+func (s *Server) unauthorized(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Bearer realm="peerline"`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	w.Write([]byte(`{"error":"unauthorized"}`))
+}
+
+// handleAuthStoreError classifies store errors during auth lookup (#96, #100).
+// Context canceled: no response (client is gone).
+// Deadline exceeded (our timeout, request context still valid): 503 + Retry-After.
+// Database busy: 503 + Retry-After.
+// Other errors: 500.
+func (s *Server) handleAuthStoreError(w http.ResponseWriter, r *http.Request, err error, ip string) {
+	// #96: Client canceled or disconnected - don't log at error level, don't write response
+	if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
+		s.log.Debug("auth lookup canceled", "ip", ip)
+		return
+	}
+
+	// #100: Our timeout fired (request context still alive) - service unavailable
+	if errors.Is(err, context.DeadlineExceeded) && r.Context().Err() == nil {
+		s.log.Warn("auth lookup timeout", "ip", ip, "timeout", authLookupTimeout)
+		w.Header().Set("Retry-After", strconv.Itoa(defaultRetryAfter))
+		writeErr(w, http.StatusServiceUnavailable, "service temporarily unavailable")
+		return
+	}
+
+	// #96: Database busy - service unavailable (don't log at error level)
+	if isSQLiteBusy(err) {
+		s.log.Warn("auth lookup: database busy", "ip", ip)
+		w.Header().Set("Retry-After", strconv.Itoa(defaultRetryAfter))
+		writeErr(w, http.StatusServiceUnavailable, "service temporarily unavailable")
+		return
+	}
+
+	// Other errors: internal error
+	s.internal(w, err)
+}
+
+// isSQLiteBusy returns true if err indicates SQLite SQLITE_BUSY or SQLITE_LOCKED.
+func isSQLiteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "SQLITE_BUSY")
+}
+
+// rateLimitedUniform returns a uniform 429 response for over-budget IPs.
+// The response is identical whether the key is valid-uncached or unknown.
+// Retry-After is derived from the configured failed-auth rate: ceil(60/perMinute), minimum 1.
+func (s *Server) rateLimitedUniform(w http.ResponseWriter, perMinute int) {
+	retryAfter := 1
+	if perMinute > 0 {
+		retryAfter = (60 + perMinute - 1) / perMinute // ceil(60/perMinute)
+	}
+	if retryAfter < 1 {
+		retryAfter = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusTooManyRequests)
+	w.Write([]byte(`{"error":"rate limited"}`))
+}
 
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	// Check register token first, before charging rate limit
@@ -402,7 +550,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	code := auth.NewSecret("inv_")
-	exp := s.now().Add(ttl).UTC()
+	exp := time.Now().Add(ttl).UTC()
 	var pairingToken string
 	var publicID string
 
