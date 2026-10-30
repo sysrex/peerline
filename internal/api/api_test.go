@@ -38,9 +38,12 @@ func newServer(t *testing.T, cfg Config) *httptest.Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	s := New(st, cfg)
-	t.Cleanup(s.Stop)
-	srv := httptest.NewServer(s.Handler())
+	apiSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(apiSrv.Stop)
+	srv := httptest.NewServer(apiSrv.Handler())
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -54,7 +57,10 @@ func newServerWithAccess(t *testing.T, cfg Config) (*httptest.Server, *Server, *
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	s := New(st, cfg)
+	s, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(s.Stop)
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
@@ -78,7 +84,10 @@ func newServerWithDB(t *testing.T, cfg Config) (*httptest.Server, *Server, *stor
 	}
 	t.Cleanup(func() { db.Close() })
 
-	s := New(st, cfg)
+	s, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(s.Stop)
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
@@ -1988,7 +1997,10 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 	}
 	defer st.Close()
 
-	rawSrv := New(st, cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := httptest.NewServer(rawSrv.Handler())
 	defer srv.Close()
 
@@ -2134,7 +2146,11 @@ func TestSingleLogLineUnauthenticatedPairing(t *testing.T) {
 
 	cfg := Config{}
 	cfg.Logger = logger
-	srv := httptest.NewServer(New(st, cfg).Handler())
+	apiSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(apiSrv.Handler())
 	defer srv.Close()
 
 	alice := register(t, srv, "Alice")
@@ -2437,7 +2453,10 @@ func TestAPIClock(t *testing.T) {
 	}
 	defer st.Close()
 
-	srv := New(st, Config{})
+	srv, err := New(st, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer srv.Stop()
 
 	// Stub the clock and verify non-nil default
