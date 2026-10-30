@@ -230,6 +230,7 @@ func (s *Server) Handler() http.Handler {
 // Valid-format keys are looked up in the index:
 //   - Hit: request gets peer_id and proceeds to per-peer rate limits.
 //   - Miss: charges per-IP failLim and returns 401, or 429 with Retry-After if over limit.
+//
 // No store lookup happens for a miss.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

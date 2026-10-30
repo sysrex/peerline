@@ -185,17 +185,17 @@ var authenticatedWriteRoutes = []string{
 func TestWriteRoutesGuard(t *testing.T) {
 	// Expected write routes (must match authenticatedWriteRoutes)
 	expected := map[string]bool{
-		"PUT /v1/me":                     true,
-		"POST /v1/me/verify-email":       true,
-		"POST /v1/invites":               true,
-		"DELETE /v1/invites/{id}":        true,
-		"POST /v1/invites/accept":        true,
-		"DELETE /v1/grants/{peer_id}":    true,
+		"PUT /v1/me":                        true,
+		"POST /v1/me/verify-email":          true,
+		"POST /v1/invites":                  true,
+		"DELETE /v1/invites/{id}":           true,
+		"POST /v1/invites/accept":           true,
+		"DELETE /v1/grants/{peer_id}":       true,
 		"POST /v1/peers/{peer_id}/messages": true,
-		"PUT /v1/bags/{name}":            true,
-		"POST /v1/pairing/{token}":       true,
+		"PUT /v1/bags/{name}":               true,
+		"POST /v1/pairing/{token}":          true,
 	}
-	
+
 	// Verify authenticatedWriteRoutes matches expected
 	if len(authenticatedWriteRoutes) != len(expected) {
 		t.Errorf("authenticatedWriteRoutes count mismatch: have %d, want %d", len(authenticatedWriteRoutes), len(expected))
@@ -276,7 +276,9 @@ func TestAllAuthenticatedWriteRoutesLimited(t *testing.T) {
 				if resp.StatusCode != 201 {
 					t.Fatalf("setup invite: %d %s", resp.StatusCode, body)
 				}
-				var inv struct{ PublicID string `json:"public_id"` }
+				var inv struct {
+					PublicID string `json:"public_id"`
+				}
 				json.Unmarshal(body, &inv)
 				return "/v1/invites/" + inv.PublicID
 			},
@@ -326,7 +328,9 @@ func TestAllAuthenticatedWriteRoutesLimited(t *testing.T) {
 				if resp.StatusCode != 201 {
 					t.Fatalf("setup pairing: %d %s", resp.StatusCode, body)
 				}
-				var inv struct{ PairingURL string `json:"pairing_url"` }
+				var inv struct {
+					PairingURL string `json:"pairing_url"`
+				}
 				if err := json.Unmarshal(body, &inv); err != nil {
 					t.Fatalf("unmarshal pairing: %v", err)
 				}
@@ -346,7 +350,7 @@ func TestAllAuthenticatedWriteRoutesLimited(t *testing.T) {
 			cfg := Config{
 				Logger:                slog.New(slog.NewTextHandler(io.Discard, nil)),
 				WritePerMinute:        10,
-				WriteBurst:            20, // Enough for setup + exhaustion calls
+				WriteBurst:            20,  // Enough for setup + exhaustion calls
 				MaxOutstandingInvites: 100, // High cap for invite tests
 			}
 			srv := newServer(t, cfg)
@@ -376,18 +380,18 @@ func TestAllAuthenticatedWriteRoutesLimited(t *testing.T) {
 
 			// Next call should definitely be rate limited with exact response
 			resp, respBody := testClient.do(tt.method, path, tt.body, nil)
-			
+
 			// Assert exact status code
 			if resp.StatusCode != 429 {
 				t.Errorf("want status 429, got %d: %s (path: %s)", resp.StatusCode, respBody, path)
 			}
-			
+
 			// Assert exact Retry-After value
 			retryAfter := resp.Header.Get("Retry-After")
 			if retryAfter != "2" {
 				t.Errorf("want Retry-After=2, got %q (status: %d, body: %s)", retryAfter, resp.StatusCode, respBody)
 			}
-			
+
 			// Assert exact error body
 			expectedBody := `{"error":"rate limited"}`
 			actualBody := strings.TrimSpace(string(respBody))

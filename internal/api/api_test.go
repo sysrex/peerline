@@ -45,7 +45,7 @@ func newServer(t *testing.T, cfg Config) *httptest.Server {
 		cfg.WritePerMinute = 1000
 		cfg.WriteBurst = 100
 	}
-	// Set high auth fail limits for tests unless explicitly configured  
+	// Set high auth fail limits for tests unless explicitly configured
 	if cfg.AuthFailPerMinute == 0 {
 		cfg.AuthFailPerMinute = 1000
 		cfg.AuthFailBurst = 100

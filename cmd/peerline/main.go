@@ -142,20 +142,20 @@ func main() {
 		"write_burst", writeBurst)
 
 	apiServer, err := api.New(st, api.Config{
-		RegisterToken:            regTok,
-		Logger:                   log,
-		Mailer:                   ml,
-		PublicURL:                publicURL,
-		EmailPerHour:             emailPerHour,
-		NotifyPerHour:            notifyPerHour,
-		TrustedProxies:           trustedProxies,
-		MaxOutstandingInvites:    maxOutstandingInvites,
-		RetentionSeconds:         retentionSeconds,
-		AuthFailPerMinute:        authFailPerMinute,
-		AuthFailBurst:            authFailBurst,
-		WritePerMinute:           writePerMinute,
-		WriteBurst:               writeBurst,
-		KeyIndexRebuildHours:     keyIndexRebuildHours,
+		RegisterToken:         regTok,
+		Logger:                log,
+		Mailer:                ml,
+		PublicURL:             publicURL,
+		EmailPerHour:          emailPerHour,
+		NotifyPerHour:         notifyPerHour,
+		TrustedProxies:        trustedProxies,
+		MaxOutstandingInvites: maxOutstandingInvites,
+		RetentionSeconds:      retentionSeconds,
+		AuthFailPerMinute:     authFailPerMinute,
+		AuthFailBurst:         authFailBurst,
+		WritePerMinute:        writePerMinute,
+		WriteBurst:            writeBurst,
+		KeyIndexRebuildHours:  keyIndexRebuildHours,
 	})
 	if err != nil {
 		log.Error("api.New failed", "err", err)
