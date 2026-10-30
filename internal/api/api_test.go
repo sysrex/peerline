@@ -415,3 +415,199 @@ func mustHome(t *testing.T, c *client) []byte {
 	want(t, resp, body, 200)
 	return body
 }
+
+func TestPairingLink(t *testing.T) {
+	srv := newServer(t, Config{RegisterToken: "test-reg-token"})
+	a := registerAs(t, srv, "alice", map[string]string{"X-Peerline-Register-Token": "test-reg-token"})
+	
+	// Create invite with pairing link
+	resp, body := a.do("POST", "/v1/invites", map[string]any{
+		"scopes": []string{"messages"},
+		"generate_pairing": true,
+	}, nil)
+	want(t, resp, body, 201)
+	var inv struct {
+		Code       string `json:"code"`
+		PairingURL string `json:"pairing_url"`
+	}
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
+	}
+	if inv.PairingURL == "" {
+		t.Fatal("no pairing_url in response")
+	}
+	if !strings.Contains(inv.PairingURL, "/v1/pairing/pair_") {
+		t.Fatalf("unexpected pairing_url: %s", inv.PairingURL)
+	}
+	
+	// Extract token from URL
+	parts := strings.Split(inv.PairingURL, "/v1/pairing/")
+	if len(parts) != 2 {
+		t.Fatalf("malformed pairing_url: %s", inv.PairingURL)
+	}
+	token := parts[1]
+	
+	// GET pairing details (no auth)
+	anon := &client{t: t, srv: srv}
+	resp, body = anon.do("GET", "/v1/pairing/"+token, nil, nil)
+	want(t, resp, body, 200)
+	var details map[string]any
+	if err := json.Unmarshal(body, &details); err != nil {
+		t.Fatal(err)
+	}
+	if details["inviter_id"] != a.id {
+		t.Fatalf("inviter_id: want %s got %v", a.id, details["inviter_id"])
+	}
+	scopes, ok := details["scopes"].([]any)
+	if !ok || len(scopes) != 1 || scopes[0] != "messages" {
+		t.Fatalf("scopes: %v", details["scopes"])
+	}
+	
+	// Accept pairing without auth (register + accept)
+	resp, body = anon.do("POST", "/v1/pairing/"+token, map[string]any{
+		"name": "bob",
+		"scopes": []string{"messages"},
+	}, map[string]string{"X-Peerline-Register-Token": "test-reg-token"})
+	want(t, resp, body, 201)
+	var result struct {
+		PeerID  string `json:"peer_id"`
+		APIKey  string `json:"api_key"`
+		GrantedToYou store.Grant `json:"granted_to_you"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.PeerID == "" || result.APIKey == "" {
+		t.Fatal("missing peer_id or api_key")
+	}
+	if result.GrantedToYou.Owner != a.id {
+		t.Fatalf("grant owner: want %s got %s", a.id, result.GrantedToYou.Owner)
+	}
+	
+	// Verify pairing worked - bob can message alice
+	b := &client{t: t, srv: srv, id: result.PeerID, key: result.APIKey}
+	resp, body = b.do("POST", "/v1/peers/"+a.id+"/messages", map[string]any{
+		"type": "note",
+		"body": "hello from bob",
+	}, nil)
+	want(t, resp, body, 201)
+	
+	// Alice can message bob
+	resp, body = a.do("POST", "/v1/peers/"+b.id+"/messages", map[string]any{
+		"type": "note",
+		"body": "hello from alice",
+	}, nil)
+	want(t, resp, body, 201)
+	
+	// Pairing token is single-use
+	resp, body = anon.do("POST", "/v1/pairing/"+token, map[string]any{
+		"name": "charlie",
+	}, map[string]string{"X-Peerline-Register-Token": "test-reg-token"})
+	want(t, resp, body, 404)
+}
+
+func TestPairingLinkAuthenticated(t *testing.T) {
+	srv := newServer(t, Config{RegisterToken: "test-reg-token"})
+	a := registerAs(t, srv, "alice", map[string]string{"X-Peerline-Register-Token": "test-reg-token"})
+	b := registerAs(t, srv, "bob", map[string]string{"X-Peerline-Register-Token": "test-reg-token"})
+	
+	// Alice creates pairing link
+	resp, body := a.do("POST", "/v1/invites", map[string]any{
+		"scopes": []string{"messages"},
+		"generate_pairing": true,
+	}, nil)
+	want(t, resp, body, 201)
+	var inv struct {
+		PairingURL string `json:"pairing_url"`
+	}
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
+	}
+	token := strings.Split(inv.PairingURL, "/v1/pairing/")[1]
+	
+	// Bob accepts with existing credentials (authenticated)
+	resp, body = b.do("POST", "/v1/pairing/"+token, map[string]any{
+		"scopes": []string{"messages"},
+	}, nil)
+	want(t, resp, body, 200)
+	var result struct {
+		GrantedToYou store.Grant `json:"granted_to_you"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.GrantedToYou.Owner != a.id || result.GrantedToYou.Grantee != b.id {
+		t.Fatalf("grant: %+v", result.GrantedToYou)
+	}
+	
+	// Verify messaging works
+	resp, body = b.do("POST", "/v1/peers/"+a.id+"/messages", map[string]any{
+		"type": "note",
+		"body": "test",
+	}, nil)
+	want(t, resp, body, 201)
+}
+
+func TestPairingLinkInvalid(t *testing.T) {
+	srv := newServer(t, Config{})
+	anon := &client{t: t, srv: srv}
+	
+	// Invalid token format
+	resp, body := anon.do("GET", "/v1/pairing/invalid", nil, nil)
+	want(t, resp, body, 400)
+	
+	// Non-existent token
+	resp, body = anon.do("GET", "/v1/pairing/pair_aGVsbG8gd29ybGQgaXMgaGVyZQ", nil, nil)
+	want(t, resp, body, 404)
+}
+
+func TestPairingLinkSelfAccept(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+	
+	// Create pairing link
+	resp, body := a.do("POST", "/v1/invites", map[string]any{
+		"scopes": []string{"messages"},
+		"generate_pairing": true,
+	}, nil)
+	want(t, resp, body, 201)
+	var inv struct {
+		PairingURL string `json:"pairing_url"`
+	}
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
+	}
+	token := strings.Split(inv.PairingURL, "/v1/pairing/")[1]
+	
+	// Alice cannot accept her own pairing link
+	resp, body = a.do("POST", "/v1/pairing/"+token, nil, nil)
+	want(t, resp, body, 400)
+	if !strings.Contains(string(body), "cannot accept your own") {
+		t.Fatalf("unexpected error: %s", body)
+	}
+}
+
+func TestPairingLinkWithoutGenerateFlag(t *testing.T) {
+	srv := newServer(t, Config{})
+	a := register(t, srv, "alice")
+	
+	// Create normal invite without generate_pairing
+	resp, body := a.do("POST", "/v1/invites", map[string]any{
+		"scopes": []string{"messages"},
+	}, nil)
+	want(t, resp, body, 201)
+	var inv map[string]any
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
+	}
+	
+	// Should not have pairing_url
+	if _, exists := inv["pairing_url"]; exists {
+		t.Fatal("pairing_url should not exist without generate_pairing flag")
+	}
+	
+	// Should still have code and accept_url
+	if inv["code"] == nil || inv["accept_url"] == nil {
+		t.Fatal("missing code or accept_url")
+	}
+}

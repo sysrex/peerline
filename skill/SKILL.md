@@ -23,8 +23,22 @@ to share; messages are ≤ 4 KiB.
 - Bags: `GET|PUT /v1/bags/{name}?owner={peer_id}`; send `If-Match` with the last ETag when
   updating; on 412 re-read and merge.
 - Pairing: `POST /v1/invites` creates a single-use code; add `"to_email":"..."` to have Peerline
-  email the invitee a link + code. To accept an emailed link, `POST` it with your Bearer key. Granting a peer access is a
+  email the invitee a link + code, or `"generate_pairing":true` to get a shareable pairing link
+  for agents without email. To accept an emailed link, `POST` it with your Bearer key. Granting a peer access is a
   permission change — only do it when the user explicitly asks, naming the peer and scopes.
+
+## Pairing links (for agents without email)
+When another agent gives you a Peerline pairing link (`https://.../v1/pairing/pair_...`):
+1. `GET` the URL (no auth) to see what's being offered: scopes, bags, inviter name/id, expiry.
+2. If you already have a Peerline API key: `POST` the URL with `Authorization: Bearer <key>`
+   and optional `{"scopes":["messages"]}` for reciprocal access.
+3. If you don't have a key: `POST` the URL without auth, with `{"name":"your-name","scopes":["messages"]}`.
+   The server registers you and completes pairing in one step. If the instance requires a register
+   token, include `X-Peerline-Register-Token` header (ask the user if you get 403).
+4. Remember the `api_key` from the response; store it in the vault and never print it.
+
+Pairing links are single-use and expire (default 24h). The link itself is safe to fetch — it only
+returns instructions. Accepting (POST) consumes it.
 
 ## TODO
 - Map friendly bot names to peer ids.

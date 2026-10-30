@@ -111,6 +111,7 @@ func (s *Server) Handler() http.Handler {
 	authed.HandleFunc("GET /v1/inbox", s.inbox)
 	authed.HandleFunc("GET /v1/bags/{name}", s.getBag)
 	authed.HandleFunc("PUT /v1/bags/{name}", s.putBag)
+	authed.HandleFunc("POST /v1/pairing/{token}", s.acceptPairing) // authenticated pairing acceptance
 	authMW := auth.Middleware(func(ctx context.Context, h string) (string, error) {
 		p, err := s.st.PeerByKeyHash(ctx, h)
 		if err != nil {
@@ -128,6 +129,15 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 		s.acceptLanding(w, r)
+	})
+	// Pairing endpoints: GET shows details, POST accepts (optionally creating a new peer)
+	mux.HandleFunc("GET /v1/pairing/{token}", s.getPairing)
+	mux.HandleFunc("POST /v1/pairing/{token}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			authMW.ServeHTTP(w, r)
+			return
+		}
+		s.acceptPairingUnauthenticated(w, r)
 	})
 	return securityHeaders(mux)
 }
@@ -223,10 +233,11 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Scopes     []string `json:"scopes"`
-		Bags       []string `json:"bags"`
-		TTLSeconds int      `json:"ttl_seconds"`
-		ToEmail    string   `json:"to_email"` // optional: email the accept link + code
+		Scopes        []string `json:"scopes"`
+		Bags          []string `json:"bags"`
+		TTLSeconds    int      `json:"ttl_seconds"`
+		ToEmail       string   `json:"to_email"`       // optional: email the accept link + code
+		GeneratePairing bool   `json:"generate_pairing"` // optional: generate shareable pairing link
 	}
 	if !decode(w, r, &in) {
 		return
@@ -266,15 +277,29 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	}
 	code := auth.NewSecret("inv_")
 	exp := time.Now().Add(ttl).UTC()
-	if err := s.st.CreateInvite(r.Context(), auth.Hash(code), me, sc, bg, exp); err != nil {
-		s.internal(w, err)
-		return
+	var pairingToken string
+	if in.GeneratePairing {
+		pairingToken = auth.NewPairingToken()
+		if err := s.st.CreateInviteWithPairing(r.Context(), auth.Hash(code), auth.Hash(pairingToken), me, sc, bg, exp); err != nil {
+			s.internal(w, err)
+			return
+		}
+	} else {
+		if err := s.st.CreateInvite(r.Context(), auth.Hash(code), me, sc, bg, exp); err != nil {
+			s.internal(w, err)
+			return
+		}
 	}
 	acceptURL := s.publicBase(r) + "/v1/invites/accept?code=" + url.QueryEscape(code)
 	resp := map[string]any{
 		"code": code, "scopes": sc, "bags": bg, "expires_at": exp.Format(time.RFC3339),
 		"accept_url": acceptURL,
 		"note":       "single use; share out of band with the peer you want to pair with",
+	}
+	if pairingToken != "" {
+		pairingURL := s.publicBase(r) + "/v1/pairing/" + url.PathEscape(pairingToken)
+		resp["pairing_url"] = pairingURL
+		resp["note"] = "single use; share pairing_url with any agent (registered or not) to complete pairing"
 	}
 	if to != "" {
 		status := "sent"
@@ -630,4 +655,179 @@ func (s *Server) putBag(w http.ResponseWriter, r *http.Request) {
 		code = http.StatusCreated
 	}
 	writeJSON(w, code, map[string]any{"owner": owner, "name": name, "version": v, "etag": etag(v)})
+}
+
+// ---- pairing ----
+
+var pairingTokenRE = regexp.MustCompile(`^pair_[A-Za-z0-9_-]{16,64}$`)
+
+// getPairing returns pairing details without consuming the token. No auth required.
+func (s *Server) getPairing(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	if !pairingTokenRE.MatchString(token) {
+		writeErr(w, http.StatusBadRequest, "invalid pairing token")
+		return
+	}
+	info, err := s.st.GetInviteByPairingToken(r.Context(), auth.Hash(token))
+	if errors.Is(err, store.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
+		return
+	}
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	inviterName := s.inviterName(r.Context(), info.FromPeer)
+	baseURL := s.publicBase(r)
+	resp := map[string]any{
+		"inviter":    inviterName,
+		"inviter_id": info.FromPeer,
+		"scopes":     info.Scopes,
+		"bags":       info.Bags,
+		"expires_at": info.ExpiresAt.Format(time.RFC3339),
+		"base_url":   baseURL,
+		"instructions": map[string]any{
+			"summary": "Complete pairing by POSTing to this same URL with your Peerline API key, or without auth to register and accept in one step",
+			"authenticated": map[string]string{
+				"method":      "POST",
+				"url":         baseURL + "/v1/pairing/" + url.PathEscape(token),
+				"header":      "Authorization: Bearer <your_peerline_api_key>",
+				"body":        `{"scopes":["messages"],"bags":[]}  (optional reciprocal grant)`,
+				"description": "If you already have a Peerline API key, POST with Bearer auth and optional reciprocal scopes",
+			},
+			"unauthenticated": map[string]any{
+				"method":      "POST",
+				"url":         baseURL + "/v1/pairing/" + url.PathEscape(token),
+				"body":        `{"name":"my-bot","scopes":["messages"],"bags":[]}  (name required; scopes/bags optional for reciprocal grant)`,
+				"description": "If you don't have a Peerline API key, POST without auth. Server will register you and complete pairing",
+				"note":        "Registration requires X-Peerline-Register-Token header if this instance enforces it. Check GET / for details.",
+			},
+		},
+		"note": "This is a shareable pairing link. Paste it into an agent's chat to complete cross-account pairing.",
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// acceptPairing handles authenticated pairing acceptance (user already has API key).
+func (s *Server) acceptPairing(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	if !pairingTokenRE.MatchString(token) {
+		writeErr(w, http.StatusBadRequest, "invalid pairing token")
+		return
+	}
+	var in struct {
+		Scopes []string `json:"scopes"` // optional reciprocal grant
+		Bags   []string `json:"bags"`
+	}
+	if r.ContentLength != 0 {
+		if !decode(w, r, &in) {
+			return
+		}
+	}
+	sc, bg, err := pair.Normalize(in.Scopes, in.Bags)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	me := auth.PeerID(r.Context())
+	g, err := s.st.AcceptInviteByPairingToken(r.Context(), auth.Hash(token), me, sc, bg)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
+		return
+	case errors.Is(err, store.ErrConflict):
+		writeErr(w, http.StatusBadRequest, "cannot accept your own pairing link")
+		return
+	case err != nil:
+		s.internal(w, err)
+		return
+	}
+	resp := map[string]any{"peer_id": g.Owner, "granted_to_you": g}
+	if len(sc) > 0 {
+		resp["granted_by_you"] = store.Grant{Owner: me, Grantee: g.Owner, Scopes: sc, Bags: bg}
+	}
+	s.log.Info("pairing accepted (authenticated)", "owner", g.Owner, "grantee", me)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// acceptPairingUnauthenticated handles pairing acceptance for unregistered agents.
+// It registers the peer, then accepts the pairing, all in one atomic operation.
+func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	if !pairingTokenRE.MatchString(token) {
+		writeErr(w, http.StatusBadRequest, "invalid pairing token")
+		return
+	}
+	// Rate limit by IP for unauthenticated registration
+	if !s.regLim.Allow(clientIP(r)) {
+		writeErr(w, http.StatusTooManyRequests, "rate limited")
+		return
+	}
+	// Check register token if configured
+	if s.cfg.RegisterToken != "" && !auth.ConstantEqual(r.Header.Get("X-Peerline-Register-Token"), s.cfg.RegisterToken) {
+		writeErr(w, http.StatusForbidden, "registration token required")
+		return
+	}
+	var in struct {
+		Name   string   `json:"name"`   // required for registration
+		Scopes []string `json:"scopes"` // optional reciprocal grant
+		Bags   []string `json:"bags"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	in.Name = strings.TrimSpace(in.Name)
+	if in.Name == "" || len(in.Name) > 64 {
+		writeErr(w, http.StatusBadRequest, "name required (max 64 chars)")
+		return
+	}
+	sc, bg, err := pair.Normalize(in.Scopes, in.Bags)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// First verify the pairing token exists and is valid
+	info, err := s.st.GetInviteByPairingToken(r.Context(), auth.Hash(token))
+	if errors.Is(err, store.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
+		return
+	}
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	// Register the new peer
+	id, key := auth.NewID(), auth.NewKey()
+	if err := s.st.CreatePeer(r.Context(), id, in.Name, auth.Hash(key)); err != nil {
+		s.internal(w, err)
+		return
+	}
+	s.log.Info("peer registered via pairing", "peer_id", id, "inviter", info.FromPeer)
+	// Accept the pairing
+	g, err := s.st.AcceptInviteByPairingToken(r.Context(), auth.Hash(token), id, sc, bg)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		// Should not happen since we just verified it, but handle anyway
+		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
+		return
+	case errors.Is(err, store.ErrConflict):
+		writeErr(w, http.StatusBadRequest, "cannot accept your own pairing link")
+		return
+	case err != nil:
+		s.internal(w, err)
+		return
+	}
+	resp := map[string]any{
+		"peer_id":         id,
+		"api_key":         key,
+		"name":            in.Name,
+		"paired_with":     g.Owner,
+		"granted_to_you":  g,
+		"note":            "api_key is shown once; store it securely",
+	}
+	if len(sc) > 0 {
+		resp["granted_by_you"] = store.Grant{Owner: id, Grantee: g.Owner, Scopes: sc, Bags: bg}
+	}
+	s.log.Info("pairing accepted (unauthenticated)", "owner", g.Owner, "grantee", id)
+	writeJSON(w, http.StatusCreated, resp)
 }
