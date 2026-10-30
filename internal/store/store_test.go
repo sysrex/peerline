@@ -212,8 +212,8 @@ func TestV0SchemaMigration(t *testing.T) {
 
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 4 {
-		t.Fatalf("user_version = %d, want 4", version)
+	if version != 5 {
+		t.Fatalf("user_version = %d, want 5", version)
 	}
 
 	email, err := s.NotifyEmail(ctx, "alice")
@@ -280,8 +280,8 @@ func TestV1SchemaMigration(t *testing.T) {
 
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 4 {
-		t.Fatalf("user_version = %d, want 4", version)
+	if version != 5 {
+		t.Fatalf("user_version = %d, want 5", version)
 	}
 
 	email, err := s.NotifyEmail(ctx, "alice")
@@ -499,8 +499,8 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 			// Verify user_version is 2
 			var version int
 			migratedStore.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-			if version != 4 {
-				t.Fatalf("user_version = %d, want 4", version)
+			if version != 5 {
+				t.Fatalf("user_version = %d, want 5", version)
 			}
 
 			// Compare full schema
@@ -541,7 +541,8 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 					}
 					continue
 				}
-				if freshSQL != migratedSQL {
+				// ALTER TABLE ADD COLUMN on the multi-line schema leaves a space before the comma.
+				if strings.ReplaceAll(freshSQL, " ,", ",") != migratedSQL {
 					t.Errorf("%s schema differs:\nfresh:    %s\nmigrated: %s", key, freshSQL, migratedSQL)
 				}
 			}
@@ -1201,8 +1202,8 @@ func TestPR11AlreadyMigrated(t *testing.T) {
 
 	// Verify user_version advanced to 2
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 4 {
-		t.Fatalf("user_version = %d, want 4", version)
+	if version != 5 {
+		t.Fatalf("user_version = %d, want 5", version)
 	}
 
 	// Verify columns still exist
@@ -1250,8 +1251,8 @@ func TestPR11AlreadyMigrated(t *testing.T) {
 
 	// Verify user_version unchanged
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 4 {
-		t.Fatalf("user_version after second migrate = %d, want 4", version)
+	if version != 5 {
+		t.Fatalf("user_version after second migrate = %d, want 5", version)
 	}
 
 	// Verify columns still present
@@ -1515,8 +1516,8 @@ func TestV2ToV3Migration(t *testing.T) {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
-		t.Errorf("user_version = %d, want 4", version)
+	if version != 5 {
+		t.Errorf("user_version = %d, want 5", version)
 	}
 
 	// Verify all rows have public_id
@@ -1600,8 +1601,8 @@ func TestV3MigrationIdempotent(t *testing.T) {
 	// Verify user_version is still 3
 	var version int
 	s.db.QueryRow(`PRAGMA user_version`).Scan(&version)
-	if version != 4 {
-		t.Errorf("user_version = %d, want 4", version)
+	if version != 5 {
+		t.Errorf("user_version = %d, want 5", version)
 	}
 }
 

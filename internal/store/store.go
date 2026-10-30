@@ -133,6 +133,7 @@ var migrations = []func(*sql.Tx) error{
 	migrateV2PairingTokenHash,
 	migrateV3InvitePublicID,
 	migrateV4EmailVerification,
+	migrateV5InviteClaimState,
 }
 
 // checkVersion refuses any user_version this binary cannot account for.
@@ -365,6 +366,47 @@ func migrateV4EmailVerification(tx *sql.Tx) error {
 	return nil
 }
 
+// migrateV5InviteClaimState rebuilds invites (ALTER cannot add multi-column CHECKs or NOT NULL)
+// with claim/confirm columns, DB-level state CHECKs and a public_id default, and marks peers
+// created by an unconfirmed claim. Existing rows become plain offered/used invites.
+// Downgrading is unsafe: older binaries ignore claim state, so restore a pre-migration backup.
+func migrateV5InviteClaimState(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+CREATE TABLE invites_new (
+  code_hash TEXT PRIMARY KEY,
+  from_peer TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
+  scopes TEXT NOT NULL,
+  bags TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used_by TEXT,
+  pairing_token_hash TEXT,
+  public_id TEXT NOT NULL DEFAULT (lower(hex(randomblob(16)))),
+  require_confirm INTEGER NOT NULL DEFAULT 0 CHECK (require_confirm IN (0,1)),
+  claimed_by TEXT REFERENCES peers(id) ON DELETE CASCADE,
+  confirm_by INTEGER,
+  declined_at INTEGER,
+  CHECK (NOT (declined_at IS NOT NULL AND used_by IS NOT NULL)),
+  CHECK (claimed_by IS NOT NULL OR (confirm_by IS NULL AND declined_at IS NULL)),
+  CHECK (require_confirm=0 OR used_by IS NULL OR used_by IS claimed_by)
+);
+INSERT INTO invites_new(code_hash,from_peer,scopes,bags,expires_at,used_by,pairing_token_hash,public_id)
+  SELECT code_hash,from_peer,scopes,bags,expires_at,used_by,pairing_token_hash,
+         COALESCE(public_id, lower(hex(randomblob(16)))) FROM invites;
+DROP TABLE invites;
+ALTER TABLE invites_new RENAME TO invites;
+CREATE UNIQUE INDEX invites_pairing_token_hash ON invites(pairing_token_hash) WHERE pairing_token_hash IS NOT NULL;
+CREATE UNIQUE INDEX invites_public_id ON invites(public_id);
+CREATE INDEX invites_from_peer ON invites(from_peer);
+CREATE INDEX invites_confirm_by ON invites(confirm_by) WHERE claimed_by IS NOT NULL AND used_by IS NULL;
+ALTER TABLE peers ADD COLUMN created_via_invite INTEGER NOT NULL DEFAULT 0;`)
+	return err
+}
+
+// outstandingInvite is the one definition of an unused invite that can still be acted on
+// (?1 = now): offered rows live until expires_at, claimed rows until confirm_by.
+const outstandingInvite = `(used_by IS NULL AND declined_at IS NULL AND
+  ((claimed_by IS NULL AND expires_at>=?1) OR (claimed_by IS NOT NULL AND confirm_by>=?1)))`
+
 func (s *Store) Close() error { return s.db.Close() }
 
 // generatePublicID returns a random 16-byte hex string for invite public_id.
@@ -565,7 +607,7 @@ func (s *Store) CreateInviteAtomic(ctx context.Context, codeHash, from string, s
 	defer tx.Rollback()
 
 	var count int
-	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`, from, s.now()).Scan(&count)
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=?2 AND `+outstandingInvite, s.now(), from).Scan(&count)
 	if err != nil {
 		return "", err
 	}
@@ -601,7 +643,7 @@ func (s *Store) CreateInviteWithPairingAtomic(ctx context.Context, codeHash, pai
 	defer tx.Rollback()
 
 	var count int
-	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`, from, s.now()).Scan(&count)
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=?2 AND `+outstandingInvite, s.now(), from).Scan(&count)
 	if err != nil {
 		return "", err
 	}
@@ -641,8 +683,8 @@ type InviteMetadata struct {
 func (s *Store) CountOutstandingInvites(ctx context.Context, peerID string) (int, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL AND expires_at>=?`,
-		peerID, s.now()).Scan(&count)
+		`SELECT COUNT(*) FROM invites WHERE from_peer=?2 AND `+outstandingInvite,
+		s.now(), peerID).Scan(&count)
 	return count, err
 }
 
@@ -656,10 +698,11 @@ func (s *Store) ListInvitesByPeer(ctx context.Context, peerID string, limit, off
 		`SELECT COALESCE(public_id, ''), scopes, bags, expires_at, used_by IS NOT NULL, 
 		        pairing_token_hash IS NOT NULL
 		 FROM invites 
-		 WHERE from_peer=? AND expires_at>=? AND public_id IS NOT NULL
+		 WHERE from_peer=?2 AND public_id IS NOT NULL
+		   AND ((used_by IS NOT NULL AND expires_at>=?1) OR `+outstandingInvite+`)
 		 ORDER BY ROWID
-		 LIMIT ? OFFSET ?`,
-		peerID, s.now(), limit, offset)
+		 LIMIT ?3 OFFSET ?4`,
+		s.now(), peerID, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -741,9 +784,10 @@ func (s *Store) PurgeExpiredInvites(ctx context.Context, retentionSeconds int64)
 		res, err := s.db.ExecContext(ctx,
 			`DELETE FROM invites WHERE rowid IN (
 				SELECT rowid FROM invites 
-				WHERE (used_by IS NULL AND expires_at < ?) 
-				   OR (used_by IS NOT NULL AND expires_at < ?)
-				LIMIT ?
+				WHERE (used_by IS NULL AND claimed_by IS NULL AND expires_at < ?1)
+				   OR (used_by IS NULL AND claimed_by IS NOT NULL AND COALESCE(declined_at, confirm_by) < ?1)
+				   OR (used_by IS NOT NULL AND expires_at < ?2)
+				LIMIT ?3
 			)`,
 			graceCutoff, retentionCutoff, purgeBatchSize)
 		if err != nil {
@@ -755,7 +799,7 @@ func (s *Store) PurgeExpiredInvites(ctx context.Context, retentionSeconds int64)
 		}
 		deleted += int(n)
 		if int(n) < purgeBatchSize {
-			return deleted, false, nil
+			return deleted, false, s.purgeOrphanPeers(ctx, graceCutoff)
 		}
 
 		select {
@@ -764,6 +808,17 @@ func (s *Store) PurgeExpiredInvites(ctx context.Context, retentionSeconds int64)
 		case <-time.After(purgeYield):
 		}
 	}
+}
+
+// purgeOrphanPeers deletes peers created by an unconfirmed claim that never gained a grant,
+// message, bag or invite. The grace cutoff protects a peer whose claim row is not yet written.
+func (s *Store) purgeOrphanPeers(ctx context.Context, cutoff int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM peers WHERE created_via_invite=1 AND created_at<?
+		AND NOT EXISTS (SELECT 1 FROM grants WHERE owner=peers.id OR grantee=peers.id)
+		AND NOT EXISTS (SELECT 1 FROM messages WHERE sender=peers.id OR recipient=peers.id)
+		AND NOT EXISTS (SELECT 1 FROM bags WHERE owner=peers.id)
+		AND NOT EXISTS (SELECT 1 FROM invites WHERE from_peer=peers.id OR claimed_by=peers.id OR used_by=peers.id)`, cutoff)
+	return err
 }
 
 type InviteInfo struct {
@@ -929,10 +984,13 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 }
 
 // acceptInviteInTx is the shared helper that atomically consumes an invite using a guarded
-// update and creates grants. Must be called within a transaction.
+// update and creates grants. Must be called within a transaction. Every legacy accept path
+// ends here, so confirm-mode, claimed and declined invites are refused here (as not found);
+// only a confirm step may grant those.
 func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string, backScopes, backBags []string, now int64) (*Grant, error) {
 	var from, scopes, bags string
-	err := tx.QueryRowContext(ctx, `SELECT from_peer,scopes,bags FROM invites WHERE code_hash=?`, codeHash).
+	err := tx.QueryRowContext(ctx, `SELECT from_peer,scopes,bags FROM invites
+		WHERE code_hash=? AND require_confirm=0 AND claimed_by IS NULL AND declined_at IS NULL`, codeHash).
 		Scan(&from, &scopes, &bags)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -946,7 +1004,8 @@ func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string
 	}
 
 	res, err := tx.ExecContext(ctx,
-		`UPDATE invites SET used_by=? WHERE code_hash=? AND used_by IS NULL AND expires_at>=?`,
+		`UPDATE invites SET used_by=? WHERE code_hash=? AND used_by IS NULL AND expires_at>=?
+		 AND require_confirm=0 AND claimed_by IS NULL AND declined_at IS NULL`,
 		accepter, codeHash, now)
 	if err != nil {
 		return nil, err
