@@ -60,8 +60,13 @@ func (c *client) do(method, path string, body any, hdr map[string]string) (*http
 
 func register(t *testing.T, srv *httptest.Server, name string) *client {
 	t.Helper()
+	return registerAs(t, srv, name, nil)
+}
+
+func registerAs(t *testing.T, srv *httptest.Server, name string, hdr map[string]string) *client {
+	t.Helper()
 	c := &client{t: t, srv: srv}
-	resp, b := c.do("POST", "/v1/register", map[string]string{"name": name}, nil)
+	resp, b := c.do("POST", "/v1/register", map[string]string{"name": name}, hdr)
 	if resp.StatusCode != 201 {
 		t.Fatalf("register: %d %s", resp.StatusCode, b)
 	}
@@ -268,3 +273,145 @@ func TestInviteValidation(t *testing.T) {
 }
 
 func itoa(n int64) string { b, _ := json.Marshal(n); return string(b) }
+
+func TestHomeAndPublicStats(t *testing.T) {
+	const token = "s3cret-register-token"
+	srv := newServer(t, Config{RegisterToken: token, PublicURL: "https://peerline.sysrex.com"})
+	anon := &client{t: t, srv: srv}
+
+	resp, body := anon.do("GET", "/", nil, nil)
+	want(t, resp, body, 200)
+	if ct := resp.Header.Get("Content-Type"); ct != "text/html; charset=utf-8" {
+		t.Fatalf("content-type %q", ct)
+	}
+	if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+		t.Fatalf("content-disposition %q", cd)
+	}
+	html := string(body)
+	for _, needle := range []string{
+		"<!DOCTYPE html>",
+		"Peerline",
+		"deny-all",
+		"For humans",
+		"For agents",
+		"https://peerline.sysrex.com",
+		"https://github.com/sysrex/peerline",
+		"skill/SKILL.md",
+		"GET /v1/public/stats",
+		"X-Peerline-Register-Token",
+		"Authorization: Bearer",
+		"bags:read",
+		"allowlist",
+		"registration token required",
+		`id="stat-peers">0<`,
+		`id="stat-messages">0<`,
+		`id="stat-grants">0<`,
+		`id="stat-bags">0<`,
+		`id="peerline-stats">{"peers":0,"messages":0,"grants":0,"bags":0}</script>`,
+		"fetch(\"/v1/public/stats\"",
+	} {
+		if !strings.Contains(html, needle) {
+			t.Errorf("home missing %q", needle)
+		}
+	}
+	if strings.Contains(html, token) {
+		t.Fatal("landing page includes the register token")
+	}
+	if strings.Contains(html, "SigmaUno") || strings.Contains(html, "OpenDuty") {
+		t.Fatal("landing page carries unrelated branding")
+	}
+	// The inline script must stay valid JS. html/template must not rewrite &&.
+	if !strings.Contains(html, "el && typeof") {
+		t.Fatal("stats refresh script was rewritten")
+	}
+	// Copied curls should show a real query separator, not a double-escaped amp.
+	if strings.Contains(html, "&amp;amp;") {
+		t.Fatal("query strings were double-escaped")
+	}
+	if !strings.Contains(html, "/v1/inbox?since=0&amp;limit=50") {
+		t.Fatal("inbox example missing")
+	}
+
+	// Public stats: no bearer, and a bearer is ignored rather than required.
+	resp, body = anon.do("GET", "/v1/public/stats", nil, nil)
+	want(t, resp, body, 200)
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("stats content-type %q", ct)
+	}
+	if strings.TrimSpace(string(body)) != `{"peers":0,"messages":0,"grants":0,"bags":0}` {
+		t.Fatalf("stats: %s", body)
+	}
+	anon.key = "pl_not-a-real-key"
+	resp, body = anon.do("GET", "/v1/public/stats", nil, nil)
+	want(t, resp, body, 200)
+
+	// The auth wall is unchanged for the rest of /v1.
+	anon.key = ""
+	resp, body = anon.do("GET", "/v1/inbox", nil, nil)
+	want(t, resp, body, 401)
+	resp, body = anon.do("GET", "/v1/public/stats/nope", nil, nil)
+	want(t, resp, body, 401)
+	resp, body = anon.do("GET", "/missing", nil, nil)
+	want(t, resp, body, 404)
+
+	a := registerAs(t, srv, "alice", map[string]string{"X-Peerline-Register-Token": token})
+	b := registerAs(t, srv, "bob", map[string]string{"X-Peerline-Register-Token": token})
+	if strings.Contains(string(mustHome(t, anon)), a.key) || strings.Contains(string(mustHome(t, anon)), b.key) {
+		t.Fatal("landing page includes an api key")
+	}
+	pairUp(t, a, b, []string{"messages", "bags:read"}, []string{"status"}, nil)
+	const bodyText = "relay-body-9f3c"
+	resp, body = b.do("POST", "/v1/peers/"+a.id+"/messages", map[string]any{"type": "note", "body": bodyText}, nil)
+	want(t, resp, body, 201)
+	resp, body = a.do("PUT", "/v1/bags/status", []byte("ok"), nil)
+	want(t, resp, body, 201)
+
+	resp, body = anon.do("GET", "/v1/public/stats", nil, nil)
+	want(t, resp, body, 200)
+	var st store.Stats
+	if err := json.Unmarshal(body, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Peers != 2 || st.Messages != 1 || st.Grants != 1 || st.Bags != 1 {
+		t.Fatalf("stats after use: %+v", st)
+	}
+	home := string(mustHome(t, anon))
+	for _, needle := range []string{
+		`id="stat-peers">2<`,
+		`id="stat-messages">1<`,
+		`id="stat-grants">1<`,
+		`id="stat-bags">1<`,
+		`{"peers":2,"messages":1,"grants":1,"bags":1}`,
+	} {
+		if !strings.Contains(home, needle) {
+			t.Errorf("rendered stats missing %q", needle)
+		}
+	}
+	if strings.Contains(home, a.id) || strings.Contains(home, b.id) {
+		t.Fatal("landing page leaked a peer id")
+	}
+	if strings.Contains(home, bodyText) || strings.Contains(home, a.key) || strings.Contains(home, b.key) {
+		t.Fatal("landing page leaked a message body or api key")
+	}
+}
+
+func TestHomeRegisterOpen(t *testing.T) {
+	srv := newServer(t, Config{})
+	c := &client{t: t, srv: srv}
+	resp, body := c.do("GET", "/", nil, nil)
+	want(t, resp, body, 200)
+	if resp.Header.Get("Content-Type") != "text/html; charset=utf-8" {
+		t.Fatalf("content-type %q", resp.Header.Get("Content-Type"))
+	}
+	if !strings.Contains(string(body), "does not require a token") {
+		t.Fatalf("open registration not explained: %s", body)
+	}
+}
+
+func mustHome(t *testing.T, c *client) []byte {
+	t.Helper()
+	c.key = ""
+	resp, body := c.do("GET", "/", nil, nil)
+	want(t, resp, body, 200)
+	return body
+}

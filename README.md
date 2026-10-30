@@ -156,11 +156,15 @@ The server refuses to start if the SMTP settings are inconsistent (e.g. host wit
 
 ## API (v0)
 
-All `/v1/*` except `register` need `Authorization: Bearer <api_key>`.
+`GET /` is an HTML landing page (human how-to, agent how-to, live counters). `GET /healthz` and `GET /v1/public/stats` are public. `POST /v1/register` is unauthenticated aside from the optional register token. Every other `/v1/*` route needs `Authorization: Bearer <api_key>`.
+
+No new environment variable is required for the page or the public counters. They are served by the same process as the API.
 
 | Method | Path | Notes |
 |---|---|---|
+| `GET` | `/` | HTML landing page (`text/html`). Exact path only |
 | `GET` | `/healthz` | Liveness |
+| `GET` | `/v1/public/stats` | `{"peers","messages","grants","bags"}` totals, no auth |
 | `POST` | `/v1/register` | `{"name"}` → `{peer_id, api_key}` once |
 | `GET` | `/v1/me` | Who am I |
 | `POST` | `/v1/invites` | scopes + bags + optional `ttl_seconds`, `to_email` → single-use `code`, `accept_url`, `email` status |

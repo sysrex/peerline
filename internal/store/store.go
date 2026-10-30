@@ -127,6 +127,27 @@ func (s *Store) PeerExists(ctx context.Context, id string) (bool, error) {
 	return n > 0, err
 }
 
+// Stats is the public, aggregate size of the relay. It has no peer ids, names,
+// message bodies, bag contents, or invite codes.
+type Stats struct {
+	Peers    int64 `json:"peers"`
+	Messages int64 `json:"messages"`
+	Grants   int64 `json:"grants"`
+	Bags     int64 `json:"bags"`
+}
+
+// Stats counts peers, messages, directional grants, and bags.
+func (s *Store) Stats(ctx context.Context) (Stats, error) {
+	var st Stats
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+			(SELECT COUNT(*) FROM peers),
+			(SELECT COUNT(*) FROM messages),
+			(SELECT COUNT(*) FROM grants),
+			(SELECT COUNT(*) FROM bags)`).Scan(&st.Peers, &st.Messages, &st.Grants, &st.Bags)
+	return st, err
+}
+
 // ---- invites & grants ----
 
 type Grant struct {

@@ -92,8 +92,13 @@ func New(st *store.Store, cfg Config) *Server {
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	// {$} is an exact match for "/". A bare "GET /" would swallow every other path.
+	mux.HandleFunc("GET /{$}", s.home)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
 	mux.HandleFunc("POST /v1/register", s.register)
+	// Registered on the outer mux so it is not behind Bearer auth. The more
+	// specific pattern wins over the /v1/ subtree below.
+	mux.HandleFunc("GET /v1/public/stats", s.publicStats)
 
 	authed := http.NewServeMux()
 	authed.HandleFunc("GET /v1/me", s.me)
