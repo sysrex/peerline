@@ -19,7 +19,6 @@ type Store struct{ db *sql.DB }
 
 const schema = `
 PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS peers (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -34,7 +33,7 @@ CREATE TABLE IF NOT EXISTS invites (
   bags TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
   used_by TEXT,
-  pairing_token_hash TEXT UNIQUE
+  pairing_token_hash TEXT
 );
 -- grants are directional: grantee may act on owner's resources within scopes/bags.
 CREATE TABLE IF NOT EXISTS grants (
@@ -68,7 +67,8 @@ CREATE TABLE IF NOT EXISTS bags (
 
 // Open opens (and migrates) the database at path. Use ":memory:" for tests.
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	dsn := buildDSN(path)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +77,7 @@ func Open(path string) (*Store, error) {
 	db.SetConnMaxLifetime(0)
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("migrate: %w", err)
+		return nil, fmt.Errorf("schema: %w", err)
 	}
 	if err := migrate(db); err != nil {
 		db.Close()
@@ -86,36 +86,101 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-// migrate adds columns that CREATE TABLE IF NOT EXISTS will not backfill on
-// databases created before they existed. Each column is checked on its own:
-// a database can already have peers.notify_email and still lack
-// invites.pairing_token_hash.
-func migrate(db *sql.DB) error {
-	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name = 'notify_email'`).Scan(&n); err != nil {
-		return err
+func buildDSN(path string) string {
+	pragmas := "_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	if path == ":memory:" {
+		// Use file-based shared-cache for :memory: so pragmas apply
+		return "file::memory:?mode=memory&cache=shared&" + pragmas
 	}
-	if n == 0 {
-		// Plaintext: Peerline has to address the wake-up mail later. The address
-		// is returned only to the peer who set it.
-		if _, err := db.Exec(`ALTER TABLE peers ADD COLUMN notify_email TEXT NOT NULL DEFAULT ''`); err != nil {
-			return err
-		}
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return path + sep + pragmas
+}
+
+// migrate applies ordered, idempotent schema upgrades tracked by PRAGMA user_version.
+func migrate(db *sql.DB) error {
+	// Read user_version outside tx to avoid holding connection
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return err
 	}
 
-	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('invites') WHERE name = 'pairing_token_hash'`).Scan(&n); err != nil {
+	migrations := []func(*sql.Tx) error{
+		migrateV1NotifyEmail,
+		migrateV2PairingTokenHash,
+	}
+
+	for i, mig := range migrations {
+		target := i + 1
+		if version >= target {
+			continue
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin migration v%d: %w", target, err)
+		}
+
+		// Run migration step on tx (not db) to avoid deadlock with MaxOpenConns=1
+		if err := mig(tx); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("migration v%d: %w", target, err)
+		}
+
+		if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, target)); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("update user_version to %d: %w", target, err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v%d: %w", target, err)
+		}
+
+		version = target
+	}
+	return nil
+}
+
+// migrateV1NotifyEmail adds the notify_email column to peers.
+func migrateV1NotifyEmail(tx *sql.Tx) error {
+	var n int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name = 'notify_email'`).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	// Plaintext: Peerline has to address the wake-up mail later. The address
+	// is returned only to the peer who set it.
+	_, err := tx.Exec(`ALTER TABLE peers ADD COLUMN notify_email TEXT NOT NULL DEFAULT ''`)
+	return err
+}
+
+// migrateV2PairingTokenHash adds the pairing_token_hash column and unique index to invites.
+// PR #11 already added both (without user_version tracking), so this checks before acting.
+func migrateV2PairingTokenHash(tx *sql.Tx) error {
+	var n int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('invites') WHERE name = 'pairing_token_hash'`).Scan(&n); err != nil {
 		return err
 	}
 	if n == 0 {
-		// Nullable so code-only invites, and rows written before pairing links,
-		// stay valid. SQLite rejects ADD COLUMN ... UNIQUE.
-		if _, err := db.Exec(`ALTER TABLE invites ADD COLUMN pairing_token_hash TEXT`); err != nil {
+		if _, err := tx.Exec(`ALTER TABLE invites ADD COLUMN pairing_token_hash TEXT`); err != nil {
 			return err
 		}
 	}
-	// Fresh databases already declare the column UNIQUE. Upgraded databases get
-	// the same constraint here. NULL pairing tokens (code-only invites) may repeat.
-	_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS invites_pairing_token_hash ON invites(pairing_token_hash)`)
+	// Check if the index already exists. PR #11 created a full unique index (no WHERE clause).
+	// We create a partial index (WHERE NOT NULL). IF NOT EXISTS won't error either way.
+	var hasIndex int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='invites_pairing_token_hash'`).Scan(&hasIndex); err != nil {
+		return err
+	}
+	if hasIndex > 0 {
+		// Index already exists (from PR #11 or a previous run). Keep it as-is.
+		return nil
+	}
+	_, err := tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS invites_pairing_token_hash ON invites(pairing_token_hash) WHERE pairing_token_hash IS NOT NULL`)
 	return err
 }
 
@@ -270,47 +335,31 @@ func (s *Store) GetInviteByPairingToken(ctx context.Context, pairingTokenHash st
 }
 
 // AcceptInviteByPairingToken atomically consumes an invite via pairing token and creates grants.
-// Returns the invite code hash (for logging) and the inviter's grant.
 func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash, accepter string, backScopes, backBags []string) (*Grant, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	var codeHash, from, scopes, bags string
-	var exp int64
-	var used sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT code_hash,from_peer,scopes,bags,expires_at,used_by FROM invites WHERE pairing_token_hash=?`, pairingTokenHash).
-		Scan(&codeHash, &from, &scopes, &bags, &exp, &used)
+
+	var codeHash string
+	err = tx.QueryRowContext(ctx, `SELECT code_hash FROM invites WHERE pairing_token_hash=?`, pairingTokenHash).Scan(&codeHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp < now() {
-		return nil, ErrNotFound
-	}
-	if from == accepter {
-		return nil, ErrConflict
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE invites SET used_by=? WHERE code_hash=?`, accepter, codeHash); err != nil {
+
+	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags)
+	if err != nil {
 		return nil, err
 	}
-	up := `INSERT INTO grants(owner,grantee,scopes,bags,created_at) VALUES(?,?,?,?,?)
-	       ON CONFLICT(owner,grantee) DO UPDATE SET scopes=excluded.scopes, bags=excluded.bags, created_at=excluded.created_at`
-	if _, err := tx.ExecContext(ctx, up, from, accepter, scopes, bags, now()); err != nil {
-		return nil, err
-	}
-	if len(backScopes) > 0 {
-		if _, err := tx.ExecContext(ctx, up, accepter, from, join(backScopes), join(backBags), now()); err != nil {
-			return nil, err
-		}
-	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return &Grant{Owner: from, Grantee: accepter, Scopes: split(scopes), Bags: split(bags)}, nil
+	return grant, nil
 }
 
 // AcceptInvite atomically consumes an invite and creates the inviter->accepter grant
@@ -321,39 +370,108 @@ func (s *Store) AcceptInvite(ctx context.Context, codeHash, accepter string, bac
 		return nil, err
 	}
 	defer tx.Rollback()
-	var from, scopes, bags string
+
+	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return grant, nil
+}
+
+// RegisterAndAcceptByPairing atomically registers a new peer and accepts a pairing invite.
+// Returns the grant from the inviter.
+func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash, peerID, name, keyHash, notifyEmail string, backScopes, backBags []string) (grant *Grant, err error) {
+	// #14 fix: Read-only check before BeginTx to avoid taking write lock for invalid tokens
+	var codeHash, fromPeer string
 	var exp int64
 	var used sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT from_peer,scopes,bags,expires_at,used_by FROM invites WHERE code_hash=?`, codeHash).
-		Scan(&from, &scopes, &bags, &exp, &used)
+	err = s.db.QueryRowContext(ctx, `SELECT code_hash,from_peer,expires_at,used_by FROM invites WHERE pairing_token_hash=?`, pairingTokenHash).
+		Scan(&codeHash, &fromPeer, &exp, &used)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp < now() {
+	ts := now()
+	if used.Valid || exp < ts {
 		return nil, ErrNotFound
 	}
-	if from == accepter {
+	if fromPeer == peerID {
 		return nil, ErrConflict
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE invites SET used_by=? WHERE code_hash=?`, accepter, codeHash); err != nil {
+
+	// Now begin transaction for writes
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		return nil, err
 	}
-	up := `INSERT INTO grants(owner,grantee,scopes,bags,created_at) VALUES(?,?,?,?,?)
-	       ON CONFLICT(owner,grantee) DO UPDATE SET scopes=excluded.scopes, bags=excluded.bags, created_at=excluded.created_at`
-	if _, err := tx.ExecContext(ctx, up, from, accepter, scopes, bags, now()); err != nil {
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email) VALUES(?,?,?,?,?)`,
+		peerID, name, keyHash, ts, notifyEmail)
+	if err != nil {
 		return nil, err
 	}
-	if len(backScopes) > 0 {
-		if _, err := tx.ExecContext(ctx, up, accepter, from, join(backScopes), join(backBags), now()); err != nil {
-			return nil, err
-		}
+
+	grant, err = acceptInviteInTx(ctx, tx, codeHash, peerID, backScopes, backBags)
+	if err != nil {
+		return nil, err
 	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	return grant, nil
+}
+
+// acceptInviteInTx is the shared helper that atomically consumes an invite using a guarded
+// update and creates grants. Must be called within a transaction.
+func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string, backScopes, backBags []string) (*Grant, error) {
+	var from, scopes, bags string
+	err := tx.QueryRowContext(ctx, `SELECT from_peer,scopes,bags FROM invites WHERE code_hash=?`, codeHash).
+		Scan(&from, &scopes, &bags)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if from == accepter {
+		return nil, ErrConflict
+	}
+
+	ts := now()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE invites SET used_by=? WHERE code_hash=? AND used_by IS NULL AND expires_at>=?`,
+		accepter, codeHash, ts)
+	if err != nil {
+		return nil, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if n != 1 {
+		return nil, ErrNotFound
+	}
+
+	up := `INSERT INTO grants(owner,grantee,scopes,bags,created_at) VALUES(?,?,?,?,?)
+	       ON CONFLICT(owner,grantee) DO UPDATE SET scopes=excluded.scopes, bags=excluded.bags, created_at=excluded.created_at`
+	if _, err := tx.ExecContext(ctx, up, from, accepter, scopes, bags, ts); err != nil {
+		return nil, err
+	}
+	if len(backScopes) > 0 {
+		if _, err := tx.ExecContext(ctx, up, accepter, from, join(backScopes), join(backBags), ts); err != nil {
+			return nil, err
+		}
+	}
+
 	return &Grant{Owner: from, Grantee: accepter, Scopes: split(scopes), Bags: split(bags)}, nil
 }
 

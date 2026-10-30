@@ -303,11 +303,11 @@ func normalizeNotifyEmail(raw string) (string, error) {
 
 func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Scopes        []string `json:"scopes"`
-		Bags          []string `json:"bags"`
-		TTLSeconds    int      `json:"ttl_seconds"`
-		ToEmail       string   `json:"to_email"`       // optional: email the accept link + code
-		GeneratePairing bool   `json:"generate_pairing"` // optional: generate shareable pairing link
+		Scopes          []string `json:"scopes"`
+		Bags            []string `json:"bags"`
+		TTLSeconds      int      `json:"ttl_seconds"`
+		ToEmail         string   `json:"to_email"`         // optional: email the accept link + code
+		GeneratePairing bool     `json:"generate_pairing"` // optional: generate shareable pairing link
 	}
 	if !decode(w, r, &in) {
 		return
@@ -936,28 +936,11 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// First verify the pairing token exists and is valid
-	info, err := s.st.GetInviteByPairingToken(r.Context(), auth.Hash(token))
-	if errors.Is(err, store.ErrNotFound) {
-		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
-		return
-	}
-	if err != nil {
-		s.internal(w, err)
-		return
-	}
-	// Register the new peer
+	// Atomically register and accept the pairing in one transaction
 	id, key := auth.NewID(), auth.NewKey()
-	if err := s.st.CreatePeer(r.Context(), id, in.Name, auth.Hash(key), ""); err != nil {
-		s.internal(w, err)
-		return
-	}
-	s.log.Info("peer registered via pairing", "peer_id", id, "inviter", info.FromPeer)
-	// Accept the pairing
-	g, err := s.st.AcceptInviteByPairingToken(r.Context(), auth.Hash(token), id, sc, bg)
+	g, err := s.st.RegisterAndAcceptByPairing(r.Context(), auth.Hash(token), id, in.Name, auth.Hash(key), "", sc, bg)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		// Should not happen since we just verified it, but handle anyway
 		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
 		return
 	case errors.Is(err, store.ErrConflict):
@@ -967,17 +950,17 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 		s.internal(w, err)
 		return
 	}
+	s.log.Info("unauthenticated pairing completed", "new_peer", id, "inviter", g.Owner)
 	resp := map[string]any{
-		"peer_id":         id,
-		"api_key":         key,
-		"name":            in.Name,
-		"paired_with":     g.Owner,
-		"granted_to_you":  g,
-		"note":            "api_key is shown once; store it securely",
+		"peer_id":        id,
+		"api_key":        key,
+		"name":           in.Name,
+		"paired_with":    g.Owner,
+		"granted_to_you": g,
+		"note":           "api_key is shown once; store it securely",
 	}
 	if len(sc) > 0 {
 		resp["granted_by_you"] = store.Grant{Owner: id, Grantee: g.Owner, Scopes: sc, Bags: bg}
 	}
-	s.log.Info("pairing accepted (unauthenticated)", "owner", g.Owner, "grantee", id)
 	writeJSON(w, http.StatusCreated, resp)
 }
