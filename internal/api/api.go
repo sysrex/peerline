@@ -605,6 +605,22 @@ func (s *Server) inviterName(ctx context.Context, id string) string {
 	return sanitizeInviterName(n)
 }
 
+// truncateUTF8 truncates s to at most max bytes at a UTF-8 rune boundary.
+// If the cut would land in the middle of a multibyte rune, backs off to
+// exclude the entire rune. Returns s unchanged if len(s) <= max.
+func truncateUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	// Back off while s[cut] is a continuation byte (not a rune start)
+	// This drops the incomplete rune entirely
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
 // sanitizeInviterName applies NFKC normalization and filters characters that can be used
 // for prompt injection or homoglyph attacks. Allows Unicode letters (L*), numbers (N*),
 // combining marks (Mn, Mc) with constraints, spaces (including tab/newline mapped to space),
@@ -632,9 +648,9 @@ func (s *Server) inviterName(ctx context.Context, id string) string {
 //   - Maximum 64 runes counted on the final NFC (composed) output
 //   - Precomposed characters (e.g., é = U+00E9) count as 1 rune
 //   - Hangul syllables (e.g., 한 = U+D55C) count as 1 rune each
-//   - Truncation respects grapheme cluster boundaries: if cutting at 64 runes
-//     would split a base from non-composing marks, backs off to exclude the
-//     entire trailing cluster
+//   - Truncation respects combining-mark cluster boundaries: if cutting at 64
+//     runes would split a base from non-composing marks, backs off to exclude
+//     the entire trailing cluster
 //
 // Returns "A Peerline peer" if the result is empty after filtering.
 //
@@ -648,15 +664,13 @@ func sanitizeInviterName(name string) string {
 		maxInputBytes   = 1024 // Guard against unbounded normalization work
 	)
 
-	// Guard: truncate raw input to maxInputBytes on a UTF-8 rune boundary
+	// Guard: truncate raw input to maxInputBytes at a UTF-8 rune boundary
 	// to prevent huge stored names from causing unbounded NFKC/NFD work
-	if len(name) > maxInputBytes {
-		name = name[:maxInputBytes]
-		// Back off to a rune boundary: step back while the last byte is not a rune start
-		for len(name) > 0 && !utf8.RuneStart(name[len(name)-1]) {
-			name = name[:len(name)-1]
-		}
-	}
+	name = truncateUTF8(name, maxInputBytes)
+
+	// Scrub invalid UTF-8 to ensure idempotence and consistent handling
+	// (norm does not apply compatibility mappings after an invalid byte)
+	name = strings.ToValidUTF8(name, "\uFFFD")
 
 	// Apply NFKC normalization first (compatibility decomposition + canonical composition)
 	// This normalizes fullwidth/halfwidth chars, ligatures, compatibility forms

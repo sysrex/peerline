@@ -1828,6 +1828,21 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"70 Hangul syllables gives 64", strings.Repeat("한", 70), strings.Repeat("한", 64)},
 		// a+acute recomposes to á in NFC, 70 gives 64
 		{"70 a+acute recomposes to 64 á", strings.Repeat("a\u0301", 70), strings.Repeat("á", 64)},
+
+		// Cluster ending exactly at rune 64 (kept whole)
+		{"Cluster at rune 64", strings.Repeat("a", 63) + "e\u0300", strings.Repeat("a", 63) + "è"},
+		// Cluster plus trailing space at cut
+		{"Cluster + space at cut", strings.Repeat("a", 62) + " e\u0316" + "zzz", strings.Repeat("a", 62)},
+		// 4 marks on one base (capped at 3)
+		{"4 marks capped at 3", "a\u0301\u0302\u0303\u0304", "á\u0302\u0303"},
+
+		// ZWJ emoji, flag, skin tone (filtered to letters or fallback)
+		{"ZWJ family emoji", "Al\u200D👨\u200D👩\u200Dice", "Alice"}, // ZWJ and emoji filtered
+		{"Flag sequence", "🇺🇸", "A Peerline peer"},                 // regional indicators are So, filtered
+		{"Skin tone modifier", "👋🏻", "A Peerline peer"},            // emoji and modifier both filtered
+
+		// NFKC-expanding input: ﷺ (U+FDFA) expands to 18 characters
+		{"NFKC expanding ﷺ×5", strings.Repeat("ﷺ", 5), "صلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى الله ع"},
 	}
 
 	for _, tt := range tests {
@@ -1895,6 +1910,59 @@ func TestSanitizerSplitCluster(t *testing.T) {
 	}
 }
 
+// TestTruncateUTF8 verifies the UTF-8 truncation helper
+func TestTruncateUTF8(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		max      int
+		wantLen  int
+		wantDesc string
+	}{
+		// Exact boundary cases
+		{"empty", "", 10, 0, ""},
+		{"shorter than max", "abc", 10, 3, "abc"},
+		{"exact max", "abcde", 5, 5, "abcde"},
+		{"max 0", "abc", 0, 0, ""},
+
+		// Cut inside multibyte runes
+		{"2-byte rune at cut", "aaa" + "é", 4, 3, "aaa"},      // é is c3 a9
+		{"3-byte rune at cut byte 1", "aa" + "日", 3, 2, "aa"}, // 日 is e6 97 a5, cut at e6
+		{"3-byte rune at cut byte 2", "aa" + "日", 4, 2, "aa"}, // cut at 97
+		{"4-byte rune at cut byte 1", "aa" + "😀", 3, 2, "aa"}, // 😀 is f0 9f 98 80, cut at f0
+		{"4-byte rune at cut byte 2", "aa" + "😀", 4, 2, "aa"}, // cut at 9f
+		{"4-byte rune at cut byte 3", "aa" + "😀", 5, 2, "aa"}, // cut at 98
+
+		// Multiple multibyte runes
+		{"multiple 3-byte", strings.Repeat("日", 10), 10, 9, "日日日"}, // 9 bytes = 3 runes
+
+		// Continuation byte runs (exercises backoff loop bound)
+		{"continuation bytes at cut", "aaa" + string([]byte{0x80, 0x80, 0x80}), 4, 2, "aa"}, // backs off past 0x80 at positions 3 and 4
+		{"many continuation bytes", string([]byte{0x80, 0x80, 0x80, 0x80, 0x80}), 3, 0, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncateUTF8(tt.input, tt.max)
+
+			// Check length
+			if len(got) != tt.wantLen {
+				t.Errorf("truncateUTF8(%q, %d) len = %d, want %d", tt.input, tt.max, len(got), tt.wantLen)
+			}
+
+			// Check valid UTF-8
+			if !utf8.ValidString(got) {
+				t.Errorf("truncateUTF8(%q, %d) returned invalid UTF-8: %q", tt.input, tt.max, got)
+			}
+
+			// Check it's a prefix
+			if !strings.HasPrefix(tt.input, got) {
+				t.Errorf("truncateUTF8(%q, %d) = %q, not a prefix", tt.input, tt.max, got)
+			}
+		})
+	}
+}
+
 // TestSanitizerHugeInput verifies the input guard prevents unbounded normalization work
 func TestSanitizerHugeInput(t *testing.T) {
 	// 100 KB of 'a' characters
@@ -1904,15 +1972,15 @@ func TestSanitizerHugeInput(t *testing.T) {
 	// Should return 64 'a' characters (truncated at input guard, then at 64 runes)
 	want := strings.Repeat("a", 64)
 	if got != want {
-		t.Errorf("sanitizeInviterName(100KB input) = %q (len %d), want %q (len %d)", got[:20]+"...", len([]rune(got)), want, len([]rune(want)))
+		t.Errorf("sanitizeInviterName(100KB input) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
 	}
 }
 
-// TestSanitizerInputGuardInvalidUTF8 verifies the input guard doesn't trim back past invalid bytes elsewhere
+// TestSanitizerInputGuardInvalidUTF8 verifies the input guard and ToValidUTF8 scrubbing
 func TestSanitizerInputGuardInvalidUTF8(t *testing.T) {
-	// 2000 bytes of 'a' with 0xff (invalid UTF-8) at byte 10
-	// Should give 64 'a' (not fallback), proving we don't trim back to empty
-	input := strings.Repeat("a", 10) + "\xff" + strings.Repeat("a", 1989)
+	// 2000 bytes of 'a' with invalid UTF-8 (continuation byte 0x80) at byte 10
+	// Should give 64 'a' (not fallback), proving we scrub invalid bytes
+	input := strings.Repeat("a", 10) + "\x80" + strings.Repeat("a", 1989)
 	got := sanitizeInviterName(input)
 	want := strings.Repeat("a", 64)
 
@@ -1936,6 +2004,25 @@ func TestSanitizerInputGuardRuneBoundary(t *testing.T) {
 	if got != want {
 		t.Errorf("sanitizeInviterName(input with 3-byte rune at boundary) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
 	}
+
+	// Verify result is valid UTF-8
+	if !utf8.ValidString(got) {
+		t.Errorf("sanitizeInviterName returned invalid UTF-8")
+	}
+}
+
+// TestSanitizerInputGuardContinuationBytes verifies backoff with continuation bytes near cut
+func TestSanitizerInputGuardContinuationBytes(t *testing.T) {
+	// 1020 'a' + run of 0x80 continuation bytes at the cut
+	input := strings.Repeat("a", 1020) + string([]byte{0x80, 0x80, 0x80, 0x80, 0x80}) + "bbb"
+	got := sanitizeInviterName(input)
+
+	// Should truncate before the continuation bytes, scrub any remaining invalid bytes,
+	// and return 64 'a'
+	want := strings.Repeat("a", 64)
+	if got != want {
+		t.Errorf("sanitizeInviterName(continuation bytes at cut) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
+	}
 }
 
 // TestSanitizerTrailingSpaceTrim verifies trailing spaces are trimmed after 64-rune cut
@@ -1950,6 +2037,77 @@ func TestSanitizerTrailingSpaceTrim(t *testing.T) {
 	if got != want {
 		t.Errorf("sanitizeInviterName(63a + space + text) = %q (len %d), want %q (len %d)", got, len([]rune(got)), want, len([]rune(want)))
 	}
+}
+
+// FuzzSanitizeInviterName fuzzes the sanitizer to ensure it never panics and maintains invariants
+func FuzzSanitizeInviterName(f *testing.F) {
+	// Seed corpus with interesting cases
+	seeds := []string{
+		"Alice Smith",
+		"José García",
+		"李明",
+		"한국어",
+		strings.Repeat("a", 100),
+		"a\u0301\u0302\u0303",
+		"\u200B\u200C\uFEFF",
+		"★★★",
+		"\xff\xfe",
+		"\x80\x80\x80",
+		"e\u0300\u0316",
+		"ﷺ",
+		strings.Repeat("é", 100),
+		strings.Repeat("한", 100),
+		"Alice\tSmith",
+		"Alice\nBob",
+		"",                                 // empty
+		"   ",                              // only spaces
+		"\u034F",                           // combining grapheme joiner
+		"a" + strings.Repeat("\u0301", 10), // many marks
+	}
+
+	for _, seed := range seeds {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, input string) {
+		// The function must not panic
+		got := sanitizeInviterName(input)
+
+		// Invariant 1: Output is valid UTF-8
+		if !utf8.ValidString(got) {
+			t.Errorf("sanitizeInviterName(%q) returned invalid UTF-8: %q", input, got)
+		}
+
+		// Invariant 2: Output is 1 to 64 runes (or the 17-char fallback)
+		runeCount := utf8.RuneCountInString(got)
+		if runeCount < 1 || runeCount > 64 {
+			t.Errorf("sanitizeInviterName(%q) returned %d runes, want 1-64: %q", input, runeCount, got)
+		}
+
+		// Invariant 3: Output is NFC normalized
+		if !norm.NFC.IsNormalString(got) {
+			t.Errorf("sanitizeInviterName(%q) returned non-NFC string: %q", input, got)
+		}
+
+		// Invariant 4: No leading or trailing space
+		if len(got) > 0 && (got[0] == ' ' || got[len(got)-1] == ' ') {
+			t.Errorf("sanitizeInviterName(%q) has leading/trailing space: %q", input, got)
+		}
+
+		// Invariant 5: No leading combining mark
+		if len(got) > 0 {
+			firstRune, _ := utf8.DecodeRuneInString(got)
+			if unicode.Is(unicode.Mn, firstRune) || unicode.Is(unicode.Mc, firstRune) || unicode.Is(unicode.Me, firstRune) {
+				t.Errorf("sanitizeInviterName(%q) starts with combining mark U+%04X: %q", input, firstRune, got)
+			}
+		}
+
+		// Invariant 6: Idempotent (sanitize(sanitize(x)) == sanitize(x))
+		got2 := sanitizeInviterName(got)
+		if got != got2 {
+			t.Errorf("sanitizeInviterName not idempotent: sanitize(%q) = %q, but sanitize(sanitize(%q)) = %q", input, got, input, got2)
+		}
+	})
 }
 
 // TestAPIClock verifies that api.Server.now is used in createInvite.
