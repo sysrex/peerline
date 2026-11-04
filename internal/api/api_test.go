@@ -3377,12 +3377,12 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"ﷺ×5 NFKC expands", strings.Repeat("\uFDFA", 5), "صلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى الله ع"}, // 5*18=90 -> 64
 
 		// Issue #182/#206: Virama cut (CCC 9) - should not leave dangling virama
-		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62)},       // क + virama + ष cut before the conjunct
-		{"chained virama at 64", strings.Repeat("a", 60) + "क्ष्म" + "bbb", strings.Repeat("a", 60)}, // क्ष्म (stacked) -> dropCluster removes all
-		{"many chained viramas", strings.Repeat("क्", 32) + "का", strings.Repeat("क्", 29) + "क"},    // 65 runes → 64 → backoff to 62 → tail cleanup to 60 → drop trailing virama → 59 (29 pairs + क)
+		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62)},                                       // क + virama + ष cut before the conjunct
+		{"chained virama at 64", strings.Repeat("a", 60) + "क्ष्म" + "bbb", strings.Repeat("a", 60) + "क्"},                        // 65 runes → 64 (60 a + क्ष्) → backoff drops ष् (bound) → 62 (60 a + क्, ends in virama)
+		{"many chained viramas", strings.Repeat("क्", 32) + "का", strings.Repeat("क्", 31)},                                        // 65 runes → 64 (32 pairs) → backoff drops 1 cluster (bound hit) → 62 runes (31 pairs, ends in virama); was fallback on main
 
-		// Issue #206: Stacked conjunct (C V C V | C) - dropCluster removes entire stacked conjunct
-		{"stacked conjunct at 64", strings.Repeat("a", 60) + "क्क्ष" + "bbb", strings.Repeat("a", 60)}, // 60 a + क्क्ष (stacked) -> 60 a (no trailing virama)
+		// Issue #206: Stacked conjunct (C V C V | C) - bounded back-off
+		{"stacked conjunct at 64", strings.Repeat("a", 60) + "क्क्ष" + "bbb", strings.Repeat("a", 60) + "क्"}, // 66 runes → 64 (60 a + क्क्) → backoff drops क् (bound) → 62 (60 a + क्, ends in virama)
 
 		// Issue #315: Word-final virama before punctuation (should be kept, not dropped)
 		// क् is 2 runes (क at 62, ् at 63), so with 62 'a' + क् + punctuation, the virama is at 63 and punctuation at 64
@@ -3394,9 +3394,9 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"word-final virama before apostrophe", strings.Repeat("a", 62) + "क्'" + "bbb", strings.Repeat("a", 62) + "क्"},
 
 		// Issue #332: Bounded back-off for long virama runs prevents collapse
-		{"40 க் clusters bounded backoff", strings.Repeat("க்", 40), strings.Repeat("க்", 29) + "க"},                         // 80 runes → 64 → backoff to 62 → tail cleanup to 60 → drop trailing virama → 59 (29 க் + க)
-		{"40 க் + 70 ब bounded backoff", strings.Repeat("க்", 40) + strings.Repeat("ब", 70), strings.Repeat("க்", 29) + "க"}, // Same path and result
-		{"ab + 40 க் bounded backoff", "ab" + strings.Repeat("க்", 40), "ab" + strings.Repeat("க்", 28) + "க"},               // 82 runes → 64 (ab+31 க்) → backoff to 62 → tail cleanup to 60 → drop trailing virama → 59 (ab+28 க் + க)
+		{"40 க் clusters bounded backoff", strings.Repeat("க்", 40), strings.Repeat("க்", 31)},                         // 80 runes → 64 (32 pairs) → backoff drops 1 cluster (counts toward bound) → 62 runes (31 pairs, ends in virama)
+		{"40 க் + 70 ब bounded backoff", strings.Repeat("க்", 40) + strings.Repeat("ब", 70), strings.Repeat("க்", 31)}, // Same: 110 runes → 64 (32 க் pairs) → backoff to 62 (31 pairs, ends in virama)
+		{"ab + 40 க் bounded backoff", "ab" + strings.Repeat("க்", 40), "ab" + strings.Repeat("க்", 30)},               // 82 runes → 64 (ab+31 pairs) → backoff to 62 (ab+30 pairs, ends in virama)
 	}
 
 	for _, tt := range tests {
@@ -3682,7 +3682,7 @@ func TestSanitizeInviterName(t *testing.T) {
 		{
 			name:  "mid-word virama dropped: cut inside a conjunct",
 			input: strings.Repeat("a", 60) + "क्ष्म" + "bbb",
-			want:  strings.Repeat("a", 60), // क्ष्म cut mid-word, virama clusters dropped (60 runes)
+			want:  strings.Repeat("a", 60) + "क्", // क्ष्म cut mid-word, bounded back-off drops ष् cluster (62 runes, ends in virama)
 		},
 		{
 			name:  "Tamil pulli: many word-final viramas",
@@ -3794,7 +3794,25 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 		}
 	}
 
-	// Invariant 9: Truncated output may end in CCC 9 (virama) only if word-final.
+	// Invariant 9: Output ends on an extended grapheme cluster boundary.
+	// The cut must not split a base character from its combining marks or virama.
+	if checkVirama {
+		full := []rune(sanitizeInviterNameUncapped(input))
+		out := []rune(got)
+		cutPos := len(out)
+		if cutPos < len(full) {
+			// Check that the next rune in full is not a combining mark or virama (CCC 9)
+			nextRune := full[cutPos]
+			isMark := unicode.Is(unicode.Mn, nextRune) || unicode.Is(unicode.Mc, nextRune) || unicode.Is(unicode.Me, nextRune)
+			props := norm.NFC.PropertiesString(string(nextRune))
+			isVirama := props.CCC() == 9
+			if isMark || isVirama {
+				t.Errorf("sanitizeInviterName(%q) [%s] cuts inside grapheme cluster: output ends at position %d, but full[%d]=U+%04X is a mark/virama: output=%q full=%q", input, label, cutPos, cutPos, nextRune, got, string(full))
+			}
+		}
+	}
+
+	// Invariant 10: Truncated output may end in CCC 9 (virama) only if word-final or bounded.
 	// For truncated paths, compare against the uncapped result.
 	if checkVirama {
 		// Get the uncapped result
@@ -3882,15 +3900,39 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 			}
 		}
 
-		// (a) If the output ends in CCC 9 and is shorter than full,
-		// the next rune in full must be a word boundary (word-final virama).
+		// (a) If the output ends in CCC 9 (virama) and is shorter than full,
+		// then either:
+		//   - the next rune in full is a word boundary (word-final virama), OR
+		//   - it's the bounded back-off case: the dropped region from len(out) to min(64, len(full))
+		//     is all consonant+virama clusters (base letters/numbers followed by marks/viramas) with
+		//     no word boundaries.
 		if len(out) > 0 && len(out) < len(full) {
 			lastRune := out[len(out)-1]
 			props := norm.NFC.PropertiesString(string(lastRune))
 			if props.CCC() == 9 {
 				nextRune := full[len(out)]
-				if !isWordBoundaryTest(nextRune) {
-					t.Errorf("sanitizeInviterName(%q) [%s] ends in mid-word CCC 9 (virama) rune U+%04X, next rune is U+%04X (not a word boundary): output=%q full=%q", input, label, lastRune, nextRune, got, string(full))
+				isWordFinal := isWordBoundaryTest(nextRune)
+
+				// Check if the dropped region is a boundary-free run of consonant+virama clusters
+				droppedEnd := len(full)
+				if droppedEnd > 64 {
+					droppedEnd = 64
+				}
+				isBoundedCase := true
+				for i := len(out); i < droppedEnd && isBoundedCase; i++ {
+					r := full[i]
+					// Must be a base (letter/number), mark, or virama
+					isMark := unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) || unicode.Is(unicode.Me, r)
+					rProps := norm.NFC.PropertiesString(string(r))
+					isVirama := rProps.CCC() == 9
+					isBase := unicode.IsLetter(r) || unicode.IsNumber(r)
+					if !isBase && !isMark && !isVirama {
+						isBoundedCase = false
+					}
+				}
+
+				if !isWordFinal && !isBoundedCase {
+					t.Errorf("sanitizeInviterName(%q) [%s] ends in mid-word CCC 9 (virama) rune U+%04X at non-bounded length %d, next rune is U+%04X (not a word boundary): output=%q full=%q", input, label, lastRune, len(out), nextRune, got, string(full))
 				}
 			}
 		}

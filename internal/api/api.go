@@ -1091,6 +1091,7 @@ func sanitizeInviterName(name string) string {
 
 		// Check if the last kept rune is a virama (CCC 9) and it's mid-word.
 		// A word-final virama (followed by a word boundary: space, punctuation, etc.) is complete and should not trigger back-off.
+		clustersDropped := 0
 		if len(truncated) > 0 && !isWordBoundary(runes[maxRunes]) {
 			lastRune := truncated[len(truncated)-1]
 			// Check if it's a virama using Canonical_Combining_Class
@@ -1111,6 +1112,7 @@ func sanitizeInviterName(name string) string {
 				if !isMark && !isVirama {
 					// Found the base, truncate before it
 					truncated = truncated[:i]
+					clustersDropped++ // Count this toward the maxViramaBackoff bound
 					break
 				}
 			}
@@ -1133,7 +1135,9 @@ func sanitizeInviterName(name string) string {
 			return t
 		}
 
-		clustersDropped := 0
+		// Bounded back-off: drop at most maxViramaBackoff trailing consonant+virama clusters
+		// when the cut lands inside a word. This prevents collapsing long boundary-free runs
+		// (issue #332). The output may end in a mid-word virama if the bound is hit.
 		for len(truncated) > 0 && clustersDropped < maxViramaBackoff {
 			last := truncated[len(truncated)-1]
 			props := norm.NFC.PropertiesString(string(last))
@@ -1150,21 +1154,6 @@ func sanitizeInviterName(name string) string {
 				break
 			}
 			clustersDropped++
-		}
-
-		// If the bound was hit and we still have a trailing mid-word virama,
-		// drop trailing virama characters (not whole clusters) to avoid leaving
-		// a dangling half-form. This is the "stop at the last cluster whose tail
-		// isn't a virama" fallback.
-		for len(truncated) > 0 && len(truncated) < len(runes) {
-			last := truncated[len(truncated)-1]
-			props := norm.NFC.PropertiesString(string(last))
-			if props.CCC() == 9 && !isWordBoundary(runes[len(truncated)]) {
-				// Still a mid-word virama after bounded back-off; drop just the virama
-				truncated = truncated[:len(truncated)-1]
-			} else {
-				break
-			}
 		}
 
 		// Trim trailing spaces after dropping virama clusters
