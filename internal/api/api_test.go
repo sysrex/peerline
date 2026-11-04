@@ -4248,6 +4248,10 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	// fake clock, so POST ?code= will see it as expired.
 	clk.Advance(2 * time.Second)
 
+	// Positive control: inv3 is now expired and returns 404 on POST accept
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv3.Code}, nil)
+	want(t, resp, body, 404)
+
 	// Use inv2
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
 	want(t, resp, body, 200)
@@ -4392,8 +4396,10 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 		if rsp.StatusCode != 405 {
 			t.Errorf("%s: want 405, got %d", method, rsp.StatusCode)
 		}
-		if rsp.Header.Get("Allow") == "" {
-			t.Errorf("%s: missing Allow header", method)
+		// Allow header includes DELETE because DELETE /v1/invites/{public_id} also matches
+		// the literal path segment "accept", and ServeMux lists all methods registered on that pattern.
+		if got := rsp.Header.Get("Allow"); got != "DELETE, POST" {
+			t.Errorf("%s: Allow = %q, want DELETE, POST", method, got)
 		}
 		if got := rsp.Header.Get("Deprecation"); got != wantDeprecation {
 			t.Errorf("%s with ?code=: Deprecation = %q, want %q", method, got, wantDeprecation)
