@@ -197,11 +197,11 @@ func TestDescribeTLSMode(t *testing.T) {
 
 func TestSMTPProbeAction(t *testing.T) {
 	tests := []struct {
-		name       string
-		err        error
-		wantFatal  bool
-		wantLevel  slog.Level
-		wantMsg    string
+		name      string
+		err       error
+		wantFatal bool
+		wantLevel slog.Level
+		wantMsg   string
 	}{
 		{
 			name:      "nil error = no action",

@@ -402,7 +402,7 @@ func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, 
 	recheckCfg := tlsCfg.Clone()
 	fixedTime := x509Invalid.Cert.NotAfter.Add(-time.Second)
 	recheckCfg.Time = func() time.Time { return fixedTime }
-	
+
 	// Re-handshake on a new connection to verify at the alternate time
 	timeout := 2 * time.Second
 	if deadline, ok := ctx.Deadline(); ok {
@@ -412,10 +412,10 @@ func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, 
 	}
 	recheckCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	
+
 	d := &net.Dialer{}
 	addr := net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
-	
+
 	if s.ImplicitTLS {
 		// For implicit TLS, dial with TLS directly
 		recheckConn, err := (&tls.Dialer{NetDialer: d, Config: recheckCfg}).DialContext(recheckCtx, "tcp", addr)
@@ -425,33 +425,33 @@ func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, 
 		}
 		return false
 	}
-	
+
 	// For STARTTLS, dial plaintext then upgrade
 	recheckConn, err := d.DialContext(recheckCtx, "tcp", addr)
 	if err != nil {
 		return false
 	}
 	defer recheckConn.Close()
-	
+
 	if deadline, ok := recheckCtx.Deadline(); ok {
 		recheckConn.SetDeadline(deadline)
 	}
-	
+
 	c, err := smtp.NewClient(recheckConn, s.Host)
 	if err != nil {
 		return false
 	}
 	defer c.Quit()
-	
+
 	if err := c.Hello("localhost"); err != nil {
 		return false
 	}
-	
+
 	hasSTARTTLS, _ := c.Extension("STARTTLS")
 	if !hasSTARTTLS {
 		return false
 	}
-	
+
 	if err := c.StartTLS(recheckCfg); err == nil {
 		return true // STARTTLS succeeded at alternate time
 	}
