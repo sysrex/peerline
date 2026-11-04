@@ -20,7 +20,7 @@ func TestLimiterManagerAllCoversEveryLimiter(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	
+
 	lm := NewLimiterManager(Config{MsgPerMinute: 1, MsgBurst: 1, AuthFailPerMinute: 1, AuthFailBurst: 1,
 		WritePerMinute: 1, WriteBurst: 1, EmailPerHour: 1, EmailBurst: 1, EmailRcptPerHour: 1, NotifyPerHour: 1, NotifyBurst: 1}, st)
 	defer lm.Stop()
@@ -47,7 +47,7 @@ func TestVersionLimiterPruned(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	
+
 	lm := NewLimiterManager(Config{MsgPerMinute: 1, MsgBurst: 1, AuthFailPerMinute: 1, AuthFailBurst: 1,
 		WritePerMinute: 1, WriteBurst: 1, EmailPerHour: 1, EmailBurst: 1, EmailRcptPerHour: 1, NotifyPerHour: 1, NotifyBurst: 1}, st)
 	defer lm.Stop()

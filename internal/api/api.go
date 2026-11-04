@@ -418,16 +418,16 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	var tokenWithExpiry string
 	var rawToken string
 	if notify != "" {
-	// Rate limit verification emails per-address
-	normalizedAddr := strings.ToLower(notify)
-	if !s.verifyLim.Allow(normalizedAddr) {
-		// Per-address budget exhausted: register anyway but skip email
-		tokenWithExpiry = "" // Leave unverified
-	} else {
-		rawToken = auth.NewSecret(auth.EmailVerifyPrefix)
-		issuedAt := s.st.Now().Unix()
-		tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
-	}
+		// Rate limit verification emails per-address
+		normalizedAddr := strings.ToLower(notify)
+		if !s.verifyLim.Allow(normalizedAddr) {
+			// Per-address budget exhausted: register anyway but skip email
+			tokenWithExpiry = "" // Leave unverified
+		} else {
+			rawToken = auth.NewSecret(auth.EmailVerifyPrefix)
+			issuedAt := s.st.Now().Unix()
+			tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
+		}
 	}
 
 	id, key := auth.NewID(), auth.NewKey()

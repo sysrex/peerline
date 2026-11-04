@@ -1958,7 +1958,7 @@ func TestLimiterManagerStops(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	
+
 	cfg := Config{
 		MsgPerMinute:     60,
 		MsgBurst:         10,
@@ -2970,7 +2970,7 @@ func TestAPIClock(t *testing.T) {
 	// Create a store with a fake clock (pointer to allow mutation)
 	currentTime := fixedTime.Unix()
 	clockFunc := func() int64 { return currentTime }
-	
+
 	st, err := store.OpenWithOptions(t.TempDir()+"/t.db", store.OpenOptions{
 		SkipMigrationBackup:  true,
 		Logger:               nil,
@@ -3057,7 +3057,7 @@ func TestAPIClock(t *testing.T) {
 
 	// Advance time to exactly expiry (expires_at)
 	currentTime = fixedTime.Unix() + 100
-	
+
 	// AcceptInvite should succeed at exactly expires_at
 	if _, err := st.AcceptInvite(ctx, testCode, "bob", nil, nil); err != nil {
 		t.Fatalf("AcceptInvite at exact boundary (now == expires_at) failed: %v", err)
@@ -3322,7 +3322,7 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 		defer mu.Unlock()
 		return now.Unix()
 	}
-	
+
 	// Create store with fake clock
 	dbPath := t.TempDir() + "/t.db"
 	st, err := store.OpenWithOptions(dbPath, store.OpenOptions{
@@ -3334,7 +3334,7 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	
+
 	cfg := Config{}
 	prepareTestConfig(t, st, &cfg)
 	apiSrv, err := New(st, cfg)
@@ -3344,7 +3344,7 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	t.Cleanup(apiSrv.Stop)
 	srv := httptest.NewServer(apiSrv.Handler())
 	t.Cleanup(srv.Close)
-	
+
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
 
 	// Create invites with different states: valid, used, expired, missing
@@ -3748,7 +3748,7 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 		defer mu429.Unlock()
 		return now429.Unix()
 	}
-	
+
 	// Create store with fake clock for rate limiting
 	dbPathLimited := t.TempDir() + "/t_limited.db"
 	stLimited, err := store.OpenWithOptions(dbPathLimited, store.OpenOptions{
@@ -3760,7 +3760,7 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { stLimited.Close() })
-	
+
 	cfgLimited := Config{WritePerMinute: 60, WriteBurst: 1}
 	prepareTestConfig(t, stLimited, &cfgLimited)
 	apiSrvLimited, err := New(stLimited, cfgLimited)
