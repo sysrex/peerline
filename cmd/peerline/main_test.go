@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -193,6 +195,68 @@ func TestDescribeTLSMode(t *testing.T) {
 	}
 }
 
+func TestSMTPProbeAction(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantFatal  bool
+		wantLevel  slog.Level
+		wantMsg    string
+	}{
+		{
+			name:      "nil error = no action",
+			err:       nil,
+			wantFatal: false,
+			wantLevel: slog.LevelInfo,
+			wantMsg:   "",
+		},
+		{
+			name:      "ErrRelayUnreachable = warn, not fatal",
+			err:       mailer.ErrRelayUnreachable,
+			wantFatal: false,
+			wantLevel: slog.LevelWarn,
+			wantMsg:   "smtp relay unreachable at startup (will retry on send)",
+		},
+		{
+			name:      "wrapped ErrRelayUnreachable = warn, not fatal",
+			err:       fmt.Errorf("context: %w", mailer.ErrRelayUnreachable),
+			wantFatal: false,
+			wantLevel: slog.LevelWarn,
+			wantMsg:   "smtp relay unreachable at startup (will retry on send)",
+		},
+		{
+			name:      "TLS error = fatal",
+			err:       errors.New("x509: certificate signed by unknown authority"),
+			wantFatal: true,
+			wantLevel: slog.LevelError,
+			wantMsg:   "smtp probe failed: TLS misconfiguration",
+		},
+		{
+			name:      "other error = fatal",
+			err:       errors.New("something else"),
+			wantFatal: true,
+			wantLevel: slog.LevelError,
+			wantMsg:   "smtp probe failed: TLS misconfiguration",
+		},
+	}
+
+	smtp := &mailer.SMTP{Host: "mail.example.com", Port: 587}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotFatal, gotLevel, gotMsg := smtpProbeAction(tt.err, smtp)
+			if gotFatal != tt.wantFatal {
+				t.Errorf("fatal = %v, want %v", gotFatal, tt.wantFatal)
+			}
+			if gotLevel != tt.wantLevel {
+				t.Errorf("level = %v, want %v", gotLevel, tt.wantLevel)
+			}
+			if gotMsg != tt.wantMsg {
+				t.Errorf("msg = %q, want %q", gotMsg, tt.wantMsg)
+			}
+		})
+	}
+}
+
 func TestDescribeSMTPMode(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -240,6 +304,18 @@ func TestDescribeSMTPMode(t *testing.T) {
 				Port:        465,
 				ImplicitTLS: true,
 				Timeout:     10 * time.Second,
+			},
+			wantLevel: slog.LevelInfo,
+			wantMsg:   "SMTP configured",
+		},
+		{
+			name: "port 465 with AllowPlaintext on non-loopback = INFO (no spurious warn)",
+			smtp: &mailer.SMTP{
+				Host:           "mail.example.com",
+				Port:           465,
+				ImplicitTLS:    true,
+				AllowPlaintext: true,
+				Timeout:        10 * time.Second,
 			},
 			wantLevel: slog.LevelInfo,
 			wantMsg:   "SMTP configured",

@@ -66,13 +66,25 @@ func describeTLSMode(smtp *mailer.SMTP) string {
 }
 
 // describeSMTPMode returns the log level and message for SMTP startup logging.
-// Returns WARN for non-loopback plaintext-allowed relays (invite codes unprotected in transit),
+// Returns WARN for non-loopback non-implicit-TLS relays with plaintext allowed (invite codes unprotected in transit),
 // INFO otherwise.
 func describeSMTPMode(smtp *mailer.SMTP) (slog.Level, string) {
-	if smtp.AllowPlaintext && !mailer.IsLoopback(smtp.Host) {
+	if !smtp.ImplicitTLS && smtp.AllowPlaintext && !mailer.IsLoopback(smtp.Host) {
 		return slog.LevelWarn, "SMTP configured with plaintext allowed to non-loopback relay; invite codes and message previews are not protected in transit"
 	}
 	return slog.LevelInfo, "SMTP configured"
+}
+
+// smtpProbeAction decides whether a probe error should be fatal (exit 1) or a warning.
+// Returns (fatal=true, level, message) for config errors; (fatal=false, level, message) for transient errors.
+func smtpProbeAction(err error, smtp *mailer.SMTP) (fatal bool, level slog.Level, message string) {
+	if err == nil {
+		return false, slog.LevelInfo, ""
+	}
+	if errors.Is(err, mailer.ErrRelayUnreachable) {
+		return false, slog.LevelWarn, "smtp relay unreachable at startup (will retry on send)"
+	}
+	return true, slog.LevelError, "smtp probe failed: TLS misconfiguration"
 }
 
 func main() {
@@ -226,11 +238,11 @@ func main() {
 	} else if smtp, ok := ml.(*mailer.SMTP); ok {
 		// Probe SMTP server at startup to fail fast if TLS is misconfigured.
 		// Network errors (connection refused, timeout) only warn; Send retries at runtime.
-		if err := smtp.Probe(context.Background()); err != nil {
-			if errors.Is(err, mailer.ErrRelayUnreachable) {
-				log.Warn("smtp relay unreachable at startup (will retry on send)", "host", smtp.Host, "port", smtp.Port, "err", err)
-			} else {
-				log.Error("smtp probe failed: TLS misconfiguration", "err", err)
+		probeErr := smtp.Probe(context.Background())
+		fatal, probeLevel, probeMsg := smtpProbeAction(probeErr, smtp)
+		if probeErr != nil {
+			log.Log(context.Background(), probeLevel, probeMsg, "host", smtp.Host, "port", smtp.Port, "err", probeErr)
+			if fatal {
 				os.Exit(1)
 			}
 		}

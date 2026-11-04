@@ -134,7 +134,6 @@ func TestFromEnv(t *testing.T) {
 		{"invalid require TLS", "localhost", "", "", "", "test@example.com", "ture", "", false, false, true, false, ""},
 		{"user without pass", "localhost", "", "u", "", "test@example.com", "", "", false, false, true, false, ""},
 		{"credentials with REQUIRE_TLS=false on non-loopback", "192.168.1.1", "", "u", "p", "test@example.com", "false", "smtp", true, false, false, false, ""},
-		{"bracketed IPv6 host is rejected", "[::1]", "", "", "", "test@example.com", "", "", false, false, true, false, ""},
 	}
 
 	for _, tt := range tests {
@@ -176,6 +175,43 @@ func TestFromEnv(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFromEnvRejectsBracketedHosts(t *testing.T) {
+	tests := []struct {
+		name            string
+		host            string
+		wantErrContains string
+	}{
+		{"[::1]", "[::1]", "bracketed"},
+		{"[::1", "[::1", "bracketed"},
+		{"::1]", "::1]", "bracketed"},
+		{"[]", "[]", "a valid hostname or IP"},
+		{"[::1]:25", "[::1]:25", "bracketed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PEERLINE_SMTP_HOST", tt.host)
+			t.Setenv("PEERLINE_SMTP_FROM", "test@example.com")
+			_, err := FromEnv(nil)
+			if err == nil {
+				t.Fatalf("expected error for host %q, got nil", tt.host)
+			}
+			if !strings.Contains(err.Error(), tt.wantErrContains) {
+				t.Fatalf("error %q should contain %q", err.Error(), tt.wantErrContains)
+			}
+		})
+	}
+}
+
+func TestFromEnvRejectsHostWithPort(t *testing.T) {
+	t.Setenv("PEERLINE_SMTP_HOST", "mail.example.com:587")
+	t.Setenv("PEERLINE_SMTP_FROM", "test@example.com")
+	_, err := FromEnv(nil)
+	if err == nil || !strings.Contains(err.Error(), "PEERLINE_SMTP_PORT") {
+		t.Fatalf("expected port error, got %v", err)
 	}
 }
 
@@ -299,6 +335,14 @@ func (fs *fakeServer) receivedCommands() []string {
 }
 
 func genTestCert(t *testing.T, hostname string) tls.Certificate {
+	return genTestCertWithValidity(t, hostname, time.Now(), time.Now().Add(time.Hour))
+}
+
+func genExpiredTestCert(t *testing.T, hostname string) tls.Certificate {
+	return genTestCertWithValidity(t, hostname, time.Now().Add(-2*time.Hour), time.Now().Add(-1*time.Hour))
+}
+
+func genTestCertWithValidity(t *testing.T, hostname string, notBefore, notAfter time.Time) tls.Certificate {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -306,8 +350,8 @@ func genTestCert(t *testing.T, hostname string) tls.Certificate {
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: hostname},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(time.Hour),
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:     []string{hostname},
@@ -772,7 +816,10 @@ func TestSMTPProbe(t *testing.T) {
 		defer srv.close()
 
 		certPool := x509.NewCertPool()
-		parsed, _ := x509.ParseCertificate(cert.Certificate[0])
+		parsed, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			t.Fatalf("failed to parse test cert: %v", err)
+		}
 		certPool.AddCert(parsed)
 
 		s := &SMTP{
@@ -782,9 +829,21 @@ func TestSMTPProbe(t *testing.T) {
 			AllowPlaintext: true,
 			TLSConfig:      &tls.Config{RootCAs: certPool, ServerName: "localhost"},
 		}
-		err := s.Probe(context.Background())
+		err = s.Probe(context.Background())
 		if err != nil {
 			t.Fatalf("probe should succeed with AllowPlaintext and good cert: %v", err)
+		}
+		// Verify STARTTLS was actually negotiated
+		cmds := srv.receivedCommands()
+		hasSTARTTLS := false
+		for _, cmd := range cmds {
+			if cmd == "STARTTLS" {
+				hasSTARTTLS = true
+				break
+			}
+		}
+		if !hasSTARTTLS {
+			t.Fatal("STARTTLS handshake should have been negotiated")
 		}
 	})
 
@@ -814,7 +873,8 @@ func TestSMTPProbe(t *testing.T) {
 			Port:           srv.port(),
 			Timeout:        2 * time.Second,
 			AllowPlaintext: true,
-			// No custom TLSConfig - will use system roots and fail
+			// Use explicit empty RootCAs pool to fail cert validation (no system roots)
+			TLSConfig: &tls.Config{RootCAs: x509.NewCertPool(), ServerName: "localhost"},
 		}
 		err := s.Probe(context.Background())
 		if err == nil {
@@ -822,6 +882,143 @@ func TestSMTPProbe(t *testing.T) {
 		}
 		if errors.Is(err, ErrRelayUnreachable) {
 			t.Fatalf("cert error should be fatal, not ErrRelayUnreachable: %v", err)
+		}
+	})
+
+	t.Run("STARTTLS with expired cert = ErrRelayUnreachable", func(t *testing.T) {
+		cert := genExpiredTestCert(t, "localhost")
+		srv := newFakeServer(t, true, &cert)
+		defer srv.close()
+
+		certPool := x509.NewCertPool()
+		parsed, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			t.Fatalf("failed to parse test cert: %v", err)
+		}
+		certPool.AddCert(parsed)
+
+		s := &SMTP{
+			Host:      "127.0.0.1",
+			Port:      srv.port(),
+			Timeout:   2 * time.Second,
+			TLSConfig: &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+		}
+		err = s.Probe(context.Background())
+		if err == nil {
+			t.Fatal("probe should fail on expired cert")
+		}
+		if !errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("expired cert should be ErrRelayUnreachable, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "expired or not yet valid") {
+			t.Fatalf("expected distinct expired cert message, got: %v", err)
+		}
+	})
+
+	t.Run("STARTTLS with not-yet-valid cert = ErrRelayUnreachable", func(t *testing.T) {
+		cert := genTestCertWithValidity(t, "localhost", time.Now().Add(time.Hour), time.Now().Add(2*time.Hour))
+		srv := newFakeServer(t, true, &cert)
+		defer srv.close()
+
+		certPool := x509.NewCertPool()
+		parsed, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			t.Fatalf("failed to parse test cert: %v", err)
+		}
+		certPool.AddCert(parsed)
+
+		s := &SMTP{
+			Host:      "127.0.0.1",
+			Port:      srv.port(),
+			Timeout:   2 * time.Second,
+			TLSConfig: &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+		}
+		err = s.Probe(context.Background())
+		if err == nil {
+			t.Fatal("probe should fail on not-yet-valid cert")
+		}
+		if !errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("not-yet-valid cert should be ErrRelayUnreachable, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "expired or not yet valid") {
+			t.Fatalf("expected distinct expired cert message, got: %v", err)
+		}
+	})
+
+	t.Run("STARTTLS expired+self-signed = fatal", func(t *testing.T) {
+		cert := genExpiredTestCert(t, "localhost")
+		srv := newFakeServer(t, true, &cert)
+		defer srv.close()
+
+		s := &SMTP{
+			Host:    "127.0.0.1",
+			Port:    srv.port(),
+			Timeout: 2 * time.Second,
+			// Use explicit empty RootCAs pool (self-signed won't be trusted)
+			TLSConfig: &tls.Config{RootCAs: x509.NewCertPool(), ServerName: "localhost"},
+		}
+		err := s.Probe(context.Background())
+		if err == nil {
+			t.Fatal("probe should fail on expired+self-signed cert")
+		}
+		if errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("expired+self-signed should be fatal, not ErrRelayUnreachable: %v", err)
+		}
+	})
+
+	t.Run("STARTTLS expired+wrong-host = fatal", func(t *testing.T) {
+		cert := genExpiredTestCert(t, "wronghost.example.com")
+		srv := newFakeServer(t, true, &cert)
+		defer srv.close()
+
+		certPool := x509.NewCertPool()
+		parsed, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			t.Fatalf("failed to parse test cert: %v", err)
+		}
+		certPool.AddCert(parsed)
+
+		s := &SMTP{
+			Host:      "127.0.0.1",
+			Port:      srv.port(),
+			Timeout:   2 * time.Second,
+			TLSConfig: &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+		}
+		err = s.Probe(context.Background())
+		if err == nil {
+			t.Fatal("probe should fail on expired+wrong-host cert")
+		}
+		if errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("expired+wrong-host should be fatal, not ErrRelayUnreachable: %v", err)
+		}
+	})
+
+	t.Run("STARTTLS expired+untrusted-CA = fatal", func(t *testing.T) {
+		cert := genExpiredTestCert(t, "localhost")
+		srv := newFakeServer(t, true, &cert)
+		defer srv.close()
+
+		// Create a different CA pool without our cert
+		otherCert := genTestCert(t, "other.example.com")
+		certPool := x509.NewCertPool()
+		otherParsed, err := x509.ParseCertificate(otherCert.Certificate[0])
+		if err != nil {
+			t.Fatalf("failed to parse other cert: %v", err)
+		}
+		certPool.AddCert(otherParsed)
+
+		s := &SMTP{
+			Host:      "127.0.0.1",
+			Port:      srv.port(),
+			Timeout:   2 * time.Second,
+			TLSConfig: &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+		}
+		err = s.Probe(context.Background())
+		if err == nil {
+			t.Fatal("probe should fail on expired+untrusted cert")
+		}
+		if errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("expired+untrusted should be fatal, not ErrRelayUnreachable: %v", err)
 		}
 	})
 
@@ -1043,6 +1240,105 @@ func TestSMTPImplicitTLS(t *testing.T) {
 		}
 		if !errors.Is(err, ErrRelayUnreachable) {
 			t.Fatalf("closed port should be ErrRelayUnreachable, got: %v", err)
+		}
+	})
+
+	t.Run("port 465 with expired cert = ErrRelayUnreachable", func(t *testing.T) {
+		cert := genExpiredTestCert(t, "localhost")
+		ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		fs := &fakeServer{ln: ln, cert: &cert, t: t}
+		go fs.serve()
+
+		certPool := x509.NewCertPool()
+		parsed, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			t.Fatalf("failed to parse test cert: %v", err)
+		}
+		certPool.AddCert(parsed)
+
+		s := &SMTP{
+			Host:        "127.0.0.1",
+			Port:        ln.Addr().(*net.TCPAddr).Port,
+			Timeout:     2 * time.Second,
+			ImplicitTLS: true,
+			TLSConfig:   &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+		}
+		err = s.Probe(context.Background())
+		if err == nil {
+			t.Fatal("probe should fail on expired cert")
+		}
+		if !errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("expired cert should be ErrRelayUnreachable, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "expired or not yet valid") {
+			t.Fatalf("expected distinct expired cert message, got: %v", err)
+		}
+	})
+
+	t.Run("port 465 expired+self-signed = fatal", func(t *testing.T) {
+		cert := genExpiredTestCert(t, "localhost")
+		ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		fs := &fakeServer{ln: ln, cert: &cert, t: t}
+		go fs.serve()
+
+		s := &SMTP{
+			Host:        "127.0.0.1",
+			Port:        ln.Addr().(*net.TCPAddr).Port,
+			Timeout:     2 * time.Second,
+			ImplicitTLS: true,
+			// Use explicit empty RootCAs pool (self-signed won't be trusted)
+			TLSConfig: &tls.Config{RootCAs: x509.NewCertPool(), ServerName: "localhost"},
+		}
+		err = s.Probe(context.Background())
+		if err == nil {
+			t.Fatal("probe should fail on expired+self-signed cert")
+		}
+		if errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("port 465 expired+self-signed should be fatal, not ErrRelayUnreachable: %v", err)
+		}
+	})
+
+	t.Run("port 465 expired+wrong-host = fatal", func(t *testing.T) {
+		cert := genExpiredTestCert(t, "wronghost.example.com")
+		ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		fs := &fakeServer{ln: ln, cert: &cert, t: t}
+		go fs.serve()
+
+		certPool := x509.NewCertPool()
+		parsed, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			t.Fatalf("failed to parse test cert: %v", err)
+		}
+		certPool.AddCert(parsed)
+
+		s := &SMTP{
+			Host:        "127.0.0.1",
+			Port:        ln.Addr().(*net.TCPAddr).Port,
+			Timeout:     2 * time.Second,
+			ImplicitTLS: true,
+			TLSConfig:   &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+		}
+		err = s.Probe(context.Background())
+		if err == nil {
+			t.Fatal("probe should fail on expired+wrong-host cert")
+		}
+		if errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("port 465 expired+wrong-host should be fatal, not ErrRelayUnreachable: %v", err)
 		}
 	})
 }
