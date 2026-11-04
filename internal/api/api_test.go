@@ -24,6 +24,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/sysrex/peerline/internal/auth"
+	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/store"
 	"golang.org/x/text/unicode/norm"
 )
@@ -3190,8 +3191,7 @@ func TestInviteAcceptGETWithScopesReturns405(t *testing.T) {
 func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	var logs syncBuf
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
-	capture := &captureMailer{}
-	srv := newServer(t, Config{Logger: logger, Mailer: capture})
+	srv := newServer(t, Config{Logger: logger, Mailer: mailer.Log{Logger: logger}})
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
 	c := register(t, srv, "carol")
 
@@ -3199,28 +3199,38 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv1 struct{ Code string }
-	json.Unmarshal(body, &inv1)
+	if err := json.Unmarshal(body, &inv1); err != nil || inv1.Code == "" {
+		t.Fatalf("inv1: %v %s", err, body)
+	}
 
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv2 struct{ Code string }
-	json.Unmarshal(body, &inv2)
+	if err := json.Unmarshal(body, &inv2); err != nil || inv2.Code == "" {
+		t.Fatalf("inv2: %v %s", err, body)
+	}
 
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv3 struct{ Code string }
-	json.Unmarshal(body, &inv3)
+	if err := json.Unmarshal(body, &inv3); err != nil || inv3.Code == "" {
+		t.Fatalf("inv3: %v %s", err, body)
+	}
 
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv4 struct{ Code string }
-	json.Unmarshal(body, &inv4)
+	if err := json.Unmarshal(body, &inv4); err != nil || inv4.Code == "" {
+		t.Fatalf("inv4: %v %s", err, body)
+	}
 
 	// Create invite with to_email to check mailer log line
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "test@example.com"}, nil)
 	want(t, resp, body, 201)
 	var inv5 struct{ Code string }
-	json.Unmarshal(body, &inv5)
+	if err := json.Unmarshal(body, &inv5); err != nil || inv5.Code == "" {
+		t.Fatalf("inv5: %v %s", err, body)
+	}
 
 	// Test all accept paths:
 	// 1. POST with body code (successful)
@@ -3276,6 +3286,10 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	}
 	if !strings.Contains(logStr, "peer registered") {
 		t.Error("logs should contain 'peer registered' (positive control)")
+	}
+	// Positive control: mailer log line is present for inv5 (to_email)
+	if !strings.Contains(logStr, "body_len") {
+		t.Error("logs should contain mailer 'body_len' (positive control for to_email path)")
 	}
 
 	// Check logs don't contain any of the codes or their prefixes.
@@ -3493,6 +3507,10 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	if resp2.StatusCode != 307 {
 		t.Errorf("// variant POST: want 307, got %d", resp2.StatusCode)
 	}
+	if got := resp2.Header.Get("Location"); got != "/v1/invites/accept?code="+inv1.Code {
+		t.Errorf("// variant Location: got %q, want /v1/invites/accept?code=...", got)
+	}
+	assertSecurityHeaders(t, resp2.Header, "// variant POST")
 
 	req, _ = http.NewRequest("POST", srv.URL+"/v1/invites/./accept?code="+inv1.Code, nil)
 	req.Header.Set("Authorization", "Bearer "+b.key)
@@ -3504,6 +3522,10 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	if resp2.StatusCode != 307 {
 		t.Errorf("/./ variant POST: want 307, got %d", resp2.StatusCode)
 	}
+	if got := resp2.Header.Get("Location"); got != "/v1/invites/accept?code="+inv1.Code {
+		t.Errorf("/./ variant Location: got %q, want /v1/invites/accept?code=...", got)
+	}
+	assertSecurityHeaders(t, resp2.Header, "/./ variant POST")
 
 	// Test 9: Unauthenticated landing with bad code returns 400
 	anon := &client{t: t, srv: srv, key: ""}

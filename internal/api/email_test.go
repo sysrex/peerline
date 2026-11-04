@@ -15,8 +15,6 @@ import (
 	"github.com/sysrex/peerline/internal/mailer"
 )
 
-var testExpiry = time.Date(2026, 12, 31, 23, 59, 59, 0, time.UTC)
-
 type syncBuf struct {
 	mu sync.Mutex
 	b  bytes.Buffer
@@ -218,6 +216,7 @@ func TestEmailSendFailureStillCreatesInvite(t *testing.T) {
 }
 
 func TestInviteEmailDirect(t *testing.T) {
+	testExpiry := time.Date(2026, 12, 31, 23, 59, 59, 0, time.UTC)
 	tests := []struct {
 		name       string
 		inviter    string
@@ -247,6 +246,7 @@ func TestInviteEmailDirect(t *testing.T) {
 				"inv_testcode123",
 				"POST",
 				"Content-Type: application/json",
+				"2026-12-31T23:59:59Z",
 			},
 			wantNotIn: []string{
 				"?code=",
@@ -268,6 +268,7 @@ func TestInviteEmailDirect(t *testing.T) {
 				`{"code":"inv_xyz789"}`,
 				"https://test.com/v1/invites/accept",
 				"inv_xyz789",
+				"2026-12-31T23:59:59Z",
 			},
 			wantNotIn: []string{
 				"?code=",
