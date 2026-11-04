@@ -130,6 +130,11 @@ func (m *MaintenanceManager) purgeExpired() bool {
 
 // reconcileKeyIndex checks the key index count against the peer count every tick,
 // and does a full rebuild if they differ or if rebuildInterval has elapsed.
+//
+// The forced rebuild fires every rebuildInterval (default 6 hours) based on elapsed
+// clock time. With a frozen clocktest.Fake, the forced rebuild never fires because
+// the clock does not advance. Tests that need the forced rebuild must Advance the
+// clock past rebuildInterval and call reconcileKeyIndex() directly.
 func (m *MaintenanceManager) reconcileKeyIndex() {
 	// Check if it's time for a periodic full rebuild
 	forceRebuild := m.clk.Now().Sub(m.lastRebuild) >= m.rebuildInterval
