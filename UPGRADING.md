@@ -281,6 +281,11 @@ After rollback:
 - `PEERLINE_BACKUP_KEEP=3`  
   Number of backups to retain across all schema versions (minimum: 1, default: 3)
 
+### Trusted Proxies
+
+- `PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD=1` (or `true`)  
+  Lowers the IPv6 floor from `/32` to `/29` (allowing public ranges like Cloudflare's `2a06:98c0::/29`) and permits ULA ranges within `fc00::/7` to skip the floor entirely. Accepted values: `1`, `true` (opt-in), `0`, `false`, or empty (default, opt-in off). Any other value causes startup failure. **Security warning:** Trusting a public `/29` lets anyone inside it spoof `X-Forwarded-For`.
+
 ### Database Location
 
 - `PEERLINE_DB=/path/to/peerline.db`  
