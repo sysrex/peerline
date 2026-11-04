@@ -993,7 +993,7 @@ func TestAcceptInviteExactBoundary(t *testing.T) {
 	ctx := context.Background()
 	currentTime := time.Unix(1000000, 0)
 	clk := clocktest.New(currentTime)
-	
+
 	s, err := OpenWithOptions(":memory:", OpenOptions{Clock: clk})
 	if err != nil {
 		t.Fatal(err)
