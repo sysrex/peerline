@@ -190,12 +190,15 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 		cfg.Logger.Warn("no trusted proxies configured: X-Forwarded-For will be ignored", "entries", len(cfg.TrustedProxies))
 	}
 
+	// Use store's clock for all rate limiters (single time source for API and store)
+	clk := msg.WithClock(st.Now)
+
 	s := &Server{
 		st:          st,
 		cfg:         cfg,
 		log:         cfg.Logger,
-		lim:         NewLimiterManager(cfg, st),
-		verifyLim:   msg.NewLimiterPerHour(3, 3), // 3 verification emails per peer/address per hour
+		lim:         NewLimiterManager(cfg, clk),
+		verifyLim:   msg.NewLimiterPerHour(3, 3, clk), // 3 verification emails per peer/address per hour
 		trustedNets: trustedNets,
 		pruneDone:   make(chan struct{}),
 	}

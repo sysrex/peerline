@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/sysrex/peerline/internal/msg"
-	"github.com/sysrex/peerline/internal/store"
 )
 
 // clientIP returns the client IP, honoring X-Forwarded-For only from trusted proxies.
@@ -292,24 +291,23 @@ const (
 )
 
 // NewLimiterManager creates and starts a new limiter manager.
-// The store's clock (st.Now) is used for all rate limiters.
-func NewLimiterManager(cfg Config, st *store.Store) *LimiterManager {
+// opts can include msg.WithClock() to use a custom time source.
+func NewLimiterManager(cfg Config, opts ...msg.LimiterOption) *LimiterManager {
 	ctx, cancel := context.WithCancel(context.Background())
-	clk := msg.WithClock(st.Now)
 	lm := &LimiterManager{
-		msgLim:        msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst, clk),
-		regLim:        msg.NewLimiter(10, 5, clk),
-		pairLim:       msg.NewLimiter(10, 5, clk),
-		failLim:       msg.NewLimiter(cfg.AuthFailPerMinute, cfg.AuthFailBurst, clk),
-		getLim:        msg.NewLimiter(getPerMinute, getBurst, clk),
-		versionLim:    msg.NewLimiter(120, 30, clk), // Separate limiter for /version to avoid monitor conflicts
-		authLim:       msg.NewLimiter(authGetPerMinute, authGetBurst, clk),
-		writeLim:      msg.NewLimiter(cfg.WritePerMinute, cfg.WriteBurst, clk),
-		bagWriteLim:   msg.NewLimiter(30, 10, clk),
-		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst, clk),
-		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour, clk),
-		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst, clk),
-		notifyAddrLim: msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst, clk), // Same limits, but per-address
+		msgLim:        msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst, opts...),
+		regLim:        msg.NewLimiter(10, 5, opts...),
+		pairLim:       msg.NewLimiter(10, 5, opts...),
+		failLim:       msg.NewLimiter(cfg.AuthFailPerMinute, cfg.AuthFailBurst, opts...),
+		getLim:        msg.NewLimiter(getPerMinute, getBurst, opts...),
+		versionLim:    msg.NewLimiter(120, 30, opts...), // Separate limiter for /version to avoid monitor conflicts
+		authLim:       msg.NewLimiter(authGetPerMinute, authGetBurst, opts...),
+		writeLim:      msg.NewLimiter(cfg.WritePerMinute, cfg.WriteBurst, opts...),
+		bagWriteLim:   msg.NewLimiter(30, 10, opts...),
+		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst, opts...),
+		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour, opts...),
+		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst, opts...),
+		notifyAddrLim: msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst, opts...), // Same limits, but per-address
 		ctx:           ctx,
 		cancel:        cancel,
 	}

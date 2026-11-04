@@ -278,10 +278,7 @@ func TestCapBeforeEmailBudget(t *testing.T) {
 func TestGETLimiterSeparateBuckets(t *testing.T) {
 	// Freeze clock to avoid wall-clock refill
 	clock := time.Unix(1000, 0)
-	st, err := store.OpenWithOptions(t.TempDir()+"/test.db", store.OpenOptions{
-		SkipMigrationBackup: true,
-		Now:                 func() int64 { return clock.Unix() },
-	})
+	st, err := openStoreWithTestClock(t.TempDir()+"/test.db", func() int64 { return clock.Unix() }, func() time.Time { return clock })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,10 +352,7 @@ func TestGETLimiterTokenRefill(t *testing.T) {
 	// Use pointer clock so we can advance it
 	clock := time.Unix(1000, 0)
 	clockPtr := &clock
-	st, err := store.OpenWithOptions(t.TempDir()+"/test.db", store.OpenOptions{
-		SkipMigrationBackup: true,
-		Now:                 func() int64 { return clockPtr.Unix() },
-	})
+	st, err := openStoreWithTestClock(t.TempDir()+"/test.db", func() int64 { return clockPtr.Unix() }, func() time.Time { return *clockPtr })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,10 +402,7 @@ func TestGETLimiterTokenRefill(t *testing.T) {
 func TestUntrustedClientRotatingXFF(t *testing.T) {
 	// Freeze clock
 	clock := time.Unix(1000, 0)
-	st, err := store.OpenWithOptions(t.TempDir()+"/test.db", store.OpenOptions{
-		SkipMigrationBackup: true,
-		Now:                 func() int64 { return clock.Unix() },
-	})
+	st, err := store.OpenWithTestClock(t.TempDir()+"/test.db", func() int64 { return clock.Unix() }, func() time.Time { return clock })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,10 +468,7 @@ func TestUntrustedClientRotatingXFF(t *testing.T) {
 func TestUntrustedClientRotatingXFFDefaultConfig(t *testing.T) {
 	// Freeze clock
 	clock := time.Unix(1000, 0)
-	st, err := store.OpenWithOptions(t.TempDir()+"/test.db", store.OpenOptions{
-		SkipMigrationBackup: true,
-		Now:                 func() int64 { return clock.Unix() },
-	})
+	st, err := store.OpenWithTestClock(t.TempDir()+"/test.db", func() int64 { return clock.Unix() }, func() time.Time { return clock })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -528,10 +516,7 @@ func TestUntrustedClientRotatingXFFDefaultConfig(t *testing.T) {
 func TestAnonymousGETDoesNotBlockAuthenticatedInbox(t *testing.T) {
 	// Freeze clock on the server's limiter manager
 	clock := time.Unix(1000, 0)
-	st, err := store.OpenWithOptions(t.TempDir()+"/test.db", store.OpenOptions{
-		SkipMigrationBackup: true,
-		Now:                 func() int64 { return clock.Unix() },
-	})
+	st, err := openStoreWithTestClock(t.TempDir()+"/test.db", func() int64 { return clock.Unix() }, func() time.Time { return clock })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -593,10 +578,7 @@ func TestAnonymousGETDoesNotBlockAuthenticatedInbox(t *testing.T) {
 func TestAuthenticatedLimiterDoesNotBlockAnonymousGET(t *testing.T) {
 	// Freeze clock
 	clock := time.Unix(1000, 0)
-	st, err := store.OpenWithOptions(t.TempDir()+"/test.db", store.OpenOptions{
-		SkipMigrationBackup: true,
-		Now:                 func() int64 { return clock.Unix() },
-	})
+	st, err := store.OpenWithTestClock(t.TempDir()+"/test.db", func() int64 { return clock.Unix() }, func() time.Time { return clock })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -641,10 +623,7 @@ func TestAuthenticatedLimiterDoesNotBlockAnonymousGET(t *testing.T) {
 func TestAuthenticatedGETLimiter(t *testing.T) {
 	// Freeze clock
 	clock := time.Unix(1000, 0)
-	st, err := store.OpenWithOptions(t.TempDir()+"/test.db", store.OpenOptions{
-		SkipMigrationBackup: true,
-		Now:                 func() int64 { return clock.Unix() },
-	})
+	st, err := store.OpenWithTestClock(t.TempDir()+"/test.db", func() int64 { return clock.Unix() }, func() time.Time { return clock })
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,7 +3,6 @@ package api
 import (
 	"bytes"
 	"context"
-	"github.com/sysrex/peerline/internal/store"
 	"log/slog"
 	"reflect"
 	"strings"
@@ -12,17 +11,12 @@ import (
 	"unsafe"
 
 	"github.com/sysrex/peerline/internal/msg"
+	"github.com/sysrex/peerline/internal/store"
 )
 
 func TestLimiterManagerAllCoversEveryLimiter(t *testing.T) {
-	st, err := store.Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-
 	lm := NewLimiterManager(Config{MsgPerMinute: 1, MsgBurst: 1, AuthFailPerMinute: 1, AuthFailBurst: 1,
-		WritePerMinute: 1, WriteBurst: 1, EmailPerHour: 1, EmailBurst: 1, EmailRcptPerHour: 1, NotifyPerHour: 1, NotifyBurst: 1}, st)
+		WritePerMinute: 1, WriteBurst: 1, EmailPerHour: 1, EmailBurst: 1, EmailRcptPerHour: 1, NotifyPerHour: 1, NotifyBurst: 1})
 	defer lm.Stop()
 	listed := map[unsafe.Pointer]bool{}
 	for _, l := range lm.all() {
@@ -39,17 +33,8 @@ func TestLimiterManagerAllCoversEveryLimiter(t *testing.T) {
 
 func TestVersionLimiterPruned(t *testing.T) {
 	now := time.Unix(1e9, 0)
-	st, err := store.OpenWithOptions(":memory:", store.OpenOptions{
-		SkipMigrationBackup: true,
-		Now:                 func() int64 { return now.Unix() },
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-
 	lm := NewLimiterManager(Config{MsgPerMinute: 1, MsgBurst: 1, AuthFailPerMinute: 1, AuthFailBurst: 1,
-		WritePerMinute: 1, WriteBurst: 1, EmailPerHour: 1, EmailBurst: 1, EmailRcptPerHour: 1, NotifyPerHour: 1, NotifyBurst: 1}, st)
+		WritePerMinute: 1, WriteBurst: 1, EmailPerHour: 1, EmailBurst: 1, EmailRcptPerHour: 1, NotifyPerHour: 1, NotifyBurst: 1}, msg.WithClock(func() time.Time { return now }))
 	defer lm.Stop()
 	lm.versionLim.Allow("1.2.3.4")
 	now = now.Add(time.Hour)

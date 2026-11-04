@@ -966,7 +966,7 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Deterministic state-flag clock: first call (pre-check) passes, second call (tx) fails
+	// Clock advances between pre-check and tx: first call passes, second call fails
 	callCount := 0
 	s.now = func() int64 {
 		callCount++
@@ -3416,7 +3416,7 @@ func TestBackupCollisionRetry(t *testing.T) {
 	opts := OpenOptions{
 		Logger:               slog.Default(),
 		BackupRetentionCount: 3,
-		Now: func() int64 {
+		now: func() int64 {
 			return fixedTime.Unix()
 		},
 	}

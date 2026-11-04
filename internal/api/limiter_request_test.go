@@ -17,10 +17,7 @@ func (c *fakeClock) unix() int64    { return c.t.Unix() }
 
 func newLimitedServer(t *testing.T, trusted []string, clk *fakeClock) http.Handler {
 	t.Helper()
-	st, err := store.OpenWithOptions(":memory:", store.OpenOptions{
-		SkipMigrationBackup: true,
-		Now:                 clk.unix,
-	})
+	st, err := openStoreWithTestClock(":memory:", clk.unix, clk.now)
 	if err != nil {
 		t.Fatal(err)
 	}

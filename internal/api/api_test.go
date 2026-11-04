@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode"
@@ -1953,12 +1954,6 @@ func doAnon(t *testing.T, srv *httptest.Server, method, path string, body any, h
 // Lifecycle tests for LimiterManager and MaintenanceManager
 
 func TestLimiterManagerStops(t *testing.T) {
-	st, err := store.Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-
 	cfg := Config{
 		MsgPerMinute:     60,
 		MsgBurst:         10,
@@ -1968,7 +1963,7 @@ func TestLimiterManagerStops(t *testing.T) {
 		NotifyPerHour:    10,
 		NotifyBurst:      5,
 	}
-	mgr := NewLimiterManager(cfg, st)
+	mgr := NewLimiterManager(cfg)
 
 	// Let it run a bit
 	time.Sleep(100 * time.Millisecond)
@@ -2964,20 +2959,17 @@ func FuzzSanitizeInviterName(f *testing.F) {
 // TestAPIClock verifies that the API uses the store's clock for invite expiry.
 // The store's clock is the single source of time for both API and store layers.
 func TestAPIClock(t *testing.T) {
-	ctx := context.Background()
 	fixedTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
 
-	// Create a store with a fake clock (pointer to allow mutation)
-	currentTime := fixedTime.Unix()
-	clockFunc := func() int64 { return currentTime }
+	// Create store with fake clock (use atomic for safe concurrent access)
+	var currentTimeUnix atomic.Int64
+	currentTimeUnix.Store(fixedTime.Unix())
 
-	st, err := store.OpenWithOptions(t.TempDir()+"/t.db", store.OpenOptions{
-		SkipMigrationBackup:  true,
-		Logger:               nil,
-		BackupRetentionCount: 3,
-		BackupDir:            "",
-		Now:                  clockFunc,
-	})
+	st, err := openStoreWithTestClock(
+		t.TempDir()+"/t.db",
+		func() int64 { return currentTimeUnix.Load() },
+		func() time.Time { return time.Unix(currentTimeUnix.Load(), 0).UTC() },
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2996,36 +2988,72 @@ func TestAPIClock(t *testing.T) {
 	}
 	defer srv.Stop()
 
+	// Verify that New defaults to a non-nil clock (test on a fresh store without fake clock)
+	stDefault, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stDefault.Close()
+	if _, _, err := stDefault.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	srvDefault, err := New(stDefault, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srvDefault.Stop()
+	// Verify clock is working by checking Now() doesn't panic and returns reasonable time
+	now := stDefault.Now()
+	if now.IsZero() || now.Before(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("New() should default to a working clock, got %v", now)
+	}
+
 	// Create test server and client
 	testSrv := httptest.NewServer(srv.Handler())
 	defer testSrv.Close()
 
-	// Register a peer
-	c := &client{t: t, srv: testSrv}
-	resp, body := c.do("POST", "/v1/register", map[string]string{"name": "alice"}, nil)
+	// Register two peers
+	alice := &client{t: t, srv: testSrv}
+	resp, body := alice.do("POST", "/v1/register", map[string]string{"name": "alice"}, nil)
 	want(t, resp, body, 201)
 
-	var regResp map[string]any
-	if err := json.Unmarshal(body, &regResp); err != nil {
-		t.Fatalf("unmarshal register response: %v", err)
+	var aliceResp map[string]any
+	if err := json.Unmarshal(body, &aliceResp); err != nil {
+		t.Fatalf("unmarshal alice register response: %v", err)
 	}
-	peerID, ok := regResp["peer_id"].(string)
-	if !ok || peerID == "" {
-		t.Fatal("register response missing peer_id")
+	aliceID, _ := aliceResp["peer_id"].(string)
+	aliceKey, _ := aliceResp["api_key"].(string)
+	if aliceID == "" || aliceKey == "" {
+		t.Fatal("register response missing peer_id or api_key")
 	}
-	apiKey, ok := regResp["api_key"].(string)
-	if !ok || apiKey == "" {
-		t.Fatal("register response missing api_key")
-	}
-	c.id, c.key = peerID, apiKey
+	alice.id, alice.key = aliceID, aliceKey
 
-	// Create an invite with default TTL (1h)
-	resp, body = c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	bob := &client{t: t, srv: testSrv}
+	resp, body = bob.do("POST", "/v1/register", map[string]string{"name": "bob"}, nil)
+	want(t, resp, body, 201)
+
+	var bobResp map[string]any
+	if err := json.Unmarshal(body, &bobResp); err != nil {
+		t.Fatalf("unmarshal bob register response: %v", err)
+	}
+	bobID, _ := bobResp["peer_id"].(string)
+	bobKey, _ := bobResp["api_key"].(string)
+	if bobID == "" || bobKey == "" {
+		t.Fatal("register response missing peer_id or api_key")
+	}
+	bob.id, bob.key = bobID, bobKey
+
+	// Create an invite via API at fixedTime with 100-second TTL
+	resp, body = alice.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 100}, nil)
 	want(t, resp, body, 201)
 
 	var invResp map[string]any
 	if err := json.Unmarshal(body, &invResp); err != nil {
 		t.Fatalf("unmarshal invite response: %v", err)
+	}
+	code, ok := invResp["code"].(string)
+	if !ok || code == "" {
+		t.Fatal("invite response missing code")
 	}
 	expiresAtStr, ok := invResp["expires_at"].(string)
 	if !ok || expiresAtStr == "" {
@@ -3036,31 +3064,38 @@ func TestAPIClock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse expires_at: %v", err)
 	}
-	expected := fixedTime.Add(time.Hour).UTC()
+	expected := fixedTime.Add(100 * time.Second).UTC()
 	if !expTime.Equal(expected) {
 		t.Errorf("expires_at = %v, want %v", expTime, expected)
 	}
 
-	// Create a second peer to accept the invite
-	if err := st.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
-		t.Fatal(err)
+	// Advance time to exactly expires_at (now == expires_at, should be accepted)
+	currentTimeUnix.Store(fixedTime.Unix() + 100)
+
+	// Accept via API at exactly expires_at - should succeed
+	resp, body = bob.do("POST", "/v1/invites/accept", map[string]any{"code": code}, nil)
+	if resp.StatusCode != 200 {
+		t.Errorf("accept at exact boundary (now == expires_at): expected 200, got %d: %s", resp.StatusCode, body)
 	}
 
-	// Test: at exactly expiry time (expires_at), invite should still be valid
-	// This proves both API and store agree on time and the exact boundary semantics
-	// Create a new invite with a known short expiry
-	inviteExpiry := fixedTime.Add(100 * time.Second)
-	testCode := "test_boundary_code"
-	if err := st.CreateInvite(ctx, testCode, peerID, []string{"messages"}, nil, inviteExpiry); err != nil {
-		t.Fatal(err)
+	// Create another invite for expires_at+1 test
+	resp, body = alice.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 100}, nil)
+	want(t, resp, body, 201)
+
+	if err := json.Unmarshal(body, &invResp); err != nil {
+		t.Fatalf("unmarshal second invite response: %v", err)
+	}
+	code2, ok := invResp["code"].(string)
+	if !ok || code2 == "" {
+		t.Fatal("second invite response missing code")
 	}
 
-	// Advance time to exactly expiry (expires_at)
-	currentTime = fixedTime.Unix() + 100
+	// Advance time to expires_at+1 (should be rejected)
+	currentTimeUnix.Store(fixedTime.Unix() + 201)
 
-	// AcceptInvite should succeed at exactly expires_at
-	if _, err := st.AcceptInvite(ctx, testCode, "bob", nil, nil); err != nil {
-		t.Fatalf("AcceptInvite at exact boundary (now == expires_at) failed: %v", err)
+	resp, body = bob.do("POST", "/v1/invites/accept", map[string]any{"code": code2}, nil)
+	if resp.StatusCode != 404 {
+		t.Errorf("accept at expires_at+1: expected 404, got %d: %s", resp.StatusCode, body)
 	}
 }
 
@@ -3325,11 +3360,7 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 
 	// Create store with fake clock
 	dbPath := t.TempDir() + "/t.db"
-	st, err := store.OpenWithOptions(dbPath, store.OpenOptions{
-		SkipMigrationBackup:  true,
-		BackupRetentionCount: 3,
-		Now:                  fakeClock,
-	})
+	st, err := openStoreWithTestClock(dbPath, fakeClock, func() time.Time { return time.Unix(fakeClock(), 0).UTC() })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3751,11 +3782,7 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 
 	// Create store with fake clock for rate limiting
 	dbPathLimited := t.TempDir() + "/t_limited.db"
-	stLimited, err := store.OpenWithOptions(dbPathLimited, store.OpenOptions{
-		SkipMigrationBackup:  true,
-		BackupRetentionCount: 3,
-		Now:                  fakeClock429,
-	})
+	stLimited, err := openStoreWithTestClock(dbPathLimited, fakeClock429, func() time.Time { return time.Unix(fakeClock429(), 0).UTC() })
 	if err != nil {
 		t.Fatal(err)
 	}

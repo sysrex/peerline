@@ -52,6 +52,7 @@ var memDBCounter uint64
 type Store struct {
 	db                 *sql.DB
 	now                func() int64
+	nowTime            func() time.Time // High-precision clock for API/rate limiters
 	schemaVersionInUse int
 	lastBackupPath     string
 	backupReused       bool
@@ -61,8 +62,9 @@ type Store struct {
 
 // Now returns the current time according to this store's clock.
 // This is the single source of time for both API and store layers.
+// Uses high-precision time.Time (not truncated to seconds) for rate limiters.
 func (s *Store) Now() time.Time {
-	return time.Unix(s.now(), 0).UTC()
+	return s.nowTime()
 }
 
 // migrations is the ordered list of schema migration functions.
@@ -119,9 +121,10 @@ type OpenOptions struct {
 	// vacuumInto is an injectable hook for testing. If nil, uses db.Exec("VACUUM INTO ?", path).
 	vacuumInto func(db *sql.DB, backupPath string) error
 
-	// Now is an injectable clock for testing. If nil, uses time.Now().Unix().
+	// now is an injectable clock for testing. If nil, uses time.Now().Unix().
 	// Used for backup timestamps and other time-based operations.
-	Now func() int64
+	// Unexported to keep clock test-only; use testNow() helper in tests.
+	now func() int64
 
 	// migrationStepHook is an injectable hook for testing migration step failures.
 	// Called before each migration step with (targetVersion, currentVersion). If it returns
@@ -275,10 +278,12 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		return nil, fmt.Errorf("schema: %w", err)
 	}
 
-	nowFunc := opts.Now
+	nowFunc := opts.now
 	if nowFunc == nil {
 		nowFunc = func() int64 { return time.Now().Unix() }
 	}
+
+	nowTimeFunc := func() time.Time { return time.Now() }
 
 	schemaInUse, err := runMigrations(db, currentVersion, opts)
 	if err != nil {
@@ -297,6 +302,7 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	return &Store{
 		db:                 db,
 		now:                nowFunc,
+		nowTime:            nowTimeFunc,
 		schemaVersionInUse: schemaInUse,
 		lastBackupPath:     backupPath,
 		backupReused:       reused,
@@ -525,7 +531,7 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 	}
 
 	// Create new backup
-	nowFunc := opts.Now
+	nowFunc := opts.now
 	if nowFunc == nil {
 		nowFunc = func() int64 { return time.Now().Unix() }
 	}
