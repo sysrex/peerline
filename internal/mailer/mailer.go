@@ -110,10 +110,16 @@ func (s *SMTP) checkSTARTTLS(offered bool) error {
 }
 
 // IsLoopback returns true if host is a loopback address.
-// Matches net/smtp PlainAuth: "localhost", "127.0.0.1", and "::1".
-// Hostnames are not resolved; only these three literals are recognized as loopback.
+// Recognizes "localhost" by name, and any IPv4 or IPv6 loopback address
+// (including expanded forms like "0:0:0:0:0:0:0:1" or "127.0.0.2").
 func IsLoopback(host string) bool {
-	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // isLoopbackAddr reports whether a connection's remote address is a loopback IP.
@@ -137,8 +143,17 @@ func FromEnv(lg *slog.Logger) (Sender, error) {
 		}
 		return nil, fmt.Errorf("PEERLINE_SMTP_HOST: bracketed address %q not allowed (use %s)", host, suggested)
 	}
+	// Reject IPv6 zone IDs (e.g. fe80::1%eth0)
+	if strings.Contains(host, "%") {
+		return nil, errors.New("PEERLINE_SMTP_HOST: IPv6 zone IDs are not supported in PEERLINE_SMTP_HOST")
+	}
 	// Reject host:port syntax (port must be in PEERLINE_SMTP_PORT), but allow IPv6 addresses
 	if strings.Contains(host, ":") && net.ParseIP(host) == nil {
+		// If it has a port, extract the bare host and port for the hint
+		bareHost, portStr, err := net.SplitHostPort(host)
+		if err == nil {
+			return nil, fmt.Errorf("PEERLINE_SMTP_HOST: host %q contains ':' (use %s with PEERLINE_SMTP_PORT=%s for the port)", host, bareHost, portStr)
+		}
 		return nil, fmt.Errorf("PEERLINE_SMTP_HOST: host %q contains ':' (use PEERLINE_SMTP_PORT for the port)", host)
 	}
 	port := 587
@@ -309,11 +324,8 @@ func (s *SMTP) Probe(ctx context.Context) error {
 		tlsConn := tls.Client(conn, tlsCfg)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			// Check for not-yet-valid certificate (fatal: clock skew or misconfiguration)
-			var x509Invalid x509.CertificateInvalidError
-			if errors.As(err, &x509Invalid) && x509Invalid.Reason == x509.Expired && x509Invalid.Cert != nil {
-				if time.Now().Before(x509Invalid.Cert.NotBefore) {
-					return fmt.Errorf("smtp probe: TLS handshake failed on port 465: certificate not yet valid (NotBefore=%v); check the host clock: %w", x509Invalid.Cert.NotBefore.Format(time.RFC3339), err)
-				}
+			if isNotYetValid, msg := isNotYetValidError(err, tlsCfg, "TLS handshake failed on port 465"); isNotYetValid {
+				return errors.New(msg)
 			}
 			// Check for expiry-only error (transient: relay state, not Peerline config)
 			if s.isExpiryOnlyError(ctx, err, conn, tlsCfg) {
@@ -353,11 +365,8 @@ func (s *SMTP) Probe(ctx context.Context) error {
 			// Actually perform the handshake to verify certs
 			if err := c.StartTLS(tlsCfg); err != nil {
 				// Check for not-yet-valid certificate (fatal: clock skew or misconfiguration)
-				var x509Invalid x509.CertificateInvalidError
-				if errors.As(err, &x509Invalid) && x509Invalid.Reason == x509.Expired && x509Invalid.Cert != nil {
-					if time.Now().Before(x509Invalid.Cert.NotBefore) {
-						return fmt.Errorf("smtp probe: STARTTLS handshake failed: certificate not yet valid (NotBefore=%v); check the host clock: %w", x509Invalid.Cert.NotBefore.Format(time.RFC3339), err)
-					}
+				if isNotYetValid, msg := isNotYetValidError(err, tlsCfg, "STARTTLS handshake failed"); isNotYetValid {
+					return errors.New(msg)
 				}
 				// Check for expiry-only error (transient: relay state, not Peerline config)
 				if s.isExpiryOnlyError(ctx, err, conn, tlsCfg) {
@@ -371,6 +380,27 @@ func (s *SMTP) Probe(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// isNotYetValidError returns true if err is a certificate not-yet-valid error (NotBefore in the future).
+// If true, it returns the error message to use (mentions "check the host clock" and includes the context).
+// The context describes where the error occurred (e.g., "port 465" or "STARTTLS handshake").
+func isNotYetValidError(err error, tlsCfg *tls.Config, context string) (bool, string) {
+	var x509Invalid x509.CertificateInvalidError
+	if !errors.As(err, &x509Invalid) || x509Invalid.Reason != x509.Expired || x509Invalid.Cert == nil {
+		return false, ""
+	}
+	// Use tlsCfg.Time if set (for tests), otherwise use time.Now()
+	now := time.Now()
+	if tlsCfg != nil && tlsCfg.Time != nil {
+		now = tlsCfg.Time()
+	}
+	if now.Before(x509Invalid.Cert.NotBefore) {
+		msg := fmt.Sprintf("smtp probe: %s: certificate not yet valid (NotBefore=%v); check the host clock: %v",
+			context, x509Invalid.Cert.NotBefore.Format(time.RFC3339), err)
+		return true, msg
+	}
+	return false, ""
 }
 
 // isTLSError returns true if err is a certificate validation error or TLS protocol error.
@@ -420,7 +450,12 @@ func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, 
 		return false
 	}
 	// Not-yet-valid (NotBefore in the future) is fatal: indicates clock skew or misconfiguration
-	if time.Now().Before(x509Invalid.Cert.NotBefore) {
+	// Use tlsCfg.Time if set (for tests), otherwise use time.Now()
+	now := time.Now()
+	if tlsCfg != nil && tlsCfg.Time != nil {
+		now = tlsCfg.Time()
+	}
+	if now.Before(x509Invalid.Cert.NotBefore) {
 		return false
 	}
 	// Cert is expired (past NotAfter). Check if it would be valid at NotAfter - 1s.
