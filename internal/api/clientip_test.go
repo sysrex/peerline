@@ -1360,6 +1360,49 @@ func TestIPv6FloorWithOptIn(t *testing.T) {
 	}
 }
 
+func TestRelaxedWarning(t *testing.T) {
+	tests := []struct {
+		name      string
+		hasPublic bool
+		hasULA    bool
+		want      string
+	}{
+		{
+			name:      "both public and ULA",
+			hasPublic: true,
+			hasULA:    true,
+			want:      "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /29 lets anyone inside it spoof X-Forwarded-For; ULA (fc00::/7) ranges are also permitted and exempt from the /32 floor",
+		},
+		{
+			name:      "public only",
+			hasPublic: true,
+			hasULA:    false,
+			want:      "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /29 lets anyone inside it spoof X-Forwarded-For",
+		},
+		{
+			name:      "ULA only",
+			hasPublic: false,
+			hasULA:    true,
+			want:      "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: ULA (fc00::/7) ranges are permitted and exempt from the /32 floor",
+		},
+		{
+			name:      "neither (fallback)",
+			hasPublic: false,
+			hasULA:    false,
+			want:      "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: broader ranges are permitted",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := relaxedWarning(tt.hasPublic, tt.hasULA)
+			if got != tt.want {
+				t.Errorf("relaxedWarning(%v, %v) = %q, want %q", tt.hasPublic, tt.hasULA, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAllowBroadIPv6Warning(t *testing.T) {
 	tests := []struct {
 		name               string
@@ -1368,6 +1411,7 @@ func TestAllowBroadIPv6Warning(t *testing.T) {
 		wantULA            bool
 		wantRelaxedEntries []string
 		wantNotOnRelaxed   []string
+		wantWarnCount      int
 	}{
 		{
 			name:               "both public and ULA",
@@ -1375,6 +1419,7 @@ func TestAllowBroadIPv6Warning(t *testing.T) {
 			wantPublic:         true,
 			wantULA:            true,
 			wantRelaxedEntries: []string{"2a06:98c0::/29", "fd00::/8"},
+			wantWarnCount:      1,
 		},
 		{
 			name:               "public only",
@@ -1383,6 +1428,7 @@ func TestAllowBroadIPv6Warning(t *testing.T) {
 			wantULA:            false,
 			wantRelaxedEntries: []string{"2a06:98c0::/29"},
 			wantNotOnRelaxed:   []string{"2001:db8::/32"},
+			wantWarnCount:      1,
 		},
 		{
 			name:               "ULA only",
@@ -1390,6 +1436,7 @@ func TestAllowBroadIPv6Warning(t *testing.T) {
 			wantPublic:         false,
 			wantULA:            true,
 			wantRelaxedEntries: []string{"fd00::/8", "fc00::/7"},
+			wantWarnCount:      1,
 		},
 	}
 
@@ -1400,55 +1447,75 @@ func TestAllowBroadIPv6Warning(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer st.Close()
-			var logs bytes.Buffer
+			h := &captureHandler{}
 			srv := mustNew(t, st, Config{
 				TrustedProxies: tt.trustedProxies,
 				AllowBroadIPv6: true,
-				Logger:         slog.New(slog.NewTextHandler(&logs, nil)),
+				Logger:         slog.New(h),
 			})
 			defer srv.lim.Stop()
 
-			logOutput := logs.String()
-			if !strings.Contains(logOutput, "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled") {
-				t.Errorf("expected warning about ALLOW_BROAD, got logs: %q", logOutput)
-			}
-
-			hasPublicMsg := strings.Contains(logOutput, "trusting a public /29 lets anyone inside it spoof X-Forwarded-For")
-			hasULAMsg := strings.Contains(logOutput, "ULA (fc00::/7)")
-
-			if tt.wantPublic && !hasPublicMsg {
-				t.Errorf("expected public /29 warning in logs: %q", logOutput)
-			}
-			if !tt.wantPublic && hasPublicMsg {
-				t.Errorf("unexpected public /29 warning (no public relaxed entries) in logs: %q", logOutput)
-			}
-			if tt.wantULA && !hasULAMsg {
-				t.Errorf("expected ULA warning in logs: %q", logOutput)
-			}
-			if !tt.wantULA && hasULAMsg {
-				t.Errorf("unexpected ULA warning (no ULA relaxed entries) in logs: %q", logOutput)
-			}
-
-			// Check that the relaxed log line contains all expected entries
-			lines := strings.Split(logOutput, "\n")
-			var relaxedLine string
-			for _, line := range lines {
-				if strings.Contains(line, "relaxed=") {
-					relaxedLine = line
-					break
+			// Count warnings for exact assertion
+			warnCount := 0
+			for _, r := range h.records {
+				if r.Level == slog.LevelWarn {
+					warnCount++
 				}
 			}
-			if relaxedLine == "" {
-				t.Errorf("expected log line with relaxed= attribute, got logs: %q", logOutput)
+			if warnCount != tt.wantWarnCount {
+				t.Errorf("got %d warnings, want %d (a duplicate relaxed warning was added)", warnCount, tt.wantWarnCount)
+			}
+
+			// Check message content
+			var warnMsg string
+			var relaxedAttr string
+			for _, r := range h.records {
+				if r.Level == slog.LevelWarn {
+					warnMsg = r.Message
+				}
+				if strings.Contains(r.Message, "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD accepted entries") {
+					// Extract relaxed attribute
+					r.Attrs(func(a slog.Attr) bool {
+						if a.Key == "relaxed" {
+							relaxedAttr = a.Value.String()
+						}
+						return true
+					})
+				}
+			}
+
+			if !strings.Contains(warnMsg, "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled") {
+				t.Errorf("expected warning about ALLOW_BROAD, got: %q", warnMsg)
+			}
+
+			hasPublicMsg := strings.Contains(warnMsg, "trusting a public /29 lets anyone inside it spoof X-Forwarded-For")
+			hasULAMsg := strings.Contains(warnMsg, "ULA (fc00::/7)")
+
+			if tt.wantPublic && !hasPublicMsg {
+				t.Errorf("expected public /29 warning, got: %q", warnMsg)
+			}
+			if !tt.wantPublic && hasPublicMsg {
+				t.Errorf("unexpected public /29 warning (no public relaxed entries), got: %q", warnMsg)
+			}
+			if tt.wantULA && !hasULAMsg {
+				t.Errorf("expected ULA warning, got: %q", warnMsg)
+			}
+			if !tt.wantULA && hasULAMsg {
+				t.Errorf("unexpected ULA warning (no ULA relaxed entries), got: %q", warnMsg)
+			}
+
+			// Check that the relaxed attribute contains all expected entries
+			if relaxedAttr == "" {
+				t.Errorf("expected log with relaxed= attribute")
 			} else {
 				for _, entry := range tt.wantRelaxedEntries {
-					if !strings.Contains(relaxedLine, entry) {
-						t.Errorf("expected relaxed log line to list %q, got: %q", entry, relaxedLine)
+					if !strings.Contains(relaxedAttr, entry) {
+						t.Errorf("expected relaxed attribute to list %q, got: %q", entry, relaxedAttr)
 					}
 				}
 				for _, entry := range tt.wantNotOnRelaxed {
-					if strings.Contains(relaxedLine, entry) {
-						t.Errorf("expected relaxed log line NOT to list %q (non-relaxed entry), got: %q", entry, relaxedLine)
+					if strings.Contains(relaxedAttr, entry) {
+						t.Errorf("expected relaxed attribute NOT to list %q (non-relaxed entry), got: %q", entry, relaxedAttr)
 					}
 				}
 			}

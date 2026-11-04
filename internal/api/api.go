@@ -201,17 +201,7 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 			if len(relaxed) > 0 {
 				cfg.Logger.Info("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD accepted entries that would have been rejected", "relaxed", strings.Join(relaxed, ", "))
 				hasPublic, hasULA := categorizeRelaxed(relaxed)
-				var warnMsg string
-				if hasPublic && hasULA {
-					warnMsg = "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /29 lets anyone inside it spoof X-Forwarded-For; ULA (fc00::/7) ranges are also permitted and exempt from the /32 floor"
-				} else if hasPublic {
-					warnMsg = "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /29 lets anyone inside it spoof X-Forwarded-For"
-				} else if hasULA {
-					warnMsg = "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: ULA (fc00::/7) ranges are permitted and exempt from the /32 floor"
-				} else {
-					// Fallback when categorization cannot classify the relaxed entries (e.g., unparsable)
-					warnMsg = "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: broader ranges are permitted"
-				}
+				warnMsg := relaxedWarning(hasPublic, hasULA)
 				cfg.Logger.Warn(warnMsg)
 			} else {
 				cfg.Logger.Warn("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled but no entries needed it; consider disabling")

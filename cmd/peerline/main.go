@@ -81,30 +81,77 @@ func describeTLSMode(smtp *mailer.SMTP) string {
 	return "STARTTLS required"
 }
 
-// applyTrustedProxyConfig extracts and validates trusted proxy configuration from environment
-// and writes it directly into cfg.TrustedProxies and cfg.AllowBroadIPv6. It parses
-// PEERLINE_TRUSTED_PROXIES and PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD, and emits any startup warnings.
-// Called once from main before passing cfg to api.New.
-func applyTrustedProxyConfig(cfg *api.Config, getenv func(string) string, log *slog.Logger) error {
+// buildAPIConfig constructs the api.Config that main() passes to api.New.
+// It parses all environment variables, validates them, emits startup warnings,
+// and returns the exact config. Called once from main(); the returned config
+// is passed verbatim to api.New with no field assignments in between.
+func buildAPIConfig(getenv func(string) string, log *slog.Logger, clk clock.Clock, ml mailer.Sender, versionDetail, publicURL string, maxBagsPerPeer int, maxBagBytesPerPeer, retentionSeconds int64) (api.Config, error) {
+	// Parse trusted proxy config first (before SMTP probe, so it fails fast)
 	tp := getenv("PEERLINE_TRUSTED_PROXIES")
 	allowBroad, err := parseBoolStrict(getenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD"))
 	if err != nil {
-		return fmt.Errorf("invalid PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD value: %w", err)
+		return api.Config{}, fmt.Errorf("invalid PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD value: %w", err)
 	}
 
-	// Warn if opt-in is enabled but no proxies configured (P3 #1)
+	// Warn if opt-in is enabled but no proxies configured
 	if allowBroad && tp == "" {
 		log.Warn("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled but PEERLINE_TRUSTED_PROXIES is unset; the opt-in has no effect")
 	}
 
-	var proxies []string
+	var trustedProxies []string
 	if tp != "" {
-		proxies = strings.Split(tp, ",")
+		trustedProxies = strings.Split(tp, ",")
 	}
 
-	cfg.TrustedProxies = proxies
-	cfg.AllowBroadIPv6 = allowBroad
-	return nil
+	regTok := getenv("PEERLINE_REGISTER_TOKEN")
+	maxOutstandingInvites, _ := strconv.Atoi(getenv("PEERLINE_MAX_OUTSTANDING_INVITES"))
+	emailPerHour, _ := strconv.Atoi(getenv("PEERLINE_EMAIL_PER_HOUR"))
+	notifyPerHour, _ := strconv.Atoi(getenv("PEERLINE_NOTIFY_PER_HOUR"))
+	keyIndexRebuildHours, _ := strconv.Atoi(getenv("PEERLINE_KEY_INDEX_REBUILD_HOURS"))
+	if keyIndexRebuildHours <= 0 {
+		keyIndexRebuildHours = 6 // default
+	}
+
+	// Parse rate limiter config
+	authFailPerMinute, err := parseInt(getenv("PEERLINE_AUTH_FAIL_PER_MINUTE"), "PEERLINE_AUTH_FAIL_PER_MINUTE")
+	if err != nil {
+		return api.Config{}, err
+	}
+	authFailBurst, err := parseInt(getenv("PEERLINE_AUTH_FAIL_BURST"), "PEERLINE_AUTH_FAIL_BURST")
+	if err != nil {
+		return api.Config{}, err
+	}
+	writePerMinute, err := parseInt(getenv("PEERLINE_WRITE_PER_MINUTE"), "PEERLINE_WRITE_PER_MINUTE")
+	if err != nil {
+		return api.Config{}, err
+	}
+	writeBurst, err := parseInt(getenv("PEERLINE_WRITE_BURST"), "PEERLINE_WRITE_BURST")
+	if err != nil {
+		return api.Config{}, err
+	}
+
+	return api.Config{
+		RegisterToken:         regTok,
+		CodePepper:            []byte(getenv("PEERLINE_CODE_PEPPER")),
+		Logger:                log,
+		Mailer:                ml,
+		PublicURL:             publicURL,
+		EmailPerHour:          emailPerHour,
+		NotifyPerHour:         notifyPerHour,
+		TrustedProxies:        trustedProxies,
+		AllowBroadIPv6:        allowBroad,
+		Clock:                 clk,
+		MaxOutstandingInvites: maxOutstandingInvites,
+		RetentionSeconds:      retentionSeconds,
+		AuthFailPerMinute:     authFailPerMinute,
+		AuthFailBurst:         authFailBurst,
+		WritePerMinute:        writePerMinute,
+		WriteBurst:            writeBurst,
+		KeyIndexRebuildHours:  keyIndexRebuildHours,
+		VersionDetail:         versionDetail,
+		MaxBagsPerPeer:        maxBagsPerPeer,
+		MaxBagBytesPerPeer:    maxBagBytesPerPeer,
+	}, nil
 }
 
 // describeSMTPMode returns the log level and message for SMTP startup logging.
@@ -253,12 +300,17 @@ func main() {
 		log.Warn("key index size exceeds PEERLINE_KEY_INDEX_WARN", "keys", n, "warn_threshold", keyIndexWarn)
 	}
 
+	// Validate trusted proxy config before SMTP probe (fail-fast on typos)
+	_, err = parseBoolStrict(os.Getenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD"))
+	if err != nil {
+		log.Error("invalid PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD value", "err", err)
+		os.Exit(1)
+	}
+
 	regTok := os.Getenv("PEERLINE_REGISTER_TOKEN")
 	if regTok == "" {
 		log.Warn("PEERLINE_REGISTER_TOKEN unset: registration is open to anyone who can reach this server")
 	}
-
-	maxOutstandingInvites, _ := strconv.Atoi(os.Getenv("PEERLINE_MAX_OUTSTANDING_INVITES"))
 
 	ml, err := mailer.FromEnv(log)
 	if err != nil {
@@ -294,8 +346,6 @@ func main() {
 	if publicURL == "" {
 		log.Warn("PEERLINE_PUBLIC_URL unset: pairing links and base_url fall back to the request Host header; set it so clients never send keys to a forged origin")
 	}
-	emailPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_EMAIL_PER_HOUR"))
-	notifyPerHour, _ := strconv.Atoi(os.Getenv("PEERLINE_NOTIFY_PER_HOUR"))
 
 	maxBagsPerPeer, maxBagBytesPerPeer, err := parseBagLimits(
 		os.Getenv("PEERLINE_MAX_BAGS_PER_PEER"),
@@ -316,64 +366,18 @@ func main() {
 		log.Warn("PEERLINE_CODE_PEPPER unset: confirm-mode short codes use a per-process secret, so pending claims cannot be confirmed across a restart")
 	}
 
-	keyIndexRebuildHours, _ := strconv.Atoi(os.Getenv("PEERLINE_KEY_INDEX_REBUILD_HOURS"))
-	if keyIndexRebuildHours <= 0 {
-		keyIndexRebuildHours = 6 // default
-	}
-
-	// Parse rate limiter config (#96: validate at startup)
-	authFailPerMinute, err := parseInt(os.Getenv("PEERLINE_AUTH_FAIL_PER_MINUTE"), "PEERLINE_AUTH_FAIL_PER_MINUTE")
+	// Build api.Config with all parsed environment variables
+	cfg, err := buildAPIConfig(os.Getenv, log, clk, ml, versionDetail, publicURL, maxBagsPerPeer, maxBagBytesPerPeer, retentionSeconds)
 	if err != nil {
-		log.Error("invalid rate limiter config", "err", err)
-		os.Exit(1)
-	}
-	authFailBurst, err := parseInt(os.Getenv("PEERLINE_AUTH_FAIL_BURST"), "PEERLINE_AUTH_FAIL_BURST")
-	if err != nil {
-		log.Error("invalid rate limiter config", "err", err)
-		os.Exit(1)
-	}
-	writePerMinute, err := parseInt(os.Getenv("PEERLINE_WRITE_PER_MINUTE"), "PEERLINE_WRITE_PER_MINUTE")
-	if err != nil {
-		log.Error("invalid rate limiter config", "err", err)
-		os.Exit(1)
-	}
-	writeBurst, err := parseInt(os.Getenv("PEERLINE_WRITE_BURST"), "PEERLINE_WRITE_BURST")
-	if err != nil {
-		log.Error("invalid rate limiter config", "err", err)
+		log.Error("api config", "err", err)
 		os.Exit(1)
 	}
 
 	log.Info("rate limiter config",
-		"auth_fail_per_minute", authFailPerMinute,
-		"auth_fail_burst", authFailBurst,
-		"write_per_minute", writePerMinute,
-		"write_burst", writeBurst)
-
-	// Build api.Config and apply trusted proxy settings
-	cfg := api.Config{
-		RegisterToken:         regTok,
-		CodePepper:            []byte(os.Getenv("PEERLINE_CODE_PEPPER")),
-		Logger:                log,
-		Mailer:                ml,
-		PublicURL:             publicURL,
-		EmailPerHour:          emailPerHour,
-		NotifyPerHour:         notifyPerHour,
-		Clock:                 clk,
-		MaxOutstandingInvites: maxOutstandingInvites,
-		RetentionSeconds:      retentionSeconds,
-		AuthFailPerMinute:     authFailPerMinute,
-		AuthFailBurst:         authFailBurst,
-		WritePerMinute:        writePerMinute,
-		WriteBurst:            writeBurst,
-		KeyIndexRebuildHours:  keyIndexRebuildHours,
-		VersionDetail:         versionDetail,
-		MaxBagsPerPeer:        maxBagsPerPeer,
-		MaxBagBytesPerPeer:    maxBagBytesPerPeer,
-	}
-	if err := applyTrustedProxyConfig(&cfg, os.Getenv, log); err != nil {
-		log.Error("trusted proxy config", "err", err)
-		os.Exit(1)
-	}
+		"auth_fail_per_minute", cfg.AuthFailPerMinute,
+		"auth_fail_burst", cfg.AuthFailBurst,
+		"write_per_minute", cfg.WritePerMinute,
+		"write_burst", cfg.WriteBurst)
 
 	apiServer, err := api.New(st, cfg)
 	if err != nil {

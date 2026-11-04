@@ -328,63 +328,21 @@ func (h *captureHandler) WithGroup(string) slog.Handler {
 	return h
 }
 
-func TestBuildTrustedProxyConfig(t *testing.T) {
+// TestBuildAPIConfig verifies that buildAPIConfig returns the exact config
+// main() passes to api.New, with no field assignments in between.
+func TestBuildAPIConfig(t *testing.T) {
 	tests := []struct {
-		name           string
-		proxiesEnv     string
-		allowBroadEnv  string
-		wantProxies    []string
-		wantAllowBroad bool
-		wantWarnCount  int
-		wantWarnMsg    string
-		wantErr        bool
+		name               string
+		proxiesEnv         string
+		allowBroadEnv      string
+		wantProxies        []string
+		wantAllowBroad     bool
+		wantWarnCount      int
+		wantWarnMsg        string
+		wantBuildErr       bool
+		wantNewErr         bool
+		wantNewErrContains string
 	}{
-		{
-			name:           "opt-in 1",
-			proxiesEnv:     "10.0.0.0/8,192.168.0.0/16",
-			allowBroadEnv:  "1",
-			wantProxies:    []string{"10.0.0.0/8", "192.168.0.0/16"},
-			wantAllowBroad: true,
-			wantWarnCount:  0,
-		},
-		{
-			name:           "opt-in true",
-			proxiesEnv:     "10.0.0.0/8",
-			allowBroadEnv:  "true",
-			wantProxies:    []string{"10.0.0.0/8"},
-			wantAllowBroad: true,
-			wantWarnCount:  0,
-		},
-		{
-			name:           "opt-in 0",
-			proxiesEnv:     "10.0.0.0/8",
-			allowBroadEnv:  "0",
-			wantProxies:    []string{"10.0.0.0/8"},
-			wantAllowBroad: false,
-			wantWarnCount:  0,
-		},
-		{
-			name:           "opt-in false",
-			proxiesEnv:     "10.0.0.0/8",
-			allowBroadEnv:  "false",
-			wantProxies:    []string{"10.0.0.0/8"},
-			wantAllowBroad: false,
-			wantWarnCount:  0,
-		},
-		{
-			name:           "opt-in unset",
-			proxiesEnv:     "10.0.0.0/8",
-			allowBroadEnv:  "",
-			wantProxies:    []string{"10.0.0.0/8"},
-			wantAllowBroad: false,
-			wantWarnCount:  0,
-		},
-		{
-			name:          "invalid opt-in value",
-			proxiesEnv:    "10.0.0.0/8",
-			allowBroadEnv: "yes",
-			wantErr:       true,
-		},
 		{
 			name:           "opt-in enabled without proxies warns once",
 			proxiesEnv:     "",
@@ -395,12 +353,26 @@ func TestBuildTrustedProxyConfig(t *testing.T) {
 			wantWarnMsg:    "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled but PEERLINE_TRUSTED_PROXIES is unset; the opt-in has no effect",
 		},
 		{
-			name:           "opt-in disabled without proxies no warn",
-			proxiesEnv:     "",
-			allowBroadEnv:  "false",
-			wantProxies:    nil,
+			name:           "proxies with opt-in enabled",
+			proxiesEnv:     "10.0.0.0/8,192.168.0.0/16",
+			allowBroadEnv:  "1",
+			wantProxies:    []string{"10.0.0.0/8", "192.168.0.0/16"},
+			wantAllowBroad: true,
+			wantWarnCount:  0,
+		},
+		{
+			name:           "proxies with opt-in disabled",
+			proxiesEnv:     "127.0.0.0/8",
+			allowBroadEnv:  "0",
+			wantProxies:    []string{"127.0.0.0/8"},
 			wantAllowBroad: false,
 			wantWarnCount:  0,
+		},
+		{
+			name:         "invalid opt-in value",
+			proxiesEnv:   "127.0.0.0/8",
+			allowBroadEnv: "yes",
+			wantBuildErr: true,
 		},
 		{
 			name:           "both unset no warn",
@@ -408,6 +380,24 @@ func TestBuildTrustedProxyConfig(t *testing.T) {
 			allowBroadEnv:  "",
 			wantProxies:    nil,
 			wantAllowBroad: false,
+			wantWarnCount:  0,
+		},
+		{
+			name:               "/29 without opt-in rejected by api.New",
+			proxiesEnv:         "2a06:98c0::/29",
+			allowBroadEnv:      "0",
+			wantProxies:        []string{"2a06:98c0::/29"},
+			wantAllowBroad:     false,
+			wantWarnCount:      0,
+			wantNewErr:         true,
+			wantNewErrContains: "must be at least /32",
+		},
+		{
+			name:           "/29 with opt-in accepted",
+			proxiesEnv:     "2a06:98c0::/29",
+			allowBroadEnv:  "1",
+			wantProxies:    []string{"2a06:98c0::/29"},
+			wantAllowBroad: true,
 			wantWarnCount:  0,
 		},
 	}
@@ -427,25 +417,58 @@ func TestBuildTrustedProxyConfig(t *testing.T) {
 
 			h := &captureHandler{}
 			log := slog.New(h)
-			cfg := &api.Config{}
-			err := applyTrustedProxyConfig(cfg, getenv, log)
-			if tt.wantErr {
+
+			// Build config exactly as main() does
+			cfg, err := buildAPIConfig(getenv, log, nil, nil, "minimal", "", 0, 0, 0)
+			if tt.wantBuildErr {
 				if err == nil {
-					t.Errorf("applyTrustedProxyConfig() succeeded, want error")
+					t.Errorf("buildAPIConfig() succeeded, want error")
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("applyTrustedProxyConfig() error = %v, want nil", err)
-			}
-			if cfg.AllowBroadIPv6 != tt.wantAllowBroad {
-				t.Errorf("cfg.AllowBroadIPv6 = %v, want %v", cfg.AllowBroadIPv6, tt.wantAllowBroad)
-			}
-			if !equalStringSlices(cfg.TrustedProxies, tt.wantProxies) {
-				t.Errorf("cfg.TrustedProxies = %v, want %v", cfg.TrustedProxies, tt.wantProxies)
+				t.Fatalf("buildAPIConfig() error = %v, want nil", err)
 			}
 
-			// Check warnings
+			// Assert the exact config values before api.New sees them
+			if cfg.AllowBroadIPv6 != tt.wantAllowBroad {
+				t.Errorf("cfg.AllowBroadIPv6 = %v, want %v (mutation: opt-in dropped or flipped in main)", cfg.AllowBroadIPv6, tt.wantAllowBroad)
+			}
+			if !equalStringSlices(cfg.TrustedProxies, tt.wantProxies) {
+				t.Errorf("cfg.TrustedProxies = %v, want %v (mutation: proxies dropped in main)", cfg.TrustedProxies, tt.wantProxies)
+			}
+
+			// Verify that api.New sees the same values
+			st, stErr := store.Open(":memory:")
+			if stErr != nil {
+				t.Fatal(stErr)
+			}
+			defer st.Close()
+			if _, _, stErr := st.LoadKeyIndex(context.Background()); stErr != nil {
+				t.Fatal(stErr)
+			}
+
+			// Set Logger for api.New
+			var logBuf bytes.Buffer
+			cfg.Logger = slog.New(slog.NewTextHandler(&logBuf, nil))
+
+			srv, newErr := api.New(st, cfg)
+			if tt.wantNewErr {
+				if newErr == nil {
+					t.Errorf("api.New succeeded, want error containing %q", tt.wantNewErrContains)
+				} else if !strings.Contains(newErr.Error(), tt.wantNewErrContains) {
+					t.Errorf("api.New error = %q, want error containing %q", newErr.Error(), tt.wantNewErrContains)
+				}
+			} else {
+				if newErr != nil {
+					t.Errorf("api.New failed: %v", newErr)
+				}
+			}
+			if srv != nil {
+				defer srv.Stop()
+			}
+
+			// Check warning count from buildAPIConfig
 			warnCount := 0
 			for _, r := range h.records {
 				if r.Level == slog.LevelWarn {
@@ -473,188 +496,6 @@ func equalStringSlices(a, b []string) bool {
 	}
 	return true
 }
-
-// TestApplyTrustedProxyConfigWiring verifies that applyTrustedProxyConfig fills api.Config
-// fields directly, and that main() would pass those exact values to api.New without modification.
-func TestApplyTrustedProxyConfigWiring(t *testing.T) {
-	tests := []struct {
-		name           string
-		proxiesEnv     string
-		allowBroadEnv  string
-		wantProxies    []string
-		wantAllowBroad bool
-	}{
-		{
-			name:           "both set",
-			proxiesEnv:     "10.0.0.0/8,192.168.0.0/16",
-			allowBroadEnv:  "1",
-			wantProxies:    []string{"10.0.0.0/8", "192.168.0.0/16"},
-			wantAllowBroad: true,
-		},
-		{
-			name:           "opt-in disabled",
-			proxiesEnv:     "2a06:98c0::/29",
-			allowBroadEnv:  "0",
-			wantProxies:    []string{"2a06:98c0::/29"},
-			wantAllowBroad: false,
-		},
-		{
-			name:           "opt-in with true",
-			proxiesEnv:     "2001:db8::/32",
-			allowBroadEnv:  "true",
-			wantProxies:    []string{"2001:db8::/32"},
-			wantAllowBroad: true,
-		},
-		{
-			name:           "no proxies with opt-in",
-			proxiesEnv:     "",
-			allowBroadEnv:  "1",
-			wantProxies:    nil,
-			wantAllowBroad: true,
-		},
-		{
-			name:           "empty AllowBroad defaults to false",
-			proxiesEnv:     "127.0.0.0/8",
-			allowBroadEnv:  "",
-			wantProxies:    []string{"127.0.0.0/8"},
-			wantAllowBroad: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			getenv := func(key string) string {
-				switch key {
-				case "PEERLINE_TRUSTED_PROXIES":
-					return tt.proxiesEnv
-				case "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD":
-					return tt.allowBroadEnv
-				default:
-					return ""
-				}
-			}
-
-			h := &captureHandler{}
-			log := slog.New(h)
-
-			// Build a config exactly as main() does
-			cfg := api.Config{
-				Logger: log,
-			}
-
-			// Apply proxy config
-			if err := applyTrustedProxyConfig(&cfg, getenv, log); err != nil {
-				t.Fatalf("applyTrustedProxyConfig failed: %v", err)
-			}
-
-			// Assert the exact values that would be passed to api.New
-			if cfg.AllowBroadIPv6 != tt.wantAllowBroad {
-				t.Errorf("cfg.AllowBroadIPv6 = %v, want %v (mutation: opt-in dropped or flipped)", cfg.AllowBroadIPv6, tt.wantAllowBroad)
-			}
-			if !equalStringSlices(cfg.TrustedProxies, tt.wantProxies) {
-				t.Errorf("cfg.TrustedProxies = %v, want %v (mutation: proxies dropped or main ignores helper output)", cfg.TrustedProxies, tt.wantProxies)
-			}
-
-			// Verify that api.New sees the same values by actually calling it
-			st, err := store.Open(":memory:")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer st.Close()
-			if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-
-			srv, err := api.New(st, cfg)
-			if err != nil {
-				// Only fail if this is an unexpected error (not a proxy validation error)
-				if !strings.Contains(err.Error(), "trusted proxy") {
-					t.Fatalf("api.New failed unexpectedly: %v", err)
-				}
-			}
-			if srv != nil {
-				defer srv.Stop()
-			}
-		})
-	}
-}
-
-func TestAllowBroadIPv6ConfigWiring(t *testing.T) {
-	tests := []struct {
-		name           string
-		proxiesEnv     string
-		allowBroadEnv  string
-		wantAllowBroad bool
-		testProxy      string
-		wantAccepted   bool
-	}{
-		{"enabled with 1", "2a06:98c0::/29", "1", true, "2a06:98c0::/29", true},
-		{"enabled with true", "2a06:98c0::/29", "true", true, "2a06:98c0::/29", true},
-		{"disabled with 0", "2a06:98c0::/29", "0", false, "2a06:98c0::/29", false},
-		{"disabled with false", "2a06:98c0::/29", "false", false, "2a06:98c0::/29", false},
-		{"disabled when unset", "2a06:98c0::/29", "", false, "2a06:98c0::/29", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			getenv := func(key string) string {
-				switch key {
-				case "PEERLINE_TRUSTED_PROXIES":
-					return tt.proxiesEnv
-				case "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD":
-					return tt.allowBroadEnv
-				default:
-					return ""
-				}
-			}
-
-			h := &captureHandler{}
-			log := slog.New(h)
-
-			// Verify the config wires through to api.Config and affects parsing
-			st, err := store.Open(":memory:")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer st.Close()
-			if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-
-			var logBuf bytes.Buffer
-			cfg := api.Config{
-				Logger: slog.New(slog.NewTextHandler(&logBuf, nil)),
-			}
-
-			// Apply trusted proxy config exactly as main() does
-			if err := applyTrustedProxyConfig(&cfg, getenv, log); err != nil {
-				t.Fatalf("applyTrustedProxyConfig failed: %v", err)
-			}
-
-			// Assert the exact config values before api.New sees them
-			if cfg.AllowBroadIPv6 != tt.wantAllowBroad {
-				t.Errorf("cfg.AllowBroadIPv6 = %v, want %v", cfg.AllowBroadIPv6, tt.wantAllowBroad)
-			}
-			if !equalStringSlices(cfg.TrustedProxies, []string{tt.proxiesEnv}) {
-				t.Errorf("cfg.TrustedProxies = %v, want [%s]", cfg.TrustedProxies, tt.proxiesEnv)
-			}
-
-			srv, err := api.New(st, cfg)
-			accepted := (err == nil)
-			if accepted != tt.wantAccepted {
-				if accepted {
-					t.Errorf("api.New succeeded with AllowBroadIPv6=%v, want failure (shows %s was accepted, but shouldn't be)", cfg.AllowBroadIPv6, tt.testProxy)
-				} else {
-					t.Errorf("api.New failed with AllowBroadIPv6=%v: %v (shows %s was rejected, but should be accepted)", cfg.AllowBroadIPv6, err, tt.testProxy)
-				}
-			}
-			if srv != nil {
-				defer srv.Stop()
-			}
-		})
-	}
-}
-
 func TestDescribeSMTPMode(t *testing.T) {
 	tests := []struct {
 		name      string
