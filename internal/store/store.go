@@ -1438,8 +1438,9 @@ func split(v string) []string {
 	return strings.Split(v, ",")
 }
 
-// normalizeScopesAndBags sorts and deduplicates scopes and bags to match writeGrantsInTx storage format.
-// This ensures grant comparison is order-insensitive and matches how grants are actually stored.
+// normalizeScopesAndBags sorts and deduplicates scopes and bags for set comparison.
+// writeGrantsInTx stores the raw join() output (not sorted), so this normalization
+// is only for grantsEqual to provide order-insensitive, duplicate-insensitive matching.
 func normalizeScopesAndBags(scopes, bags string) (string, string) {
 	normSlice := func(s string) string {
 		if s == "" {
@@ -1921,13 +1922,16 @@ func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string
 	}
 
 	// If a grant exists and differs, return ErrConflict without touching the invite or grants
+	forwardIdentical := false
 	if existingScopes.Valid {
 		if !grantsEqual(scopes, bags, existingScopes.String, existingBags.String) {
 			return nil, ErrConflict
 		}
+		forwardIdentical = true
 	}
 
 	// If back scopes are present, also check the reverse grant
+	reverseIdentical := false
 	if len(backScopes) > 0 {
 		backScopesStr, backBagsStr := join(backScopes), join(backBags)
 		var existingBackScopes, existingBackBags sql.NullString
@@ -1941,6 +1945,7 @@ func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string
 			if !grantsEqual(backScopesStr, backBagsStr, existingBackScopes.String, existingBackBags.String) {
 				return nil, ErrConflict
 			}
+			reverseIdentical = true
 		}
 	}
 
@@ -1959,8 +1964,13 @@ func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string
 		return nil, ErrNotFound
 	}
 
-	if err := writeGrantsInTx(ctx, tx, from, accepter, scopes, bags, backScopes, backBags, now); err != nil {
-		return nil, err
+	// Skip grant rewrite on identical re-accept to keep created_at and row order stable.
+	// Still consume the invite exactly as today.
+	skipWrite := forwardIdentical && (len(backScopes) == 0 || reverseIdentical)
+	if !skipWrite {
+		if err := writeGrantsInTx(ctx, tx, from, accepter, scopes, bags, backScopes, backBags, now); err != nil {
+			return nil, err
+		}
 	}
 
 	return &Grant{Owner: from, Grantee: accepter, Scopes: split(scopes), Bags: split(bags)}, nil
