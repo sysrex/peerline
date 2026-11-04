@@ -81,28 +81,25 @@ func describeTLSMode(smtp *mailer.SMTP) string {
 	return "STARTTLS required"
 }
 
-// trustedProxyConfig extracts trusted proxy configuration from environment variables.
-// Returns the proxy list and allowBroad flag, or an error if ALLOW_BROAD is invalid.
-func trustedProxyConfig(getenv func(string) string) (proxies []string, allowBroad bool, err error) {
+// buildTrustedProxyConfig extracts and validates trusted proxy configuration from environment.
+// It parses PEERLINE_TRUSTED_PROXIES and PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD, emits any
+// startup warnings, and returns the values to pass to api.Config. Called once from main.
+func buildTrustedProxyConfig(getenv func(string) string, log *slog.Logger) (proxies []string, allowBroad bool, err error) {
 	tp := getenv("PEERLINE_TRUSTED_PROXIES")
 	allowBroad, err = parseBoolStrict(getenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD"))
 	if err != nil {
 		return nil, false, fmt.Errorf("invalid PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD value: %w", err)
 	}
+
+	// Warn if opt-in is enabled but no proxies configured (P3 #1)
+	if allowBroad && tp == "" {
+		log.Warn("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled but PEERLINE_TRUSTED_PROXIES is unset; the opt-in has no effect")
+	}
+
 	if tp != "" {
 		proxies = strings.Split(tp, ",")
 	}
 	return proxies, allowBroad, nil
-}
-
-// warnTrustedProxyStartup emits all trusted-proxy-related startup warnings.
-// This includes: opt-in enabled but no proxies configured. Exactly one warning is emitted
-// for each condition. Call this once after parsing trusted proxies but before api.New.
-func warnTrustedProxyStartup(log *slog.Logger, allowBroad bool, trustedProxies []string, trustedProxiesEnv string) {
-	// Warn if opt-in is enabled but no proxies configured (P3 #1)
-	if allowBroad && trustedProxiesEnv == "" {
-		log.Warn("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled but PEERLINE_TRUSTED_PROXIES is unset; the opt-in has no effect")
-	}
 }
 
 // describeSMTPMode returns the log level and message for SMTP startup logging.
@@ -257,13 +254,11 @@ func main() {
 	}
 
 	// Parse trusted proxy CIDRs and opt-in for broader IPv6
-	trustedProxies, allowBroadIPv6, err := trustedProxyConfig(os.Getenv)
+	trustedProxies, allowBroadIPv6, err := buildTrustedProxyConfig(os.Getenv, log)
 	if err != nil {
 		log.Error("trusted proxy config", "err", err)
 		os.Exit(1)
 	}
-	tp := os.Getenv("PEERLINE_TRUSTED_PROXIES")
-	warnTrustedProxyStartup(log, allowBroadIPv6, trustedProxies, tp)
 
 	maxOutstandingInvites, _ := strconv.Atoi(os.Getenv("PEERLINE_MAX_OUTSTANDING_INVITES"))
 
