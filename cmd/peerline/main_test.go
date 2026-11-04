@@ -308,12 +308,12 @@ func TestSMTPProbeAction(t *testing.T) {
 
 func TestTrustedProxyConfig(t *testing.T) {
 	tests := []struct {
-		name               string
-		proxiesEnv         string
-		allowBroadEnv      string
-		wantProxies        []string
-		wantAllowBroad     bool
-		wantErr            bool
+		name           string
+		proxiesEnv     string
+		allowBroadEnv  string
+		wantProxies    []string
+		wantAllowBroad bool
+		wantErr        bool
 	}{
 		{
 			name:           "both set with opt-in enabled",
@@ -466,12 +466,12 @@ func TestWarnTrustedProxyStartup(t *testing.T) {
 
 func TestAllowBroadIPv6ConfigWiring(t *testing.T) {
 	tests := []struct {
-		name                string
-		proxiesEnv          string
-		allowBroadEnv       string
-		wantAllowBroad      bool
-		testProxy           string
-		wantAccepted        bool
+		name           string
+		proxiesEnv     string
+		allowBroadEnv  string
+		wantAllowBroad bool
+		testProxy      string
+		wantAccepted   bool
 	}{
 		{"enabled with 1", "2a06:98c0::/29", "1", true, "2a06:98c0::/29", true},
 		{"enabled with true", "2a06:98c0::/29", "true", true, "2a06:98c0::/29", true},

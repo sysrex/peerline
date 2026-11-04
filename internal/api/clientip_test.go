@@ -1330,31 +1330,31 @@ func TestIPv6FloorWithOptIn(t *testing.T) {
 
 func TestAllowBroadIPv6Warning(t *testing.T) {
 	tests := []struct {
-		name              string
-		trustedProxies    []string
-		wantPublic        bool
-		wantULA           bool
+		name               string
+		trustedProxies     []string
+		wantPublic         bool
+		wantULA            bool
 		wantRelaxedEntries []string
 	}{
 		{
-			name:              "both public and ULA",
-			trustedProxies:    []string{"2a06:98c0::/29", "fd00::/8"},
-			wantPublic:        true,
-			wantULA:           true,
+			name:               "both public and ULA",
+			trustedProxies:     []string{"2a06:98c0::/29", "fd00::/8"},
+			wantPublic:         true,
+			wantULA:            true,
 			wantRelaxedEntries: []string{"2a06:98c0::/29", "fd00::/8"},
 		},
 		{
-			name:              "public only",
-			trustedProxies:    []string{"2a06:98c0::/29", "2001:db8::/32"},
-			wantPublic:        true,
-			wantULA:           false,
+			name:               "public only",
+			trustedProxies:     []string{"2a06:98c0::/29", "2001:db8::/32"},
+			wantPublic:         true,
+			wantULA:            false,
 			wantRelaxedEntries: []string{"2a06:98c0::/29"},
 		},
 		{
-			name:              "ULA only",
-			trustedProxies:    []string{"fd00::/8", "fc00::/7"},
-			wantPublic:        false,
-			wantULA:           true,
+			name:               "ULA only",
+			trustedProxies:     []string{"fd00::/8", "fc00::/7"},
+			wantPublic:         false,
+			wantULA:            true,
 			wantRelaxedEntries: []string{"fd00::/8", "fc00::/7"},
 		},
 	}
