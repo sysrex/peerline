@@ -2907,6 +2907,16 @@ func TestSanitizeInviterName(t *testing.T) {
 			want:  "ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம்", // 62 runes, keeps words
 		},
 		{
+			name:  "Tamil pulli at exactly position 64",
+			input: "xx" + strings.Repeat("ம் ", 40),                                                    // Rune 63 is ் (virama), rune 64 is space
+			want:  "xxம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம்", // 64 runes, word-final virama kept
+		},
+		{
+			name:  "Devanagari halant at exactly position 64",
+			input: strings.Repeat("a", 62) + "क् " + strings.Repeat("b", 10),
+			want:  strings.Repeat("a", 62) + "क्", // 64 runes, word-final virama kept
+		},
+		{
 			name:  "Tamil word kept whole: மரம் not cut",
 			input: strings.Repeat("a", 58) + " மரம் zz" + strings.Repeat("b", 10),
 			want:  strings.Repeat("a", 58) + " மரம்", // 63 runes, மரம் kept whole
@@ -2994,25 +3004,35 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 	}
 
 	// Invariant 9: Truncated output may end in CCC 9 (virama) only if word-final.
-	// For truncated paths, compare against the uncapped result: if the capped output
-	// ends in a virama and there are more runes in the uncapped result, the next rune
-	// must be a space (indicating the virama is word-final, not mid-word).
-	if checkVirama && len(runes) > 0 {
-		lastRune := runes[len(runes)-1]
-		props := norm.NFC.PropertiesString(string(lastRune))
-		if props.CCC() == 9 {
-			// The output ends in virama. Get the uncapped result.
-			uncapped := sanitizeInviterName(input)
-			uncappedRunes := []rune(uncapped)
-			// If the capped output is shorter than uncapped, check the next rune.
-			if len(runes) < len(uncappedRunes) {
-				nextRune := uncappedRunes[len(runes)]
+	// For truncated paths, compare against the uncapped result.
+	if checkVirama {
+		// Get the uncapped result
+		full := []rune(sanitizeInviterNameUncapped(input))
+		out := []rune(got)
+
+		// (a) If the output ends in CCC 9 and is shorter than full,
+		// the next rune in full must be a space (word-final virama).
+		if len(out) > 0 && len(out) < len(full) {
+			lastRune := out[len(out)-1]
+			props := norm.NFC.PropertiesString(string(lastRune))
+			if props.CCC() == 9 {
+				nextRune := full[len(out)]
 				if nextRune != ' ' {
-					t.Errorf("sanitizeInviterName(%q) [%s] ends in mid-word CCC 9 (virama) rune U+%04X, next rune is U+%04X (not space): capped=%q uncapped=%q", input, label, lastRune, nextRune, got, uncapped)
+					t.Errorf("sanitizeInviterName(%q) [%s] ends in mid-word CCC 9 (virama) rune U+%04X, next rune is U+%04X (not space): output=%q full=%q", input, label, lastRune, nextRune, got, string(full))
 				}
 			}
-			// If capped == uncapped, the virama is at the very end, which is allowed
-			// (the loop only drops virama when followed by more content).
+		}
+
+		// (b) If full is >64 runes, full[63] has CCC 9, and full[64] is a space,
+		// the output must equal string(full[:64]) (word-final virama kept).
+		if len(full) > 64 {
+			props := norm.NFC.PropertiesString(string(full[63]))
+			if props.CCC() == 9 && full[64] == ' ' {
+				expected := string(full[:64])
+				if got != expected {
+					t.Errorf("sanitizeInviterName(%q) [%s] should keep word-final virama at position 63: got=%q, expected=%q", input, label, got, expected)
+				}
+			}
 		}
 	}
 }

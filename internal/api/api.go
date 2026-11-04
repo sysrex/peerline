@@ -906,11 +906,11 @@ func truncateUTF8(s string, max int) string {
 //
 // Note: Cross-script homoglyphs (e.g., Cyrillic а vs Latin a) are not fully solvable here
 // and require application-level awareness or visual similarity detection.
-func sanitizeInviterName(name string) string {
+// sanitizeInviterNameUncapped performs all sanitization steps except the 64-rune cap.
+// It returns the NFC-normalized, filtered result before length truncation.
+func sanitizeInviterNameUncapped(name string) string {
 	const (
-		maxRunes        = 64
 		maxMarksPerBase = 3 // Issue #84 specifies 3 marks per base (issue #63 asked for 2 but #84 is the live tracker)
-		fallbackName    = "A Peerline peer"
 		maxInputBytes   = 1024 // Guard against unbounded normalization work
 	)
 
@@ -1014,7 +1014,16 @@ func sanitizeInviterName(name string) string {
 
 	// Apply NFC (canonical composition) to the filtered result
 	// This recomposes base+mark sequences into precomposed forms where possible
-	result := norm.NFC.String(strings.TrimSpace(out.String()))
+	return norm.NFC.String(strings.TrimSpace(out.String()))
+}
+
+func sanitizeInviterName(name string) string {
+	const (
+		maxRunes     = 64
+		fallbackName = "A Peerline peer"
+	)
+
+	result := sanitizeInviterNameUncapped(name)
 
 	// Return fallback if result is empty
 	if result == "" {
@@ -1042,8 +1051,9 @@ func sanitizeInviterName(name string) string {
 			}
 		}
 
-		// Check if the last kept rune is a virama (CCC 9)
-		if len(truncated) > 0 {
+		// Check if the last kept rune is a virama (CCC 9) and it's mid-word.
+		// A word-final virama (followed by space) is complete and should not trigger back-off.
+		if len(truncated) > 0 && runes[maxRunes] != ' ' {
 			lastRune := truncated[len(truncated)-1]
 			// Check if it's a virama using Canonical_Combining_Class
 			props := norm.NFC.PropertiesString(string(lastRune))
