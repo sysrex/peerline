@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 // tightenDatabaseFilePermissions tightens permissions on the database file and
@@ -21,30 +22,45 @@ func tightenDatabaseFilePermissions(dbPath string, logger *slog.Logger) {
 	}
 
 	for _, path := range paths {
-		info, err := os.Lstat(path)
+		// Open with O_NOFOLLOW to avoid following symlinks
+		f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue // File doesn't exist yet (e.g. -wal, -shm)
 			}
-			continue // Skip on error
+			logger.Warn("failed to open database file for chmod", "path", filepath.Base(path), "error", err)
+			continue
 		}
 
-		// Only process regular files (not symlinks or other special files)
+		// Fstat the open fd to check file type and current mode
+		info, err := f.Stat()
+		if err != nil {
+			f.Close()
+			logger.Warn("failed to stat database file for chmod", "path", filepath.Base(path), "error", err)
+			continue
+		}
+
+		// Only process regular files
 		if !info.Mode().IsRegular() {
+			f.Close()
 			continue
 		}
 
 		oldMode := info.Mode().Perm()
 		// Check if file is wider than 0600 (has group or other bits set)
 		if oldMode&0o077 == 0 {
+			f.Close()
 			continue // Already tight
 		}
 
 		// Tighten to remove group and other permissions
 		newMode := oldMode &^ 0o077
-		if err := os.Chmod(path, newMode); err != nil {
-			continue // Skip on error
+		if err := f.Chmod(newMode); err != nil {
+			f.Close()
+			logger.Warn("failed to tighten database file permissions", "path", filepath.Base(path), "error", err)
+			continue
 		}
+		f.Close()
 
 		logger.Warn("tightened database file permissions", "path", filepath.Base(path), "old_mode", oldMode, "new_mode", newMode)
 	}

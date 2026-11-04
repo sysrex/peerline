@@ -74,7 +74,8 @@ func TestBackupFileMode(t *testing.T) {
 		t.Fatal("no backup created")
 	}
 
-	info, err := os.Stat(backupBase)
+	backupPath := tempDir + "/" + backupBase
+	info, err := os.Stat(backupPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,8 +144,8 @@ func TestBackupPermissionsOnReuse(t *testing.T) {
 	if !st.BackupReused() {
 		t.Fatal("expected backup to be reused")
 	}
-	if st.LastBackupPath() != backupPath {
-		t.Errorf("backup path = %q, want %q", st.LastBackupPath(), backupPath)
+	if st.LastBackupPath() != backupName {
+		t.Errorf("backup path = %q, want %q", st.LastBackupPath(), backupName)
 	}
 
 	// Verify backup still has 0600 permissions
