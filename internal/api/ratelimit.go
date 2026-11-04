@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sysrex/peerline/internal/clock"
 	"github.com/sysrex/peerline/internal/msg"
 )
 
@@ -293,7 +294,7 @@ const (
 // NewLimiterManager creates and starts a new limiter manager.
 func NewLimiterManager(cfg Config) *LimiterManager {
 	ctx, cancel := context.WithCancel(context.Background())
-	clk := msg.WithClock(cfg.Now)
+	clk := msg.WithClock(clock.Or(cfg.Clock).Now)
 	lm := &LimiterManager{
 		msgLim:        msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst, clk),
 		regLim:        msg.NewLimiter(10, 5, clk),

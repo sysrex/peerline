@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/sysrex/peerline/internal/auth"
+	"github.com/sysrex/peerline/internal/clock"
 	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/msg"
 	"github.com/sysrex/peerline/internal/pair"
@@ -51,8 +52,8 @@ type Config struct {
 	// Mailer sends invite and message-notification emails. Nil = dev mode
 	// (log the email, never fail the request).
 	Mailer mailer.Sender
-	// PublicURL is the externally reachable base URL used in emailed accept
-	// links (e.g. https://peerline.example.com). If empty, it is derived from
+	// PublicURL is the externally reachable base URL used in the accept_url
+	// landing page (e.g. https://peerline.example.com). If empty, it is derived from
 	// the request (fine for local dev; set it in production).
 	PublicURL string
 	// Email send limits: per inviting peer and per recipient address, per hour.
@@ -66,8 +67,8 @@ type Config struct {
 	// TrustedProxies is a list of CIDR ranges (e.g. "10.0.0.0/8") from which
 	// X-Forwarded-For headers are honored. If empty, X-Forwarded-For is ignored.
 	TrustedProxies []string
-	// Now is the clock for invite expiry and rate limiters; defaults to time.Now.
-	Now func() time.Time
+	// Clock is the time source for invite expiry and rate limiters; defaults to clock.Real{}.
+	Clock clock.Clock
 	// MaxOutstandingInvites is the per-peer limit on active (non-expired, unused) invites.
 	MaxOutstandingInvites int
 	// RetentionSeconds is how long (in seconds) to keep used invites before purging.
@@ -104,8 +105,8 @@ type Server struct {
 	maint       *MaintenanceManager
 	log         *slog.Logger
 	trustedNets []*net.IPNet
-	now         func() time.Time // clock for invite expiry; defaults to time.Now
-	claims      ClaimStore       // claim/confirm backend; nil = claim routes are not served
+	clk         clock.Clock // time source for invite expiry and rate limiters
+	claims      ClaimStore  // claim/confirm backend; nil = claim routes are not served
 
 	// For pruning verifyLim
 	pruneDone chan struct{}
@@ -179,9 +180,7 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 	}
 	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
 
-	if cfg.Now == nil {
-		cfg.Now = time.Now
-	}
+	clk := clock.Or(cfg.Clock)
 
 	trustedNets, err := ParseTrustedProxies(cfg.TrustedProxies)
 	if err != nil {
@@ -204,9 +203,9 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 		cfg:         cfg,
 		log:         cfg.Logger,
 		lim:         NewLimiterManager(cfg),
-		verifyLim:   msg.NewLimiterPerHour(3, 3), // 3 verification emails per peer/address per hour
+		verifyLim:   msg.NewLimiterPerHour(3, 3, msg.WithClock(clk.Now)), // 3 verification emails per peer/address per hour
 		trustedNets: trustedNets,
-		now:         cfg.Now,
+		clk:         clk,
 		pruneDone:   make(chan struct{}),
 	}
 
@@ -214,7 +213,7 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 	go s.pruneVerifyLoop()
 
 	// Start maintenance tasks
-	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, cfg.RetentionSeconds, cfg.KeyIndexRebuildHours)
+	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, clk, cfg.RetentionSeconds, cfg.KeyIndexRebuildHours)
 
 	return s, nil
 }
@@ -435,7 +434,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 			tokenWithExpiry = "" // Leave unverified
 		} else {
 			rawToken = auth.NewSecret(auth.EmailVerifyPrefix)
-			issuedAt := s.now().Unix()
+			issuedAt := s.clk.Now().Unix()
 			tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
 		}
 	}
@@ -558,7 +557,7 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 			return
 		} else {
 			rawToken = auth.NewSecret(auth.EmailVerifyPrefix)
-			issuedAt := s.now().Unix()
+			issuedAt := s.clk.Now().Unix()
 			tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
 		}
 	}
@@ -715,7 +714,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	code := auth.NewSecret("inv_")
-	exp := s.now().Add(ttl).UTC()
+	exp := s.clk.Now().Add(ttl).UTC()
 	var pairingToken string
 	var publicID string
 
@@ -1163,7 +1162,7 @@ func inviteEmail(inviter, inviterID, to, code, publicBase string, scopes, bags [
 
 var inviteCodeRE = regexp.MustCompile(`^inv_[A-Za-z0-9_-]{16,64}$`)
 
-// acceptLanding answers an unauthenticated GET of the emailed link. It never
+// acceptLanding answers an unauthenticated GET of the accept_url landing page. It never
 // touches the invite (so mail scanners and previews cannot burn it).
 func (s *Server) acceptLanding(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
