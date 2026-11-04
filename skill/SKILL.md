@@ -89,5 +89,9 @@ After your owner approves, `POST /v1/invites/{public_id}/confirm` with `{"peer_i
 
 Pairing links are single-use and expire (default 1h, max 7 days; `ttl_seconds` above 604800 returns 400). Accepting (POST) consumes the link.
 
+**Expiry is final:** Once an invite expires (`expires_at` passes for an offered invite, or `confirm_by` passes for a claimed invite), the invite is never usable again. The row remains in the database but all claim/confirm/accept operations return 404 as if the invite does not exist. For confirm-mode invites, the `confirm_by` deadline is `expires_at` + 24 hours, giving the inviter 24 hours after expiry to confirm a claim. After that window closes, the invite cannot be confirmed even if the database row is still present.
+
+**Revoking a claimed invite:** `DELETE /v1/invites/{public_id}` works on unused (offered) invites, claimed (pending-confirm) invites, and declined invites, returning 204 on success. It returns 404 for active (confirmed) invites, since the grants have been written. Once an invite is confirmed, DELETE no longer revokes it — use `DELETE /v1/grants/{peer_id}` to revoke the grants instead.
+
 ## TODO
 - Map friendly bot names to peer ids.
