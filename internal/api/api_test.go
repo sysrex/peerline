@@ -3378,89 +3378,199 @@ func TestSanitizerTrailingSpaceTrim(t *testing.T) {
 	}
 }
 
+// TestSanitizeInviterName verifies specific sanitization cases
+func TestSanitizeInviterName(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "basic ASCII",
+			input: "Alice",
+			want:  "Alice",
+		},
+		{
+			name:  "word-final virama kept: Devanagari halant before space",
+			input: "00000!000000000000000000000000000000000000000000000000000000क्ष् 00000" + strings.Repeat("ब", 70),
+			want:  "00000000000000000000000000000000000000000000000000000000000क्ष्", // word-final क्ष् kept (63 runes)
+		},
+		{
+			name:  "word-final virama kept: single syllable before space",
+			input: strings.Repeat("a", 61) + "क् " + strings.Repeat("b", 10),
+			want:  strings.Repeat("a", 61) + "क्", // word-final क् kept (63 runes)
+		},
+		{
+			name:  "word-final viramas kept: two words ending in virama",
+			input: strings.Repeat("a", 59) + "क् ष्" + strings.Repeat("b", 10),
+			want:  strings.Repeat("a", 59) + "क्", // truncates after क्, word-final so kept (61 runes)
+		},
+		{
+			name:  "mid-word virama dropped: cut inside a conjunct",
+			input: strings.Repeat("a", 60) + "क्ष्म" + "bbb",
+			want:  strings.Repeat("a", 60), // क्ष्म cut mid-word, virama clusters dropped (60 runes)
+		},
+		{
+			name:  "Tamil pulli: many word-final viramas",
+			input: strings.Repeat("ம் ", 40),                                        // 40 Tamil words ending in pulli
+			want:  "ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம்", // 62 runes, keeps words
+		},
+		{
+			name:  "Tamil pulli at exactly position 64",
+			input: "xx" + strings.Repeat("ம் ", 40),                                   // Rune 63 is ் (virama), rune 64 is space
+			want:  "xxம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம்", // 64 runes, word-final virama kept
+		},
+		{
+			name:  "Devanagari halant at exactly position 64",
+			input: strings.Repeat("a", 62) + "क् " + strings.Repeat("b", 10),
+			want:  strings.Repeat("a", 62) + "क्", // 64 runes, word-final virama kept
+		},
+		{
+			name:  "Tamil word kept whole: மரம் not cut",
+			input: strings.Repeat("a", 58) + " மரம் zz" + strings.Repeat("b", 10),
+			want:  strings.Repeat("a", 58) + " மரம்", // 63 runes, மரம் kept whole
+		},
+		{
+			name:  "empty after cleanup falls back",
+			input: "!@#$%",
+			want:  "A Peerline peer",
+		},
+		{
+			name:  "only spaces falls back",
+			input: "     ",
+			want:  "A Peerline peer",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeInviterName(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeInviterName(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// checkSanitizeInvariants verifies all sanitizeInviterName invariants on an output.
+// checkVirama should be true only when checking a forced-truncation path.
+func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama bool) {
+	t.Helper()
+
+	// Invariant 1: Output is valid UTF-8
+	if !utf8.ValidString(got) {
+		t.Errorf("sanitizeInviterName(%q) [%s] returned invalid UTF-8: %q", input, label, got)
+	}
+
+	// Invariant 2: Output is NFC normalized
+	if !norm.NFC.IsNormalString(got) {
+		t.Errorf("sanitizeInviterName(%q) [%s] returned non-NFC string: %q", input, label, got)
+	}
+
+	// Invariant 3: At most 64 runes
+	runeCount := utf8.RuneCountInString(got)
+	if runeCount > 64 {
+		t.Errorf("sanitizeInviterName(%q) [%s] returned %d runes (> 64): %q", input, label, runeCount, got)
+	}
+
+	// Invariant 4: Non-empty (fallback applied if needed)
+	if got == "" {
+		t.Errorf("sanitizeInviterName(%q) [%s] returned empty string", input, label)
+	}
+
+	// Invariant 5: No leading/trailing space
+	if strings.TrimSpace(got) != got {
+		t.Errorf("sanitizeInviterName(%q) [%s] has leading/trailing space: %q", input, label, got)
+	}
+
+	// Invariant 6: No leading combining mark
+	runes := []rune(got)
+	if len(runes) > 0 {
+		firstRune := runes[0]
+		if unicode.Is(unicode.Mn, firstRune) || unicode.Is(unicode.Mc, firstRune) {
+			t.Errorf("sanitizeInviterName(%q) [%s] starts with combining mark: %q", input, label, got)
+		}
+	}
+
+	// Invariant 7: Idempotent
+	got2 := sanitizeInviterName(got)
+	if got != got2 {
+		t.Errorf("sanitizeInviterName [%s] not idempotent for input %q: first=%q, second=%q", label, input, got, got2)
+	}
+
+	// Invariant 8: Every output rune is in the allowlist (L*, N*, Mn, Mc, space, . , - _ ')
+	// and no U+FFFD
+	for _, r := range got {
+		if r == '\uFFFD' {
+			t.Errorf("sanitizeInviterName(%q) [%s] contains U+FFFD: %q", input, label, got)
+		}
+		isAllowed := unicode.IsLetter(r) || unicode.IsNumber(r) ||
+			unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) ||
+			r == ' ' || r == '.' || r == ',' || r == '-' || r == '_' || r == '\''
+		if !isAllowed {
+			t.Errorf("sanitizeInviterName(%q) [%s] contains disallowed rune %U (%c): %q", input, label, r, r, got)
+		}
+	}
+
+	// Invariant 9: Truncated output may end in CCC 9 (virama) only if word-final.
+	// For truncated paths, compare against the uncapped result.
+	if checkVirama {
+		// Get the uncapped result
+		full := []rune(sanitizeInviterNameUncapped(input))
+		out := []rune(got)
+
+		// (a) If the output ends in CCC 9 and is shorter than full,
+		// the next rune in full must be a space (word-final virama).
+		if len(out) > 0 && len(out) < len(full) {
+			lastRune := out[len(out)-1]
+			props := norm.NFC.PropertiesString(string(lastRune))
+			if props.CCC() == 9 {
+				nextRune := full[len(out)]
+				if nextRune != ' ' {
+					t.Errorf("sanitizeInviterName(%q) [%s] ends in mid-word CCC 9 (virama) rune U+%04X, next rune is U+%04X (not space): output=%q full=%q", input, label, lastRune, nextRune, got, string(full))
+				}
+			}
+		}
+
+		// (b) If full is >64 runes, full[63] has CCC 9, and full[64] is a space,
+		// the output must equal string(full[:64]) (word-final virama kept).
+		if len(full) > 64 {
+			props := norm.NFC.PropertiesString(string(full[63]))
+			if props.CCC() == 9 && full[64] == ' ' {
+				expected := string(full[:64])
+				if got != expected {
+					t.Errorf("sanitizeInviterName(%q) [%s] should keep word-final virama at position 63: got=%q, expected=%q", input, label, got, expected)
+				}
+			}
+		}
+	}
+}
+
 // FuzzSanitizeInviterName verifies invariants over random inputs
 func FuzzSanitizeInviterName(f *testing.F) {
 	// Seed corpus with edge cases
 	f.Add("Alice")
 	f.Add(strings.Repeat("a", 70))
-	f.Add("e\u0300\u0316")                           // non-composing marks
-	f.Add("\uFDFA")                                  // NFKC expands
-	f.Add("\xf0\u00b2")                              // invalid byte + NFKC char
-	f.Add(strings.Repeat("a", 1022) + "日")           // 3-byte rune at 1024
-	f.Add("क्ष")                                     // Indic conjunct (virama)
-	f.Add(strings.Repeat("a", 60) + "क्ष्म" + "bbb") // Chained virama (force CCC 9 strip)
-	f.Add(strings.Repeat("ब", 70))                   // Force 64-rune cap path
+	f.Add("e\u0300\u0316")                                 // non-composing marks
+	f.Add("\uFDFA")                                        // NFKC expands
+	f.Add("\xf0\u00b2")                                    // invalid byte + NFKC char
+	f.Add(strings.Repeat("a", 1022) + "日")                 // 3-byte rune at 1024
+	f.Add("क्ष")                                           // Indic conjunct (virama)
+	f.Add(strings.Repeat("a", 60) + "क्ष्म" + "bbb")       // Mid-word virama: cut inside conjunct
+	f.Add(strings.Repeat("ब", 70))                         // Force 64-rune cap path
+	f.Add(strings.Repeat("a", 59) + "क् ष्" + "bbbbbbbbb") // Word-final virama: keep complete words
 
 	f.Fuzz(func(t *testing.T, input string) {
 		got := sanitizeInviterName(input)
 
-		// Invariant 1: Output is valid UTF-8
-		if !utf8.ValidString(got) {
-			t.Errorf("sanitizeInviterName(%q) returned invalid UTF-8: %q", input, got)
-		}
+		// Check all invariants on the direct output (Invariant 9 not checked here)
+		checkSanitizeInvariants(t, input, got, "direct", false)
 
-		// Invariant 2: Output is NFC normalized
-		if !norm.NFC.IsNormalString(got) {
-			t.Errorf("sanitizeInviterName(%q) returned non-NFC string: %q", input, got)
-		}
-
-		// Invariant 3: At most 64 runes
-		runeCount := utf8.RuneCountInString(got)
-		if runeCount > 64 {
-			t.Errorf("sanitizeInviterName(%q) returned %d runes (> 64): %q", input, runeCount, got)
-		}
-
-		// Invariant 4: Non-empty (fallback applied if needed)
-		if got == "" {
-			t.Errorf("sanitizeInviterName(%q) returned empty string", input)
-		}
-
-		// Invariant 5: No leading/trailing space
-		if strings.TrimSpace(got) != got {
-			t.Errorf("sanitizeInviterName(%q) has leading/trailing space: %q", input, got)
-		}
-
-		// Invariant 6: No leading combining mark
-		runes := []rune(got)
-		if len(runes) > 0 {
-			firstRune := runes[0]
-			if unicode.Is(unicode.Mn, firstRune) || unicode.Is(unicode.Mc, firstRune) {
-				t.Errorf("sanitizeInviterName(%q) starts with combining mark: %q", input, got)
-			}
-		}
-
-		// Invariant 7: Idempotent
-		got2 := sanitizeInviterName(got)
-		if got != got2 {
-			t.Errorf("sanitizeInviterName not idempotent for input %q: first=%q, second=%q", input, got, got2)
-		}
-
-		// Invariant 8: Every output rune is in the allowlist (L*, N*, Mn, Mc, space, . , - _ ')
-		// and no U+FFFD
-		for _, r := range got {
-			if r == '\uFFFD' {
-				t.Errorf("sanitizeInviterName(%q) contains U+FFFD: %q", input, got)
-			}
-			isAllowed := unicode.IsLetter(r) || unicode.IsNumber(r) ||
-				unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) ||
-				r == ' ' || r == '.' || r == ',' || r == '-' || r == '_' || r == '\''
-			if !isAllowed {
-				t.Errorf("sanitizeInviterName(%q) contains disallowed rune %U (%c): %q", input, r, r, got)
-			}
-		}
-
-		// Invariant 9: Truncated output never ends in CCC 9 (virama) unless it's the only rune
-		// This only applies when the 64-rune cap was hit (force truncation by appending text)
+		// Force truncation by appending ब×70 and check all invariants on that path too.
+		// This is the only path that exercises the tail cleanup loop.
 		truncationTest := input + strings.Repeat("ब", 70)
 		gotTruncated := sanitizeInviterName(truncationTest)
-		runesTruncated := []rune(gotTruncated)
-		if len(runesTruncated) > 1 && utf8.RuneCountInString(gotTruncated) == 64 {
-			lastRune := runesTruncated[len(runesTruncated)-1]
-			props := norm.NFC.PropertiesString(string(lastRune))
-			if props.CCC() == 9 {
-				t.Errorf("sanitizeInviterName(%q+...70×ब) truncated output ends in CCC 9 (virama) rune %U: %q", input, lastRune, gotTruncated)
-			}
-		}
+		checkSanitizeInvariants(t, truncationTest, gotTruncated, "truncated", true)
 	})
 }
 

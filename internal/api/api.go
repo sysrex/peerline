@@ -919,11 +919,11 @@ func truncateUTF8(s string, max int) string {
 //
 // Note: Cross-script homoglyphs (e.g., Cyrillic а vs Latin a) are not fully solvable here
 // and require application-level awareness or visual similarity detection.
-func sanitizeInviterName(name string) string {
+// sanitizeInviterNameUncapped performs all sanitization steps except the 64-rune cap.
+// It returns the NFC-normalized, filtered result before length truncation.
+func sanitizeInviterNameUncapped(name string) string {
 	const (
-		maxRunes        = 64
-		maxMarksPerBase = 3 // Issue #84 specifies 3 marks per base (issue #63 asked for 2 but #84 is the live tracker)
-		fallbackName    = "A Peerline peer"
+		maxMarksPerBase = 3    // Issue #84 specifies 3 marks per base (issue #63 asked for 2 but #84 is the live tracker)
 		maxInputBytes   = 1024 // Guard against unbounded normalization work
 	)
 
@@ -1027,7 +1027,16 @@ func sanitizeInviterName(name string) string {
 
 	// Apply NFC (canonical composition) to the filtered result
 	// This recomposes base+mark sequences into precomposed forms where possible
-	result := norm.NFC.String(strings.TrimSpace(out.String()))
+	return norm.NFC.String(strings.TrimSpace(out.String()))
+}
+
+func sanitizeInviterName(name string) string {
+	const (
+		maxRunes     = 64
+		fallbackName = "A Peerline peer"
+	)
+
+	result := sanitizeInviterNameUncapped(name)
 
 	// Return fallback if result is empty
 	if result == "" {
@@ -1055,8 +1064,9 @@ func sanitizeInviterName(name string) string {
 			}
 		}
 
-		// Check if the last kept rune is a virama (CCC 9)
-		if len(truncated) > 0 {
+		// Check if the last kept rune is a virama (CCC 9) and it's mid-word.
+		// A word-final virama (followed by space) is complete and should not trigger back-off.
+		if len(truncated) > 0 && runes[maxRunes] != ' ' {
 			lastRune := truncated[len(truncated)-1]
 			// Check if it's a virama using Canonical_Combining_Class
 			props := norm.NFC.PropertiesString(string(lastRune))
@@ -1081,9 +1091,9 @@ func sanitizeInviterName(name string) string {
 			}
 		}
 
-		// Strip any trailing viramas (CCC 9) after truncation to handle stacked conjuncts
-		// (e.g., क्क्ष where multiple viramas chain, issue #206). Keep dropping entire
-		// clusters until no virama remains at the end.
+		// Drop trailing virama clusters only if the cut is inside a word.
+		// A virama at word end (followed by space in the full runes slice) is complete.
+		// Trim trailing spaces afterwards.
 		dropCluster := func(t []rune) []rune {
 			for i := len(t) - 1; i >= 0; i-- {
 				r := t[i]
@@ -1099,30 +1109,31 @@ func sanitizeInviterName(name string) string {
 		}
 
 		for len(truncated) > 0 {
-			if len(truncated) == 0 {
+			last := truncated[len(truncated)-1]
+			props := norm.NFC.PropertiesString(string(last))
+			// Stop if not a virama, or if it's a word-final virama (next rune is space).
+			// runes[len(truncated)] is always in range here because truncated is a strict
+			// prefix of runes on this path.
+			if props.CCC() != 9 || runes[len(truncated)] == ' ' {
 				break
 			}
-			lastRune := truncated[len(truncated)-1]
-			props := norm.NFC.PropertiesString(string(lastRune))
-			if props.CCC() == 9 {
-				n := len(truncated)
-				truncated = dropCluster(truncated)
-				if len(truncated) == n {
-					// No progress made, stop to avoid infinite loop
-					break
-				}
-			} else {
+			n := len(truncated)
+			truncated = dropCluster(truncated)
+			if len(truncated) == n {
+				// No progress made, stop to avoid infinite loop
 				break
 			}
+		}
+
+		// Trim trailing spaces after dropping virama clusters
+		for len(truncated) > 0 && truncated[len(truncated)-1] == ' ' {
+			truncated = truncated[:len(truncated)-1]
 		}
 
 		result = string(truncated)
 	}
 
-	// Trim trailing spaces that may have been left by the 64-rune truncation
-	result = strings.TrimRight(result, " ")
-
-	// Return fallback if result is now empty after trimming
+	// Apply empty-string fallback after cleanup
 	if result == "" {
 		return fallbackName
 	}
