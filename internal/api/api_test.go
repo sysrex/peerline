@@ -3383,7 +3383,8 @@ func TestSanitizerUnicode(t *testing.T) {
 
 		// Issue #206: Stacked conjunct (C V C V | C) - dropCluster removes entire stacked conjunct
 		{"stacked conjunct at 64", strings.Repeat("a", 60) + "क्क्ष" + "bbb", strings.Repeat("a", 60)},   // 60 a + क्क्ष (stacked) → 66 runes → 64 → backs off through all 3 clusters → 60 a (no trailing virama)
-		{"4-virama stack at 64", strings.Repeat("a", 56) + "स्त्र्य्म" + "bbb", strings.Repeat("a", 56)}, // 56 a + 5 clusters (10 runes) → 66 runes → 64 → backs off through 4 clusters (म dropped, 4 viramas remain) → 56 a (bound hit)
+		{"4-virama stack at 64", strings.Repeat("a", 56) + "स्त्र्य्म" + "bbb", strings.Repeat("a", 56)}, // 68 runes total (56 a + 9-rune stack + bbb) → 64 (म at 64) → backs off 4 clusters → 56 a (bound hit)
+		{"6-virama stack at 64", strings.Repeat("a", 54) + "स्त्र्य्म्न" + "bbb", strings.Repeat("a", 54)}, // 68 runes total (54 a + 11-rune stack + bbb) → 64 (न at 64) → backs off 4 clusters (म्न + य् dropped) → 54 a (bound hit, fails if bound=5)
 
 		// Issue #315: Word-final virama before punctuation (should be kept, not dropped)
 		// क् is 2 runes (क at 62, ् at 63), so with 62 'a' + क् + punctuation, the virama is at 63 and punctuation at 64
@@ -3394,10 +3395,23 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"word-final virama before underscore", strings.Repeat("a", 62) + "ம்_" + "bbb", strings.Repeat("a", 62) + "ம்"},
 		{"word-final virama before apostrophe", strings.Repeat("a", 62) + "क्'" + "bbb", strings.Repeat("a", 62) + "क्"},
 
-		// Issue #332: Bounded back-off for long virama runs prevents collapse
-		{"40 க் clusters bounded backoff", strings.Repeat("க்", 40), strings.Repeat("க்", 28)},                         // 80 runes → 64 (32 pairs) → first backoff to 62 (31 pairs, count=1) → tail loop drops 3 more → 56 runes (28 pairs, bound hit, ends in virama)
-		{"40 க் + 70 ब bounded backoff", strings.Repeat("க்", 40) + strings.Repeat("ब", 70), strings.Repeat("க்", 28)}, // 110 runes → 64 (32 pairs) → first backoff to 62 (31 pairs, count=1) → tail loop drops 3 more → 56 runes (28 pairs, bound hit, ends in virama)
-		{"ab + 40 க் bounded backoff", "ab" + strings.Repeat("க்", 40), "ab" + strings.Repeat("க்", 27)},               // 82 runes → 64 (ab+31 pairs) → first backoff to 62 (ab+30 pairs, count=1) → tail loop drops 3 more → 56 runes (ab+27 pairs, bound hit, ends in virama)
+		// Issue #332, #346: Bounded back-off for long virama runs prevents collapse.
+		// When the bound is hit, the output may end in a visible virama or half-form (#346).
+		{"40 Tamil க் bounded", strings.Repeat("க்", 40), strings.Repeat("க்", 28)},                         // 80 runes → 64 (32 pairs) → backoff drops 4 clusters → 56 runes (28 pairs, bound hit, ends in pulli)
+		{"40 க் + 70 ब bounded", strings.Repeat("க்", 40) + strings.Repeat("ब", 70), strings.Repeat("க்", 28)}, // 150 runes → 64 (32 க் pairs) → backoff drops 4 clusters → 56 runes (28 pairs, bound hit, ends in pulli)
+		{"ab + 40 Tamil க் bounded", "ab" + strings.Repeat("க்", 40), "ab" + strings.Repeat("க்", 27)},               // 82 runes → 64 (ab+31 pairs) → backoff drops 4 clusters → 56 runes (ab+27 pairs, bound hit, ends in pulli)
+		{"40 Devanagari क् bounded", strings.Repeat("क्", 40), strings.Repeat("क्", 28)},                   // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama; #346 pin)
+		{"ab + 40 Devanagari क् bounded", "ab" + strings.Repeat("क्", 40), "ab" + strings.Repeat("क्", 27)}, // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in virama)
+		{"40 क् + 70 ब bounded", strings.Repeat("क्", 40) + strings.Repeat("ब", 70), strings.Repeat("क्", 28)}, // 150 runes → 64 (32 क् clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama)
+		{"40 Bengali ক্ bounded", strings.Repeat("ক্", 40), strings.Repeat("ক্", 28)},                     // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in hasanta)
+		{"ab + 40 Bengali ক্ bounded", "ab" + strings.Repeat("ক্", 40), "ab" + strings.Repeat("ক্", 27)},   // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in hasanta)
+		{"40 ক্ + 70 ব bounded", strings.Repeat("ক্", 40) + strings.Repeat("ব", 70), strings.Repeat("ক্", 28)}, // 150 runes → 64 (32 ক্ clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in hasanta)
+		{"40 Malayalam ക് bounded", strings.Repeat("ക്", 40), strings.Repeat("ക്", 28)},                   // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama)
+		{"ab + 40 Malayalam ക് bounded", "ab" + strings.Repeat("ക്", 40), "ab" + strings.Repeat("ക്", 27)}, // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in virama)
+		{"40 ക് + 70 ബ bounded", strings.Repeat("ക്", 40) + strings.Repeat("ബ", 70), strings.Repeat("ക്", 28)}, // 150 runes → 64 (32 ക് clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama)
+		{"Latin 70×a at cap", strings.Repeat("a", 70), strings.Repeat("a", 64)},                           // 70 runes → 64 runes (no virama, simple cap)
+		{"64 runes Deva क् at end", strings.Repeat("a", 62) + "क्", strings.Repeat("a", 62) + "क्"},       // Exactly 64 runes ending in virama → unchanged
+		{"65 runes Deva क् at 63", strings.Repeat("a", 63) + "क्", strings.Repeat("a", 63)},               // 65 runes → 64 (virama at 64) → backoff drops 1 cluster → 63 a (word-final virama removed)
 	}
 
 	for _, tt := range tests {
@@ -3795,8 +3809,10 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 		}
 	}
 
-	// Invariant 9: Output ends on an extended grapheme cluster boundary.
-	// The cut must not split a base character from its combining marks or virama.
+	// Invariant 9: No split base+mark cluster.
+	// The output must not split a base character from its immediately following combining marks
+	// or virama. This prevents dangling marks, but the output may end in a mid-word virama
+	// (a trailing half-form) when the bound is hit.
 	if checkVirama {
 		full := []rune(sanitizeInviterNameUncapped(input))
 		out := []rune(got)
@@ -3808,7 +3824,7 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 			props := norm.NFC.PropertiesString(string(nextRune))
 			isVirama := props.CCC() == 9
 			if isMark || isVirama {
-				t.Errorf("sanitizeInviterName(%q) [%s] cuts inside grapheme cluster: output ends at position %d, but full[%d]=U+%04X is a mark/virama: output=%q full=%q", input, label, cutPos, cutPos, nextRune, got, string(full))
+				t.Errorf("sanitizeInviterName(%q) [%s] splits base from mark/virama: output ends at position %d, but full[%d]=U+%04X is a mark/virama: output=%q full=%q", input, label, cutPos, cutPos, nextRune, got, string(full))
 			}
 		}
 	}
@@ -3906,7 +3922,7 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 		//   - the next rune in full is a word boundary (word-final virama), OR
 		//   - it's the bounded back-off case: the dropped region from len(out) to min(64, len(full))
 		//     is all consonant+virama clusters (no boundaries), AND the dropped region contains
-		//     at least maxViramaBackoff (4) whole clusters.
+		//     at least maxViramaBackoff whole clusters.
 		if len(out) > 0 && len(out) < len(full) {
 			lastRune := out[len(out)-1]
 			props := norm.NFC.PropertiesString(string(lastRune))
@@ -3937,8 +3953,8 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 					}
 				}
 
-				// Bounded case only applies when ≥ maxViramaBackoff (4) clusters were dropped
-				isBoundedCase = isBoundedCase && clustersInDropped >= 4
+				// Bounded case only applies when ≥ maxViramaBackoff clusters were dropped
+				isBoundedCase = isBoundedCase && clustersInDropped >= maxViramaBackoff
 
 				if !isWordFinal && !isBoundedCase {
 					t.Errorf("sanitizeInviterName(%q) [%s] ends in mid-word CCC 9 (virama) rune U+%04X at non-bounded length %d, next rune is U+%04X (not a word boundary): output=%q full=%q", input, label, lastRune, len(out), nextRune, got, string(full))
@@ -3977,7 +3993,7 @@ func TestSanitizerWordFinalViramaWithSpace(t *testing.T) {
 		},
 		{
 			name: "Tamil virama at 63, space at 64, forced path",
-			// "xx" + 20×"ம் " + "ம்" + " " = 2 + 60 + 2 + 1 = 65 runes (virama at 63, space at 64)
+			// "xx" + 20×"ம் " + "ம்" + " " + 70×"ब" = 135 runes input (virama at 63, space at 64, cut before ब)
 			// The virama is word-final (space follows), so it's kept, but trailing space is trimmed
 			input: "xx" + strings.Repeat("ம் ", 20) + "ம் " + strings.Repeat("ब", 70),
 			want:  "xx" + strings.Repeat("ம் ", 20) + "ம்",
@@ -4014,10 +4030,19 @@ func FuzzSanitizeInviterName(f *testing.F) {
 	f.Add(strings.Repeat("a", 62) + "क् " + "bbbbbbbbbb") // virama at 63, space at 64
 	f.Add(strings.Repeat("a", 62) + "क்." + "bbbbbbbbbb") // virama at 63, dot at 64
 	f.Add(strings.Repeat("a", 62) + "ம்-" + "bbbbbbbbbb") // virama at 63, dash at 64
-	// Issue #332: Fuzz seeds for bounded back-off on long virama runs
-	f.Add(strings.Repeat("க்", 40))                           // 40 க் clusters (80 runes)
-	f.Add(strings.Repeat("க்", 40) + strings.Repeat("ब", 70)) // 40 க் + 70 ब (110 runes total)
+	// Issue #332, #346: Fuzz seeds for bounded back-off on long virama runs
+	f.Add(strings.Repeat("க்", 40))                           // 40 Tamil க் clusters (80 runes)
+	f.Add(strings.Repeat("க்", 40) + strings.Repeat("ब", 70)) // 40 க் + 70 ब (150 runes total)
 	f.Add("ab" + strings.Repeat("க்", 40))                    // ab + 40 க் clusters (82 runes)
+	f.Add(strings.Repeat("क्", 40))                           // 40 Devanagari क् clusters (80 runes)
+	f.Add("ab" + strings.Repeat("क्", 40))                    // ab + 40 क् clusters (82 runes)
+	f.Add(strings.Repeat("क्", 40) + strings.Repeat("ब", 70)) // 40 क् + 70 ब (150 runes total)
+	f.Add(strings.Repeat("ক্", 40))                           // 40 Bengali ক্ clusters (80 runes)
+	f.Add("ab" + strings.Repeat("ক্", 40))                    // ab + 40 ক্ clusters (82 runes)
+	f.Add(strings.Repeat("ক্", 40) + strings.Repeat("ব", 70)) // 40 ক্ + 70 ব (150 runes total)
+	f.Add(strings.Repeat("ക്", 40))                           // 40 Malayalam ക് clusters (80 runes)
+	f.Add("ab" + strings.Repeat("ക്", 40))                    // ab + 40 ക് clusters (82 runes)
+	f.Add(strings.Repeat("ക്", 40) + strings.Repeat("ബ", 70)) // 40 ക് + 70 ബ (150 runes total)
 
 	f.Fuzz(func(t *testing.T, input string) {
 		got := sanitizeInviterName(input)

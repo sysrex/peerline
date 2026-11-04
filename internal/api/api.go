@@ -898,6 +898,14 @@ func truncateUTF8(s string, max int) string {
 	return s[:cut]
 }
 
+// maxViramaBackoff is the maximum number of trailing consonant+virama clusters
+// to drop when the 64-rune cut lands inside a word. This prevents collapsing
+// a name to the fallback when a long run of clusters (e.g. strings.Repeat("க்", 40))
+// has no word boundary (issue #332), while still backing off through real stacked
+// conjuncts (3–4 clusters, e.g. स्त्र्य). Set to 4 to cover typical conjunct stacks.
+// When the bound is hit, the output may end in a mid-word virama (a trailing half-form).
+const maxViramaBackoff = 4
+
 // isWordBoundary returns true if the rune is not a letter, number, or mark (Mn, Mc, Me).
 // Used to detect word boundaries for virama handling and truncation.
 func isWordBoundary(r rune) bool {
@@ -1049,9 +1057,14 @@ func sanitizeInviterNameUncapped(name string) string {
 //   - Truncation respects combining-mark cluster boundaries: if cutting at 64
 //     runes would split a base from non-composing marks, backs off to exclude
 //     the entire trailing cluster
-//   - Virama-safe: backs off when cutting after a virama (CCC 9), then strips
-//     any remaining trailing viramas to prevent dangling half-form conjuncts or
-//     stacked conjuncts in Indic scripts (issues #182, #206)
+//   - Virama-safe: backs off when cutting after a virama (CCC 9) to prevent
+//     splitting base+mark clusters. For long runs of virama clusters with no word
+//     boundary, back-off is bounded to prevent collapsing the name (#332). When
+//     the bound is hit, the output may end in a visible virama or half-form in
+//     Indic linker scripts (Devanagari, Bengali, Malayalam, etc.; #346). The
+//     output is always a prefix of the full sanitized name and idempotent.
+//   - Real stacked conjuncts (≤4 clusters, e.g., स्त्र्य) are backed off completely
+//     to word or base boundaries (#182, #206)
 //   - Limitation: archaic Hangul sequences that don't compose (e.g., L L V or
 //     trailing jamo) may leave a lone leading jamo at the cut; these sequences
 //     do not occur in real names
@@ -1064,12 +1077,6 @@ func sanitizeInviterName(name string) string {
 	const (
 		maxRunes     = 64
 		fallbackName = "A Peerline peer"
-		// maxViramaBackoff is the maximum number of trailing consonant+virama clusters
-		// to drop when the 64-rune cut lands inside a word. This prevents collapsing
-		// a name to the fallback when a long run of clusters (e.g. strings.Repeat("க்", 40))
-		// has no word boundary (issue #332), while still backing off through real stacked
-		// conjuncts (3–4 clusters, e.g. स्त्र्य). Set to 4 to cover typical conjunct stacks.
-		maxViramaBackoff = 4
 	)
 
 	result := sanitizeInviterNameUncapped(name)
@@ -1166,6 +1173,12 @@ func sanitizeInviterName(name string) string {
 			}
 			clustersDropped++
 		}
+
+		// When the bound is hit in Indic linker scripts (Devanagari, Bengali, Malayalam, etc.),
+		// the output may end in a visible virama or half-form consonant. Under UAX #29 GB9c,
+		// a linker run is one extended grapheme cluster, so backing off to a complete aksara
+		// would collapse back to #332. The output remains a prefix of the full sanitized name
+		// and is idempotent. See #346 for security review.
 
 		// Trim trailing spaces after dropping virama clusters
 		for len(truncated) > 0 && truncated[len(truncated)-1] == ' ' {
