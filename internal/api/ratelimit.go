@@ -259,7 +259,7 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 		} else {
 			// IPv6: apply floor and additional checks
 			addr := prefix.Addr()
-			
+
 			// Always reject ::/0
 			// Already handled by bits == 0 check above
 
@@ -276,12 +276,12 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 			// ULA ranges (fc00::/7, fd00::/8) are only allowed with opt-in
 			minBits := 32
 			isULA := (addr.As16()[0] == 0xfc || addr.As16()[0] == 0xfd)
-			
+
 			if isULA && !allowBroadIPv6 {
 				// Reject ULA ranges without opt-in (they're broader than /32)
 				return nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /%d", cidr, minBits)
 			}
-			
+
 			if allowBroadIPv6 {
 				if isULA {
 					// ULA ranges are allowed with opt-in even though they're broader than /29
@@ -290,7 +290,7 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 					minBits = 29
 				}
 			}
-			
+
 			if !isULA && bits < minBits {
 				return nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /%d", cidr, minBits)
 			}
