@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sysrex/peerline/internal/mailer"
 )
@@ -212,4 +213,88 @@ func TestEmailSendFailureStillCreatesInvite(t *testing.T) {
 	}
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv.Code}, nil)
 	want(t, resp, body, 200)
+}
+
+func TestInviteEmailDirect(t *testing.T) {
+	testExpiry := time.Date(2026, 12, 31, 23, 59, 59, 0, time.UTC)
+	tests := []struct {
+		name       string
+		inviter    string
+		inviterID  string
+		to         string
+		code       string
+		publicBase string
+		scopes     []string
+		bags       []string
+		wantIn     []string
+		wantNotIn  []string
+	}{
+		{
+			name:       "basic invite",
+			inviter:    "Alice",
+			inviterID:  "p_alice123",
+			to:         "bot@example.com",
+			code:       "inv_testcode123",
+			publicBase: "https://peerline.example.com",
+			scopes:     []string{"messages"},
+			bags:       nil,
+			wantIn: []string{
+				"Alice (Peerline peer p_alice123) invited",
+				"Scopes granted to you: messages",
+				`{"code":"inv_testcode123"}`,
+				"https://peerline.example.com/v1/invites/accept",
+				"inv_testcode123",
+				"POST",
+				"Content-Type: application/json",
+				"2026-12-31T23:59:59Z",
+			},
+			wantNotIn: []string{
+				"?code=",
+			},
+		},
+		{
+			name:       "multiple scopes and bags",
+			inviter:    "Bob",
+			inviterID:  "p_bob456",
+			to:         "test@example.com",
+			code:       "inv_xyz789",
+			publicBase: "https://test.com",
+			scopes:     []string{"messages", "bags:read"},
+			bags:       []string{"notes", "data"},
+			wantIn: []string{
+				"Bob (Peerline peer p_bob456) invited",
+				"Scopes granted to you: messages, bags:read",
+				"Bags: notes, data",
+				`{"code":"inv_xyz789"}`,
+				"https://test.com/v1/invites/accept",
+				"inv_xyz789",
+				"2026-12-31T23:59:59Z",
+			},
+			wantNotIn: []string{
+				"?code=",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := inviteEmail(tt.inviter, tt.inviterID, tt.to, tt.code, tt.publicBase, tt.scopes, tt.bags, testExpiry)
+			if msg.To != tt.to {
+				t.Errorf("To = %q, want %q", msg.To, tt.to)
+			}
+			if !strings.Contains(msg.Subject, tt.inviter) {
+				t.Errorf("Subject %q should contain inviter %q", msg.Subject, tt.inviter)
+			}
+			for _, want := range tt.wantIn {
+				if !strings.Contains(msg.Body, want) {
+					t.Errorf("Body missing %q\nBody: %s", want, msg.Body)
+				}
+			}
+			for _, notWant := range tt.wantNotIn {
+				if strings.Contains(msg.Body, notWant) {
+					t.Errorf("Body should not contain %q\nBody: %s", notWant, msg.Body)
+				}
+			}
+		})
+	}
 }
