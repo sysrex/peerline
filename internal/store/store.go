@@ -182,7 +182,7 @@ CREATE INDEX IF NOT EXISTS invites_expires_at ON invites(expires_at);
 `
 
 // Open opens the database at path, applies migrations, and returns a Store.
-// Use ":memory:" for tests. It is the only Store constructor; a zero-value Store{} has a nil now func and must not be used directly.
+// Use ":memory:" for tests. It is the only Store constructor; a zero-value Store{} has a nil clock and must not be used directly.
 func Open(path string) (*Store, error) {
 	keepEnv := os.Getenv("PEERLINE_BACKUP_KEEP")
 	var keep int
