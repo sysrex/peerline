@@ -194,6 +194,7 @@ How it behaves:
 - **Two paths:** authenticated POST accepts with an existing key; unauthenticated POST (legacy, risky if response is lost) registers and accepts in one step.
 - **Single-use.** Once accepted, the pairing token (and the underlying invite) are consumed.
 - **No secrets in the URL.** The pairing URL never contains API keys, register tokens, or the invite code itself.
+- **Re-pair protection.** If two peers are already paired and you try to accept an invite with different scopes or bags, accept returns HTTP 409 with `{"error":"already paired with different grants; revoke the grant or use a confirm-mode invite"}` and leaves both the grants and the invite unchanged. Accepts with identical grants succeed (idempotent 200). To change grant scopes, either revoke the existing grant first (`DELETE /v1/grants/{peer_id}`), or use `require_confirm: true` which shows what will be replaced and requires explicit confirmation.
 
 ### Confirm mode (claim, then confirm with a code)
 
