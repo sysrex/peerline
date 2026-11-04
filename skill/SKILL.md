@@ -89,5 +89,9 @@ After your owner approves, `POST /v1/invites/{public_id}/confirm` with `{"peer_i
 
 Pairing links are single-use and expire (default 1h, max 7 days; `ttl_seconds` above 604800 returns 400). Accepting (POST) consumes the link.
 
+**Expiry is final:** Once an invite expires (`expires_at` passes for an offered invite, or `confirm_by` passes for a claimed invite), the invite is never usable again. All claim/confirm/accept operations return 404 as if the invite does not exist. The invite stays unusable until the purge job removes it (no sooner than 5 minutes after `expires_at` for offered invites, or 5 minutes after `confirm_by` for claimed invites, or 5 minutes after `declined_at` for declined invites), then it's gone. For confirm-mode invites, the `confirm_by` deadline is set to 24 hours from the moment the claimant calls claim, giving the inviter 24 hours from claim time to confirm. After that window closes, the invite cannot be confirmed.
+
+**Revoking a claimed invite:** `DELETE /v1/invites/{public_id}` works on unused (offered) invites, claimed (pending-confirm) invites, and declined invites, returning 204 on success. It returns 404 for active (confirmed) invites, since the grants have been written. Once an invite is confirmed, DELETE no longer revokes it — each side must revoke its own grant with `DELETE /v1/grants/{peer_id}`. When A revokes with `DELETE /v1/grants/{B}`, B immediately loses access to A's resources, but A keeps access to B's resources until B revokes its own grant with `DELETE /v1/grants/{A}`. An expired invite still returns 204 on DELETE until the purge job removes it, which happens no sooner than 5 minutes after expiry (for offered invites) or after `confirm_by` or `declined_at` lapses (for claimed or declined invites). After the purge job removes it, DELETE returns 404.
+
 ## TODO
 - Map friendly bot names to peer ids.
