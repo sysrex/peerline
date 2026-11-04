@@ -551,7 +551,7 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 	timestamp := clk.Now().UTC().Format("20060102-150405.000000")
 
 	// Sweep stale .partial files from previous interrupted backups (older than 2 minutes)
-	sweepPartialBackups(backupDir, dbBase, clk, opts.Logger)
+	sweepPartialBackups(backupDir, dbBase, opts.Logger)
 
 	backupName := fmt.Sprintf("%s.pre-v%d-from-v%d.%s", dbBase, targetVersion, currentVersion, timestamp)
 
@@ -564,6 +564,7 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 	var finalPath string
 	var backupSize int64
 	var backupDuration time.Duration
+	var linked bool
 
 	for attempts := 0; attempts < 10; attempts++ {
 		tryName := backupName
@@ -606,19 +607,19 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 			return "", false, fmt.Errorf("stat created partial backup file: %w", pathless(err))
 		}
 
-		if !ownedByCurrentUser(partialFinfo) {
-			f.Close()
-			os.Remove(partialPath)
-			return "", false, fmt.Errorf("partial backup file %q is not owned by the user running peerline", filepath.Base(partialPath))
-		}
-
-		// Mode should be 0600 from OpenFile, but verify
-		if perm := partialFinfo.Mode().Perm(); perm != 0600 {
-			f.Close()
-			os.Remove(partialPath)
-			return "", false, fmt.Errorf("partial backup file %q has mode %04o, expected 0600", filepath.Base(partialPath), perm)
-		}
+	if !ownedByCurrentUser(partialFinfo) {
 		f.Close()
+		os.Remove(partialPath)
+		return "", false, fmt.Errorf("partial backup file %q is not owned by the user running peerline", filepath.Base(partialPath))
+	}
+
+	// Mode should be 0600 from OpenFile, but verify (unix-only check)
+	if err := verifyBackupFileMode(partialFinfo, partialPath); err != nil {
+		f.Close()
+		os.Remove(partialPath)
+		return "", false, err
+	}
+	f.Close()
 
 		// Execute VACUUM INTO with context timeout
 		opts.Logger.Info("starting pre-migration backup", "backup", filepath.Base(tryName), "size_bytes", "pending")
@@ -653,14 +654,14 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 			os.Remove(partialPath)
 			return "", false, fmt.Errorf("stat partial after VACUUM: %w", pathless(err))
 		}
-		if !os.SameFile(partialFinfo, afterVacuum) {
-			os.Remove(partialPath)
-			return "", false, fmt.Errorf("partial backup file was replaced during VACUUM")
-		}
-		if afterVacuum.Mode().Perm() != 0600 {
-			os.Remove(partialPath)
-			return "", false, fmt.Errorf("partial backup mode changed to %04o during VACUUM, expected 0600", afterVacuum.Mode().Perm())
-		}
+	if !os.SameFile(partialFinfo, afterVacuum) {
+		os.Remove(partialPath)
+		return "", false, fmt.Errorf("partial backup file was replaced during VACUUM")
+	}
+	if err := verifyBackupFileMode(afterVacuum, partialPath); err != nil {
+		os.Remove(partialPath)
+		return "", false, fmt.Errorf("mode changed during VACUUM: %w", err)
+	}
 
 		// Fsync the backup file
 		if err := fsyncFile(partialPath, opts.Logger); err != nil {
@@ -689,11 +690,12 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 		// Link succeeded, remove the .partial file (the final name now exists via hard link)
 		os.Remove(partialPath)
 		backupSize = afterVacuum.Size()
+		linked = true
 		break
 	}
 
 	// If we exhausted all retries, fail
-	if backupSize == 0 {
+	if !linked {
 		return "", false, fmt.Errorf("backup failed after 10 collision retries")
 	}
 
@@ -904,14 +906,17 @@ func fsyncDirectory(path string, logger *slog.Logger) error {
 
 // sweepPartialBackups removes stale .partial files older than 2 minutes
 // from interrupted backups. Only removes files matching our naming pattern.
-func sweepPartialBackups(backupDir, dbBase string, clk clock.Clock, logger *slog.Logger) {
+//
+// Uses real time.Now() to compare against real file mtimes from the filesystem.
+// An injected fake clock would incorrectly classify files as old or new.
+func sweepPartialBackups(backupDir, dbBase string, logger *slog.Logger) {
 	entries, err := os.ReadDir(backupDir)
 	if err != nil {
 		// Silently skip if directory is unreadable
 		return
 	}
 
-	cutoff := clk.Now().Add(-2 * time.Minute)
+	cutoff := time.Now().Add(-2 * time.Minute)
 	// Match: <dbBase>.pre-vN-from-vM.<timestamp>[.<suffix>].partial
 	pattern := regexp.MustCompile(`^` + regexp.QuoteMeta(dbBase) + `\.pre-v\d+-from-v\d+\.` + `\d{8}-\d{6}\.\d{6}` + `(\.[0-9a-f]{8}|\.\d+)?\.partial$`)
 

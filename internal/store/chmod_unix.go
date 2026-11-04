@@ -22,13 +22,13 @@ func tightenDatabaseFilePermissions(dbPath string, logger *slog.Logger) {
 	}
 
 	for _, path := range paths {
-		// Open with O_NOFOLLOW to avoid following symlinks
-		f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		// Open with O_NOFOLLOW to avoid following symlinks and O_NONBLOCK to avoid blocking on FIFOs
+		f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue // File doesn't exist yet (e.g. -wal, -shm)
 			}
-			logger.Warn("failed to open database file for chmod", "path", filepath.Base(path), "error", err)
+			logger.Warn("failed to open database file for chmod", "path", filepath.Base(path), "error", pathless(err))
 			continue
 		}
 
@@ -36,7 +36,7 @@ func tightenDatabaseFilePermissions(dbPath string, logger *slog.Logger) {
 		info, err := f.Stat()
 		if err != nil {
 			f.Close()
-			logger.Warn("failed to stat database file for chmod", "path", filepath.Base(path), "error", err)
+			logger.Warn("failed to stat database file for chmod", "path", filepath.Base(path), "error", pathless(err))
 			continue
 		}
 
@@ -57,7 +57,7 @@ func tightenDatabaseFilePermissions(dbPath string, logger *slog.Logger) {
 		newMode := oldMode &^ 0o077
 		if err := f.Chmod(newMode); err != nil {
 			f.Close()
-			logger.Warn("failed to tighten database file permissions", "path", filepath.Base(path), "error", err)
+			logger.Warn("failed to tighten database file permissions", "path", filepath.Base(path), "error", pathless(err))
 			continue
 		}
 		f.Close()

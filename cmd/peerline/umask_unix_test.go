@@ -43,20 +43,18 @@ func TestUmaskProtectsNewDatabaseFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s.Close()
-
-	// Verify DB, -wal, and -shm are all 0600
+	// Verify DB, -wal, and -shm are all 0600 while the store is still open
+	// (after Close, -wal and -shm are checkpointed and removed)
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		path := dbPath + suffix
 		info, err := os.Stat(path)
 		if err != nil {
-			if os.IsNotExist(err) && suffix != "" {
-				continue // WAL or SHM might not exist yet
-			}
-			t.Fatalf("stat %s: %v", filepath.Base(path), err)
+			t.Fatalf("stat %s (store still open): %v", filepath.Base(path), err)
 		}
 		if perm := info.Mode().Perm(); perm != 0600 {
 			t.Errorf("%s mode: got %04o, want 0600 (umask 0077 should create files at 0600)", filepath.Base(path), perm)
 		}
 	}
+
+	s.Close()
 }

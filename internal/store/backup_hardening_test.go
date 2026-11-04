@@ -357,26 +357,25 @@ func TestCollisionMultipleRetries(t *testing.T) {
 func TestSweepPartialBackups(t *testing.T) {
 	dir := secureTempDir(t)
 
-	// Create some .partial files with different ages
-	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
-	clk := clocktest.New(now)
+	// Create some .partial files with different ages relative to real time.Now()
+	now := time.Now()
 
-	// Old .partial (>2 minutes old, should be swept)
+	// Old .partial (10 minutes old, >2 minutes, should be swept)
 	oldPartial := filepath.Join(dir, "x.db.pre-v6-from-v2.20260101-115700.000000.partial")
 	if err := os.WriteFile(oldPartial, []byte("old"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	oldTime := now.Add(-3 * time.Minute)
+	oldTime := now.Add(-10 * time.Minute)
 	if err := os.Chtimes(oldPartial, oldTime, oldTime); err != nil {
 		t.Fatal(err)
 	}
 
-	// Fresh .partial (<2 minutes old, should be kept)
+	// Fresh .partial (30 seconds old, <2 minutes, should be kept)
 	freshPartial := filepath.Join(dir, "x.db.pre-v6-from-v2.20260101-115830.000000.partial")
 	if err := os.WriteFile(freshPartial, []byte("fresh"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	freshTime := now.Add(-1 * time.Minute)
+	freshTime := now.Add(-30 * time.Second)
 	if err := os.Chtimes(freshPartial, freshTime, freshTime); err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +387,7 @@ func TestSweepPartialBackups(t *testing.T) {
 	}
 
 	// Run sweep
-	sweepPartialBackups(dir, "x.db", clk, slog.Default())
+	sweepPartialBackups(dir, "x.db", slog.Default())
 
 	// Check old .partial was removed
 	if _, err := os.Stat(oldPartial); !os.IsNotExist(err) {

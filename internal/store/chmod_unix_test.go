@@ -4,10 +4,12 @@ package store
 
 import (
 	"database/sql"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestTightenExistingDatabasePermissions(t *testing.T) {
@@ -164,5 +166,49 @@ func TestSymlinkNotFollowedDuringChmod(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0644 {
 		t.Errorf("symlink target was modified: got %04o, want 0644", perm)
+	}
+}
+
+func TestTightenSkipsFIFO(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	walPath := dbPath + "-wal"
+
+	// Create a FIFO at the -wal path
+	if err := syscall.Mkfifo(walPath, 0644); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+
+	// Verify it's a FIFO
+	info, err := os.Lstat(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatal("expected FIFO, got regular file")
+	}
+	originalMode := info.Mode().Perm()
+
+	// Call tightenDatabaseFilePermissions in a goroutine with 2s timeout
+	done := make(chan bool, 1)
+	go func() {
+		tightenDatabaseFilePermissions(dbPath, slog.Default())
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		// OK, returned in time
+	case <-time.After(2 * time.Second):
+		t.Fatal("tightenDatabaseFilePermissions blocked on FIFO for >2s")
+	}
+
+	// Verify FIFO mode is unchanged
+	afterInfo, err := os.Lstat(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterInfo.Mode().Perm() != originalMode {
+		t.Errorf("FIFO mode changed: got %04o, want %04o", afterInfo.Mode().Perm(), originalMode)
 	}
 }
