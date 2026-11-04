@@ -3242,156 +3242,177 @@ func TestSingleLogLineUnauthenticatedPairing(t *testing.T) {
 // TestSanitizerUnicode verifies Unicode handling in sanitizeInviterName
 func TestSanitizerUnicode(t *testing.T) {
 	tests := []struct {
-		name  string
-		input string
-		want  string
+		name               string
+		input              string
+		want               string
+		skipInvariantCheck bool // Set true for fallback rows (no base characters) where invariant checks don't apply
 	}{
 		// Basic cases
-		{"ASCII", "Alice Smith", "Alice Smith"},
-		{"Unicode letters", "José García", "José García"},
-		{"Chinese", "李明", "李明"},
-		{"Japanese", "田中太郎", "田中太郎"},
-		{"Arabic", "محمد علي", "محمد علي"},
-		{"Mixed valid", "Alice-O'Neil, Jr.", "Alice-O'Neil, Jr."},
-		{"Hindi with combining marks", "राजेश कुमार", "राजेश कुमार"},
-		{"Thai with combining marks", "สมชาย ใจดี", "สมชาย ใจดี"},
+		{"ASCII", "Alice Smith", "Alice Smith", false},
+		{"Unicode letters", "José García", "José García", false},
+		{"Chinese", "李明", "李明", false},
+		{"Japanese", "田中太郎", "田中太郎", false},
+		{"Arabic", "محمد علي", "محمد علي", false},
+		{"Mixed valid", "Alice-O'Neil, Jr.", "Alice-O'Neil, Jr.", false},
+		{"Hindi with combining marks", "राजेश कुमार", "राजेश कुमार", false},
+		{"Thai with combining marks", "สมชาย ใจดี", "สมชาย ใจดี", false},
 		// Issue #68: Devanagari test
-		{"Devanagari", "हिन्दी", "हिन्दी"},
+		{"Devanagari", "हिन्दी", "हिन्दी", false},
 
 		// Bidi controls (Cf category) - all filtered
-		{"Bidi LRE", "Alice\u202AEvil", "AliceEvil"},
-		{"Bidi RLE", "Alice\u202BEvil", "AliceEvil"},
-		{"Bidi PDF", "Alice\u202CEvil", "AliceEvil"},
-		{"Bidi LRO", "Alice\u202DEvil", "AliceEvil"},
-		{"Bidi RLO", "Alice\u202EEvil", "AliceEvil"},
-		{"Bidi LRI", "Alice\u2066Evil", "AliceEvil"},
-		{"Bidi RLI", "Alice\u2067Evil", "AliceEvil"},
-		{"Bidi FSI", "Alice\u2068Evil", "AliceEvil"},
-		{"Bidi PDI", "Alice\u2069Evil", "AliceEvil"},
-		{"Bidi LRM", "Alice\u200EEvil", "AliceEvil"},
-		{"Bidi RLM", "Alice\u200FEvil", "AliceEvil"},
+		{"Bidi LRE", "Alice\u202AEvil", "AliceEvil", false},
+		{"Bidi RLE", "Alice\u202BEvil", "AliceEvil", false},
+		{"Bidi PDF", "Alice\u202CEvil", "AliceEvil", false},
+		{"Bidi LRO", "Alice\u202DEvil", "AliceEvil", false},
+		{"Bidi RLO", "Alice\u202EEvil", "AliceEvil", false},
+		{"Bidi LRI", "Alice\u2066Evil", "AliceEvil", false},
+		{"Bidi RLI", "Alice\u2067Evil", "AliceEvil", false},
+		{"Bidi FSI", "Alice\u2068Evil", "AliceEvil", false},
+		{"Bidi PDI", "Alice\u2069Evil", "AliceEvil", false},
+		{"Bidi LRM", "Alice\u200EEvil", "AliceEvil", false},
+		{"Bidi RLM", "Alice\u200FEvil", "AliceEvil", false},
 
 		// Zero-width and format characters (Cf category)
-		{"Zero-width space", "Alice\u200BEvil", "AliceEvil"},
-		{"Zero-width non-joiner", "Alice\u200CEvil", "AliceEvil"},
-		{"Zero-width joiner", "Alice\u200DEvil", "AliceEvil"},
-		{"BOM", "Alice\uFEFFEvil", "AliceEvil"},
+		{"Zero-width space", "Alice\u200BEvil", "AliceEvil", false},
+		{"Zero-width non-joiner", "Alice\u200CEvil", "AliceEvil", false},
+		{"Zero-width joiner", "Alice\u200DEvil", "AliceEvil", false},
+		{"BOM", "Alice\uFEFFEvil", "AliceEvil", false},
 
 		// Tag characters
-		{"Tag space", "Alice\U000E0020Evil", "AliceEvil"},
-		{"Tag char", "Alice\U000E0041Evil", "AliceEvil"},
+		{"Tag space", "Alice\U000E0020Evil", "AliceEvil", false},
+		{"Tag char", "Alice\U000E0041Evil", "AliceEvil", false},
 
 		// Hangul fillers
-		{"Hangul filler U+115F", "Alice\u115FEvil", "AliceEvil"},
-		{"Hangul filler U+1160", "Alice\u1160Evil", "AliceEvil"},
-		{"Hangul filler U+3164", "Alice\u3164Evil", "AliceEvil"},
-		{"Hangul filler U+FFA0", "Alice\uFFA0Evil", "AliceEvil"},
+		{"Hangul filler U+115F", "Alice\u115FEvil", "AliceEvil", false},
+		{"Hangul filler U+1160", "Alice\u1160Evil", "AliceEvil", false},
+		{"Hangul filler U+3164", "Alice\u3164Evil", "AliceEvil", false},
+		{"Hangul filler U+FFA0", "Alice\uFFA0Evil", "AliceEvil", false},
 
 		// Variation selectors
-		{"Variation selector FE00", "Alice\uFE00Evil", "AliceEvil"},
-		{"Variation selector FE0F", "Alice\uFE0FEvil", "AliceEvil"},
-		{"Variation selector E0100", "Alice\U000E0100Evil", "AliceEvil"},
+		{"Variation selector FE00", "Alice\uFE00Evil", "AliceEvil", false},
+		{"Variation selector FE0F", "Alice\uFE0FEvil", "AliceEvil", false},
+		{"Variation selector E0100", "Alice\U000E0100Evil", "AliceEvil", false},
 
 		// Issue #35: Additional Cf characters and Zl/Zp
-		{"U+061C Arabic letter mark", "Alice\u061CEvil", "AliceEvil"},
-		{"U+2060 Word joiner", "Alice\u2060Evil", "AliceEvil"},
-		{"U+00AD Soft hyphen", "Alice\u00ADEvil", "AliceEvil"},
-		{"U+2028 Line separator", "Alice\u2028Evil", "AliceEvil"},
-		{"U+2029 Paragraph separator", "Alice\u2029Evil", "AliceEvil"},
+		{"U+061C Arabic letter mark", "Alice\u061CEvil", "AliceEvil", false},
+		{"U+2060 Word joiner", "Alice\u2060Evil", "AliceEvil", false},
+		{"U+00AD Soft hyphen", "Alice\u00ADEvil", "AliceEvil", false},
+		{"U+2028 Line separator", "Alice\u2028Evil", "AliceEvil", false},
+		{"U+2029 Paragraph separator", "Alice\u2029Evil", "AliceEvil", false},
 
 		// Issue #63 & #84: Invisible Mn characters
-		{"U+034F COMBINING GRAPHEME JOINER", "a\u034Fb", "ab"},
-		{"U+0334 Combining tilde overlay", "a\u0334b", "a\u0334b"},
-		{"U+180B Mongolian FVS1", "a\u180Bb", "ab"},
-		{"U+180C Mongolian FVS2", "a\u180Cb", "ab"},
-		{"U+180D Mongolian FVS3", "a\u180Db", "ab"},
-		{"U+180F Mongolian FVS4", "a\u180Fb", "ab"},
-		{"U+17B4 Khmer inherent vowel", "a\u17B4b", "ab"},
-		{"U+17B5 Khmer inherent vowel", "a\u17B5b", "ab"},
+		{"U+034F COMBINING GRAPHEME JOINER", "a\u034Fb", "ab", false},
+		{"U+0334 Combining tilde overlay", "a\u0334b", "a\u0334b", false},
+		{"U+180B Mongolian FVS1", "a\u180Bb", "ab", false},
+		{"U+180C Mongolian FVS2", "a\u180Cb", "ab", false},
+		{"U+180D Mongolian FVS3", "a\u180Db", "ab", false},
+		{"U+180F Mongolian FVS4", "a\u180Fb", "ab", false},
+		{"U+17B4 Khmer inherent vowel", "a\u17B4b", "ab", false},
+		{"U+17B5 Khmer inherent vowel", "a\u17B5b", "ab", false},
 
 		// Issue #84: Combining marks constraints
 		// Mark limit is checked in NFD (decomposed) form to ensure visible result has max 3 marks per base
-		{"3 marks allowed", "a\u0301\u0302\u0303", "á\u0302\u0303"},                          // a + 3 marks -> á + 2 marks (NFC composition)
-		{"20 marks capped at 3", "a" + strings.Repeat("\u0301", 20), "á́́"},                  // a + 20 marks -> a + 3 marks (may compose)
-		{"64 marks alone becomes fallback", strings.Repeat("\u0301", 64), "A Peerline peer"}, // No base -> fallback (issue #68)
-		{"100 marks capped at 3", "a" + strings.Repeat("\u0301", 100), "á́́"},                // a + 100 marks -> a + 3 marks
-		{"Mark after space dropped", "a \u0301b", "a b"},
-		{"Mark at start dropped", "\u0301abc", "abc"},
-		{"Mark after punctuation dropped", "a.\u0301b", "a.b"},
-		{"Mark after letter then punctuation", "a\u0301.b", "á.b"}, // a+mark -> á (NFC)
+		{"3 marks allowed", "a\u0301\u0302\u0303", "á\u0302\u0303", false},                         // a + 3 marks -> á + 2 marks (NFC composition)
+		{"20 marks capped at 3", "a" + strings.Repeat("\u0301", 20), "á́́", false},                 // a + 20 marks -> a + 3 marks (may compose)
+		{"64 marks alone becomes fallback", strings.Repeat("\u0301", 64), "A Peerline peer", true}, // No base -> fallback (issue #68); skip invariants
+		{"100 marks capped at 3", "a" + strings.Repeat("\u0301", 100), "á́́", false},               // a + 100 marks -> a + 3 marks
+		{"Mark after space dropped", "a \u0301b", "a b", false},
+		{"Mark at start dropped", "\u0301abc", "abc", false},
+		{"Mark after punctuation dropped", "a.\u0301b", "a.b", false},
+		{"Mark after letter then punctuation", "a\u0301.b", "á.b", false}, // a+mark -> á (NFC)
 
 		// Issue #68: Tab and newline handling
-		{"Tab becomes space", "Alice\tSmith", "Alice Smith"},
-		{"Newline becomes space", "Alice\nSmith", "Alice Smith"},
-		{"Carriage return becomes space", "Alice\rSmith", "Alice Smith"},
-		{"Tab with spaces", "Alice  \t  Smith", "Alice Smith"},
+		{"Tab becomes space", "Alice\tSmith", "Alice Smith", false},
+		{"Newline becomes space", "Alice\nSmith", "Alice Smith", false},
+		{"Carriage return becomes space", "Alice\rSmith", "Alice Smith", false},
+		{"Tab with spaces", "Alice  \t  Smith", "Alice Smith", false},
 
 		// Issue #68: Empty result fallback
-		{"Only symbols becomes fallback", "★★★", "A Peerline peer"},
-		{"Only filtered chars", "\u200B\u200C\uFEFF", "A Peerline peer"},
-		{"Only marks becomes fallback", "\u0301\u0302\u0303", "A Peerline peer"},
+		{"Only symbols becomes fallback", "★★★", "A Peerline peer", true},              // Skip invariants (no base)
+		{"Only filtered chars", "\u200B\u200C\uFEFF", "A Peerline peer", true},         // Skip invariants (all filtered)
+		{"Only marks becomes fallback", "\u0301\u0302\u0303", "A Peerline peer", true}, // Skip invariants (no base)
 
 		// NFKC normalization
-		{"Fullwidth ASCII", "Ａｌｉｃｅ", "Alice"},  // Fullwidth → ASCII
-		{"Superscript", "Alice²", "Alice2"},    // ² → 2
-		{"Ligature", "ﬁle", "file"},            // ﬁ → fi
-		{"Circled number", "Alice①", "Alice1"}, // ① → 1
-		{"Compatibility ideograph", "塚", "塚"},  // U+FA10 → U+585A
+		{"Fullwidth ASCII", "Ａｌｉｃｅ", "Alice", false},  // Fullwidth → ASCII
+		{"Superscript", "Alice²", "Alice2", false},    // ² → 2
+		{"Ligature", "ﬁle", "file", false},            // ﬁ → fi
+		{"Circled number", "Alice①", "Alice1", false}, // ① → 1
+		{"Compatibility ideograph", "塚", "塚", false},  // U+FA10 → U+585A
 
 		// Space collapsing
-		{"Multiple spaces", "Alice   Smith", "Alice Smith"},
-		{"Leading spaces", "   Alice", "Alice"},
-		{"Trailing spaces", "Alice   ", "Alice"},
+		{"Multiple spaces", "Alice   Smith", "Alice Smith", false},
+		{"Leading spaces", "   Alice", "Alice", false},
+		{"Trailing spaces", "Alice   ", "Alice", false},
 
 		// Emoji and symbols (filtered out)
-		{"Emoji removed", "Alice 😀 Smith", "Alice Smith"},
-		{"Symbol removed", "Alice ★ Smith", "Alice Smith"},
+		{"Emoji removed", "Alice 😀 Smith", "Alice Smith", false},
+		{"Symbol removed", "Alice ★ Smith", "Alice Smith", false},
 
 		// Edge cases
-		{"Empty string", "", "A Peerline peer"},
-		{"Only spaces", "   ", "A Peerline peer"},
+		{"Empty string", "", "A Peerline peer", true},   // Skip invariants (empty)
+		{"Only spaces", "   ", "A Peerline peer", true}, // Skip invariants (only spaces)
 
 		// Issue #68: Length tests (64 runes max, counted on final NFC output)
-		{"70 ASCII letters", strings.Repeat("a", 70), strings.Repeat("a", 64)},
-		{"30 CJK chars under byte limit", strings.Repeat("日", 30), strings.Repeat("日", 30)},
+		{"70 ASCII letters", strings.Repeat("a", 70), strings.Repeat("a", 64), false},
+		{"30 CJK chars under byte limit", strings.Repeat("日", 30), strings.Repeat("日", 30), false},
 		// 64 runes (not bytes): "日" is 3 bytes, 64 copies = 192 bytes, should keep exactly 64 runes
-		{"Long multibyte truncated at 64 runes", strings.Repeat("日", 70), strings.Repeat("日", 64)},
+		{"Long multibyte truncated at 64 runes", strings.Repeat("日", 70), strings.Repeat("日", 64), false},
 		// Precomposed characters: é (U+00E9) is 1 rune in NFC
-		{"70 precomposed é gives 64", strings.Repeat("é", 70), strings.Repeat("é", 64)},
+		{"70 precomposed é gives 64", strings.Repeat("é", 70), strings.Repeat("é", 64), false},
 		// Hangul syllables: 한 (U+D55C) is 1 rune in NFC, decomposes to 3 jamo in NFD
-		{"70 Hangul syllables gives 64", strings.Repeat("한", 70), strings.Repeat("한", 64)},
+		{"70 Hangul syllables gives 64", strings.Repeat("한", 70), strings.Repeat("한", 64), false},
 		// a+acute recomposes to á in NFC, 70 gives 64
-		{"70 a+acute recomposes to 64 á", strings.Repeat("a\u0301", 70), strings.Repeat("á", 64)},
+		{"70 a+acute recomposes to 64 á", strings.Repeat("a\u0301", 70), strings.Repeat("á", 64), false},
 
 		// Issue #181: Edge cases for combining-mark cluster boundaries
-		{"cluster ending at rune 64 kept whole", strings.Repeat("a", 63) + "e\u0300", strings.Repeat("a", 63) + "è"},
-		{"cluster + trailing space at cut", strings.Repeat("a", 63) + "e\u0300 zzz", strings.Repeat("a", 63) + "è"},
-		{"4 marks on one base capped at 3", "a\u0300\u0301\u0302\u0303", "\u00e0\u0301\u0302"}, // 4 marks -> 3 marks
+		{"cluster ending at rune 64 kept whole", strings.Repeat("a", 63) + "e\u0300", strings.Repeat("a", 63) + "è", false},
+		{"cluster + trailing space at cut", strings.Repeat("a", 63) + "e\u0300 zzz", strings.Repeat("a", 63) + "è", false},
+		{"4 marks on one base capped at 3", "a\u0300\u0301\u0302\u0303", "\u00e0\u0301\u0302", false}, // 4 marks -> 3 marks
 
 		// Emoji with ZWJ, flags, skin tone modifiers (all filtered: ZWJ is Cf, regional indicators and modifiers are So/Sk)
-		{"ZWJ emoji filtered", "Alice👨‍👩‍👧Smith", "AliceSmith"},
-		{"Flag emoji filtered", "Alice🇺🇸Smith", "AliceSmith"},
-		{"Skin tone modifier filtered", "Alice👍🏻Smith", "AliceSmith"},
+		{"ZWJ emoji filtered", "Alice👨‍👩‍👧Smith", "AliceSmith", false},
+		{"Flag emoji filtered", "Alice🇺🇸Smith", "AliceSmith", false},
+		{"Skin tone modifier filtered", "Alice👍🏻Smith", "AliceSmith", false},
 
 		// NFKC expansion: U+FDFA (ﷺ) expands to 18 characters in NFKC
-		{"ﷺ×5 NFKC expands", strings.Repeat("\uFDFA", 5), "صلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى الله ع"}, // 5*18=90 -> 64
+		{"ﷺ×5 NFKC expands", strings.Repeat("\uFDFA", 5), "صلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى الله ع", false}, // 5*18=90 -> 64
 
 		// Issue #182/#206: Virama cut (CCC 9) - should not leave dangling virama
-		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62)},       // क + virama + ष cut before the conjunct
-		{"chained virama at 64", strings.Repeat("a", 60) + "क्ष्म" + "bbb", strings.Repeat("a", 60)}, // क्ष्म (stacked) -> dropCluster removes all
-		{"many chained viramas", strings.Repeat("क्", 32) + "का", "A Peerline peer"},                 // 32 क् pairs (all viramas) -> drops everything -> fallback
+		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62), false},       // क + virama + ष cut before the conjunct
+		{"chained virama at 64", strings.Repeat("a", 60) + "क्ष्म" + "bbb", strings.Repeat("a", 60), false}, // क्ष्म (stacked) → 65 runes → 64 → backs off through all 3 clusters → 60 a (no trailing virama)
+		{"many chained viramas", strings.Repeat("क्", 32) + "का", strings.Repeat("क्", 28), false},          // 65 runes → 64 (32 pairs) → backoff drops 4 clusters (bound hit) → 56 runes (28 pairs, ends in virama); was fallback on main
 
 		// Issue #206: Stacked conjunct (C V C V | C) - dropCluster removes entire stacked conjunct
-		{"stacked conjunct at 64", strings.Repeat("a", 60) + "क्क्ष" + "bbb", strings.Repeat("a", 60)}, // 60 a + क्क्ष (stacked) -> 60 a (no trailing virama)
+		{"stacked conjunct at 64", strings.Repeat("a", 60) + "क्क्ष" + "bbb", strings.Repeat("a", 60), false},            // 60 a + क्क्ष (stacked) → 66 runes → 64 → backs off through all 3 clusters → 60 a (no trailing virama)
+		{"4-virama stack at 64", strings.Repeat("a", 56) + "स्त्र्य्म" + "bbb", strings.Repeat("a", 56), false},          // 68 runes total (56 a + 9-rune stack + bbb) → 64 (म at 64) → backs off 4 clusters → 56 a (bound hit)
+		{"6-virama stack at 64", strings.Repeat("a", 54) + "स्त्र्य्म्न" + "bbb", strings.Repeat("a", 54) + "स्", false}, // 68 runes total (54 a + 11-rune stack + bbb) → 64 ends at ् (म् at cut) → backs off 4 clusters (म्, य्, र्, त् dropped) → 54 a + स् (56 runes, 1 cluster remains; bound hit, fails if bound≥5)
 
 		// Issue #315: Word-final virama before punctuation (should be kept, not dropped)
 		// क् is 2 runes (क at 62, ् at 63), so with 62 'a' + क् + punctuation, the virama is at 63 and punctuation at 64
 		// The cap is 64 runes (positions 0-63), so we keep the virama but not the punctuation at position 64
-		{"word-final virama before dot", strings.Repeat("a", 62) + "क्." + "bbb", strings.Repeat("a", 62) + "क्"},  // क at 62, ् at 63, . at 64 → keep virama (word-final)
-		{"word-final virama before dash", strings.Repeat("a", 62) + "ம்-" + "bbb", strings.Repeat("a", 62) + "ம்"}, // ம at 62, ் at 63, - at 64 → keep virama (word-final)
-		{"word-final virama before comma", strings.Repeat("a", 62) + "क्," + "bbb", strings.Repeat("a", 62) + "क्"},
-		{"word-final virama before underscore", strings.Repeat("a", 62) + "ம்_" + "bbb", strings.Repeat("a", 62) + "ம்"},
-		{"word-final virama before apostrophe", strings.Repeat("a", 62) + "क्'" + "bbb", strings.Repeat("a", 62) + "क्"},
+		{"word-final virama before dot", strings.Repeat("a", 62) + "क्." + "bbb", strings.Repeat("a", 62) + "क्", false},  // क at 62, ् at 63, . at 64 → keep virama (word-final)
+		{"word-final virama before dash", strings.Repeat("a", 62) + "ம்-" + "bbb", strings.Repeat("a", 62) + "ம்", false}, // ம at 62, ் at 63, - at 64 → keep virama (word-final)
+		{"word-final virama before comma", strings.Repeat("a", 62) + "क्," + "bbb", strings.Repeat("a", 62) + "क्", false},
+		{"word-final virama before underscore", strings.Repeat("a", 62) + "ம்_" + "bbb", strings.Repeat("a", 62) + "ம்", false},
+		{"word-final virama before apostrophe", strings.Repeat("a", 62) + "क्'" + "bbb", strings.Repeat("a", 62) + "क्", false},
+
+		// Issue #332, #346: Bounded back-off for long virama runs prevents collapse.
+		// When the bound is hit, the output may end in a visible virama or half-form (#346).
+		{"40 Tamil க் bounded", strings.Repeat("க்", 40), strings.Repeat("க்", 28), false},                            // 80 runes → 64 (32 pairs) → backoff drops 4 clusters → 56 runes (28 pairs, bound hit, ends in pulli)
+		{"40 க் + 70 ब bounded", strings.Repeat("க்", 40) + strings.Repeat("ब", 70), strings.Repeat("க்", 28), false}, // 150 runes → 64 (32 க் pairs) → backoff drops 4 clusters → 56 runes (28 pairs, bound hit, ends in pulli)
+		{"ab + 40 Tamil க் bounded", "ab" + strings.Repeat("க்", 40), "ab" + strings.Repeat("க்", 27), false},         // 82 runes → 64 (ab+31 pairs) → backoff drops 4 clusters → 56 runes (ab+27 pairs, bound hit, ends in pulli)
+		{"40 Devanagari क् bounded", strings.Repeat("क्", 40), strings.Repeat("क्", 28), false},                       // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama; #346 pin)
+		{"ab + 40 Devanagari क् bounded", "ab" + strings.Repeat("क्", 40), "ab" + strings.Repeat("क्", 27), false},    // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in virama)
+		{"40 क् + 70 ब bounded", strings.Repeat("क्", 40) + strings.Repeat("ब", 70), strings.Repeat("क्", 28), false}, // 150 runes → 64 (32 क् clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama)
+		{"40 Bengali ক্ bounded", strings.Repeat("ক্", 40), strings.Repeat("ক্", 28), false},                          // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in hasanta)
+		{"ab + 40 Bengali ক্ bounded", "ab" + strings.Repeat("ক্", 40), "ab" + strings.Repeat("ক্", 27), false},       // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in hasanta)
+		{"40 ক্ + 70 ব bounded", strings.Repeat("ক্", 40) + strings.Repeat("ব", 70), strings.Repeat("ক্", 28), false}, // 150 runes → 64 (32 ক্ clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in hasanta)
+		{"40 Malayalam ക് bounded", strings.Repeat("ക്", 40), strings.Repeat("ക്", 28), false},                        // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama)
+		{"ab + 40 Malayalam ക് bounded", "ab" + strings.Repeat("ക്", 40), "ab" + strings.Repeat("ക്", 27), false},     // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in virama)
+		{"40 ക് + 70 ബ bounded", strings.Repeat("ക്", 40) + strings.Repeat("ബ", 70), strings.Repeat("ക്", 28), false}, // 150 runes → 64 (32 ക് clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama)
+		{"Latin 70×a at cap", strings.Repeat("a", 70), strings.Repeat("a", 64), false},                                // 70 runes → 64 runes (no virama, simple cap)
+		{"64 runes Deva क् at end", strings.Repeat("a", 62) + "क्", strings.Repeat("a", 62) + "क्", false},            // Exactly 64 runes ending in virama → unchanged
+		{"65 runes Deva क् at 63", strings.Repeat("a", 63) + "क्", strings.Repeat("a", 63), false},                    // 65 runes → 64 (virama at 64) → backoff drops 1 cluster → 63 a (word-final virama removed)
 	}
 
 	for _, tt := range tests {
@@ -3399,6 +3420,12 @@ func TestSanitizerUnicode(t *testing.T) {
 			got := sanitizeInviterName(tt.input)
 			if got != tt.want {
 				t.Errorf("sanitizeInviterName(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+
+			// Check all invariants (idempotence, prefix, ≤64 runes, no Cf) unless skipped
+			// Skip only for fallback rows (no base characters) where structural checks don't apply
+			if !tt.skipInvariantCheck {
+				checkSanitizeInvariants(t, tt.input, got, "table", true)
 			}
 
 			// For tests involving combining marks, verify that NFD form has at most 3 marks per base
@@ -3677,7 +3704,7 @@ func TestSanitizeInviterName(t *testing.T) {
 		{
 			name:  "mid-word virama dropped: cut inside a conjunct",
 			input: strings.Repeat("a", 60) + "क्ष्म" + "bbb",
-			want:  strings.Repeat("a", 60), // क्ष्म cut mid-word, virama clusters dropped (60 runes)
+			want:  strings.Repeat("a", 60), // क्ष्म cut mid-word, backs off through all 3 clusters (60 runes, no trailing virama)
 		},
 		{
 			name:  "Tamil pulli: many word-final viramas",
@@ -3723,6 +3750,14 @@ func TestSanitizeInviterName(t *testing.T) {
 
 // checkSanitizeInvariants verifies all sanitizeInviterName invariants on an output.
 // checkVirama should be true only when checking a forced-truncation path.
+// isWordBoundaryTest is the test-side boundary definition, independent of the production code.
+// It matches the intended behavior: a rune is a word boundary if it's not a letter, number, or combining mark.
+// This is defined separately from the production isWordBoundary so the invariant can't drift with the code.
+func isWordBoundaryTest(r rune) bool {
+	return !(unicode.IsLetter(r) || unicode.IsNumber(r) ||
+		unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) || unicode.Is(unicode.Me, r))
+}
+
 func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama bool) {
 	t.Helper()
 
@@ -3781,16 +3816,51 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 		}
 	}
 
-	// Invariant 9: Truncated output may end in CCC 9 (virama) only if word-final.
+	// Invariant 9: No split base+mark cluster.
+	// The output must not split a base character from its immediately following combining marks
+	// or virama. This prevents dangling marks, but the output may end in a mid-word virama
+	// (a trailing half-form) when the bound is hit.
+	if checkVirama {
+		full := []rune(sanitizeInviterNameUncapped(input))
+		out := []rune(got)
+		cutPos := len(out)
+		if cutPos < len(full) {
+			// Check that the next rune in full is not a combining mark or virama (CCC 9)
+			nextRune := full[cutPos]
+			isMark := unicode.Is(unicode.Mn, nextRune) || unicode.Is(unicode.Mc, nextRune) || unicode.Is(unicode.Me, nextRune)
+			props := norm.NFC.PropertiesString(string(nextRune))
+			isVirama := props.CCC() == 9
+			if isMark || isVirama {
+				t.Errorf("sanitizeInviterName(%q) [%s] splits base from mark/virama: output ends at position %d, but full[%d]=U+%04X is a mark/virama: output=%q full=%q", input, label, cutPos, cutPos, nextRune, got, string(full))
+			}
+		}
+	}
+
+	// Invariant 10: Truncated output may end in CCC 9 (virama) only if word-final or bounded.
 	// For truncated paths, compare against the uncapped result.
 	if checkVirama {
 		// Get the uncapped result
 		full := []rune(sanitizeInviterNameUncapped(input))
 		out := []rune(got)
 
-		// General assertion: capped output is a prefix of uncapped result
+		// General assertion: capped output is a prefix of uncapped result, or it's the fallback.
+		// If the fallback is returned, the uncapped result must not have any letters
+		// (otherwise the name collapsed when it shouldn't have).
+		const fallbackName = "A Peerline peer"
 		if len(out) > 0 && len(full) > 0 {
-			if !strings.HasPrefix(string(full), got) {
+			if got == fallbackName {
+				// Check if the uncapped result has at least one letter
+				hasLetter := false
+				for _, r := range full {
+					if unicode.IsLetter(r) {
+						hasLetter = true
+						break
+					}
+				}
+				if hasLetter {
+					t.Errorf("sanitizeInviterName(%q) [%s] returned fallback %q but uncapped has letters: full=%q", input, label, got, string(full))
+				}
+			} else if !strings.HasPrefix(string(full), got) {
 				t.Errorf("sanitizeInviterName(%q) [%s] capped output is not a prefix of uncapped: got=%q full=%q", input, label, got, string(full))
 			}
 		}
@@ -3819,7 +3889,7 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 
 					// Check (a): no word boundaries in the dropped region
 					for _, r := range droppedRegion {
-						if isWordBoundary(r) {
+						if isWordBoundaryTest(r) {
 							t.Errorf("sanitizeInviterName(%q) [%s] dropped runes before position 64 contain word boundary U+%04X (excluding leading spaces): output=%q full=%q dropped=%q", input, label, r, got, string(full), string(droppedRegion))
 							break
 						}
@@ -3854,15 +3924,47 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 			}
 		}
 
-		// (a) If the output ends in CCC 9 and is shorter than full,
-		// the next rune in full must be a word boundary (word-final virama).
+		// (a) If the output ends in CCC 9 (virama) and is shorter than full,
+		// then either:
+		//   - the next rune in full is a word boundary (word-final virama), OR
+		//   - it's the bounded back-off case: the dropped region from len(out) to min(64, len(full))
+		//     is all consonant+virama clusters (no boundaries), AND the dropped region contains
+		//     at least maxViramaBackoff whole clusters.
 		if len(out) > 0 && len(out) < len(full) {
 			lastRune := out[len(out)-1]
 			props := norm.NFC.PropertiesString(string(lastRune))
 			if props.CCC() == 9 {
 				nextRune := full[len(out)]
-				if !isWordBoundary(nextRune) {
-					t.Errorf("sanitizeInviterName(%q) [%s] ends in mid-word CCC 9 (virama) rune U+%04X, next rune is U+%04X (not a word boundary): output=%q full=%q", input, label, lastRune, nextRune, got, string(full))
+				isWordFinal := isWordBoundaryTest(nextRune)
+
+				// Check if the dropped region is a boundary-free run of consonant+virama clusters
+				droppedEnd := len(full)
+				if droppedEnd > 64 {
+					droppedEnd = 64
+				}
+				isBoundedCase := true
+				clustersInDropped := 0
+				for i := len(out); i < droppedEnd && isBoundedCase; i++ {
+					r := full[i]
+					// Must be a base (letter/number), mark, or virama
+					isMark := unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) || unicode.Is(unicode.Me, r)
+					rProps := norm.NFC.PropertiesString(string(r))
+					isVirama := rProps.CCC() == 9
+					isBase := unicode.IsLetter(r) || unicode.IsNumber(r)
+					if !isBase && !isMark && !isVirama {
+						isBoundedCase = false
+					}
+					// Count clusters (bases followed by marks/viramas)
+					if isBase {
+						clustersInDropped++
+					}
+				}
+
+				// Bounded case only applies when ≥ maxViramaBackoff clusters were dropped
+				isBoundedCase = isBoundedCase && clustersInDropped >= maxViramaBackoff
+
+				if !isWordFinal && !isBoundedCase {
+					t.Errorf("sanitizeInviterName(%q) [%s] ends in mid-word CCC 9 (virama) rune U+%04X at non-bounded length %d, next rune is U+%04X (not a word boundary): output=%q full=%q", input, label, lastRune, len(out), nextRune, got, string(full))
 				}
 			}
 		}
@@ -3871,7 +3973,7 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 		// the output must equal string(full[:64]) (word-final virama kept).
 		if len(full) > 64 {
 			props := norm.NFC.PropertiesString(string(full[63]))
-			if props.CCC() == 9 && isWordBoundary(full[64]) {
+			if props.CCC() == 9 && isWordBoundaryTest(full[64]) {
 				expected := string(full[:64])
 				if got != expected {
 					t.Errorf("sanitizeInviterName(%q) [%s] should keep word-final virama at position 63: got=%q, expected=%q", input, label, got, expected)
@@ -3891,14 +3993,14 @@ func TestSanitizerWordFinalViramaWithSpace(t *testing.T) {
 	}{
 		{
 			name: "virama at 63, space at 64, forced path",
-			// 61 'a' + "क्" (2 runes) + " " (1 rune) = 64 runes total (virama at 63, space at 64)
+			// 62 'a' + "क्" (2 runes) + " " (1 rune) = 65 runes total (क at 62, virama at 63, space at 64)
 			// The virama is word-final (space follows), so it's kept, but trailing space is trimmed
-			input: strings.Repeat("a", 61) + "क् " + strings.Repeat("ब", 70),
-			want:  strings.Repeat("a", 61) + "क्",
+			input: strings.Repeat("a", 62) + "क् " + strings.Repeat("ब", 70),
+			want:  strings.Repeat("a", 62) + "क्",
 		},
 		{
 			name: "Tamil virama at 63, space at 64, forced path",
-			// "xx" + 20×"ம் " + "ம்" + " " = 2 + 60 + 2 + 1 = 65 runes (virama at 63, space at 64)
+			// "xx" + 20×"ம் " + "ம்" + " " + 70×"ब" = 135 runes input (virama at 63, space at 64, cut before ब)
 			// The virama is word-final (space follows), so it's kept, but trailing space is trimmed
 			input: "xx" + strings.Repeat("ம் ", 20) + "ம் " + strings.Repeat("ब", 70),
 			want:  "xx" + strings.Repeat("ம் ", 20) + "ம்",
@@ -3935,6 +4037,19 @@ func FuzzSanitizeInviterName(f *testing.F) {
 	f.Add(strings.Repeat("a", 62) + "क् " + "bbbbbbbbbb") // virama at 63, space at 64
 	f.Add(strings.Repeat("a", 62) + "क்." + "bbbbbbbbbb") // virama at 63, dot at 64
 	f.Add(strings.Repeat("a", 62) + "ம்-" + "bbbbbbbbbb") // virama at 63, dash at 64
+	// Issue #332, #346: Fuzz seeds for bounded back-off on long virama runs
+	f.Add(strings.Repeat("க்", 40))                           // 40 Tamil க் clusters (80 runes)
+	f.Add(strings.Repeat("க்", 40) + strings.Repeat("ब", 70)) // 40 க் + 70 ब (150 runes total)
+	f.Add("ab" + strings.Repeat("க்", 40))                    // ab + 40 க் clusters (82 runes)
+	f.Add(strings.Repeat("क्", 40))                           // 40 Devanagari क् clusters (80 runes)
+	f.Add("ab" + strings.Repeat("क्", 40))                    // ab + 40 क् clusters (82 runes)
+	f.Add(strings.Repeat("क्", 40) + strings.Repeat("ब", 70)) // 40 क् + 70 ब (150 runes total)
+	f.Add(strings.Repeat("ক্", 40))                           // 40 Bengali ক্ clusters (80 runes)
+	f.Add("ab" + strings.Repeat("ক্", 40))                    // ab + 40 ক্ clusters (82 runes)
+	f.Add(strings.Repeat("ক্", 40) + strings.Repeat("ব", 70)) // 40 ক্ + 70 ব (150 runes total)
+	f.Add(strings.Repeat("ക്", 40))                           // 40 Malayalam ക് clusters (80 runes)
+	f.Add("ab" + strings.Repeat("ക്", 40))                    // ab + 40 ക് clusters (82 runes)
+	f.Add(strings.Repeat("ക്", 40) + strings.Repeat("ബ", 70)) // 40 ക് + 70 ബ (150 runes total)
 
 	f.Fuzz(func(t *testing.T, input string) {
 		got := sanitizeInviterName(input)
