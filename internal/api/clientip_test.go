@@ -1330,28 +1330,32 @@ func TestIPv6FloorWithOptIn(t *testing.T) {
 
 func TestAllowBroadIPv6Warning(t *testing.T) {
 	tests := []struct {
-		name           string
-		trustedProxies []string
-		wantPublic     bool
-		wantULA        bool
+		name              string
+		trustedProxies    []string
+		wantPublic        bool
+		wantULA           bool
+		wantRelaxedEntries []string
 	}{
 		{
-			name:           "both public and ULA",
-			trustedProxies: []string{"2a06:98c0::/29", "fd00::/8"},
-			wantPublic:     true,
-			wantULA:        true,
+			name:              "both public and ULA",
+			trustedProxies:    []string{"2a06:98c0::/29", "fd00::/8"},
+			wantPublic:        true,
+			wantULA:           true,
+			wantRelaxedEntries: []string{"2a06:98c0::/29", "fd00::/8"},
 		},
 		{
-			name:           "public only",
-			trustedProxies: []string{"2a06:98c0::/29", "2001:db8::/32"},
-			wantPublic:     true,
-			wantULA:        false,
+			name:              "public only",
+			trustedProxies:    []string{"2a06:98c0::/29", "2001:db8::/32"},
+			wantPublic:        true,
+			wantULA:           false,
+			wantRelaxedEntries: []string{"2a06:98c0::/29"},
 		},
 		{
-			name:           "ULA only",
-			trustedProxies: []string{"fd00::/8", "fc00::/7"},
-			wantPublic:     false,
-			wantULA:        true,
+			name:              "ULA only",
+			trustedProxies:    []string{"fd00::/8", "fc00::/7"},
+			wantPublic:        false,
+			wantULA:           true,
+			wantRelaxedEntries: []string{"fd00::/8", "fc00::/7"},
 		},
 	}
 
@@ -1389,6 +1393,25 @@ func TestAllowBroadIPv6Warning(t *testing.T) {
 			}
 			if !tt.wantULA && hasULAMsg {
 				t.Errorf("unexpected ULA warning (no ULA relaxed entries) in logs: %q", logOutput)
+			}
+
+			// Check that the relaxed log line contains all expected entries
+			lines := strings.Split(logOutput, "\n")
+			var relaxedLine string
+			for _, line := range lines {
+				if strings.Contains(line, "relaxed=") {
+					relaxedLine = line
+					break
+				}
+			}
+			if relaxedLine == "" {
+				t.Errorf("expected log line with relaxed= attribute, got logs: %q", logOutput)
+			} else {
+				for _, entry := range tt.wantRelaxedEntries {
+					if !strings.Contains(relaxedLine, entry) {
+						t.Errorf("expected relaxed log line to list %q, got: %q", entry, relaxedLine)
+					}
+				}
 			}
 		})
 	}

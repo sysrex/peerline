@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -307,33 +306,158 @@ func TestSMTPProbeAction(t *testing.T) {
 	}
 }
 
-func TestWarnUnusedAllowBroad(t *testing.T) {
+func TestTrustedProxyConfig(t *testing.T) {
 	tests := []struct {
-		name           string
-		allowBroad     bool
-		trustedProxies string
-		wantWarn       bool
+		name               string
+		proxiesEnv         string
+		allowBroadEnv      string
+		wantProxies        []string
+		wantAllowBroad     bool
+		wantErr            bool
 	}{
-		{"opt-in enabled with proxies", true, "10.0.0.0/8", false},
-		{"opt-in enabled without proxies", true, "", true},
-		{"opt-in disabled without proxies", false, "", false},
-		{"opt-in disabled with proxies", false, "10.0.0.0/8", false},
+		{
+			name:           "both set with opt-in enabled",
+			proxiesEnv:     "10.0.0.0/8,192.168.0.0/16",
+			allowBroadEnv:  "1",
+			wantProxies:    []string{"10.0.0.0/8", "192.168.0.0/16"},
+			wantAllowBroad: true,
+		},
+		{
+			name:           "proxies set, opt-in disabled",
+			proxiesEnv:     "10.0.0.0/8",
+			allowBroadEnv:  "0",
+			wantProxies:    []string{"10.0.0.0/8"},
+			wantAllowBroad: false,
+		},
+		{
+			name:           "proxies unset, opt-in enabled",
+			proxiesEnv:     "",
+			allowBroadEnv:  "true",
+			wantProxies:    nil,
+			wantAllowBroad: true,
+		},
+		{
+			name:           "both unset",
+			proxiesEnv:     "",
+			allowBroadEnv:  "",
+			wantProxies:    nil,
+			wantAllowBroad: false,
+		},
+		{
+			name:          "invalid opt-in value",
+			proxiesEnv:    "10.0.0.0/8",
+			allowBroadEnv: "yes",
+			wantErr:       true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var buf strings.Builder
-			log := slog.New(slog.NewTextHandler(&buf, nil))
-			warnUnusedAllowBroad(log, tt.allowBroad, tt.trustedProxies)
-			output := buf.String()
-			hasWarn := strings.Contains(output, "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled but PEERLINE_TRUSTED_PROXIES is unset")
-			if hasWarn != tt.wantWarn {
-				t.Errorf("warnUnusedAllowBroad(%v, %q) emitted warning = %v, want %v; output: %q", tt.allowBroad, tt.trustedProxies, hasWarn, tt.wantWarn, output)
+			getenv := func(key string) string {
+				switch key {
+				case "PEERLINE_TRUSTED_PROXIES":
+					return tt.proxiesEnv
+				case "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD":
+					return tt.allowBroadEnv
+				default:
+					return ""
+				}
 			}
-			if tt.wantWarn {
-				warnCount := strings.Count(output, "ALLOW_BROAD")
-				if warnCount != 1 {
-					t.Errorf("expected exactly 1 warning, got %d in output: %q", warnCount, output)
+
+			proxies, allowBroad, err := trustedProxyConfig(getenv)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("trustedProxyConfig() succeeded, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("trustedProxyConfig() error = %v, want nil", err)
+			}
+			if allowBroad != tt.wantAllowBroad {
+				t.Errorf("allowBroad = %v, want %v", allowBroad, tt.wantAllowBroad)
+			}
+			if !equalStringSlices(proxies, tt.wantProxies) {
+				t.Errorf("proxies = %v, want %v", proxies, tt.wantProxies)
+			}
+		})
+	}
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestWarnTrustedProxyStartup(t *testing.T) {
+	tests := []struct {
+		name           string
+		allowBroad     bool
+		trustedProxies []string
+		proxiesEnv     string
+		wantWarnCount  int
+		wantMessage    string
+		wantLevel      slog.Level
+	}{
+		{
+			name:           "opt-in enabled without proxies env",
+			allowBroad:     true,
+			trustedProxies: nil,
+			proxiesEnv:     "",
+			wantWarnCount:  1,
+			wantMessage:    "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled but PEERLINE_TRUSTED_PROXIES is unset; the opt-in has no effect",
+			wantLevel:      slog.LevelWarn,
+		},
+		{
+			name:           "opt-in enabled with proxies",
+			allowBroad:     true,
+			trustedProxies: []string{"10.0.0.0/8"},
+			proxiesEnv:     "10.0.0.0/8",
+			wantWarnCount:  0,
+		},
+		{
+			name:           "opt-in disabled without proxies",
+			allowBroad:     false,
+			trustedProxies: nil,
+			proxiesEnv:     "",
+			wantWarnCount:  0,
+		},
+		{
+			name:           "opt-in disabled with proxies",
+			allowBroad:     false,
+			trustedProxies: []string{"10.0.0.0/8"},
+			proxiesEnv:     "10.0.0.0/8",
+			wantWarnCount:  0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			log := slog.New(slog.NewTextHandler(&buf, nil))
+			warnTrustedProxyStartup(log, tt.allowBroad, tt.trustedProxies, tt.proxiesEnv)
+			output := buf.String()
+
+			// Count warnings
+			warnCount := strings.Count(output, "level=WARN")
+			if warnCount != tt.wantWarnCount {
+				t.Errorf("got %d warnings, want %d; output: %q", warnCount, tt.wantWarnCount, output)
+			}
+
+			// Check specific message and level if warning expected
+			if tt.wantWarnCount > 0 {
+				if !strings.Contains(output, tt.wantMessage) {
+					t.Errorf("output missing expected message %q; got: %q", tt.wantMessage, output)
+				}
+				if !strings.Contains(output, "level=WARN") {
+					t.Errorf("output missing level=WARN; got: %q", output)
 				}
 			}
 		})
@@ -342,33 +466,43 @@ func TestWarnUnusedAllowBroad(t *testing.T) {
 
 func TestAllowBroadIPv6ConfigWiring(t *testing.T) {
 	tests := []struct {
-		name     string
-		envValue string
-		want     bool
+		name                string
+		proxiesEnv          string
+		allowBroadEnv       string
+		wantAllowBroad      bool
+		testProxy           string
+		wantAccepted        bool
 	}{
-		{"enabled with 1", "1", true},
-		{"enabled with true", "true", true},
-		{"disabled with 0", "0", false},
-		{"disabled with false", "false", false},
-		{"disabled when unset", "", false},
+		{"enabled with 1", "2a06:98c0::/29", "1", true, "2a06:98c0::/29", true},
+		{"enabled with true", "2a06:98c0::/29", "true", true, "2a06:98c0::/29", true},
+		{"disabled with 0", "2a06:98c0::/29", "0", false, "2a06:98c0::/29", false},
+		{"disabled with false", "2a06:98c0::/29", "false", false, "2a06:98c0::/29", false},
+		{"disabled when unset", "2a06:98c0::/29", "", false, "2a06:98c0::/29", false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.envValue != "" {
-				os.Setenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD", tt.envValue)
-				defer os.Unsetenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD")
+			getenv := func(key string) string {
+				switch key {
+				case "PEERLINE_TRUSTED_PROXIES":
+					return tt.proxiesEnv
+				case "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD":
+					return tt.allowBroadEnv
+				default:
+					return ""
+				}
 			}
 
-			allowBroad, err := parseBoolStrict(os.Getenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD"))
+			proxies, allowBroad, err := trustedProxyConfig(getenv)
 			if err != nil {
-				t.Fatalf("parseBoolStrict failed: %v", err)
+				t.Fatalf("trustedProxyConfig failed: %v", err)
 			}
 
-			if allowBroad != tt.want {
-				t.Errorf("parseBoolStrict(%q) = %v, want %v", tt.envValue, allowBroad, tt.want)
+			if allowBroad != tt.wantAllowBroad {
+				t.Errorf("allowBroad = %v, want %v", allowBroad, tt.wantAllowBroad)
 			}
 
+			// Verify the config wires through to api.Config and affects parsing
 			st, err := store.Open(":memory:")
 			if err != nil {
 				t.Fatal(err)
@@ -380,18 +514,21 @@ func TestAllowBroadIPv6ConfigWiring(t *testing.T) {
 
 			var logBuf bytes.Buffer
 			cfg := api.Config{
-				TrustedProxies: []string{"10.0.0.0/8"},
+				TrustedProxies: proxies,
 				AllowBroadIPv6: allowBroad,
 				Logger:         slog.New(slog.NewTextHandler(&logBuf, nil)),
 			}
 			srv, err := api.New(st, cfg)
-			if err != nil {
-				t.Fatalf("api.New failed: %v", err)
+			accepted := (err == nil)
+			if accepted != tt.wantAccepted {
+				if accepted {
+					t.Errorf("api.New succeeded with allowBroad=%v, want failure (shows %s was accepted, but shouldn't be)", allowBroad, tt.testProxy)
+				} else {
+					t.Errorf("api.New failed with allowBroad=%v: %v (shows %s was rejected, but should be accepted)", allowBroad, err, tt.testProxy)
+				}
 			}
-			defer srv.Stop()
-
-			if got := srv.ConfigAllowBroadIPv6(); got != tt.want {
-				t.Errorf("server.ConfigAllowBroadIPv6() = %v, want %v", got, tt.want)
+			if srv != nil {
+				defer srv.Stop()
 			}
 		})
 	}
