@@ -27,8 +27,8 @@ func TestPurgeExpiredInvites_GrantsAndPeersSurvive(t *testing.T) {
 	}
 
 	// Mock time
-	origNow := s.now
-	defer func() { s.now = origNow }()
+	origClock := s.clock
+	defer func() { s.clock = origClock }()
 
 	currentTime := int64(2000000)
 
@@ -38,7 +38,7 @@ func TestPurgeExpiredInvites_GrantsAndPeersSurvive(t *testing.T) {
 	thirtyOneDaysAgo := currentTime - 31*24*60*60
 
 	// Go back in time to create and accept the invite
-	s.now = func() int64 { return thirtyOneDaysAgo - 100 }
+	s.SetClock(func() time.Time { return time.Unix(thirtyOneDaysAgo-100, 0) })
 
 	// Create invite that expires at thirtyOneDaysAgo
 	exp := time.Unix(thirtyOneDaysAgo, 0)
@@ -51,7 +51,7 @@ func TestPurgeExpiredInvites_GrantsAndPeersSurvive(t *testing.T) {
 	}
 
 	// Move to current time (invite is now expired and beyond retention)
-	s.now = func() int64 { return currentTime }
+	s.SetClock(func() time.Time { return time.Unix(currentTime, 0) })
 
 	// Purge expired invites with default retention (30 days)
 	count, _, err := s.PurgeExpiredInvites(ctx, 0)
@@ -104,15 +104,15 @@ func TestPurgeExpiredInvites_RetentionDefault(t *testing.T) {
 	}
 
 	// Mock time
-	origNow := s.now
-	defer func() { s.now = origNow }()
+	origClock := s.clock
+	defer func() { s.clock = origClock }()
 
 	currentTime := int64(3000000)
 
 	// Create a used invite that expired 29 days ago (within 30-day default)
 	twentyNineDaysAgo := currentTime - 29*24*60*60
 	exp := time.Unix(twentyNineDaysAgo, 0)
-	s.now = func() int64 { return twentyNineDaysAgo - 100 }
+	s.SetClock(func() time.Time { return time.Unix(twentyNineDaysAgo-100, 0) })
 	if err := s.CreateInvite(ctx, "code1", "alice", []string{"messages"}, nil, exp); err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestPurgeExpiredInvites_RetentionDefault(t *testing.T) {
 	// Create a used invite that expired 31 days ago (beyond 30-day default)
 	thirtyOneDaysAgo := currentTime - 31*24*60*60
 	exp2 := time.Unix(thirtyOneDaysAgo, 0)
-	s.now = func() int64 { return thirtyOneDaysAgo - 100 }
+	s.SetClock(func() time.Time { return time.Unix(thirtyOneDaysAgo-100, 0) })
 	if err := s.CreateInvite(ctx, "code2", "alice", []string{"messages"}, nil, exp2); err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func TestPurgeExpiredInvites_RetentionDefault(t *testing.T) {
 	}
 
 	// Move to current time
-	s.now = func() int64 { return currentTime }
+	s.SetClock(func() time.Time { return time.Unix(currentTime, 0) })
 
 	// Purge with retentionSeconds = 0 (should use 30-day default)
 	count, _, err := s.PurgeExpiredInvites(ctx, 0)
@@ -173,11 +173,11 @@ func TestPurgeExpiredInvites_ExactCutoffBoundary(t *testing.T) {
 	}
 
 	// Mock time
-	origNow := s.now
-	defer func() { s.now = origNow }()
+	origClock := s.clock
+	defer func() { s.clock = origClock }()
 
 	currentTime := int64(4000000)
-	s.now = func() int64 { return currentTime }
+	s.SetClock(func() time.Time { return time.Unix(currentTime, 0) })
 
 	// Test unused invites with 5-minute (300s) grace window
 	// Grace cutoff is currentTime - 300
@@ -207,7 +207,7 @@ func TestPurgeExpiredInvites_ExactCutoffBoundary(t *testing.T) {
 	// Used invite expired exactly retention ago (at boundary) - should NOT be purged (< not <=)
 	sevenDaysAgo := currentTime - retention
 	expAtRetention := time.Unix(sevenDaysAgo, 0)
-	s.now = func() int64 { return sevenDaysAgo - 100 }
+	s.SetClock(func() time.Time { return time.Unix(sevenDaysAgo-100, 0) })
 	if err := s.CreateInvite(ctx, "ret-at", "alice", []string{"messages"}, nil, expAtRetention); err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestPurgeExpiredInvites_ExactCutoffBoundary(t *testing.T) {
 
 	// Used invite expired (retention - 1) ago (within retention) - should be kept
 	expWithinRetention := time.Unix(currentTime-retention+1, 0)
-	s.now = func() int64 { return currentTime - retention - 100 }
+	s.SetClock(func() time.Time { return time.Unix(currentTime-retention-100, 0) })
 	if err := s.CreateInvite(ctx, "ret-within", "alice", []string{"messages"}, nil, expWithinRetention); err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestPurgeExpiredInvites_ExactCutoffBoundary(t *testing.T) {
 
 	// Used invite expired (retention + 1) ago (beyond retention) - should be purged
 	expBeyondRetention := time.Unix(currentTime-retention-1, 0)
-	s.now = func() int64 { return currentTime - retention - 200 }
+	s.SetClock(func() time.Time { return time.Unix(currentTime-retention-200, 0) })
 	if err := s.CreateInvite(ctx, "ret-beyond", "alice", []string{"messages"}, nil, expBeyondRetention); err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +236,7 @@ func TestPurgeExpiredInvites_ExactCutoffBoundary(t *testing.T) {
 	}
 
 	// Return to current time
-	s.now = func() int64 { return currentTime }
+	s.SetClock(func() time.Time { return time.Unix(currentTime, 0) })
 
 	// Debug: check what we have before purge
 	var inviteCount int
@@ -314,11 +314,11 @@ func TestPurgeExpiredInvites_MultiBatch(t *testing.T) {
 	}
 
 	// Mock time
-	origNow := s.now
-	defer func() { s.now = origNow }()
+	origClock := s.clock
+	defer func() { s.clock = origClock }()
 
 	currentTime := int64(5000000)
-	s.now = func() int64 { return currentTime }
+	s.SetClock(func() time.Time { return time.Unix(currentTime, 0) })
 
 	// Create 1000 expired invites (expired more than 5 minutes ago to exceed grace)
 	expiredTime := time.Unix(currentTime-1000, 0)
@@ -366,7 +366,7 @@ func seedPurge(t *testing.T, s *Store, n int) (now int64, survivors int) {
 	t.Helper()
 	ctx := context.Background()
 	now = 6000000
-	s.now = func() int64 { return now }
+	s.SetClock(func() time.Time { return time.Unix(now, 0) })
 	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -501,7 +501,7 @@ func TestPurgeGraceDoesNotAffectAccept(t *testing.T) {
 		t.Fatal("row inside grace window was purged")
 	}
 	now += 400
-	s.now = func() int64 { return now }
+	s.SetClock(func() time.Time { return time.Unix(now, 0) })
 	if _, _, err := s.PurgeExpiredInvites(ctx, 0); err != nil {
 		t.Fatal(err)
 	}

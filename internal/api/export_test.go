@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/sysrex/peerline/internal/store"
 )
@@ -50,10 +49,4 @@ func mustNew(t testing.TB, st *store.Store, cfg Config) *Server {
 		t.Fatal(err)
 	}
 	return srv
-}
-
-// openStoreWithTestClock is a helper for tests to create a store with a custom clock.
-// The nowFunc is for DB operations (int64 Unix seconds), nowTimeFunc is for Store.Now() and rate limiters.
-func openStoreWithTestClock(path string, nowFunc func() int64, nowTimeFunc func() time.Time) (*store.Store, error) {
-	return store.OpenWithTestClock(path, nowFunc, nowTimeFunc)
 }

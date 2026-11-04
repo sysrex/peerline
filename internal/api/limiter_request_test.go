@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sysrex/peerline/internal/store"
+	"github.com/sysrex/peerline/internal/store/storetest"
 )
 
 type fakeClock struct{ t time.Time }
@@ -17,7 +18,7 @@ func (c *fakeClock) unix() int64    { return c.t.Unix() }
 
 func newLimitedServer(t *testing.T, trusted []string, clk *fakeClock) http.Handler {
 	t.Helper()
-	st, err := openStoreWithTestClock(":memory:", clk.unix, clk.now)
+	st, err := storetest.OpenWithClock(":memory:", clk.now)
 	if err != nil {
 		t.Fatal(err)
 	}

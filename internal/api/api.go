@@ -92,6 +92,10 @@ type Config struct {
 	// MaxBagBytesPerPeer is the maximum total bytes across all bags for a peer.
 	// <= 0 uses the default (1 MiB).
 	MaxBagBytesPerPeer int64
+
+	// Now is the time source for rate limiters. If nil, uses time.Now.
+	// Set by New() to st.Now for test clock support.
+	Now func() time.Time
 }
 
 type Server struct {
@@ -190,15 +194,17 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 		cfg.Logger.Warn("no trusted proxies configured: X-Forwarded-For will be ignored", "entries", len(cfg.TrustedProxies))
 	}
 
-	// Use store's clock for all rate limiters (single time source for API and store)
-	clk := msg.WithClock(st.Now)
+	// Use store's clock for rate limiters (single time source for API and store)
+	if cfg.Now == nil {
+		cfg.Now = st.Now
+	}
 
 	s := &Server{
 		st:          st,
 		cfg:         cfg,
 		log:         cfg.Logger,
-		lim:         NewLimiterManager(cfg, clk),
-		verifyLim:   msg.NewLimiterPerHour(3, 3, clk), // 3 verification emails per peer/address per hour
+		lim:         NewLimiterManager(cfg),
+		verifyLim:   msg.NewLimiterPerHour(3, 3, msg.WithClock(st.Now)), // 3 verification emails per peer/address per hour
 		trustedNets: trustedNets,
 		pruneDone:   make(chan struct{}),
 	}

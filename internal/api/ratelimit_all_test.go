@@ -34,7 +34,7 @@ func TestLimiterManagerAllCoversEveryLimiter(t *testing.T) {
 func TestVersionLimiterPruned(t *testing.T) {
 	now := time.Unix(1e9, 0)
 	lm := NewLimiterManager(Config{MsgPerMinute: 1, MsgBurst: 1, AuthFailPerMinute: 1, AuthFailBurst: 1,
-		WritePerMinute: 1, WriteBurst: 1, EmailPerHour: 1, EmailBurst: 1, EmailRcptPerHour: 1, NotifyPerHour: 1, NotifyBurst: 1}, msg.WithClock(func() time.Time { return now }))
+		WritePerMinute: 1, WriteBurst: 1, EmailPerHour: 1, EmailBurst: 1, EmailRcptPerHour: 1, NotifyPerHour: 1, NotifyBurst: 1, Now: func() time.Time { return now }})
 	defer lm.Stop()
 	lm.versionLim.Allow("1.2.3.4")
 	now = now.Add(time.Hour)

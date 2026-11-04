@@ -12,6 +12,7 @@ import (
 
 	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/store"
+	"github.com/sysrex/peerline/internal/store/storetest"
 )
 
 // TestRevokePreventsPairingGetAndPost verifies that after revoking a pairing
@@ -278,7 +279,7 @@ func TestCapBeforeEmailBudget(t *testing.T) {
 func TestGETLimiterSeparateBuckets(t *testing.T) {
 	// Freeze clock to avoid wall-clock refill
 	clock := time.Unix(1000, 0)
-	st, err := openStoreWithTestClock(t.TempDir()+"/test.db", func() int64 { return clock.Unix() }, func() time.Time { return clock })
+	st, err := storetest.OpenWithClock(t.TempDir()+"/test.db", func() time.Time { return clock })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +353,7 @@ func TestGETLimiterTokenRefill(t *testing.T) {
 	// Use pointer clock so we can advance it
 	clock := time.Unix(1000, 0)
 	clockPtr := &clock
-	st, err := openStoreWithTestClock(t.TempDir()+"/test.db", func() int64 { return clockPtr.Unix() }, func() time.Time { return *clockPtr })
+	st, err := storetest.OpenWithClock(t.TempDir()+"/test.db", func() time.Time { return *clockPtr })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +403,7 @@ func TestGETLimiterTokenRefill(t *testing.T) {
 func TestUntrustedClientRotatingXFF(t *testing.T) {
 	// Freeze clock
 	clock := time.Unix(1000, 0)
-	st, err := store.OpenWithTestClock(t.TempDir()+"/test.db", func() int64 { return clock.Unix() }, func() time.Time { return clock })
+	st, err := storetest.OpenWithClock(t.TempDir()+"/test.db", func() time.Time { return clock })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,7 +469,7 @@ func TestUntrustedClientRotatingXFF(t *testing.T) {
 func TestUntrustedClientRotatingXFFDefaultConfig(t *testing.T) {
 	// Freeze clock
 	clock := time.Unix(1000, 0)
-	st, err := store.OpenWithTestClock(t.TempDir()+"/test.db", func() int64 { return clock.Unix() }, func() time.Time { return clock })
+	st, err := storetest.OpenWithClock(t.TempDir()+"/test.db", func() time.Time { return clock })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,7 +517,7 @@ func TestUntrustedClientRotatingXFFDefaultConfig(t *testing.T) {
 func TestAnonymousGETDoesNotBlockAuthenticatedInbox(t *testing.T) {
 	// Freeze clock on the server's limiter manager
 	clock := time.Unix(1000, 0)
-	st, err := openStoreWithTestClock(t.TempDir()+"/test.db", func() int64 { return clock.Unix() }, func() time.Time { return clock })
+	st, err := storetest.OpenWithClock(t.TempDir()+"/test.db", func() time.Time { return clock })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -578,7 +579,7 @@ func TestAnonymousGETDoesNotBlockAuthenticatedInbox(t *testing.T) {
 func TestAuthenticatedLimiterDoesNotBlockAnonymousGET(t *testing.T) {
 	// Freeze clock
 	clock := time.Unix(1000, 0)
-	st, err := store.OpenWithTestClock(t.TempDir()+"/test.db", func() int64 { return clock.Unix() }, func() time.Time { return clock })
+	st, err := storetest.OpenWithClock(t.TempDir()+"/test.db", func() time.Time { return clock })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -623,7 +624,7 @@ func TestAuthenticatedLimiterDoesNotBlockAnonymousGET(t *testing.T) {
 func TestAuthenticatedGETLimiter(t *testing.T) {
 	// Freeze clock
 	clock := time.Unix(1000, 0)
-	st, err := store.OpenWithTestClock(t.TempDir()+"/test.db", func() int64 { return clock.Unix() }, func() time.Time { return clock })
+	st, err := storetest.OpenWithClock(t.TempDir()+"/test.db", func() time.Time { return clock })
 	if err != nil {
 		t.Fatal(err)
 	}

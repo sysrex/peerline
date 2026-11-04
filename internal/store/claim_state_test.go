@@ -17,7 +17,7 @@ func claimStore(t *testing.T) *Store {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { s.Close() })
-	s.now = func() int64 { return claimNow }
+	s.SetClock(func() time.Time { return time.Unix(claimNow, 0) })
 	for _, id := range []string{"alice", "bob", "carol"} {
 		if err := s.CreatePeer(context.Background(), id, id, "h"+id, "", ""); err != nil {
 			t.Fatal(err)
@@ -110,7 +110,7 @@ func TestClaimedInviteLivesUntilConfirmBy(t *testing.T) {
 	confirmBy := claimNow + 60 + 86400
 	s.mustExec(t, `UPDATE invites SET claimed_by='carol', confirm_by=?`, confirmBy)
 
-	at := func(ts int64) { s.now = func() int64 { return ts } }
+	at := func(ts int64) { s.SetClock(func() time.Time { return time.Unix(ts, 0) }) }
 	state := func() (count, listed, purged int) {
 		count, _ = s.CountOutstandingInvites(ctx, "alice")
 		l, _ := s.ListInvitesByPeer(ctx, "alice", 50, 0)
@@ -143,7 +143,7 @@ func TestInviteCapCountsClaimed(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.mustExec(t, `UPDATE invites SET claimed_by='carol', confirm_by=?`, claimNow+86400)
-	s.now = func() int64 { return claimNow + 120 }
+	s.SetClock(func() time.Time { return time.Unix(claimNow+120, 0) })
 	if _, err := s.CreateInviteAtomic(ctx, "y", "alice", nil, nil, time.Unix(claimNow+9999, 0), 1); !errors.Is(err, ErrTooManyInvites) {
 		t.Fatalf("cap bypassed by claimed invite: %v", err)
 	}

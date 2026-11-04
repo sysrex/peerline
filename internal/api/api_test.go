@@ -26,6 +26,7 @@ import (
 
 	"github.com/sysrex/peerline/internal/auth"
 	"github.com/sysrex/peerline/internal/store"
+	"github.com/sysrex/peerline/internal/store/storetest"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -2965,9 +2966,8 @@ func TestAPIClock(t *testing.T) {
 	var currentTimeUnix atomic.Int64
 	currentTimeUnix.Store(fixedTime.Unix())
 
-	st, err := openStoreWithTestClock(
+	st, err := storetest.OpenWithClock(
 		t.TempDir()+"/t.db",
-		func() int64 { return currentTimeUnix.Load() },
 		func() time.Time { return time.Unix(currentTimeUnix.Load(), 0).UTC() },
 	)
 	if err != nil {
@@ -2988,24 +2988,16 @@ func TestAPIClock(t *testing.T) {
 	}
 	defer srv.Stop()
 
-	// Verify that New defaults to a non-nil clock (test on a fresh store without fake clock)
-	stDefault, err := store.Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
+	// Verify that New defaults to a non-nil clock
+	// (the store clock is wired into cfg.Now, and from there into limiters)
+	if srv.cfg.Now == nil {
+		t.Fatal("New() should set cfg.Now to st.Now")
 	}
-	defer stDefault.Close()
-	if _, _, err := stDefault.LoadKeyIndex(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	srvDefault, err := New(stDefault, Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer srvDefault.Stop()
-	// Verify clock is working by checking Now() doesn't panic and returns reasonable time
-	now := stDefault.Now()
-	if now.IsZero() || now.Before(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)) {
-		t.Fatalf("New() should default to a working clock, got %v", now)
+	// Check that limiters use the shared clock by verifying st.Now and cfg.Now agree
+	stNow := st.Now()
+	cfgNow := srv.cfg.Now()
+	if !stNow.Equal(cfgNow) {
+		t.Errorf("st.Now() and cfg.Now() disagree: %v vs %v", stNow, cfgNow)
 	}
 
 	// Create test server and client
@@ -3360,7 +3352,7 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 
 	// Create store with fake clock
 	dbPath := t.TempDir() + "/t.db"
-	st, err := openStoreWithTestClock(dbPath, fakeClock, func() time.Time { return time.Unix(fakeClock(), 0).UTC() })
+	st, err := storetest.OpenWithClock(dbPath, func() time.Time { return time.Unix(fakeClock(), 0).UTC() })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3782,7 +3774,7 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 
 	// Create store with fake clock for rate limiting
 	dbPathLimited := t.TempDir() + "/t_limited.db"
-	stLimited, err := openStoreWithTestClock(dbPathLimited, fakeClock429, func() time.Time { return time.Unix(fakeClock429(), 0).UTC() })
+	stLimited, err := storetest.OpenWithClock(dbPathLimited, func() time.Time { return time.Unix(fakeClock429(), 0).UTC() })
 	if err != nil {
 		t.Fatal(err)
 	}
