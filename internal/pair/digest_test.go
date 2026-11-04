@@ -106,7 +106,7 @@ func TestOfferDigestEmpty(t *testing.T) {
 }
 
 func TestOfferDigestOrder(t *testing.T) {
-	// Verify that order of scopes matters
+	// With canonical encoding, order should NOT matter (lists are sorted)
 	d1 := OfferDigest("pub", "alice", "bob",
 		[]string{"messages", "bags:read"}, nil,
 		nil, nil, nil, nil, nil, nil)
@@ -115,7 +115,7 @@ func TestOfferDigestOrder(t *testing.T) {
 		[]string{"bags:read", "messages"}, nil,
 		nil, nil, nil, nil, nil, nil)
 
-	if d1 == d2 {
-		t.Error("different scope order should produce different digest")
+	if d1 != d2 {
+		t.Error("same scopes in different order should produce same digest (canonical)")
 	}
 }

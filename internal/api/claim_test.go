@@ -67,32 +67,39 @@ func (f *fakeClaims) InviterView(_ context.Context, pub, who string) (*ClaimInvi
 	return nil, store.ErrNotFound
 }
 
-func (f *fakeClaims) ConfirmClaim(_ context.Context, pub, who string, max int, check func(*ClaimInvite) bool) (string, error) {
+func (f *fakeClaims) ConfirmClaim(_ context.Context, pub, who string, max int, check func(*ClaimInvite) (store.CheckResult, *ClaimInvite)) (string, *ClaimInvite, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	c := f.byPub(pub)
 	if c == nil || c.Inviter != who {
-		return "", store.ErrNotFound
+		return "", nil, store.ErrNotFound
 	}
 	// Idempotent: already active
 	if c.State == claimStateActive {
-		if check(cp(c)) {
-			return claimStateActive, nil
+		result, _ := check(cp(c))
+		if result == store.CheckOK || result == store.CheckDigestStale {
+			return claimStateActive, nil, nil
 		}
-		return "", store.ErrNotFound
+		return "", nil, store.ErrNotFound
 	}
 	if c.State != claimStateClaimed {
-		return "", store.ErrNotFound
+		return "", nil, store.ErrNotFound
 	}
-	if check(cp(c)) {
+	result, fresh := check(cp(c))
+	if result == store.CheckOK {
 		c.State = claimStateActive
 		f.grant = append(f.grant, c.Claimant)
-		return c.State, nil
+		return c.State, nil, nil
 	}
+	// Stale digest returns fresh state but doesn't count
+	if result == store.CheckDigestStale {
+		return c.State, fresh, nil
+	}
+	// Code or peer_id mismatch counts toward auto-decline
 	if f.fails[pub]++; f.fails[pub] >= max {
 		c.State = claimStateDeclined
 	}
-	return c.State, nil
+	return c.State, nil, nil
 }
 
 func (f *fakeClaims) DeclineClaim(_ context.Context, pub, who string) error {
@@ -229,6 +236,8 @@ func TestClaimMissesAreIdentical(t *testing.T) {
 	do := func(c *client, m, p string, body any) func() (int, []byte) {
 		return func() (int, []byte) { r, b := c.do(m, p, body, nil); return r.StatusCode, b }
 	}
+	// Get a dummy digest for confirm calls (required now)
+	dummyDigest := "0000000000000000000000000000000000000000000000000000000000000000"
 	tok := map[string]string{"token": e.token}
 	cases := map[string]func() (int, []byte){
 		"status unknown token":    do(e.real, "POST", "/v1/pairing/status", map[string]string{"token": "nope"}),
@@ -239,9 +248,9 @@ func TestClaimMissesAreIdentical(t *testing.T) {
 		"claim unknown":           do(e.other, "POST", "/v1/pairing/claim", map[string]string{"token": "nope"}),
 		"view non-inviter":        do(e.other, "GET", "/v1/invites/"+e.pub, nil),
 		"view unknown":            do(e.inviter, "GET", "/v1/invites/nope", nil),
-		"confirm non-inviter":     do(e.real, "POST", "/v1/invites/"+e.pub+"/confirm", map[string]string{"peer_id": e.real.id, "code": "x"}),
+		"confirm non-inviter":     do(e.real, "POST", "/v1/invites/"+e.pub+"/confirm", map[string]string{"peer_id": e.real.id, "code": "x", "offer_digest": dummyDigest}),
 		"decline non-inviter":     do(e.real, "POST", "/v1/invites/"+e.pub+"/decline", map[string]string{}),
-		"confirm unknown":         do(e.inviter, "POST", "/v1/invites/nope/confirm", map[string]string{"peer_id": "x", "code": "x"}),
+		"confirm unknown":         do(e.inviter, "POST", "/v1/invites/nope/confirm", map[string]string{"peer_id": "x", "code": "x", "offer_digest": dummyDigest}),
 	}
 	var ref []byte
 	for name, f := range cases {

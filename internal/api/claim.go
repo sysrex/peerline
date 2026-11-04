@@ -33,10 +33,10 @@ type ClaimStore interface {
 	ClaimStatus(ctx context.Context, tokenHash, claimant string) (*ClaimInvite, error)
 	// InviterView returns the invite only to its inviter.
 	InviterView(ctx context.Context, publicID, inviter string) (*ClaimInvite, error)
-	// ConfirmClaim runs check on a claimed invite in one transaction. On true it
-	// writes the grants and activates it; on false it counts a failure and declines
-	// at maxCodeFails. Returns the resulting state.
-	ConfirmClaim(ctx context.Context, publicID, inviter string, maxFails int, check func(*ClaimInvite) bool) (string, error)
+	// ConfirmClaim runs check on a claimed invite in one transaction. CheckOK writes
+	// the grants and activates it; CheckCodeFail/CheckPeerIDFail count toward maxFails;
+	// CheckDigestStale does not count. Returns the resulting state and optionally a fresh claim.
+	ConfirmClaim(ctx context.Context, publicID, inviter string, maxFails int, check func(*ClaimInvite) (store.CheckResult, *ClaimInvite)) (string, *ClaimInvite, error)
 	DeclineClaim(ctx context.Context, publicID, inviter string) error
 }
 
@@ -154,7 +154,13 @@ func (s *Server) inviteView(w http.ResponseWriter, r *http.Request) {
 	if c.Claimant != "" {
 		out["claimant"] = map[string]any{"peer_id": c.Claimant, "untrusted": map[string]string{"name": sanitizeInviterName(c.ClaimantName)}}
 		out["offer_digest"] = s.offerDigest(c)
-		if c.Replaces != nil {
+		// Show the offered scopes/bags in both directions so the inviter can review what confirm will write
+		out["offer"] = map[string]any{
+			"inviter_to_claimant": map[string]any{"scopes": c.Scopes, "bags": c.Bags},
+			"claimant_to_inviter": map[string]any{"scopes": c.BackScopes, "bags": c.BackBags},
+		}
+		// Show replaces only for claimed invites (not active), since after activation it would show the just-written grants
+		if c.State == store.ClaimClaimed && c.Replaces != nil {
 			replaces := map[string]any{}
 			if c.Replaces.InviterToClaimant != nil {
 				replaces["inviter_to_claimant"] = map[string]any{
@@ -183,13 +189,93 @@ func (s *Server) confirmClaim(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
+
+	// Validate offer_digest is present and well-formed (64 hex chars) before evaluating code
+	if in.OfferDigest == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "offer_digest required: GET /v1/invites/{public_id} and echo offer_digest",
+		})
+		return
+	}
+	if len(in.OfferDigest) != 64 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "offer_digest must be 64 hex characters",
+		})
+		return
+	}
+	for _, c := range in.OfferDigest {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "offer_digest must be hex",
+			})
+			return
+		}
+	}
+
 	pub := r.PathValue("public_id")
-	state, err := s.claims.ConfirmClaim(r.Context(), pub, auth.PeerID(r.Context()), maxCodeFails, func(c *ClaimInvite) bool {
-		idOK := subtle.ConstantTimeCompare([]byte(in.PeerID), []byte(c.Claimant)) == 1
-		codeOK := pair.CodeMatches(s.claimCode(c), in.Code)
+	state, freshClaim, err := s.claims.ConfirmClaim(r.Context(), pub, auth.PeerID(r.Context()), maxCodeFails, func(c *ClaimInvite) (store.CheckResult, *ClaimInvite) {
+		// Check digest FIRST, before evaluating code (prevents code oracle)
 		digestOK := pair.OfferDigestMatches(s.offerDigest(c), in.OfferDigest)
-		return idOK && codeOK && digestOK
+		if !digestOK {
+			// Reload fresh claim for 409 response
+			fresh, viewErr := s.claims.InviterView(r.Context(), pub, auth.PeerID(r.Context()))
+			if viewErr != nil {
+				fresh = c // fallback to what we have
+			}
+			return store.CheckDigestStale, fresh
+		}
+
+		// Only check code and peer_id if digest matches
+		idOK := subtle.ConstantTimeCompare([]byte(in.PeerID), []byte(c.Claimant)) == 1
+		if !idOK {
+			return store.CheckPeerIDFail, nil
+		}
+
+		codeOK := pair.CodeMatches(s.claimCode(c), in.Code)
+		if !codeOK {
+			return store.CheckCodeFail, nil
+		}
+
+		return store.CheckOK, nil
 	})
+
+	// Handle stale digest (does not count toward failures)
+	if state == claimStateClaimed && freshClaim != nil {
+		s.log.Info("invite_confirm_stale_digest", "public_id", pub, "inviter", auth.PeerID(r.Context()))
+		resp := map[string]any{
+			"error":        "offer changed: GET /v1/invites/{public_id} for current offer_digest",
+			"state":        state,
+			"public_id":    freshClaim.PublicID,
+			"offer_digest": s.offerDigest(freshClaim),
+			"claimant": map[string]any{
+				"peer_id":   freshClaim.Claimant,
+				"untrusted": map[string]string{"name": sanitizeInviterName(freshClaim.ClaimantName)},
+			},
+			"offer": map[string]any{
+				"inviter_to_claimant": map[string]any{"scopes": freshClaim.Scopes, "bags": freshClaim.Bags},
+				"claimant_to_inviter": map[string]any{"scopes": freshClaim.BackScopes, "bags": freshClaim.BackBags},
+			},
+		}
+		if freshClaim.Replaces != nil {
+			replaces := map[string]any{}
+			if freshClaim.Replaces.InviterToClaimant != nil {
+				replaces["inviter_to_claimant"] = map[string]any{
+					"scopes": freshClaim.Replaces.InviterToClaimant.Scopes,
+					"bags":   freshClaim.Replaces.InviterToClaimant.Bags,
+				}
+			}
+			if freshClaim.Replaces.ClaimantToInviter != nil {
+				replaces["claimant_to_inviter"] = map[string]any{
+					"scopes": freshClaim.Replaces.ClaimantToInviter.Scopes,
+					"bags":   freshClaim.Replaces.ClaimantToInviter.Bags,
+				}
+			}
+			resp["replaces"] = replaces
+		}
+		writeJSON(w, http.StatusConflict, resp)
+		return
+	}
+
 	if !s.claimResult(w, err) {
 		return
 	}
@@ -198,7 +284,7 @@ func (s *Server) confirmClaim(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"state": state})
 		return
 	}
-	writeJSON(w, http.StatusBadRequest, map[string]string{"error": "peer_id, code, or offer_digest mismatch", "state": state})
+	writeJSON(w, http.StatusBadRequest, map[string]string{"error": "peer_id or code mismatch", "state": state})
 }
 
 func (s *Server) declineClaim(w http.ResponseWriter, r *http.Request) {

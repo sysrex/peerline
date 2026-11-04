@@ -144,6 +144,14 @@ func TestConfirmInviteRefusesLegacyAcceptAndMissesAreIdentical(t *testing.T) {
 		}
 		return string(b)
 	}
+	// Get the offer_digest for confirm calls
+	resp, b = inviter.do("GET", "/v1/invites/"+pub, nil, nil)
+	want(t, resp, b, 200)
+	var view struct {
+		OfferDigest string `json:"offer_digest"`
+	}
+	json.Unmarshal(b, &view)
+
 	bodies := []string{
 		miss(other, "POST", "/v1/pairing/claim", map[string]string{"token": token}),
 		miss(claimant, "POST", "/v1/pairing/claim", map[string]string{"token": "pair_unknown"}),
@@ -152,8 +160,8 @@ func TestConfirmInviteRefusesLegacyAcceptAndMissesAreIdentical(t *testing.T) {
 		miss(claimant, "POST", "/v1/pairing/status", map[string]string{"token": "pair_unknown"}),
 		miss(other, "GET", "/v1/invites/"+pub, nil),
 		miss(inviter, "GET", "/v1/invites/nope", nil),
-		miss(other, "POST", "/v1/invites/"+pub+"/confirm", map[string]string{"peer_id": claimant.id, "code": "AAAA-AAAA"}),
-		miss(inviter, "POST", "/v1/invites/nope/confirm", map[string]string{"peer_id": claimant.id, "code": "AAAA-AAAA"}),
+		miss(other, "POST", "/v1/invites/"+pub+"/confirm", map[string]string{"peer_id": claimant.id, "code": "AAAA-AAAA", "offer_digest": view.OfferDigest}),
+		miss(inviter, "POST", "/v1/invites/nope/confirm", map[string]string{"peer_id": claimant.id, "code": "AAAA-AAAA", "offer_digest": view.OfferDigest}),
 		miss(other, "POST", "/v1/invites/"+pub+"/decline", nil),
 	}
 	for _, b := range bodies[1:] {

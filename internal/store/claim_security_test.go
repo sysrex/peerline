@@ -2,12 +2,13 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
 
 // TestConfirmWithStaleDigestWritesNothing verifies that confirming with a wrong
-// or stale offer_digest writes no grants (#80, requirement 1).
+// or stale offer_digest writes no grants and does not count toward code_fails (#80, requirement 1; #291).
 func TestConfirmWithStaleDigestWritesNothing(t *testing.T) {
 	s := claimStore(t)
 	ctx := context.Background()
@@ -25,21 +26,53 @@ func TestConfirmWithStaleDigestWritesNothing(t *testing.T) {
 		t.Fatalf("claim: %v, %v", err, c)
 	}
 
-	// Alice tries to confirm with a wrong digest (simulating stale or tampered data)
-	wrongCheck := func(claim *Claim) bool { return false } // Digest mismatch
-	state, err := s.ConfirmClaim(ctx, c.PublicID, "alice", 3, wrongCheck)
+	// Alice tries to confirm with a stale digest (returns CheckDigestStale)
+	staleCheck := func(claim *Claim) (CheckResult, *Claim) {
+		// Simulate digest mismatch (stale offer)
+		return CheckDigestStale, claim
+	}
+	state, freshClaim, err := s.ConfirmClaim(ctx, c.PublicID, "alice", 3, staleCheck)
 	if err != nil {
 		t.Fatalf("confirm failed: %v", err)
 	}
-	if state == ClaimActive {
-		t.Fatal("confirm succeeded with wrong digest")
+	if state != ClaimClaimed {
+		t.Fatalf("stale digest should return claimed, got %s", state)
+	}
+	if freshClaim == nil {
+		t.Fatal("stale digest should return fresh claim")
 	}
 
 	// Verify no grants were written
 	var n int
 	s.db.QueryRow(`SELECT COUNT(*) FROM grants`).Scan(&n)
 	if n != 0 {
-		t.Errorf("%d grants written with wrong digest", n)
+		t.Errorf("%d grants written with stale digest", n)
+	}
+
+	// Verify code_fails was not incremented
+	var codeFails int
+	s.db.QueryRow(`SELECT code_fails FROM invites WHERE public_id=?`, c.PublicID).Scan(&codeFails)
+	if codeFails != 0 {
+		t.Errorf("code_fails=%d, want 0 (stale digest should not count)", codeFails)
+	}
+
+	// Now try with correct digest but wrong code - this SHOULD count
+	wrongCodeCheck := func(claim *Claim) (CheckResult, *Claim) {
+		// Digest OK but code wrong
+		return CheckCodeFail, nil
+	}
+	state, _, err = s.ConfirmClaim(ctx, c.PublicID, "alice", 3, wrongCodeCheck)
+	if err != nil {
+		t.Fatalf("confirm failed: %v", err)
+	}
+	if state == ClaimActive {
+		t.Fatal("wrong code should not activate")
+	}
+
+	// Verify code_fails WAS incremented for code mismatch
+	s.db.QueryRow(`SELECT code_fails FROM invites WHERE public_id=?`, c.PublicID).Scan(&codeFails)
+	if codeFails != 1 {
+		t.Errorf("code_fails=%d after code mismatch, want 1", codeFails)
 	}
 }
 
@@ -86,10 +119,13 @@ func TestConfirmOverExistingGrantShowsReplaces(t *testing.T) {
 	}
 
 	// Confirm with correct check (digest would include the replaces)
-	correctCheck := func(claim *Claim) bool {
-		return claim.Claimant == "bob" && claim.Replaces != nil
+	correctCheck := func(claim *Claim) (CheckResult, *Claim) {
+		if claim.Claimant == "bob" && claim.Replaces != nil {
+			return CheckOK, nil
+		}
+		return CheckPeerIDFail, nil
 	}
-	state, err := s.ConfirmClaim(ctx, c.PublicID, "alice", 3, correctCheck)
+	state, _, err := s.ConfirmClaim(ctx, c.PublicID, "alice", 3, correctCheck)
 	if err != nil {
 		t.Fatalf("confirm: %v", err)
 	}
@@ -111,7 +147,7 @@ func TestConfirmOverExistingGrantShowsReplaces(t *testing.T) {
 }
 
 // TestDoubleConfirmIsIdempotent verifies that a repeated confirm by the same inviter
-// with the same claimant returns the same result (#80, requirement 3).
+// with the same claimant returns the same result (#80, requirement 3; #290).
 func TestDoubleConfirmIsIdempotent(t *testing.T) {
 	s := claimStore(t)
 	ctx := context.Background()
@@ -129,15 +165,20 @@ func TestDoubleConfirmIsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Alice confirms
-	correctCheck := func(claim *Claim) bool { return claim.Claimant == "bob" }
-	state1, err := s.ConfirmClaim(ctx, c.PublicID, "alice", 3, correctCheck)
+	// Alice confirms - on replay, only peer_id is checked (not digest, since replaces would be the just-written grants)
+	correctCheck := func(claim *Claim) (CheckResult, *Claim) {
+		if claim.Claimant == "bob" {
+			return CheckOK, nil
+		}
+		return CheckPeerIDFail, nil
+	}
+	state1, _, err := s.ConfirmClaim(ctx, c.PublicID, "alice", 3, correctCheck)
 	if err != nil || state1 != ClaimActive {
 		t.Fatalf("first confirm: %v, %s", err, state1)
 	}
 
-	// Alice confirms again (idempotent)
-	state2, err := s.ConfirmClaim(ctx, c.PublicID, "alice", 3, correctCheck)
+	// Alice confirms again (idempotent) - check still passes even though digest would differ
+	state2, _, err := s.ConfirmClaim(ctx, c.PublicID, "alice", 3, correctCheck)
 	if err != nil || state2 != ClaimActive {
 		t.Fatalf("second confirm: %v, %s", err, state2)
 	}
@@ -170,15 +211,25 @@ func TestDoubleConfirmWithDifferentPeerIs404(t *testing.T) {
 	}
 
 	// Alice confirms for Bob
-	correctCheck := func(claim *Claim) bool { return claim.Claimant == "bob" }
-	state, err := s.ConfirmClaim(ctx, c.PublicID, "alice", 3, correctCheck)
+	correctCheck := func(claim *Claim) (CheckResult, *Claim) {
+		if claim.Claimant == "bob" {
+			return CheckOK, nil
+		}
+		return CheckPeerIDFail, nil
+	}
+	state, _, err := s.ConfirmClaim(ctx, c.PublicID, "alice", 3, correctCheck)
 	if err != nil || state != ClaimActive {
 		t.Fatalf("confirm: %v, %s", err, state)
 	}
 
 	// Alice tries to confirm again but for Carol (wrong peer_id)
-	wrongCheck := func(claim *Claim) bool { return claim.Claimant == "carol" }
-	_, err = s.ConfirmClaim(ctx, c.PublicID, "alice", 3, wrongCheck)
+	wrongCheck := func(claim *Claim) (CheckResult, *Claim) {
+		if claim.Claimant == "carol" {
+			return CheckOK, nil
+		}
+		return CheckPeerIDFail, nil
+	}
+	_, _, err = s.ConfirmClaim(ctx, c.PublicID, "alice", 3, wrongCheck)
 	if err != ErrNotFound {
 		t.Fatalf("confirm with wrong peer_id: got %v, want ErrNotFound", err)
 	}
@@ -216,63 +267,139 @@ func TestDoubleDeclineIsIdempotent(t *testing.T) {
 // TestConcurrentConfirmDeclineRevokeExpiry verifies that concurrent operations
 // produce exactly one terminal state and at most two grant rows (#80, requirement 4).
 func TestConcurrentConfirmDeclineRevokeExpiry(t *testing.T) {
-	s := claimStore(t)
-	ctx := context.Background()
+	const iterations = 50
 
-	// Test confirm racing decline
-	t.Run("confirm_vs_decline", func(t *testing.T) {
-		exp := time.Unix(claimNow+3600, 0)
-		if err := s.CreateInviteWithPairing(ctx, "code1", "pair1", "alice", []string{"messages"}, nil, exp); err != nil {
-			t.Fatal(err)
-		}
-		s.mustExec(t, `UPDATE invites SET require_confirm=1, nonce=x'ab01' WHERE code_hash='code1'`)
-		c, _ := s.ClaimByToken(ctx, "pair1", "bob", []byte{0xab, 0x01}, []string{"messages"}, nil)
+	runRace := func(t *testing.T, name string, op1, op2 func(ctx context.Context, s *Store, c *Claim) (string, error)) {
+		t.Run(name, func(t *testing.T) {
+			for i := 0; i < iterations; i++ {
+				s := claimStore(t)
+				ctx := context.Background()
+				exp := time.Unix(claimNow+3600, 0)
 
-		done := make(chan string, 2)
-		go func() {
-			state, _ := s.ConfirmClaim(ctx, c.PublicID, "alice", 3, func(cl *Claim) bool { return true })
-			done <- state
-		}()
-		go func() {
-			err := s.DeclineClaim(ctx, c.PublicID, "alice")
-			if err == nil {
-				done <- ClaimDeclined
-			} else {
-				done <- ""
+				// Fresh invite each iteration
+				code := fmt.Sprintf("code%d", i)
+				pair := fmt.Sprintf("pair%d", i)
+				if err := s.CreateInviteWithPairing(ctx, code, pair, "alice", []string{"messages"}, nil, exp); err != nil {
+					t.Fatal(err)
+				}
+				s.mustExec(t, `UPDATE invites SET require_confirm=1, nonce=x'abcd' WHERE code_hash=?`, code)
+				c, err := s.ClaimByToken(ctx, pair, "bob", []byte{0xab, 0xcd}, []string{"messages"}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				// Start barrier
+				start := make(chan struct{})
+				results := make(chan struct {
+					state string
+					err   error
+				}, 2)
+
+				// Launch both operations
+				go func() {
+					<-start
+					state, err := op1(ctx, s, c)
+					results <- struct {
+						state string
+						err   error
+					}{state, err}
+				}()
+				go func() {
+					<-start
+					state, err := op2(ctx, s, c)
+					results <- struct {
+						state string
+						err   error
+					}{state, err}
+				}()
+
+				// Release both
+				close(start)
+
+				r1 := <-results
+				r2 := <-results
+
+				// Count success outcomes
+				activeCount := 0
+				declinedCount := 0
+				deletedCount := 0
+				notFoundCount := 0
+
+				for _, r := range []struct {
+					state string
+					err   error
+				}{r1, r2} {
+					if r.err != nil && r.err != ErrNotFound {
+						t.Fatalf("unexpected error: %v", r.err)
+					}
+					if r.state == ClaimActive {
+						activeCount++
+					}
+					if r.state == ClaimDeclined {
+						declinedCount++
+					}
+					if r.state == "deleted" {
+						deletedCount++
+					}
+					if r.err == ErrNotFound {
+						notFoundCount++
+					}
+				}
+
+				// Exactly one should succeed, the other gets NotFound
+				if activeCount > 1 || declinedCount > 1 || deletedCount > 1 {
+					t.Fatalf("multiple operations succeeded: active=%d declined=%d deleted=%d", activeCount, declinedCount, deletedCount)
+				}
+				if activeCount+declinedCount+deletedCount != 1 {
+					t.Fatalf("no operation succeeded: active=%d declined=%d deleted=%d", activeCount, declinedCount, deletedCount)
+				}
+
+				// Check grant count
+				var grantCount int
+				s.db.QueryRow(`SELECT COUNT(*) FROM grants`).Scan(&grantCount)
+				if activeCount == 1 {
+					if grantCount != 2 {
+						t.Errorf("active but %d grants, want 2", grantCount)
+					}
+				} else {
+					if grantCount != 0 {
+						t.Errorf("not active but %d grants, want 0", grantCount)
+					}
+				}
 			}
-		}()
+		})
+	}
 
-		r1, r2 := <-done, <-done
-		// Exactly one should succeed
-		if (r1 == ClaimActive || r2 == ClaimActive) && (r1 == ClaimDeclined || r2 == ClaimDeclined) {
-			t.Error("both confirm and decline succeeded")
-		}
-		if r1 == "" && r2 == "" {
-			t.Error("both operations failed")
-		}
-	})
+	confirmOp := func(ctx context.Context, s *Store, c *Claim) (string, error) {
+		state, _, err := s.ConfirmClaim(ctx, c.PublicID, "alice", 3, func(cl *Claim) (CheckResult, *Claim) {
+			if cl.Claimant == "bob" {
+				return CheckOK, nil
+			}
+			return CheckPeerIDFail, nil
+		})
+		return state, err
+	}
 
-	// Test confirm racing expiry
-	t.Run("confirm_vs_expiry", func(t *testing.T) {
-		// Set up invite that's about to expire
-		exp := time.Unix(claimNow+10, 0)
-		if err := s.CreateInviteWithPairing(ctx, "code2", "pair2", "alice", []string{"messages"}, nil, exp); err != nil {
-			t.Fatal(err)
+	declineOp := func(ctx context.Context, s *Store, c *Claim) (string, error) {
+		err := s.DeclineClaim(ctx, c.PublicID, "alice")
+		if err == nil {
+			return ClaimDeclined, nil
 		}
-		s.mustExec(t, `UPDATE invites SET require_confirm=1, nonce=x'ab02' WHERE code_hash='code2'`)
-		c, _ := s.ClaimByToken(ctx, "pair2", "bob", []byte{0xab, 0x02}, []string{"messages"}, nil)
+		return "", err
+	}
 
-		// Advance time past confirm_by
-		oldNow := s.now
-		s.now = func() int64 { return claimNow + 86400 + 100 }
-		defer func() { s.now = oldNow }()
-
-		// Try to confirm (should fail due to expiry)
-		_, err := s.ConfirmClaim(ctx, c.PublicID, "alice", 3, func(cl *Claim) bool { return true })
-		if err != ErrNotFound {
-			t.Errorf("confirm after expiry: got %v, want ErrNotFound", err)
+	revokeOp := func(ctx context.Context, s *Store, c *Claim) (string, error) {
+		_, err := s.db.ExecContext(ctx, `DELETE FROM invites WHERE public_id=? AND used_by IS NULL`, c.PublicID)
+		if err == nil {
+			return "deleted", nil
 		}
-	})
+		return "", err
+	}
+	
+	runRace(t, "confirm_vs_decline", confirmOp, declineOp)
+	runRace(t, "confirm_vs_revoke", confirmOp, revokeOp)
+	runRace(t, "decline_vs_revoke", declineOp, revokeOp)
+	// Note: expiry race is tested separately since it requires clock manipulation
 }
 
 // TestNoApiKeyInResponse verifies that no response contains api_key (#80, requirement 4).
