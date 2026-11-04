@@ -1276,6 +1276,8 @@ func TestIPv6FloorWithOptIn(t *testing.T) {
 		{name: "6to4 2002::/16 rejected (opt-in)", input: []string{"2002::/16"}, allowBroad: true, wantError: "must be at least /29"},
 		{name: "6to4 /32 2002:c000::/32 rejected (default)", input: []string{"2002:c000::/32"}, allowBroad: false, wantError: "overlaps 6to4 prefix 2002::/16"},
 		{name: "6to4 /32 2002:c000::/32 rejected (opt-in)", input: []string{"2002:c000::/32"}, allowBroad: true, wantError: "overlaps 6to4 prefix 2002::/16"},
+		{name: "broad 2001::/29 contains Teredo (opt-in)", input: []string{"2001::/29"}, allowBroad: true, wantError: "overlaps Teredo"},
+		{name: "broad 64:ff9b::/32 contains NAT64 (default)", input: []string{"64:ff9b::/32"}, allowBroad: false, wantError: "overlaps NAT64"},
 
 		// Positive controls: normal prefixes near transition ranges still allowed
 		{name: "2001:db8::/32 allowed (default)", input: []string{"2001:db8::/32"}, allowBroad: false, wantNet: "2001:db8::/32"},
