@@ -2915,7 +2915,7 @@ func TestRecipientLimitRefundDeleteFailure(t *testing.T) {
 	capture := &captureMailer{}
 	cfg := Config{}
 	cfg.EmailPerHour = 10
-	cfg.EmailBurst = 2 // Burst of 2 to test refund logic
+	cfg.EmailBurst = 2       // Burst of 2 to test refund logic
 	cfg.EmailRcptPerHour = 1 // Only 1 email per recipient
 	cfg.Mailer = capture
 
