@@ -151,7 +151,10 @@ func TestDefaultDBDirectoryPermissions(t *testing.T) {
 }
 
 // TestGroupWritableDBDirectoryRefused verifies that a group-writable (0775)
-// or world-writable (0777) database directory is refused when migration is pending.
+// or world-writable (0777) database directory is refused when migration is pending
+// AND using the default backup location (the DB directory itself).
+// Note: This only matters when the DB directory itself is writable; a 0755 (readable)
+// directory is allowed. The test verifies the 0022 check works.
 func TestGroupWritableDBDirectoryRefused(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("test requires non-root (chmod doesn't restrict root)")
@@ -162,7 +165,7 @@ func TestGroupWritableDBDirectoryRefused(t *testing.T) {
 		mode os.FileMode
 		want string // substring expected in error
 	}{
-		{"group-writable 0775", 0775, "group or world writable"},
+		{"group-writable 0770", 0770, "group or world writable"},
 		{"world-writable 0777", 0777, "group or world writable"},
 		{"group-and-world-writable 0766", 0766, "group or world writable"},
 	}
@@ -171,7 +174,12 @@ func TestGroupWritableDBDirectoryRefused(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			baseDir := t.TempDir()
 			dbDir := filepath.Join(baseDir, "data")
-			if err := os.Mkdir(dbDir, tc.mode); err != nil {
+			if err := os.Mkdir(dbDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			
+			// Change to writable mode after creation
+			if err := os.Chmod(dbDir, tc.mode); err != nil {
 				t.Fatal(err)
 			}
 			

@@ -3385,15 +3385,21 @@ func TestBackupCollisionRetry(t *testing.T) {
 	}
 	defer st.Close()
 
-	// Verify a backup with PID suffix was created
+	// Verify a backup with random suffix was created (not the colliding name)
 	backupBase := st.LastBackupPath()
 	if backupBase == "" {
 		t.Fatal("no backup was created")
 	}
 
-	// Should contain PID suffix
-	if !strings.Contains(backupBase, fmt.Sprintf(".%d", os.Getpid())) {
-		t.Errorf("backup name %q should contain PID suffix .%d", backupBase, os.Getpid())
+	// Should have a random suffix (8 hex chars), not match the pre-existing name
+	if backupBase == filepath.Base(existingBackup) {
+		t.Errorf("backup should have random suffix, not overwrite collision")
+	}
+
+	// Should start with the base name
+	expectedPrefix := "collision.db.pre-v6-from-v2.20260130-120000.000000."
+	if !strings.HasPrefix(backupBase, expectedPrefix) {
+		t.Errorf("backup name %q should start with %s", backupBase, expectedPrefix)
 	}
 
 	// Both files should exist
@@ -3408,7 +3414,13 @@ func TestBackupCollisionRetry(t *testing.T) {
 		}
 	}
 	if backupCount != 2 {
-		t.Errorf("got %d backups, want 2 (original + PID suffix)", backupCount)
+		t.Errorf("got %d backups, want 2 (original + random suffix)", backupCount)
+	}
+
+	// Verify pre-existing file wasn't modified
+	data, _ := os.ReadFile(existingBackup)
+	if string(data) != "fake" {
+		t.Errorf("pre-existing file was modified")
 	}
 }
 
