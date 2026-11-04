@@ -112,8 +112,10 @@ type Server struct {
 	pruneDone chan struct{}
 	pruneOnce sync.Once
 
-	// Test-only hook: called before the atomic invite cap check and the email limit check
+	// Test-only hook: called before CreateInviteAtomic (before the atomic invite cap check and the email limit check)
 	testInviteCreatedHook func(peerID string)
+	// Test-only hook: called after email Ready checks pass and before mailLim.Allow (for deterministic Ready→Allow race testing)
+	testAfterEmailReadyHook func(peerID string)
 }
 
 func New(st *store.Store, cfg Config) (*Server, error) {
@@ -756,7 +758,18 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		rk := strings.ToLower(to)
 		// Ready does not consume, so concurrent requests can pass it together; the
 		// sender token taken first is refunded if the recipient token is then gone.
-		if !s.lim.mailLim.Ready(me) || !s.lim.rcptLim.Ready(rk) || !s.lim.mailLim.Allow(me) {
+		if !s.lim.mailLim.Ready(me) || !s.lim.rcptLim.Ready(rk) {
+			s.rejectEmailRateLimited(w, r, publicID, me)
+			return
+		}
+
+		// testAfterEmailReadyHook is called after both Ready checks pass, for deterministic testing.
+		// Production: nil. Test: N-party barrier synchronizes before Allow calls.
+		if s.testAfterEmailReadyHook != nil {
+			s.testAfterEmailReadyHook(me)
+		}
+
+		if !s.lim.mailLim.Allow(me) {
 			s.rejectEmailRateLimited(w, r, publicID, me)
 			return
 		}
