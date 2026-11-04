@@ -145,7 +145,7 @@ func TestSymlinkResolvedAndTightened(t *testing.T) {
 
 	// Create a valid database at target with loose permissions
 	targetPath := filepath.Join(dir, "target.db")
-	
+
 	// Create the database first to make it valid
 	db, err := sql.Open("sqlite", targetPath)
 	if err != nil {
