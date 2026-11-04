@@ -23,9 +23,6 @@ import (
 	"time"
 )
 
-// dialContext is the default dialer for SMTP connections.
-// Tests can override this to redirect connections.
-var dialContext = (&net.Dialer{}).DialContext
 
 // ErrRelayUnreachable is returned by Probe when the SMTP server is unreachable
 // (connection refused, timeout, reset, or SMTP-level greeting/EHLO errors).
@@ -101,6 +98,9 @@ type SMTP struct {
 	ImplicitTLS bool
 	// TLSConfig is optional (tests); defaults to ServerName=Host.
 	TLSConfig *tls.Config
+	// dialContext is the dialer for SMTP connections (tests).
+	// nil means the default net.Dialer{}.DialContext.
+	dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 func (s *SMTP) Mode() string { return "smtp" }
@@ -124,6 +124,17 @@ func IsLoopback(host string) bool {
 		return ip.IsLoopback()
 	}
 	return false
+}
+
+// isPlainAuthLoopback reports whether host is one of the three exact literals
+// that net/smtp's PlainAuth accepts: "localhost", "127.0.0.1", or "::1".
+// PlainAuth refuses to send credentials in cleartext unless the hostname
+// matches one of these three strings exactly, without DNS resolution or IP parsing.
+// Probe uses this narrower check (rather than IsLoopback) to predict whether
+// Send's PlainAuth will accept or refuse credentials when STARTTLS is absent.
+// Differs from IsLoopback, which accepts all loopback IPs (127.0.0.2, expanded IPv6 forms, etc.).
+func isPlainAuthLoopback(host string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 // isLoopbackAddr reports whether a connection's remote address is a loopback IP.
@@ -240,12 +251,29 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 		tlsCfg = &tls.Config{ServerName: s.Host, MinVersion: tls.VersionTLS12}
 	}
 
+	dial := s.dialContext
+	if dial == nil {
+		dial = (&net.Dialer{}).DialContext
+	}
+
 	var conn net.Conn
 	if s.ImplicitTLS {
-		d := &net.Dialer{}
-		conn, err = (&tls.Dialer{NetDialer: d, Config: tlsCfg}).DialContext(ctx, "tcp", addr)
+		conn, err = dial(ctx, "tcp", addr)
+		if err != nil {
+			return fmt.Errorf("smtp dial: %w", err)
+		}
+		// Perform TLS handshake on the established connection
+		tlsConn := tls.Client(conn, tlsCfg)
+		if dl, ok := ctx.Deadline(); ok {
+			tlsConn.SetDeadline(dl)
+		}
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			conn.Close()
+			return fmt.Errorf("smtp tls handshake: %w", err)
+		}
+		conn = tlsConn
 	} else {
-		conn, err = dialContext(ctx, "tcp", addr)
+		conn, err = dial(ctx, "tcp", addr)
 	}
 	if err != nil {
 		return fmt.Errorf("smtp dial: %w", err)
@@ -322,8 +350,13 @@ func (s *SMTP) Probe(ctx context.Context) error {
 		tlsCfg = &tls.Config{ServerName: s.Host, MinVersion: tls.VersionTLS12}
 	}
 
+	dial := s.dialContext
+	if dial == nil {
+		dial = (&net.Dialer{}).DialContext
+	}
+
 	// Always do TCP dial first
-	conn, err := dialContext(ctx, "tcp", addr)
+	conn, err := dial(ctx, "tcp", addr)
 	if err != nil {
 		// TCP dial failure: connection refused, timeout, no route, etc. - transient
 		return fmt.Errorf("%w: %v", ErrRelayUnreachable, err)
@@ -373,9 +406,7 @@ func (s *SMTP) Probe(ctx context.Context) error {
 		if err := s.checkSTARTTLS(hasSTARTTLS); err != nil {
 			return fmt.Errorf("smtp probe: %s:%d: %w", s.Host, s.Port, err)
 		}
-		// Use PlainAuth's exact literal set to predict what Send will do
-		isPlainAuthLoopback := s.Host == "localhost" || s.Host == "127.0.0.1" || s.Host == "::1"
-		if !hasSTARTTLS && s.User != "" && !isPlainAuthLoopback {
+		if !hasSTARTTLS && s.User != "" && !isPlainAuthLoopback(s.Host) {
 			return fmt.Errorf("smtp probe: credentials are set but %s:%d offers no STARTTLS and is not loopback; PLAIN auth would be refused", s.Host, s.Port)
 		}
 		if hasSTARTTLS {
@@ -486,21 +517,33 @@ func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, 
 	recheckCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
+	dial := s.dialContext
+	if dial == nil {
+		dial = (&net.Dialer{}).DialContext
+	}
+
 	addr := net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
 
 	if s.ImplicitTLS {
-		// For implicit TLS, dial with TLS directly
-		d := &net.Dialer{}
-		recheckConn, err := (&tls.Dialer{NetDialer: d, Config: recheckCfg}).DialContext(recheckCtx, "tcp", addr)
-		if err == nil {
-			recheckConn.Close()
+		// For implicit TLS, dial then upgrade
+		recheckConn, err := dial(recheckCtx, "tcp", addr)
+		if err != nil {
+			return false
+		}
+		tlsConn := tls.Client(recheckConn, recheckCfg)
+		if deadline, ok := recheckCtx.Deadline(); ok {
+			tlsConn.SetDeadline(deadline)
+		}
+		if err := tlsConn.HandshakeContext(recheckCtx); err == nil {
+			tlsConn.Close()
 			return true // Handshake succeeded at alternate time, so expiry was the only problem
 		}
+		recheckConn.Close()
 		return false
 	}
 
 	// For STARTTLS, dial plaintext then upgrade
-	recheckConn, err := dialContext(recheckCtx, "tcp", addr)
+	recheckConn, err := dial(recheckCtx, "tcp", addr)
 	if err != nil {
 		return false
 	}

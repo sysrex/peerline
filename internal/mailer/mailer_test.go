@@ -312,6 +312,7 @@ type fakeServer struct {
 	stallSecondConn   bool // if true, stall the second connection's greeting
 	connCount         int
 	closeCh           chan struct{} // closed when server closes
+	closeOnce         sync.Once
 }
 
 func newFakeServer(t *testing.T, advertiseSTARTTLS bool, cert *tls.Certificate) *fakeServer {
@@ -432,8 +433,12 @@ func (fs *fakeServer) port() int {
 }
 
 func (fs *fakeServer) close() {
-	fs.ln.Close()
-	close(fs.closeCh)
+	fs.closeOnce.Do(func() {
+		fs.ln.Close()
+		if fs.closeCh != nil {
+			close(fs.closeCh)
+		}
+	})
 }
 
 func (fs *fakeServer) receivedCommands() []string {
@@ -763,6 +768,37 @@ func TestSMTPSendRefusesExpiredCert(t *testing.T) {
 	}
 }
 
+func TestSMTPSendRefusedBeforeAUTH(t *testing.T) {
+	srv := newFakeServer(t, false, nil) // no STARTTLS
+	defer srv.close()
+
+	s := &SMTP{
+		Host:           "127.0.0.1",
+		Port:           srv.port(),
+		From:           "test@example.com",
+		User:           "testuser",
+		Pass:           "testpass",
+		Timeout:        2 * time.Second,
+		AllowPlaintext: false, // STARTTLS required
+	}
+	err := s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
+	if err == nil {
+		t.Fatal("Send should fail when STARTTLS is required but not offered")
+	}
+	if !strings.Contains(err.Error(), "STARTTLS required") {
+		t.Fatalf("error should mention STARTTLS required, got: %v", err)
+	}
+
+	// Verify no AUTH, MAIL FROM, RCPT or DATA were sent
+	cmds := srv.receivedCommands()
+	for _, cmd := range cmds {
+		if strings.HasPrefix(cmd, "AUTH") || strings.HasPrefix(cmd, "MAIL") ||
+			strings.HasPrefix(cmd, "RCPT") || cmd == "DATA" {
+			t.Fatalf("command %q should not have been sent when STARTTLS is missing: %v", cmd, cmds)
+		}
+	}
+}
+
 func TestSMTPSend(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -880,14 +916,7 @@ func TestSMTPProbeCredentialsWithoutSTARTTLS(t *testing.T) {
 			srv := newFakeServer(t, false, nil) // no STARTTLS
 			defer srv.close()
 
-			// Override dialContext to redirect to the local fake server
-			originalDialContext := dialContext
-			dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-				// Redirect to the fake server
-				return originalDialContext(ctx, network, srv.addr())
-			}
-			t.Cleanup(func() { dialContext = originalDialContext })
-
+			dial := (&net.Dialer{}).DialContext
 			s := &SMTP{
 				Host:           tt.host,
 				Port:           srv.port(),
@@ -895,6 +924,10 @@ func TestSMTPProbeCredentialsWithoutSTARTTLS(t *testing.T) {
 				Pass:           "p",
 				Timeout:        2 * time.Second,
 				AllowPlaintext: true,
+				dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+					// Redirect to the fake server
+					return dial(ctx, network, srv.addr())
+				},
 			}
 			err := s.Probe(context.Background())
 
@@ -1467,6 +1500,50 @@ func TestSMTPProbe(t *testing.T) {
 		}
 		if errors.Is(err, ErrRelayUnreachable) {
 			t.Fatalf("expired+untrusted should be fatal, not ErrRelayUnreachable: %v", err)
+		}
+	})
+
+	t.Run("STARTTLS wrong-hostname on TRUSTED chain = fatal", func(t *testing.T) {
+		cert := genTestCert(t, "wronghost.example.com")
+		srv := newFakeServer(t, true, &cert)
+		defer srv.close()
+
+		certPool := x509.NewCertPool()
+		parsed, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			t.Fatalf("failed to parse test cert: %v", err)
+		}
+		certPool.AddCert(parsed)
+
+		s := &SMTP{
+			Host:      "127.0.0.1",
+			Port:      srv.port(),
+			Timeout:   2 * time.Second,
+			TLSConfig: &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+		}
+		err = s.Probe(context.Background())
+		if err == nil {
+			t.Fatal("probe should fail on hostname mismatch")
+		}
+		if errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("hostname mismatch should be fatal, not ErrRelayUnreachable: %v", err)
+		}
+		// Verify STARTTLS was attempted
+		cmds := srv.receivedCommands()
+		hasSTARTTLS := false
+		for _, cmd := range cmds {
+			if cmd == "STARTTLS" {
+				hasSTARTTLS = true
+				break
+			}
+		}
+		if !hasSTARTTLS {
+			t.Fatal("STARTTLS should have been attempted")
+		}
+		// Verify it's a hostname error
+		var hostnameErr x509.HostnameError
+		if !errors.As(err, &hostnameErr) {
+			t.Fatalf("error should be x509.HostnameError, got: %T: %v", err, err)
 		}
 	})
 
