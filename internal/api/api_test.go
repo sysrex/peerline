@@ -2522,7 +2522,7 @@ func TestReadyAllowRaceSharedRecipient(t *testing.T) {
 	const concurrent = 10
 	sharedRecipient := "shared@example.com"
 	barrier := newBarrier(t, concurrent, 5*time.Second)
-	
+
 	// Use testAfterEmailReadyHook to synchronize after Ready checks, before Allow calls
 	rawSrv.testAfterEmailReadyHook = func(peerID string) {
 		barrier()
