@@ -167,7 +167,7 @@ func TestVacuumIntoFailureRemovesOnlyCreatedFile(t *testing.T) {
 
 func TestCollisionRetryWithRandomSuffix(t *testing.T) {
 	dir := secureTempDir(t)
-	
+
 	// Create a v2 database and immediately make valid backups with fixed timestamps
 	// This simulates pre-existing backups from earlier failed attempts
 	dbPath := filepath.Join(dir, "x.db")
@@ -198,7 +198,7 @@ func TestCollisionRetryWithRandomSuffix(t *testing.T) {
 	opts := openOpts(dir)
 	opts.BackupRetentionCount = 10
 	opts.now = func() int64 { return 1704110400 } // Fixed timestamp matching the pre-created files
-	
+
 	s, err := OpenWithOptions(dbPath, opts)
 	if err != nil {
 		t.Fatalf("Open should succeed with random suffix: %v", err)
@@ -244,7 +244,7 @@ func TestOwnerCheckOnCreatedFile(t *testing.T) {
 	// We can't easily make a file owned by another user without root,
 	// but we can verify the check runs by ensuring Open succeeds normally
 	// (the fd owner matches current user)
-	
+
 	opts := openOpts(dir)
 	s, err := OpenWithOptions(p, opts)
 	if err != nil {

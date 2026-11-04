@@ -420,7 +420,7 @@ func setupBackupDir(dir string, explicitlyConfigured bool, logger *slog.Logger) 
 	if !ownedByCurrentUser(info) {
 		return fmt.Errorf("backup directory %q is not owned by the user running peerline", dirBase)
 	}
-	
+
 	perm := info.Mode().Perm()
 	if explicitlyConfigured {
 		// Strict check for PEERLINE_BACKUP_DIR: no group/world access at all
@@ -538,11 +538,11 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 	if nowFunc == nil {
 		nowFunc = func() int64 { return time.Now().Unix() }
 	}
-	
+
 	// Use real microsecond resolution (not fake .000000)
 	nowTime := time.Unix(nowFunc(), 0).UTC()
 	timestamp := nowTime.Format("20060102-150405")
-	
+
 	// Add microseconds if available (requires time.Now() not mocked)
 	if opts.now == nil {
 		timestamp = time.Now().UTC().Format("20060102-150405.000000")
@@ -550,10 +550,10 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 		// For injected clocks, append .000000 as before
 		timestamp += ".000000"
 	}
-	
+
 	backupName := fmt.Sprintf("%s.pre-v%d-from-v%d.%s", dbBase, targetVersion, currentVersion, timestamp)
 	backupPath := filepath.Join(backupDir, backupName)
-	
+
 	// Pre-create the file at 0600 with O_EXCL|O_NOFOLLOW (unix) to avoid race condition
 	// On collision, add a random 4-byte suffix and retry
 	var createdFile *os.File
@@ -568,7 +568,7 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 			}
 			tryPath = fmt.Sprintf("%s.%x", backupPath, randomBytes)
 		}
-		
+
 		f, err := openBackupFileExclusive(tryPath)
 		if err == nil {
 			createdFile = f
@@ -581,11 +581,11 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 		}
 		// File exists, retry with random suffix
 	}
-	
+
 	if createdFile == nil {
 		return "", false, fmt.Errorf("create backup file: failed after 10 collision retries")
 	}
-	
+
 	// Verify owner and mode on the open fd (not the path)
 	finfo, err := createdFile.Stat()
 	if err != nil {
@@ -593,20 +593,20 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 		os.Remove(createdPath)
 		return "", false, fmt.Errorf("stat created backup file: %w", pathless(err))
 	}
-	
+
 	if !ownedByCurrentUser(finfo) {
 		createdFile.Close()
 		os.Remove(createdPath)
 		return "", false, fmt.Errorf("backup file %q is not owned by the user running peerline", filepath.Base(createdPath))
 	}
-	
+
 	// Mode should be 0600 from OpenFile, but verify
 	if perm := finfo.Mode().Perm(); perm != 0600 {
 		createdFile.Close()
 		os.Remove(createdPath)
 		return "", false, fmt.Errorf("backup file %q has mode %04o, expected 0600", filepath.Base(createdPath), perm)
 	}
-	
+
 	createdFile.Close()
 
 	// Check available disk space
@@ -657,7 +657,7 @@ func verifyBackup(backupPath string, expectedVersion int) error {
 	if err != nil {
 		return fmt.Errorf("get absolute path: %w", err)
 	}
-	
+
 	// Build file: URI with proper escaping for special characters
 	// On Unix, file: URIs are file:///path, on Windows file:///C:/path
 	var uri string
@@ -668,7 +668,7 @@ func verifyBackup(backupPath string, expectedVersion int) error {
 		// Windows: file:///C:/path - convert backslashes
 		uri = "file:///" + filepath.ToSlash(absPath) + "?mode=ro"
 	}
-	
+
 	db, err := sql.Open("sqlite", uri)
 	if err != nil {
 		return fmt.Errorf("open backup: %w", err)
