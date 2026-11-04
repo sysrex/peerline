@@ -3525,8 +3525,8 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv4.Code}, nil)
 	want(t, resp, body, 200)
 
-	// Advance clock well past TTL (TTL + 1h) to expire inv5
-	clk.Advance(1*time.Second + 1*time.Hour)
+	// Advance clock past inv5's 1s TTL to expire it
+	clk.Advance(2 * time.Second)
 
 	// Compare expired vs missing for both forms: ?code= and body-only
 	for _, tc := range []struct {
