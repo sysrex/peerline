@@ -1323,8 +1323,8 @@ func TestSMTPProbe(t *testing.T) {
 		// The leaf must be issued while the intermediate was valid, so the re-check succeeds.
 		now := time.Now()
 		leafCert, rootCert := genTestCertChain(t, "localhost",
-			now.Add(-3*time.Hour), now.Add(24*time.Hour),   // leaf: issued 3h ago, valid for 24h more
-			now.Add(-4*time.Hour), now.Add(-time.Hour))    // intermediate: issued 4h ago, expired 1h ago
+			now.Add(-3*time.Hour), now.Add(24*time.Hour), // leaf: issued 3h ago, valid for 24h more
+			now.Add(-4*time.Hour), now.Add(-time.Hour)) // intermediate: issued 4h ago, expired 1h ago
 
 		srv := newFakeServer(t, true, &leafCert)
 		defer srv.close()
@@ -1357,8 +1357,8 @@ func TestSMTPProbe(t *testing.T) {
 		// #246: expired intermediate under an untrusted (or no) root.
 		now := time.Now()
 		leafCert, _ := genTestCertChain(t, "localhost",
-			now.Add(-3*time.Hour), now.Add(24*time.Hour),   // leaf: issued 3h ago, valid for 24h more
-			now.Add(-4*time.Hour), now.Add(-time.Hour))    // intermediate: issued 4h ago, expired 1h ago
+			now.Add(-3*time.Hour), now.Add(24*time.Hour), // leaf: issued 3h ago, valid for 24h more
+			now.Add(-4*time.Hour), now.Add(-time.Hour)) // intermediate: issued 4h ago, expired 1h ago
 
 		srv := newFakeServer(t, true, &leafCert)
 		defer srv.close()
