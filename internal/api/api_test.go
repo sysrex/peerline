@@ -3379,7 +3379,7 @@ func TestSanitizerUnicode(t *testing.T) {
 		// Issue #182/#206: Virama cut (CCC 9) - should not leave dangling virama
 		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62)},       // क + virama + ष cut before the conjunct
 		{"chained virama at 64", strings.Repeat("a", 60) + "क्ष्म" + "bbb", strings.Repeat("a", 60)}, // क्ष्म (stacked) -> dropCluster removes all
-		{"many chained viramas", strings.Repeat("क्", 32) + "का", strings.Repeat("क्", 29) + "क"},                 // 65 runes → 64 → backoff to 62 → tail cleanup to 60 → drop trailing virama → 59 (29 pairs + क)
+		{"many chained viramas", strings.Repeat("क्", 32) + "का", strings.Repeat("क्", 29) + "क"},    // 65 runes → 64 → backoff to 62 → tail cleanup to 60 → drop trailing virama → 59 (29 pairs + क)
 
 		// Issue #206: Stacked conjunct (C V C V | C) - dropCluster removes entire stacked conjunct
 		{"stacked conjunct at 64", strings.Repeat("a", 60) + "क्क्ष" + "bbb", strings.Repeat("a", 60)}, // 60 a + क्क्ष (stacked) -> 60 a (no trailing virama)
@@ -3394,9 +3394,9 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"word-final virama before apostrophe", strings.Repeat("a", 62) + "क्'" + "bbb", strings.Repeat("a", 62) + "क्"},
 
 		// Issue #332: Bounded back-off for long virama runs prevents collapse
-		{"40 க் clusters bounded backoff", strings.Repeat("க்", 40), strings.Repeat("க்", 29) + "க"},                                     // 80 runes → 64 → backoff to 62 → tail cleanup to 60 → drop trailing virama → 59 (29 க் + க)
-		{"40 க் + 70 ब bounded backoff", strings.Repeat("க்", 40) + strings.Repeat("ब", 70), strings.Repeat("க்", 29) + "க"},           // Same path and result
-		{"ab + 40 க் bounded backoff", "ab" + strings.Repeat("க்", 40), "ab" + strings.Repeat("க்", 28) + "க"},                        // 82 runes → 64 (ab+31 க்) → backoff to 62 → tail cleanup to 60 → drop trailing virama → 59 (ab+28 க் + க)
+		{"40 க் clusters bounded backoff", strings.Repeat("க்", 40), strings.Repeat("க்", 29) + "க"},                         // 80 runes → 64 → backoff to 62 → tail cleanup to 60 → drop trailing virama → 59 (29 க் + க)
+		{"40 க் + 70 ब bounded backoff", strings.Repeat("க்", 40) + strings.Repeat("ब", 70), strings.Repeat("க்", 29) + "க"}, // Same path and result
+		{"ab + 40 க் bounded backoff", "ab" + strings.Repeat("க்", 40), "ab" + strings.Repeat("க்", 28) + "க"},               // 82 runes → 64 (ab+31 க்) → backoff to 62 → tail cleanup to 60 → drop trailing virama → 59 (ab+28 க் + க)
 	}
 
 	for _, tt := range tests {
@@ -3964,9 +3964,9 @@ func FuzzSanitizeInviterName(f *testing.F) {
 	f.Add(strings.Repeat("a", 62) + "क்." + "bbbbbbbbbb") // virama at 63, dot at 64
 	f.Add(strings.Repeat("a", 62) + "ம்-" + "bbbbbbbbbb") // virama at 63, dash at 64
 	// Issue #332: Fuzz seeds for bounded back-off on long virama runs
-	f.Add(strings.Repeat("க்", 40))                                     // 40 க் clusters (80 runes)
-	f.Add(strings.Repeat("க்", 40) + strings.Repeat("ब", 70))          // 40 க் + 70 ब (110 runes total)
-	f.Add("ab" + strings.Repeat("க்", 40))                             // ab + 40 க் clusters (82 runes)
+	f.Add(strings.Repeat("க்", 40))                           // 40 க் clusters (80 runes)
+	f.Add(strings.Repeat("க்", 40) + strings.Repeat("ब", 70)) // 40 க் + 70 ब (110 runes total)
+	f.Add("ab" + strings.Repeat("க்", 40))                    // ab + 40 க் clusters (82 runes)
 
 	f.Fuzz(func(t *testing.T, input string) {
 		got := sanitizeInviterName(input)
