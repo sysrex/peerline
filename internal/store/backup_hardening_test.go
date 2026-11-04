@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sysrex/peerline/internal/clock/clocktest"
 )
 
 func makeV2DB(t *testing.T, dir string) string {
@@ -195,7 +197,7 @@ func TestCollisionRetryWithRandomSuffix(t *testing.T) {
 	// Open should succeed by adding a random hex suffix
 	opts := openOpts(dir)
 	opts.BackupRetentionCount = 10
-	opts.now = func() int64 { return clockTime.Unix() }
+	opts.Clock = clocktest.New(clockTime)
 
 	s, err := OpenWithOptions(dbPath, opts)
 	if err != nil {
