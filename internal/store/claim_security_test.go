@@ -395,7 +395,7 @@ func TestConcurrentConfirmDeclineRevokeExpiry(t *testing.T) {
 		}
 		return "", err
 	}
-	
+
 	runRace(t, "confirm_vs_decline", confirmOp, declineOp)
 	runRace(t, "confirm_vs_revoke", confirmOp, revokeOp)
 	runRace(t, "decline_vs_revoke", declineOp, revokeOp)
