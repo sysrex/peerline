@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sysrex/peerline/internal/clock/clocktest"
 	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/store"
 )
@@ -285,7 +286,7 @@ func TestGETLimiterSeparateBuckets(t *testing.T) {
 	cfg := Config{
 		Logger:         slog.Default(),
 		TrustedProxies: []string{"10.0.0.0/8"},
-		Now:            func() time.Time { return time.Unix(1000, 0) },
+		Clock:          clocktest.New(time.Unix(1000, 0)),
 	}
 
 	// Freeze clock to avoid wall-clock refill

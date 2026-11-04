@@ -5,12 +5,26 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sysrex/peerline/internal/clock"
+	"github.com/sysrex/peerline/internal/msg"
 	"github.com/sysrex/peerline/internal/store"
 )
 
+type funcClock struct {
+	fn func() time.Time
+}
+
+func (c funcClock) Now() time.Time {
+	return c.fn()
+}
+
+func clockFromFunc(fn func() time.Time) clock.Clock {
+	return funcClock{fn}
+}
+
 // newTestServer creates a Server whose rate limiters use a custom clock (testing only).
 func newTestServer(st *store.Store, cfg Config, clock func() time.Time) *Server {
-	cfg.Now = clock
+	cfg.Clock = clockFromFunc(clock)
 	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
 		panic(err)
 	}
@@ -50,4 +64,16 @@ func mustNew(t testing.TB, st *store.Store, cfg Config) *Server {
 		t.Fatal(err)
 	}
 	return srv
+}
+
+// withLimiterOverride applies a limiter override to a Server, preserving the server's clock.
+// The callback receives the LimiterManager and a constructor that builds limiters using the
+// server's clock, so callers cannot forget to pass WithClock.
+// Use this in tests that need custom rate limits without duplicating LimiterManager setup.
+func withLimiterOverride(t *testing.T, s *Server, f func(lm *LimiterManager, newLimiter func(perMinute, burst int) *msg.Limiter)) {
+	t.Helper()
+	newLimiter := func(perMinute, burst int) *msg.Limiter {
+		return msg.NewLimiter(perMinute, burst, msg.WithClock(s.clk.Now))
+	}
+	f(s.lim, newLimiter)
 }

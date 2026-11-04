@@ -24,6 +24,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/sysrex/peerline/internal/auth"
+	"github.com/sysrex/peerline/internal/clock/clocktest"
 	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/store"
 	"golang.org/x/text/unicode/norm"
@@ -3308,61 +3309,68 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 // TestInviteAccept405Comprehensive covers all the edge cases from issue #146 and #174.
 func TestInviteAccept405Comprehensive(t *testing.T) {
 	// Use fake clock to control invite expiry deterministically
-	var mu sync.Mutex
-	now := time.Now()
-	fakeClock := func() time.Time {
-		mu.Lock()
-		defer mu.Unlock()
-		return now
+	clk := clocktest.New(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+
+	// Open store with fake clock so expiry checks use it
+	st, err := store.OpenWithOptions(t.TempDir()+"/t.db", store.OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
 	}
-	srv := newServer(t, Config{Now: fakeClock})
+	t.Cleanup(func() { st.Close() })
+
+	cfg := Config{Clock: clk}
+	prepareTestConfig(t, st, &cfg)
+	apiSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(apiSrv.Stop)
+	srv := httptest.NewServer(apiSrv.Handler())
+	t.Cleanup(srv.Close)
+
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
 
 	// Create invites with different states: valid, used, expired, missing
 	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv1 struct{ Code string }
-	json.Unmarshal(body, &inv1)
+	if err := json.Unmarshal(body, &inv1); err != nil || inv1.Code == "" {
+		t.Fatalf("inv1: %v, code=%q", err, inv1.Code)
+	}
 
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv2 struct{ Code string }
-	json.Unmarshal(body, &inv2)
+	if err := json.Unmarshal(body, &inv2); err != nil || inv2.Code == "" {
+		t.Fatalf("inv2: %v, code=%q", err, inv2.Code)
+	}
 
-	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	// Create an invite that will be advanced-expired for the 405 equality check
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
+	want(t, resp, body, 201)
+	var invExpired struct{ Code string }
+	if err := json.Unmarshal(body, &invExpired); err != nil || invExpired.Code == "" {
+		t.Fatalf("invExpired: %v, code=%q", err, invExpired.Code)
+	}
+
+	// Create another invite to prove expiry (404 positive control)
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
 	want(t, resp, body, 201)
 	var inv3 struct{ Code string }
-	json.Unmarshal(body, &inv3)
-
-	// Create two invites that will genuinely expire (1 second TTL relative to the store's real clock)
-	// One for the POST accept proof, one for the 405 equality check
-	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
-	want(t, resp, body, 201)
-	var invExpiredForPost struct{ Code string }
-	json.Unmarshal(body, &invExpiredForPost)
-
-	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
-	want(t, resp, body, 201)
-	var invExpiredFor405 struct{ Code string }
-	json.Unmarshal(body, &invExpiredFor405)
+	if err := json.Unmarshal(body, &inv3); err != nil || inv3.Code == "" {
+		t.Fatalf("inv3: %v, code=%q", err, inv3.Code)
+	}
 
 	// Use inv2
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
 	want(t, resp, body, 200)
 
-	// Wait for expired invites to expire relative to the store's real clock (not the fake API clock).
-	// Store checks exp < s.now() where both are Unix timestamps (seconds), so need to wait >1 second
-	// past the boundary to ensure s.now() has incremented.
-	time.Sleep(2100 * time.Millisecond)
+	// Advance clock past invExpired and inv3's expiry (1 second TTL)
+	clk.Advance(2 * time.Second)
 
-	// Prove invExpiredForPost is expired: POST accept returns 404
-	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": invExpiredForPost.Code}, nil)
+	// Prove inv3 is expired: POST accept returns 404 (positive control)
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv3.Code}, nil)
 	want(t, resp, body, 404)
-
-	// Advance fake clock for API-side time-based features (rate limiters, etc.)
-	mu.Lock()
-	now = now.Add(2 * time.Second)
-	mu.Unlock()
 
 	missingCode := auth.NewSecret("inv_")
 
@@ -3426,7 +3434,7 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	}
 	validBody, validHdr := get405(inv1.Code)
 	usedBody, usedHdr := get405(inv2.Code)
-	expiredBody, expiredHdr := get405(invExpiredFor405.Code)
+	expiredBody, expiredHdr := get405(invExpired.Code)
 	missingBody, missingHdr := get405(missingCode)
 
 	for i, pair := range []struct {
@@ -3459,6 +3467,8 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	// Test 6: Other methods (strict, issue #174)
 	// PUT/PATCH should get 405 from the authed mux (handler exists but wrong method).
 	// DELETE gets 404 (no handler at all in authed mux).
+	// Allow header includes DELETE because DELETE /v1/invites/{public_id} also matches
+	// the literal path "accept", and ServeMux lists all methods registered on that pattern.
 	for _, method := range []string{"PUT", "PATCH"} {
 		r, _ := http.NewRequest(method, srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
 		r.Header.Set("Authorization", "Bearer "+b.key)

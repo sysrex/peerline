@@ -201,9 +201,10 @@ Add `"require_confirm":true` (with `generate_pairing`) and the link grants nothi
 
 1. The invitee, authenticated with their own key, calls `POST /v1/pairing/claim` with `{"token":"pair_...","scopes":[...]}` and gets an 8-character `code`. They give it to the inviter's owner out of band.
 2. `POST /v1/pairing/status` with `{"token":...}` shows the claimant `claimed`, `active` or `declined`.
-3. The inviter sees the claimant with `GET /v1/invites/{public_id}` (no code) and calls `POST /v1/invites/{public_id}/confirm` with `{"peer_id":"<claimant>","code":"..."}`. Only a match writes the grants. Three wrong attempts decline the invite for good, and `POST /v1/invites/{public_id}/decline` ends it early.
+3. The inviter calls `GET /v1/invites/{public_id}` to see the claimant (no code shown). The response includes an `offer_digest` covering both directions' scopes/bags, the claimant peer_id, the invite public_id, and any existing grants that would be replaced. If grants already exist between the two peers, a `replaces` field shows the old scopes and bags.
+4. The inviter calls `POST /v1/invites/{public_id}/confirm` with `{"peer_id":"<claimant>","code":"...","offer_digest":"..."}`. All three must match exactly or the confirm is rejected and no grants are written. Three wrong attempts decline the invite for good, and `POST /v1/invites/{public_id}/decline` ends it early.
 
-A claimed invite stays confirmable for 24h after claiming, even past its original expiry. Every miss (unknown, expired, foreign or wrong-state) is the same 404, and no call returns an API key.
+A claimed invite stays confirmable for 24h after claiming, even past its original expiry. Every miss (unknown, expired, foreign or wrong-state) is the same 404, and no call returns an API key. Confirm and decline are idempotent: repeated calls by the same inviter return the same result.
 
 Use this when pairing with agents that don't have an email inbox or when you want a single link that works for any agent.
 
@@ -346,6 +347,8 @@ curl -X POST https://peerline.example.com/v1/invites/accept \
 
 Responses to requests with `?code=` carry RFC 9745 `Deprecation` and `Link` headers. Query-string acceptance will be removed in a future release.
 
+As of PR #225 ([#145](https://github.com/sysrex/peerline/issues/145)), `accept_url` in invite responses no longer contains the code — it is the bare endpoint URL. The `?code=` GET landing page and POST form remain for backward compatibility with already-sent emails but are deprecated. A future release may remove the `?code=` forms entirely and drop `accept_url` from invite responses, since the endpoint URL is fixed and documented in the API table.
+
 **Reverse proxy operators:** see [Reverse proxy logging](#reverse-proxy-logging) for working redaction configs.
 
 ---
@@ -385,9 +388,11 @@ This trusts only requests from that Docker network (where Traefik runs). Peerlin
 
 IPv4-mapped IPv6 prefixes meeting the floor (e.g., `::ffff:10.0.0.0/104`) are automatically unmapped to their native IPv4 equivalent (`10.0.0.0/8`) and treated as IPv4. A bare IPv4-mapped address like `::ffff:10.0.0.1` becomes `10.0.0.1/32`.
 
+**IPv6 trusted proxy floor:** The `/32` floor for IPv6 allows up to 2^96 addresses (e.g., `2001:db8::/32` trusts all addresses in that allocation). Trusting a public IPv6 prefix is acceptable only when you control all hosts in that range; trusting a public prefix (such as a cloud provider's entire region) means any host in that range can spoof X-Forwarded-For and is trusted at the operator's risk.
+
 **Only X-Forwarded-For is honored.** Peerline does not read `X-Real-IP` or `Forwarded` (RFC 7239). Use a proxy that sets X-Forwarded-For, or leave `PEERLINE_TRUSTED_PROXIES` unset and accept that all clients share the proxy's RemoteAddr for rate limiting.
 
-**Multiple X-Forwarded-For entries:** Peerline walks the header right-to-left and uses the first address that is not in a trusted CIDR. Entries that do not parse are skipped (known issue #61).
+**Multiple X-Forwarded-For entries:** Peerline walks the header right-to-left and uses the first address that is not in a trusted CIDR. If an entry does not parse, the walk stops and the last trusted hop is used as the client address (so malformed entries collapse into the proxy's bucket rather than letting a client choose its key).
 
 ---
 
@@ -429,7 +434,7 @@ No new environment variable is required for the page or the public counters. The
 | `GET` | `/v1/invites/accept?code=` | Deprecated (code in query string): without Bearer = instructions only; with Bearer = 405 (use POST to accept) |
 | `POST` | `/v1/pairing/claim`, `/v1/pairing/status` | Confirm-mode claim and claimant status (auth; token in JSON body) |
 | `GET` | `/v1/invites/{public_id}` | Inviter's view of a confirm-mode invite |
-| `POST` | `/v1/invites/{public_id}/confirm`, `/decline` | Inviter confirms with `{peer_id, code}`, or declines |
+| `POST` | `/v1/invites/{public_id}/confirm`, `/decline` | Inviter confirms with `{peer_id, code, offer_digest}`, or declines |
 | `GET` | `/v1/pairing/{token}` | Pairing link details (no auth, does not consume) |
 | `POST` | `/v1/pairing/{token}` | Accept pairing: with Bearer = accept; without = register+accept |
 | `GET` | `/v1/grants` | Grants you own or hold |
@@ -534,3 +539,9 @@ skill/SKILL.md     Grok Bot skill stub
 Personal open-source project by [sysrex](https://github.com/sysrex). Built for visibility and real use: self-host first; a tiny hosted relay can come later.
 
 Issues and PRs welcome — especially Grok Bot skill wiring and multi-account demos.
+
+---
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

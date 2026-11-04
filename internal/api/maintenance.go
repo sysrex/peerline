@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/sysrex/peerline/internal/clock"
 )
 
 // StorePurger defines the interface for cleaning expired invites.
@@ -18,6 +20,7 @@ type StorePurger interface {
 type MaintenanceManager struct {
 	store                StorePurger
 	log                  *slog.Logger
+	clk                  clock.Clock
 	ctx                  context.Context
 	cancel               context.CancelFunc
 	wg                   sync.WaitGroup
@@ -52,14 +55,16 @@ func WithFollowUpInterval(d time.Duration) MaintenanceManagerOption {
 }
 
 // NewMaintenanceManager creates and starts a maintenance manager.
-func NewMaintenanceManager(ctx context.Context, store StorePurger, log *slog.Logger, retentionSeconds int64, rebuildIntervalHours int, opts ...MaintenanceManagerOption) *MaintenanceManager {
+func NewMaintenanceManager(ctx context.Context, store StorePurger, log *slog.Logger, clk clock.Clock, retentionSeconds int64, rebuildIntervalHours int, opts ...MaintenanceManagerOption) *MaintenanceManager {
 	ctx, cancel := context.WithCancel(ctx)
 	if rebuildIntervalHours <= 0 {
 		rebuildIntervalHours = 6 // default: rebuild every 6 hours
 	}
+	clk = clock.Or(clk)
 	m := &MaintenanceManager{
 		store:                store,
 		log:                  log,
+		clk:                  clk,
 		ctx:                  ctx,
 		cancel:               cancel,
 		retentionSeconds:     retentionSeconds,
@@ -67,7 +72,7 @@ func NewMaintenanceManager(ctx context.Context, store StorePurger, log *slog.Log
 		followUpInterval:     1 * time.Minute,
 		rebuildInterval:      time.Duration(rebuildIntervalHours) * time.Hour,
 		rebuildIntervalHours: rebuildIntervalHours,
-		lastRebuild:          time.Now(), // start timer from now
+		lastRebuild:          clk.Now(), // start timer from now
 	}
 
 	for _, opt := range opts {
@@ -127,7 +132,7 @@ func (m *MaintenanceManager) purgeExpired() bool {
 // and does a full rebuild if they differ or if rebuildInterval has elapsed.
 func (m *MaintenanceManager) reconcileKeyIndex() {
 	// Check if it's time for a periodic full rebuild
-	forceRebuild := time.Since(m.lastRebuild) >= m.rebuildInterval
+	forceRebuild := m.clk.Now().Sub(m.lastRebuild) >= m.rebuildInterval
 
 	rebuilt, err := m.store.ReconcileKeyIndex(m.ctx, forceRebuild)
 	if err != nil {
@@ -141,7 +146,7 @@ func (m *MaintenanceManager) reconcileKeyIndex() {
 			reason = "periodic rebuild"
 		}
 		m.log.Info("maintenance: key index rebuilt", "reason", reason)
-		m.lastRebuild = time.Now()
+		m.lastRebuild = m.clk.Now()
 	}
 }
 
