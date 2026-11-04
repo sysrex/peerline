@@ -175,7 +175,7 @@ func TestNotifyEmailMigration(t *testing.T) {
 // TestV0SchemaMigration verifies v0 databases (without notify_email) upgrade correctly.
 func TestV0SchemaMigration(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/v0.db"
+	path := t.TempDir() + "/v0.db"
 
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -238,7 +238,7 @@ func TestV0SchemaMigration(t *testing.T) {
 // TestV1SchemaMigration verifies v1 databases (with notify_email) upgrade to v2.
 func TestV1SchemaMigration(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/v1.db"
+	path := t.TempDir() + "/v1.db"
 
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -306,7 +306,7 @@ func TestV1SchemaMigration(t *testing.T) {
 // TestPartialMigrationState verifies recovery when column exists but index is missing.
 func TestPartialMigrationState(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/partial.db"
+	path := t.TempDir() + "/partial.db"
 
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -480,7 +480,7 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 		},
 	}
 
-	freshPath := secureTempDir(t) + "/fresh.db"
+	freshPath := t.TempDir() + "/fresh.db"
 	freshStore, err := Open(freshPath)
 	if err != nil {
 		t.Fatal(err)
@@ -493,7 +493,7 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			path := secureTempDir(t) + "/" + tt.name + ".db"
+			path := t.TempDir() + "/" + tt.name + ".db"
 			db, err := sql.Open("sqlite", path)
 			if err != nil {
 				t.Fatal(err)
@@ -587,7 +587,7 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 // Store instances to test real lock contention.
 func TestConcurrentPairingRedemption(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/concurrent.db"
+	path := t.TempDir() + "/concurrent.db"
 
 	s1, err := Open(path)
 	if err != nil {
@@ -1005,7 +1005,7 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 // after the peer insert but before commit, no orphan peer is left and the invite remains unconsumed.
 func TestRollbackAfterPeerInsert(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/rollback.db"
+	path := t.TempDir() + "/rollback.db"
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -1062,7 +1062,7 @@ func TestRollbackAfterPeerInsert(t *testing.T) {
 
 // TestContextCancellationBeforeTransaction verifies that cancelling before BeginTx doesn't wedge the DB.
 func TestContextCancellationBeforeTransaction(t *testing.T) {
-	path := secureTempDir(t) + "/cancel-before.db"
+	path := t.TempDir() + "/cancel-before.db"
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -1139,7 +1139,7 @@ func TestContextCancellationBeforeTransaction(t *testing.T) {
 // TestContextCancellationMidTransaction verifies that cancelling after BeginTx and after the peer INSERT
 // rolls back correctly, leaving no orphan peer and the invite unconsumed.
 func TestContextCancellationMidTransaction(t *testing.T) {
-	path := secureTempDir(t) + "/cancel-mid-tx.db"
+	path := t.TempDir() + "/cancel-mid-tx.db"
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -1220,7 +1220,7 @@ func TestContextCancellationMidTransaction(t *testing.T) {
 // so migrate must not stop there. invites has no pairing_token_hash until Open.
 func TestPairingTokenHashMigration(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/pre-pairing.db"
+	path := t.TempDir() + "/pre-pairing.db"
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
@@ -1317,7 +1317,7 @@ func TestPairingTokenHashMigration(t *testing.T) {
 // Returning after the first column leaves pairing invites broken.
 func TestMigrateNotifyEmailAndPairingToken(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/v0.db"
+	path := t.TempDir() + "/v0.db"
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
@@ -1375,7 +1375,7 @@ func TestMigrateNotifyEmailAndPairingToken(t *testing.T) {
 // 5. The index (whether PR #11's full or our partial) works correctly
 func TestPR11AlreadyMigrated(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/pr11.db"
+	path := t.TempDir() + "/pr11.db"
 
 	// Create exactly PR #11's post-migration schema (238b916)
 	db, err := sql.Open("sqlite", path)
@@ -1534,7 +1534,7 @@ func TestPragmasInEffect(t *testing.T) {
 		path string
 	}{
 		{"memory", ":memory:"},
-		{"file", secureTempDir(t) + "/pragmas.db"},
+		{"file", t.TempDir() + "/pragmas.db"},
 	}
 
 	for _, tt := range tests {
@@ -2513,7 +2513,7 @@ func TestInMemorySkipsBackup(t *testing.T) {
 }
 
 func TestV3MigrationFreshDB(t *testing.T) {
-	s, err := Open(secureTempDir(t) + "/test.db")
+	s, err := Open(t.TempDir() + "/test.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2554,7 +2554,7 @@ func TestV3MigrationFreshDB(t *testing.T) {
 
 // Test v2 to v3 migration with backfill
 func TestV2ToV3Migration(t *testing.T) {
-	dbPath := secureTempDir(t) + "/test.db"
+	dbPath := t.TempDir() + "/test.db"
 
 	// Create a v2 database manually
 	db, err := sql.Open("sqlite", dbPath+"?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
@@ -2655,7 +2655,7 @@ func TestV2ToV3Migration(t *testing.T) {
 
 // Test v3 migration idempotence
 func TestV3MigrationIdempotent(t *testing.T) {
-	dbPath := secureTempDir(t) + "/test.db"
+	dbPath := t.TempDir() + "/test.db"
 
 	// Create v2 DB
 	db, err := sql.Open("sqlite", dbPath+"?_txlock=immediate")

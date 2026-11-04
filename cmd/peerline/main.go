@@ -56,6 +56,10 @@ func parseVersionDetail(raw string) (string, error) {
 }
 
 func main() {
+	// Set umask to 0077 to ensure all files (database, WAL, SHM, backups) are created with 0600
+	// This prevents other local users from reading the database in a 0755 data directory
+	syscall.Umask(0o077)
+
 	showVersion := flag.Bool("version", false, "print version and exit")
 	addr := flag.String("addr", env("PEERLINE_ADDR", "127.0.0.1:8787"), "listen address")
 	dbPath := flag.String("db", env("PEERLINE_DB", "peerline.db"), "SQLite database path")
@@ -83,6 +87,7 @@ func main() {
 	skipBackup := os.Getenv("PEERLINE_SKIP_MIGRATION_BACKUP") == "1"
 	backupDir := os.Getenv("PEERLINE_BACKUP_DIR")
 	backupKeep := 3
+	backupTimeout := 5 * time.Minute // Default: 5 minutes
 
 	if keepEnv := os.Getenv("PEERLINE_BACKUP_KEEP"); keepEnv != "" {
 		if n, err := strconv.Atoi(keepEnv); err == nil {
@@ -96,6 +101,18 @@ func main() {
 		}
 	}
 
+	if timeoutEnv := os.Getenv("PEERLINE_BACKUP_TIMEOUT"); timeoutEnv != "" {
+		if n, err := strconv.Atoi(timeoutEnv); err == nil {
+			if n > 0 {
+				backupTimeout = time.Duration(n) * time.Second
+			} else {
+				log.Warn("PEERLINE_BACKUP_TIMEOUT must be > 0, using default", "invalid_value", timeoutEnv, "default_seconds", 300)
+			}
+		} else {
+			log.Warn("PEERLINE_BACKUP_TIMEOUT must be a number (seconds), using default", "invalid_value", timeoutEnv, "default_seconds", 300)
+		}
+	}
+
 	if skipBackup {
 		log.Warn("PEERLINE_SKIP_MIGRATION_BACKUP is enabled, pre-migration backups are disabled")
 	}
@@ -105,6 +122,7 @@ func main() {
 		SkipMigrationBackup:  skipBackup,
 		BackupDir:            backupDir,
 		BackupRetentionCount: backupKeep,
+		BackupTimeout:        backupTimeout,
 		Logger:               log,
 	}
 
