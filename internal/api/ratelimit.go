@@ -13,6 +13,18 @@ import (
 	"github.com/sysrex/peerline/internal/msg"
 )
 
+// rejectedIPv6Prefixes lists IPv6 transition/translation ranges that are rejected
+// from trusted proxy lists because they cover arbitrary clients.
+var rejectedIPv6Prefixes = []struct {
+	prefix netip.Prefix
+	errMsg string
+}{
+	{netip.MustParsePrefix("2001::/32"), "overlaps Teredo prefix 2001::/32"},
+	{netip.MustParsePrefix("64:ff9b::/96"), "overlaps NAT64 well-known prefix 64:ff9b::/96"},
+	{netip.MustParsePrefix("64:ff9b:1::/48"), "overlaps NAT64 local prefix 64:ff9b:1::/48"},
+	{netip.MustParsePrefix("2002::/16"), "overlaps 6to4 prefix 2002::/16"},
+}
+
 // clientIP returns the client IP, honoring X-Forwarded-For only from trusted proxies.
 // It walks X-Forwarded-For right-to-left, skipping entries in trustedNets, and returns
 // the first untrusted IP. Only consults XFF when RemoteAddr itself is trusted.
@@ -168,11 +180,13 @@ func rateLimitKey(ip string) string {
 
 // ParseTrustedProxies parses a list of CIDR strings (or bare IPs) into IPNets.
 // Rejects overly broad prefixes (0.0.0.0/0, ::/0, and prefixes shorter than
-// /8 for IPv4 or /32 for IPv6, or /29 for IPv6 with AllowBroadIPv6) to prevent misconfiguration (#62).
+// /8 for IPv4 or /32 for IPv6) to prevent misconfiguration (#62).
 // IPv4-mapped IPv6 prefixes (e.g., ::ffff:10.0.0.0/104) are unmapped and
 // converted to IPv4 (10.0.0.0/8), with the IPv4 /8 floor applied.
 // Rejects zone identifiers (e.g., fe80::1%eth0).
 // Rejects 0.0.0.0/8 ("this network") and its IPv4-mapped form.
+// Rejects IPv6 transition/translation prefixes: Teredo 2001::/32,
+// NAT64 64:ff9b::/96 and 64:ff9b:1::/48, and 6to4 2002::/16.
 func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 	nets, _, err := ParseTrustedProxiesWithOpts(cidrs, false)
 	return nets, err
@@ -180,8 +194,10 @@ func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 
 // ParseTrustedProxiesWithOpts parses trusted proxies with optional broader IPv6 floor.
 // When allowBroadIPv6 is true, the IPv6 floor is /29 (allowing Cloudflare 2a06:98c0::/29,
-// and rejecting 2000::/3 and 2002::/16 as too broad), and ULA ranges contained in fc00::/7
+// and rejecting 2000::/3 as too broad), and ULA ranges contained in fc00::/7
 // (bits >= 7) are permitted. ::/0 is always rejected.
+// IPv6 transition/translation prefixes are always rejected: Teredo 2001::/32,
+// NAT64 64:ff9b::/96 and 64:ff9b:1::/48, and 6to4 2002::/16.
 // Returns the parsed networks and a list of entries that were accepted only because allowBroadIPv6 was true.
 func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IPNet, []string, error) {
 	var nets []*net.IPNet
@@ -293,6 +309,14 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 				return nil, nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /%d", cidr, minBits)
 			}
 
+			// Reject transition/translation prefixes that cover arbitrary clients
+			// (after floor check, so overly broad prefixes get the floor error)
+			for _, rejected := range rejectedIPv6Prefixes {
+				if rejected.prefix.Overlaps(prefix) {
+					return nil, nil, fmt.Errorf("parsing %q: %s", cidr, rejected.errMsg)
+				}
+			}
+
 			if neededOptIn {
 				relaxed = append(relaxed, prefix.String())
 			}
@@ -333,10 +357,18 @@ type LimiterManager struct {
 
 // Rate limit constants for public GET endpoints and authenticated endpoints.
 const (
-	getPerMinute     = 60
-	getBurst         = 20
-	authGetPerMinute = 120
-	authGetBurst     = 40
+	getPerMinute      = 60
+	getBurst          = 20
+	authGetPerMinute  = 120
+	authGetBurst      = 40
+	regPerMinute      = 10
+	regBurst          = 5
+	pairPerMinute     = 10
+	pairBurst         = 5
+	versionPerMinute  = 120
+	versionBurst      = 30
+	bagWritePerMinute = 30
+	bagWriteBurst     = 10
 )
 
 // NewLimiterManager creates and starts a new limiter manager.
@@ -345,14 +377,14 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 	clk := msg.WithClock(clock.Or(cfg.Clock).Now)
 	lm := &LimiterManager{
 		msgLim:        msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst, clk),
-		regLim:        msg.NewLimiter(10, 5, clk),
-		pairLim:       msg.NewLimiter(10, 5, clk),
+		regLim:        msg.NewLimiter(regPerMinute, regBurst, clk),
+		pairLim:       msg.NewLimiter(pairPerMinute, pairBurst, clk),
 		failLim:       msg.NewLimiter(cfg.AuthFailPerMinute, cfg.AuthFailBurst, clk),
 		getLim:        msg.NewLimiter(getPerMinute, getBurst, clk),
-		versionLim:    msg.NewLimiter(120, 30, clk), // Separate limiter for /version to avoid monitor conflicts
+		versionLim:    msg.NewLimiter(versionPerMinute, versionBurst, clk), // Separate limiter for /version to avoid monitor conflicts
 		authLim:       msg.NewLimiter(authGetPerMinute, authGetBurst, clk),
 		writeLim:      msg.NewLimiter(cfg.WritePerMinute, cfg.WriteBurst, clk),
-		bagWriteLim:   msg.NewLimiter(30, 10, clk),
+		bagWriteLim:   msg.NewLimiter(bagWritePerMinute, bagWriteBurst, clk),
 		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst, clk),
 		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour, clk),
 		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst, clk),
