@@ -1914,6 +1914,61 @@ func TestSMTPImplicitTLS(t *testing.T) {
 			t.Fatalf("error should wrap x509.CertificateInvalidError, got: %T %v", err, err)
 		}
 	})
+
+	t.Run("port 465 uses dialContext field and handles empty ServerName", func(t *testing.T) {
+		cert := genTestCert(t, "localhost")
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		tlsLn := tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}})
+		defer tlsLn.Close()
+
+		fs := &fakeServer{ln: tlsLn, cert: &cert, t: t, closeCh: make(chan struct{})}
+		go fs.serve()
+
+		certPool := x509.NewCertPool()
+		parsed, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			t.Fatalf("failed to parse test cert: %v", err)
+		}
+		certPool.AddCert(parsed)
+
+		dialCalled := false
+		dial := (&net.Dialer{}).DialContext
+		s := &SMTP{
+			Host:        "127.0.0.1",
+			Port:        tlsLn.Addr().(*net.TCPAddr).Port,
+			From:        "test@example.com",
+			Timeout:     2 * time.Second,
+			ImplicitTLS: true,
+			// Empty ServerName to verify the helper fills it in
+			TLSConfig: &tls.Config{RootCAs: certPool},
+			dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				dialCalled = true
+				return dial(ctx, network, tlsLn.Addr().String())
+			},
+		}
+		err = s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
+		if err != nil {
+			t.Fatalf("Send should succeed with dialContext hook: %v", err)
+		}
+		if !dialCalled {
+			t.Fatal("dialContext hook should have been called for implicit TLS")
+		}
+		// Verify DATA was sent (handshake succeeded)
+		cmds := fs.receivedCommands()
+		hasDATA := false
+		for _, cmd := range cmds {
+			if cmd == "DATA" {
+				hasDATA = true
+				break
+			}
+		}
+		if !hasDATA {
+			t.Fatalf("DATA should have been sent (handshake succeeded), got: %v", cmds)
+		}
+	})
 }
 
 func TestIsLoopbackAddr(t *testing.T) {

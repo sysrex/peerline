@@ -104,6 +104,17 @@ type SMTP struct {
 
 func (s *SMTP) Mode() string { return "smtp" }
 
+// tlsConfigForImplicitTLS clones cfg and ensures ServerName is set to s.Host.
+// This matches the old tls.Dialer behavior: DialContext filled in an empty
+// Config.ServerName from the addr host. Raw tls.Client doesn't, so we do it here.
+func (s *SMTP) tlsConfigForImplicitTLS(cfg *tls.Config) *tls.Config {
+	clone := cfg.Clone()
+	if clone.ServerName == "" {
+		clone.ServerName = s.Host
+	}
+	return clone
+}
+
 // checkSTARTTLS validates STARTTLS policy: returns an error if STARTTLS is required but not offered.
 func (s *SMTP) checkSTARTTLS(offered bool) error {
 	if !offered && !s.AllowPlaintext {
@@ -262,7 +273,8 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 			return fmt.Errorf("smtp dial: %w", err)
 		}
 		// Perform TLS handshake on the established connection
-		tlsConn := tls.Client(conn, tlsCfg)
+		implicitCfg := s.tlsConfigForImplicitTLS(tlsCfg)
+		tlsConn := tls.Client(conn, implicitCfg)
 		if dl, ok := ctx.Deadline(); ok {
 			tlsConn.SetDeadline(dl)
 		}
@@ -529,7 +541,8 @@ func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, 
 		if err != nil {
 			return false
 		}
-		tlsConn := tls.Client(recheckConn, recheckCfg)
+		implicitCfg := s.tlsConfigForImplicitTLS(recheckCfg)
+		tlsConn := tls.Client(recheckConn, implicitCfg)
 		if deadline, ok := recheckCtx.Deadline(); ok {
 			tlsConn.SetDeadline(deadline)
 		}
