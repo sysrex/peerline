@@ -3796,9 +3796,9 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 
 		// Assert that back-off only drops virama clusters, not complete words.
 		// The dropped region (after legitimately trimmed trailing spaces from output and leading spaces
-		// from the dropped part) must only contain runes that are part of clusters ending in viramas.
-		// Every base letter/number must be immediately followed by a mark or virama (CCC 9), either
-		// within the dropped region or at position 64 (the boundary).
+		// from the dropped part) must satisfy two conditions:
+		// (a) It contains no word boundary runes (spaces, punctuation).
+		// (b) Every base letter/number is immediately followed by a mark or virama (CCC 9).
 		if len(out) > 0 && len(full) >= 64 {
 			// Find the last non-space rune in the output to account for trailing space trim
 			lastNonSpace := len(out) - 1
@@ -3812,9 +3812,19 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 				for startCheck < 64 && full[startCheck] == ' ' {
 					startCheck++
 				}
-				// Now validate the dropped region: every base letter/number must be part of a virama cluster
+				// Now validate the dropped region
 				if startCheck < 64 {
 					droppedRegion := full[startCheck:64]
+					
+					// Check (a): no word boundaries in the dropped region
+					for _, r := range droppedRegion {
+						if isWordBoundary(r) {
+							t.Errorf("sanitizeInviterName(%q) [%s] dropped runes before position 64 contain word boundary U+%04X (excluding leading spaces): output=%q full=%q dropped=%q", input, label, r, got, string(full), string(droppedRegion))
+							break
+						}
+					}
+					
+					// Check (b): every base letter/number must be part of a virama cluster
 					for i, r := range droppedRegion {
 						// If this is a base character (letter or number)
 						if unicode.IsLetter(r) || unicode.IsNumber(r) {
