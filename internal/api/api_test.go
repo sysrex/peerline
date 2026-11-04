@@ -3635,7 +3635,7 @@ func TestAPIClock(t *testing.T) {
 	}
 	bob.id, bob.key = bobReg.PeerID, bobReg.APIKey
 
-	// Create an invite with 100-second TTL via API
+	// Create first invite with 100-second TTL via API
 	resp, body = alice.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 100}, nil)
 	want(t, resp, body, 201)
 
@@ -3656,17 +3656,7 @@ func TestAPIClock(t *testing.T) {
 		t.Errorf("expires_at = %v, want %v", expTime, expected)
 	}
 
-	// Advance clock to exactly expires_at
-	clk.Advance(100 * time.Second)
-
-	// Accept at exactly expires_at (now == expires_at) - should succeed
-	resp, body = bob.do("POST", "/v1/invites/accept", map[string]any{"code": inv1.Code}, nil)
-	if resp.StatusCode != 200 {
-		t.Errorf("accept at exact boundary (now == expires_at): expected 200, got %d: %s", resp.StatusCode, body)
-	}
-
-	// Reset clock to fixed time and create another invite for expires_at+1 test
-	clk.Set(fixedTime)
+	// Create second invite with 100-second TTL before advancing clock
 	resp, body = alice.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 100}, nil)
 	want(t, resp, body, 201)
 
@@ -3677,10 +3667,19 @@ func TestAPIClock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Advance clock to expires_at + 1 second
-	clk.Advance(101 * time.Second)
+	// Advance clock to exactly expires_at (fixedTime + 100s)
+	clk.Advance(100 * time.Second)
 
-	// Accept at expires_at+1 - should be rejected with 404
+	// Accept invite1 at exactly expires_at (now == expires_at) - should succeed
+	resp, body = bob.do("POST", "/v1/invites/accept", map[string]any{"code": inv1.Code}, nil)
+	if resp.StatusCode != 200 {
+		t.Errorf("accept at exact boundary (now == expires_at): expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	// Advance clock by 1 more second (now = expires_at + 1)
+	clk.Advance(1 * time.Second)
+
+	// Accept invite2 at expires_at+1 - should be rejected with 404
 	resp, body = bob.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
 	if resp.StatusCode != 404 {
 		t.Errorf("accept at expires_at+1: expected 404, got %d: %s", resp.StatusCode, body)
@@ -4911,4 +4910,41 @@ func TestAcceptRoutesSecurityHeaders(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestNewDefaultsToNonNilClock verifies that api.New with a nil Config.Clock
+// defaults to a non-nil clock, as guaranteed by clock.Or.
+func TestNewDefaultsToNonNilClock(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	cfg := Config{}
+	prepareTestConfig(t, st, &cfg)
+	srv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+
+	// Creating an invite exercises clk.Now and proves it's non-nil (would panic otherwise)
+	testSrv := httptest.NewServer(srv.Handler())
+	defer testSrv.Close()
+
+	c := &client{t: t, srv: testSrv}
+	resp, body := c.do("POST", "/v1/register", map[string]string{"name": "test"}, nil)
+	want(t, resp, body, 201)
+	var reg struct{ PeerID, APIKey string }
+	if err := json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&reg.PeerID, &reg.APIKey}); err != nil {
+		t.Fatal(err)
+	}
+	c.id, c.key = reg.PeerID, reg.APIKey
+
+	resp, body = c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, resp, body, 201)
 }

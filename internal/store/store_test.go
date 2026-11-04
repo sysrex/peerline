@@ -855,6 +855,18 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 	if err := s.CreateInviteWithPairing(ctx, codeHash2, pairingHash2, "alice", []string{"messages"}, nil, expiresAt2); err != nil {
 		t.Fatal(err)
 	}
+
+	// At exactly expires_at, GetInviteByPairingToken should succeed
+	clk.Set(time.Unix(currentTime+200, 0))
+	invite, err := s.GetInviteByPairingToken(ctx, pairingHash2)
+	if err != nil {
+		t.Errorf("GetInviteByPairingToken at exact expiry should succeed, got %v", err)
+	}
+	if invite == nil || invite.FromPeer != "alice" {
+		t.Errorf("GetInviteByPairingToken at exact expiry returned wrong invite: %+v", invite)
+	}
+
+	// One second after expiry, GetInviteByPairingToken should fail
 	clk.Set(time.Unix(currentTime+201, 0))
 	_, err = s.GetInviteByPairingToken(ctx, pairingHash2)
 	if !errors.Is(err, ErrNotFound) {
