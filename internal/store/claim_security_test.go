@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/sysrex/peerline/internal/clock/clocktest"
 )
 
 // TestConfirmWithStaleDigestWritesNothing verifies that confirming with a wrong
 // or stale offer_digest writes no grants and does not count toward code_fails (#80, requirement 1; #291).
 func TestConfirmWithStaleDigestWritesNothing(t *testing.T) {
-	s := claimStore(t)
+	s, _ := claimStore(t)
 	ctx := context.Background()
 	exp := time.Unix(claimNow+3600, 0)
 
@@ -86,7 +88,7 @@ func TestConfirmWithStaleDigestWritesNothing(t *testing.T) {
 // TestConfirmStaleDigestNoDeadlock verifies that confirming with a stale digest does not
 // deadlock the single-connection store pool (#310).
 func TestConfirmStaleDigestNoDeadlock(t *testing.T) {
-	s := claimStore(t)
+	s, _ := claimStore(t)
 	ctx := context.Background()
 	exp := time.Unix(claimNow+3600, 0)
 
@@ -157,7 +159,7 @@ func TestConfirmStaleDigestNoDeadlock(t *testing.T) {
 // between inviter and claimant, the status response includes replaces and the digest
 // covers it (#80, requirement 2).
 func TestConfirmOverExistingGrantShowsReplaces(t *testing.T) {
-	s := claimStore(t)
+	s, _ := claimStore(t)
 	ctx := context.Background()
 	exp := time.Unix(claimNow+3600, 0)
 
@@ -226,7 +228,7 @@ func TestConfirmOverExistingGrantShowsReplaces(t *testing.T) {
 // TestDoubleConfirmIsIdempotent verifies that a repeated confirm by the same inviter
 // with the same claimant returns the same result (#80, requirement 3; #290).
 func TestDoubleConfirmIsIdempotent(t *testing.T) {
-	s := claimStore(t)
+	s, _ := claimStore(t)
 	ctx := context.Background()
 	exp := time.Unix(claimNow+3600, 0)
 
@@ -273,7 +275,7 @@ func TestDoubleConfirmIsIdempotent(t *testing.T) {
 // TestDoubleConfirmWithDifferentPeerIs404 verifies that confirming for a different
 // peer_id after activation returns 404 (#80, requirement 3).
 func TestDoubleConfirmWithDifferentPeerIs404(t *testing.T) {
-	s := claimStore(t)
+	s, _ := claimStore(t)
 	ctx := context.Background()
 	exp := time.Unix(claimNow+3600, 0)
 
@@ -315,7 +317,7 @@ func TestDoubleConfirmWithDifferentPeerIs404(t *testing.T) {
 
 // TestDoubleDeclineIsIdempotent verifies that repeated decline returns success (#80).
 func TestDoubleDeclineIsIdempotent(t *testing.T) {
-	s := claimStore(t)
+	s, _ := claimStore(t)
 	ctx := context.Background()
 	exp := time.Unix(claimNow+3600, 0)
 
@@ -351,14 +353,14 @@ func TestConcurrentConfirmDecline(t *testing.T) {
 		t.Run(fmt.Sprintf("iteration-%d", i), func(t *testing.T) {
 			// Use a file-backed DB so we can open it with two Store instances
 			dbPath := t.TempDir() + "/test.db"
+			clk := clocktest.New(time.Unix(claimNow, 0))
 
 			// First store creates the invite
-			s1, err := Open(dbPath)
+			s1, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { s1.Close() })
-			s1.now = func() int64 { return claimNow }
 			ctx := context.Background()
 			for _, id := range []string{"alice", "bob"} {
 				if err := s1.CreatePeer(ctx, id, id, "h"+id, "", ""); err != nil {
@@ -379,19 +381,17 @@ func TestConcurrentConfirmDecline(t *testing.T) {
 			s1.Close()
 
 			// Open two separate Store instances on the same DB file (simulates two replicas/processes)
-			s1, err = Open(dbPath)
+			s1, err = OpenWithOptions(dbPath, OpenOptions{Clock: clk})
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { s1.Close() })
-			s1.now = func() int64 { return claimNow }
 
-			s2, err := Open(dbPath)
+			s2, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { s2.Close() })
-			s2.now = func() int64 { return claimNow }
 
 			// Start barrier
 			start := make(chan struct{})
@@ -467,13 +467,13 @@ func TestConcurrentConfirmRevoke(t *testing.T) {
 	for i := 0; i < iterations; i++ {
 		t.Run(fmt.Sprintf("iteration-%d", i), func(t *testing.T) {
 			dbPath := t.TempDir() + "/test.db"
+			clk := clocktest.New(time.Unix(claimNow, 0))
 
-			s1, err := Open(dbPath)
+			s1, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { s1.Close() })
-			s1.now = func() int64 { return claimNow }
 			ctx := context.Background()
 			for _, id := range []string{"alice", "bob"} {
 				if err := s1.CreatePeer(ctx, id, id, "h"+id, "", ""); err != nil {
@@ -493,19 +493,17 @@ func TestConcurrentConfirmRevoke(t *testing.T) {
 			publicID := c.PublicID
 			s1.Close()
 
-			s1, err = Open(dbPath)
+			s1, err = OpenWithOptions(dbPath, OpenOptions{Clock: clk})
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { s1.Close() })
-			s1.now = func() int64 { return claimNow }
 
-			s2, err := Open(dbPath)
+			s2, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { s2.Close() })
-			s2.now = func() int64 { return claimNow }
 
 			start := make(chan struct{})
 			confirmDone := make(chan error, 1)
@@ -568,7 +566,7 @@ func TestConcurrentConfirmRevoke(t *testing.T) {
 
 // TestConfirmAfterExpiry verifies that confirm fails after confirm_by passes.
 func TestConfirmAfterExpiry(t *testing.T) {
-	s := claimStore(t)
+	s, clk := claimStore(t)
 	ctx := context.Background()
 
 	// Create invite
@@ -582,8 +580,8 @@ func TestConfirmAfterExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Advance time past confirm_by (which is set to now() + 24h at claim time)
-	s.now = func() int64 { return claimNow + 86400 + 100 }
+	// Advance time past confirm_by (which is set to nowUnix() + 24h at claim time)
+	clk.Advance(24*time.Hour + 100*time.Second)
 
 	// Confirm should fail
 	_, _, err = s.ConfirmClaim(ctx, c.PublicID, "alice", "bob", 3, func(cl *Claim) (CheckResult, *Claim) {
@@ -609,7 +607,7 @@ func TestConfirmAfterExpiry(t *testing.T) {
 // TestNoApiKeyInResponse verifies that no response contains api_key (#80, requirement 4).
 // This is primarily tested at the API level, but we verify the store layer doesn't leak it.
 func TestStoreNeverReturnsApiKey(t *testing.T) {
-	s := claimStore(t)
+	s, _ := claimStore(t)
 	ctx := context.Background()
 	exp := time.Unix(claimNow+3600, 0)
 
