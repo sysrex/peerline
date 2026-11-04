@@ -386,6 +386,7 @@ This trusts only requests from that Docker network (where Traefik runs). Peerlin
 - IPv4-mapped prefixes `/96` through `/103` (would map to IPv4 prefixes broader than `/8`)
 - Zone identifiers in any form (e.g., `fe80::1%eth0`)
 - `0.0.0.0/8` ("this network") and its IPv4-mapped form `::ffff:0.0.0.0/104`
+- IPv6 transition/translation prefixes (regardless of opt-in): Teredo `2001::/32`, NAT64 `64:ff9b::/96` and `64:ff9b:1::/48`, and 6to4 `2002::/16`
 
 IPv4-mapped IPv6 prefixes meeting the floor (e.g., `::ffff:10.0.0.0/104`) are automatically unmapped to their native IPv4 equivalent (`10.0.0.0/8`) and treated as IPv4. A bare IPv4-mapped address like `::ffff:10.0.0.1` becomes `10.0.0.1/32`.
 

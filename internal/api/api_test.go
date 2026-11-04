@@ -26,6 +26,7 @@ import (
 
 	"github.com/sysrex/peerline/internal/auth"
 	"github.com/sysrex/peerline/internal/clock/clocktest"
+	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/store"
 	"golang.org/x/text/unicode/norm"
 )
@@ -3382,6 +3383,15 @@ func TestSanitizerUnicode(t *testing.T) {
 
 		// Issue #206: Stacked conjunct (C V C V | C) - dropCluster removes entire stacked conjunct
 		{"stacked conjunct at 64", strings.Repeat("a", 60) + "क्क्ष" + "bbb", strings.Repeat("a", 60)}, // 60 a + क्क्ष (stacked) -> 60 a (no trailing virama)
+
+		// Issue #315: Word-final virama before punctuation (should be kept, not dropped)
+		// क् is 2 runes (क at 62, ् at 63), so with 62 'a' + क् + punctuation, the virama is at 63 and punctuation at 64
+		// The cap is 64 runes (positions 0-63), so we keep the virama but not the punctuation at position 64
+		{"word-final virama before dot", strings.Repeat("a", 62) + "क्." + "bbb", strings.Repeat("a", 62) + "क्"},  // क at 62, ् at 63, . at 64 → keep virama (word-final)
+		{"word-final virama before dash", strings.Repeat("a", 62) + "ம்-" + "bbb", strings.Repeat("a", 62) + "ம்"}, // ம at 62, ் at 63, - at 64 → keep virama (word-final)
+		{"word-final virama before comma", strings.Repeat("a", 62) + "क्," + "bbb", strings.Repeat("a", 62) + "क्"},
+		{"word-final virama before underscore", strings.Repeat("a", 62) + "ம்_" + "bbb", strings.Repeat("a", 62) + "ம்"},
+		{"word-final virama before apostrophe", strings.Repeat("a", 62) + "क्'" + "bbb", strings.Repeat("a", 62) + "क्"},
 	}
 
 	for _, tt := range tests {
@@ -3778,30 +3788,132 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 		full := []rune(sanitizeInviterNameUncapped(input))
 		out := []rune(got)
 
+		// General assertion: capped output is a prefix of uncapped result
+		if len(out) > 0 && len(full) > 0 {
+			if !strings.HasPrefix(string(full), got) {
+				t.Errorf("sanitizeInviterName(%q) [%s] capped output is not a prefix of uncapped: got=%q full=%q", input, label, got, string(full))
+			}
+		}
+
+		// Assert that back-off only drops virama clusters, not complete words.
+		// The dropped region (after legitimately trimmed trailing spaces from output and leading spaces
+		// from the dropped part) must satisfy two conditions:
+		// (a) It contains no word boundary runes (spaces, punctuation).
+		// (b) Every base letter/number is immediately followed by a mark or virama (CCC 9).
+		if len(out) > 0 && len(full) >= 64 {
+			// Find the last non-space rune in the output to account for trailing space trim
+			lastNonSpace := len(out) - 1
+			for lastNonSpace >= 0 && out[lastNonSpace] == ' ' {
+				lastNonSpace--
+			}
+			// Check from the position after the last non-space to position 64, excluding leading spaces
+			if lastNonSpace >= 0 && lastNonSpace+1 < 64 {
+				startCheck := lastNonSpace + 1
+				// Skip any leading spaces that were legitimately trimmed
+				for startCheck < 64 && full[startCheck] == ' ' {
+					startCheck++
+				}
+				// Now validate the dropped region
+				if startCheck < 64 {
+					droppedRegion := full[startCheck:64]
+
+					// Check (a): no word boundaries in the dropped region
+					for _, r := range droppedRegion {
+						if isWordBoundary(r) {
+							t.Errorf("sanitizeInviterName(%q) [%s] dropped runes before position 64 contain word boundary U+%04X (excluding leading spaces): output=%q full=%q dropped=%q", input, label, r, got, string(full), string(droppedRegion))
+							break
+						}
+					}
+
+					// Check (b): every base letter/number must be part of a virama cluster
+					for i, r := range droppedRegion {
+						// If this is a base character (letter or number)
+						if unicode.IsLetter(r) || unicode.IsNumber(r) {
+							// It must be followed by a mark or virama (CCC 9), either within the region or at position 64
+							var nextRune rune
+							if i+1 < len(droppedRegion) {
+								nextRune = droppedRegion[i+1]
+							} else if startCheck+i+1 == 64 && len(full) > 64 {
+								// The base is at position 63, check if position 64 is a mark/virama
+								nextRune = full[64]
+							} else {
+								// Base at end of dropped region with nothing after it - this is wrong
+								t.Errorf("sanitizeInviterName(%q) [%s] dropped base character U+%04X (%c) not followed by mark/virama: output=%q full=%q dropped=%q", input, label, r, r, got, string(full), string(droppedRegion))
+								break
+							}
+							isMark := unicode.Is(unicode.Mn, nextRune) || unicode.Is(unicode.Mc, nextRune) || unicode.Is(unicode.Me, nextRune)
+							props := norm.NFC.PropertiesString(string(nextRune))
+							isVirama := props.CCC() == 9
+							if !isMark && !isVirama {
+								t.Errorf("sanitizeInviterName(%q) [%s] dropped base character U+%04X (%c) not followed by mark/virama (next: U+%04X): output=%q full=%q dropped=%q", input, label, r, r, nextRune, got, string(full), string(droppedRegion))
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+
 		// (a) If the output ends in CCC 9 and is shorter than full,
-		// the next rune in full must be a space (word-final virama).
+		// the next rune in full must be a word boundary (word-final virama).
 		if len(out) > 0 && len(out) < len(full) {
 			lastRune := out[len(out)-1]
 			props := norm.NFC.PropertiesString(string(lastRune))
 			if props.CCC() == 9 {
 				nextRune := full[len(out)]
-				if nextRune != ' ' {
-					t.Errorf("sanitizeInviterName(%q) [%s] ends in mid-word CCC 9 (virama) rune U+%04X, next rune is U+%04X (not space): output=%q full=%q", input, label, lastRune, nextRune, got, string(full))
+				if !isWordBoundary(nextRune) {
+					t.Errorf("sanitizeInviterName(%q) [%s] ends in mid-word CCC 9 (virama) rune U+%04X, next rune is U+%04X (not a word boundary): output=%q full=%q", input, label, lastRune, nextRune, got, string(full))
 				}
 			}
 		}
 
-		// (b) If full is >64 runes, full[63] has CCC 9, and full[64] is a space,
+		// (b) If full is >64 runes, full[63] has CCC 9, and full[64] is a word boundary,
 		// the output must equal string(full[:64]) (word-final virama kept).
 		if len(full) > 64 {
 			props := norm.NFC.PropertiesString(string(full[63]))
-			if props.CCC() == 9 && full[64] == ' ' {
+			if props.CCC() == 9 && isWordBoundary(full[64]) {
 				expected := string(full[:64])
 				if got != expected {
 					t.Errorf("sanitizeInviterName(%q) [%s] should keep word-final virama at position 63: got=%q, expected=%q", input, label, got, expected)
 				}
 			}
 		}
+	}
+}
+
+// TestSanitizerWordFinalViramaWithSpace verifies the word-final virama path with a space before the suffix.
+// This exercises the virama+space case deterministically, since CI fuzzing doesn't reach it from the seeds.
+func TestSanitizerWordFinalViramaWithSpace(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name: "virama at 63, space at 64, forced path",
+			// 61 'a' + "क्" (2 runes) + " " (1 rune) = 64 runes total (virama at 63, space at 64)
+			// The virama is word-final (space follows), so it's kept, but trailing space is trimmed
+			input: strings.Repeat("a", 61) + "क् " + strings.Repeat("ब", 70),
+			want:  strings.Repeat("a", 61) + "क्",
+		},
+		{
+			name: "Tamil virama at 63, space at 64, forced path",
+			// "xx" + 20×"ம் " + "ம்" + " " = 2 + 60 + 2 + 1 = 65 runes (virama at 63, space at 64)
+			// The virama is word-final (space follows), so it's kept, but trailing space is trimmed
+			input: "xx" + strings.Repeat("ம் ", 20) + "ம் " + strings.Repeat("ब", 70),
+			want:  "xx" + strings.Repeat("ம் ", 20) + "ம்",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeInviterName(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeInviterName(%q) = %q (len %d), want %q (len %d)", tt.input, got, len([]rune(got)), tt.want, len([]rune(tt.want)))
+			}
+			// Verify all invariants on this forced path
+			checkSanitizeInvariants(t, tt.input, got, "forced-space-path", true)
+		})
 	}
 }
 
@@ -3818,6 +3930,11 @@ func FuzzSanitizeInviterName(f *testing.F) {
 	f.Add(strings.Repeat("a", 60) + "क्ष्म" + "bbb")       // Mid-word virama: cut inside conjunct
 	f.Add(strings.Repeat("ब", 70))                         // Force 64-rune cap path
 	f.Add(strings.Repeat("a", 59) + "क् ष्" + "bbbbbbbbb") // Word-final virama: keep complete words
+	// Issue #315: Fuzz seeds for word-final virama at rune 63 (before space or punctuation at rune 64)
+	f.Add("xx" + strings.Repeat("ம் ", 40))               // 40 × "ம் " → virama at 63, space at 64
+	f.Add(strings.Repeat("a", 62) + "क् " + "bbbbbbbbbb") // virama at 63, space at 64
+	f.Add(strings.Repeat("a", 62) + "क்." + "bbbbbbbbbb") // virama at 63, dot at 64
+	f.Add(strings.Repeat("a", 62) + "ம்-" + "bbbbbbbbbb") // virama at 63, dash at 64
 
 	f.Fuzz(func(t *testing.T, input string) {
 		got := sanitizeInviterName(input)
@@ -4090,8 +4207,9 @@ func TestInviteAcceptGETWithScopesReturns405(t *testing.T) {
 // This test captures only the slog logger; there is no http.Server.ErrorLog or access-log middleware today.
 func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	var logs syncBuf
+	// Share one logger with both API and mailer for a single unified log stream
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
-	srv := newServer(t, Config{Logger: logger})
+	srv := newServer(t, Config{Logger: logger, Mailer: mailer.Log{Logger: logger}})
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
 	c := register(t, srv, "carol")
 
@@ -4099,22 +4217,37 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv1 struct{ Code string }
-	json.Unmarshal(body, &inv1)
+	if err := json.Unmarshal(body, &inv1); err != nil || inv1.Code == "" {
+		t.Fatalf("inv1: %v %s", err, body)
+	}
 
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv2 struct{ Code string }
-	json.Unmarshal(body, &inv2)
+	if err := json.Unmarshal(body, &inv2); err != nil || inv2.Code == "" {
+		t.Fatalf("inv2: %v %s", err, body)
+	}
 
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv3 struct{ Code string }
-	json.Unmarshal(body, &inv3)
+	if err := json.Unmarshal(body, &inv3); err != nil || inv3.Code == "" {
+		t.Fatalf("inv3: %v %s", err, body)
+	}
 
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv4 struct{ Code string }
-	json.Unmarshal(body, &inv4)
+	if err := json.Unmarshal(body, &inv4); err != nil || inv4.Code == "" {
+		t.Fatalf("inv4: %v %s", err, body)
+	}
+
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "test@example.com"}, nil)
+	want(t, resp, body, 201)
+	var inv5 struct{ Code string }
+	if err := json.Unmarshal(body, &inv5); err != nil || inv5.Code == "" {
+		t.Fatalf("inv5: %v %s", err, body)
+	}
 
 	// Test all accept paths:
 	// 1. POST with body code (successful)
@@ -4171,9 +4304,12 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	if !strings.Contains(logStr, "peer registered") {
 		t.Error("logs should contain 'peer registered' (positive control)")
 	}
+	if !strings.Contains(logStr, "body_len") {
+		t.Error("logs should contain mailer 'body_len' (positive control for to_email path)")
+	}
 
 	// Check logs don't contain any of the codes or their prefixes
-	for _, code := range []string{inv1.Code, inv2.Code, inv3.Code, inv4.Code, unknownCode} {
+	for _, code := range []string{inv1.Code, inv2.Code, inv3.Code, inv4.Code, inv5.Code, unknownCode} {
 		if strings.Contains(logStr, code) {
 			t.Errorf("invite code %s found in logs", code)
 		}
@@ -4227,6 +4363,10 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	// Advance clock past inv3's expiry (1 second TTL). The store uses the same
 	// fake clock, so POST ?code= will see it as expired.
 	clk.Advance(2 * time.Second)
+
+	// Positive control: inv3 is now expired and returns 404 on POST accept
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv3.Code}, nil)
+	want(t, resp, body, 404)
 
 	// Use inv2
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
@@ -4317,6 +4457,40 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 		}
 	}
 
+	// Test 4.5: Path cleaning variants (// and /./) redirect 307 to canonical path
+	noRedirect := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	req, _ = http.NewRequest("POST", srv.URL+"/v1/invites//accept?code="+inv1.Code, nil)
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	resp2, err = noRedirect.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 307 {
+		t.Errorf("// variant POST: want 307, got %d", resp2.StatusCode)
+	}
+	if got := resp2.Header.Get("Location"); got != "/v1/invites/accept?code="+inv1.Code {
+		t.Errorf("// variant Location: got %q, want /v1/invites/accept?code=...", got)
+	}
+	assertSecurityHeaders(t, resp2.Header, "// variant POST")
+
+	req, _ = http.NewRequest("POST", srv.URL+"/v1/invites/./accept?code="+inv1.Code, nil)
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	resp2, err = noRedirect.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 307 {
+		t.Errorf("/./ variant POST: want 307, got %d", resp2.StatusCode)
+	}
+	if got := resp2.Header.Get("Location"); got != "/v1/invites/accept?code="+inv1.Code {
+		t.Errorf("/./ variant Location: got %q, want /v1/invites/accept?code=...", got)
+	}
+	assertSecurityHeaders(t, resp2.Header, "/./ variant POST")
+
 	// Test 5: Body and query code mismatch returns 400
 	resp, body = b.do("POST", "/v1/invites/accept?code="+inv1.Code, map[string]any{"code": "inv_other"}, nil)
 	want(t, resp, body, 400)
@@ -4338,8 +4512,10 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 		if rsp.StatusCode != 405 {
 			t.Errorf("%s: want 405, got %d", method, rsp.StatusCode)
 		}
-		if rsp.Header.Get("Allow") == "" {
-			t.Errorf("%s: missing Allow header", method)
+		// Allow header includes DELETE because DELETE /v1/invites/{public_id} also matches
+		// the literal path segment "accept", and ServeMux lists all methods registered on that pattern.
+		if got := rsp.Header.Get("Allow"); got != "DELETE, POST" {
+			t.Errorf("%s: Allow = %q, want DELETE, POST", method, got)
 		}
 		if got := rsp.Header.Get("Deprecation"); got != wantDeprecation {
 			t.Errorf("%s with ?code=: Deprecation = %q, want %q", method, got, wantDeprecation)
