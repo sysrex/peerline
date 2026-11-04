@@ -16,7 +16,7 @@ const (
 	ClaimDeclined = "declined"
 )
 
-// confirmWindow is how long a claimed invite waits for its inviter, past expires_at.
+// confirmWindow is how long a claimed invite waits for its inviter, from claim time.
 const confirmWindow = 24 * time.Hour
 
 // Claim is a confirm-mode invite as the claim handlers see it.
