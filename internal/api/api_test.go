@@ -35,6 +35,36 @@ type client struct {
 	id  string
 }
 
+// newBarrier creates an N-party barrier for concurrent test synchronization.
+// All n callers block in the returned function until all arrive, then all are released together.
+// If not all arrive within timeout, the test fails.
+// Note: arrivalCount == n allows the barrier to pass; a caller arriving after release passes through immediately.
+func newBarrier(t testing.TB, n int, timeout time.Duration) func() {
+	t.Helper()
+	var arrivalCount int
+	var mu sync.Mutex
+	allArrived := make(chan struct{})
+	var closeOnce sync.Once
+
+	return func() {
+		mu.Lock()
+		arrivalCount++
+		if arrivalCount == n {
+			closeOnce.Do(func() { close(allArrived) })
+		}
+		mu.Unlock()
+
+		select {
+		case <-allArrived:
+		case <-time.After(timeout):
+			mu.Lock()
+			arrived := arrivalCount
+			mu.Unlock()
+			t.Errorf("barrier timeout: %d/%d goroutines arrived", arrived, n)
+		}
+	}
+}
+
 func newServer(t *testing.T, cfg Config) *httptest.Server {
 	t.Helper()
 	st, err := store.Open(t.TempDir() + "/t.db")
@@ -2254,9 +2284,9 @@ func TestDeletedInviteCannotBeAccepted(t *testing.T) {
 
 // TestConcurrentInviteCapRace verifies the concurrent cap check race is fixed (#53).
 //
-// The barrier holds all requests before the atomic cap check. The created count
-// (> 1) catches a count-then-insert regression in CreateInviteAtomic, and the final
-// email budget assertion (4 of 6 left) catches charging the limiter before the create.
+// The barrier (via testInviteCreatedHook) holds all requests before CreateInviteAtomic.
+// The "created == 1" assertion catches a count-then-insert regression in the atomic cap check.
+// The "budgetSucceeded == 4" assertion catches charging the email limiter before the create succeeds.
 func TestConcurrentInviteCapRace(t *testing.T) {
 	cfg := Config{}
 	cfg.MaxOutstandingInvites = 2
@@ -2275,12 +2305,13 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	srv := httptest.NewServer(rawSrv.Handler())
 	defer srv.Close()
 
 	alice := register(t, srv, "Alice")
 
-	// Create first invite to get close to cap (1/2)
+	// Create first invite to get close to cap (1/2), before setting the hook
 	resp, b := alice.do("POST", "/v1/invites", map[string]any{
 		"scopes": []string{"messages"},
 	}, nil)
@@ -2288,27 +2319,10 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
 	}
 
-	// Set up N-party barrier: all 5 goroutines wait until all arrive, then release together
 	const concurrent = 5
-	var arrivalCount int
-	var arrivalMu sync.Mutex
-	allArrived := make(chan struct{})
-	var closeOnce sync.Once
-
+	barrier := newBarrier(t, concurrent, 5*time.Second)
 	rawSrv.testInviteCreatedHook = func(peerID string) {
-		arrivalMu.Lock()
-		arrivalCount++
-		if arrivalCount == concurrent {
-			closeOnce.Do(func() { close(allArrived) })
-		}
-		arrivalMu.Unlock()
-
-		select {
-		case <-allArrived:
-			// All arrived, proceed
-		case <-time.After(5 * time.Second):
-			t.Error("barrier timeout: not all goroutines arrived")
-		}
+		barrier()
 	}
 
 	// Launch concurrent requests at the cap with to_email
@@ -2403,6 +2417,501 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 		t.Errorf("budget check: %d email invites succeeded, want 4 (5 total tokens - 1 consumed in race)", budgetSucceeded)
 		t.Errorf("this proves email budget was over-consumed during concurrent cap rejection")
 	}
+}
+
+// TestConcurrentInviteCapRacePairing verifies the concurrent cap check race through the generate_pairing path.
+// The hook runs before both CreateInviteAtomic and CreateInviteWithPairingAtomic, so both paths need testing.
+func TestConcurrentInviteCapRacePairing(t *testing.T) {
+	cfg := Config{}
+	cfg.MaxOutstandingInvites = 2
+
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	prepareTestConfig(t, st, &cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(rawSrv.Handler())
+	defer srv.Close()
+
+	alice := register(t, srv, "Alice")
+
+	// Create first invite to get close to cap (1/2), before setting the hook
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"scopes":           []string{"messages"},
+		"generate_pairing": true,
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
+	}
+
+	const concurrent = 5
+	barrier := newBarrier(t, concurrent, 5*time.Second)
+	rawSrv.testInviteCreatedHook = func(peerID string) {
+		barrier()
+	}
+
+	results := make(chan int, concurrent)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, _ := alice.do("POST", "/v1/invites", map[string]any{
+				"scopes":           []string{"messages"},
+				"generate_pairing": true,
+			}, nil)
+			results <- resp.StatusCode
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	var created, rejected int
+	for status := range results {
+		if status == http.StatusCreated {
+			created++
+		} else if status == http.StatusTooManyRequests {
+			rejected++
+		} else {
+			t.Errorf("unexpected status: %d", status)
+		}
+	}
+
+	if created != 1 {
+		t.Errorf("concurrent creates: %d succeeded, want 1", created)
+	}
+	if rejected != concurrent-1 {
+		t.Errorf("concurrent rejects: %d, want %d", rejected, concurrent-1)
+	}
+
+	rawSrv.testInviteCreatedHook = nil
+
+	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites: %d %s", resp.StatusCode, b)
+	}
+	var listResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(listResp.Invites) != 2 {
+		t.Errorf("final invite count: %d, want 2 (at cap)", len(listResp.Invites))
+	}
+}
+
+// TestConcurrentInviteCapRaceConfirm verifies the concurrent cap check race through the require_confirm path.
+// The hook runs before CreateConfirmInviteAtomic (when require_confirm is true), so this path needs coverage too.
+func TestConcurrentInviteCapRaceConfirm(t *testing.T) {
+	cfg := Config{}
+	cfg.MaxOutstandingInvites = 2
+	cfg.CodePepper = []byte("test-pepper")
+
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	prepareTestConfig(t, st, &cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawSrv.SetClaimStore(st)
+
+	srv := httptest.NewServer(rawSrv.Handler())
+	defer srv.Close()
+
+	alice := register(t, srv, "Alice")
+
+	// Create first invite to get close to cap (1/2), before setting the hook
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"scopes":           []string{"messages"},
+		"generate_pairing": true,
+		"require_confirm":  true,
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
+	}
+
+	const concurrent = 5
+	barrier := newBarrier(t, concurrent, 5*time.Second)
+	rawSrv.testInviteCreatedHook = func(peerID string) {
+		barrier()
+	}
+
+	results := make(chan int, concurrent)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, _ := alice.do("POST", "/v1/invites", map[string]any{
+				"scopes":           []string{"messages"},
+				"generate_pairing": true,
+				"require_confirm":  true,
+			}, nil)
+			results <- resp.StatusCode
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	var created, rejected int
+	for status := range results {
+		if status == http.StatusCreated {
+			created++
+		} else if status == http.StatusTooManyRequests {
+			rejected++
+		} else {
+			t.Errorf("unexpected status: %d", status)
+		}
+	}
+
+	if created != 1 {
+		t.Errorf("concurrent creates: %d succeeded, want 1", created)
+	}
+	if rejected != concurrent-1 {
+		t.Errorf("concurrent rejects: %d, want %d", rejected, concurrent-1)
+	}
+
+	rawSrv.testInviteCreatedHook = nil
+
+	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites: %d %s", resp.StatusCode, b)
+	}
+	var listResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(listResp.Invites) != 2 {
+		t.Errorf("final invite count: %d, want 2 (at cap)", len(listResp.Invites))
+	}
+}
+
+// TestReadyAllowRaceSharedRecipient verifies the Ready→Allow race with concurrent requests to the same recipient.
+// Ready does not consume tokens, so multiple requests can pass Ready together, but only the first Allow succeeds.
+// The test uses a frozen clock and a test seam (testAfterEmailReadyHook) to deterministically verify that losers
+// of the rcptLim race get their mailLim tokens refunded.
+func TestReadyAllowRaceSharedRecipient(t *testing.T) {
+	frozenTime := time.Unix(1000000000, 0)
+	cfg := Config{}
+	cfg.MaxOutstandingInvites = 20
+	cfg.EmailPerHour = 10
+	cfg.EmailBurst = 10
+	cfg.EmailRcptPerHour = 1
+	cfg.Now = func() time.Time { return frozenTime }
+
+	dbPath := t.TempDir() + "/t.db"
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	prepareTestConfig(t, st, &cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawSrv.Stop()
+
+	const concurrent = 10
+	sharedRecipient := "shared@example.com"
+	barrier := newBarrier(t, concurrent, 5*time.Second)
+
+	// Use testAfterEmailReadyHook to synchronize after Ready checks, before Allow calls
+	rawSrv.testAfterEmailReadyHook = func(peerID string) {
+		barrier()
+	}
+
+	srv := httptest.NewServer(rawSrv.Handler())
+	defer srv.Close()
+
+	alice := register(t, srv, "Alice")
+
+	results := make(chan int, concurrent)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, _ := alice.do("POST", "/v1/invites", map[string]any{
+				"to_email": sharedRecipient,
+				"scopes":   []string{"messages"},
+			}, nil)
+			results <- resp.StatusCode
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	var created, rejected int
+	for status := range results {
+		if status == http.StatusCreated {
+			created++
+		} else if status == http.StatusTooManyRequests {
+			rejected++
+		} else {
+			t.Errorf("unexpected status: %d", status)
+		}
+	}
+
+	// With EmailRcptPerHour = 1 (burst also 1), only one request should succeed
+	if created != 1 {
+		t.Errorf("concurrent creates to same recipient: %d succeeded, want 1", created)
+	}
+	if rejected != concurrent-1 {
+		t.Errorf("concurrent rejects: %d, want %d", rejected, concurrent-1)
+	}
+
+	rawSrv.testAfterEmailReadyHook = nil
+
+	// Verify exactly 1 invite exists (the others were cleaned up during rejection)
+	var inviteCount int
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL`,
+		alice.id).Scan(&inviteCount); err != nil {
+		t.Fatalf("count invites: %v", err)
+	}
+	if inviteCount != 1 {
+		t.Errorf("invite count: %d, want 1 (others should be cleaned up)", inviteCount)
+	}
+
+	// Verify sender budget was refunded: with EmailBurst=10 and 1 consumed, alice should send 9 more
+	// invites to distinct recipients (total 10 consumed), then the 11th should fail at 429.
+	for i := 0; i < 9; i++ {
+		resp, b := alice.do("POST", "/v1/invites", map[string]any{
+			"to_email": fmt.Sprintf("distinct%d@example.com", i),
+			"scopes":   []string{"messages"},
+		}, nil)
+		if resp.StatusCode != http.StatusCreated {
+			t.Errorf("budget check invite %d: expected 201, got %d: %s", i, resp.StatusCode, b)
+			t.Errorf("this proves the sender's mailLim tokens were NOT refunded after losing the rcptLim race")
+			break
+		}
+	}
+
+	// The 11th email invite should fail at 429 (burst exhausted)
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "should-fail@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("expected 429 after exhausting EmailBurst=10, got %d: %s", resp.StatusCode, b)
+	}
+}
+
+// TestInviteRateLimitDeleteFailure verifies behavior when the compensating delete fails after email rate limit rejection.
+// Uses a SQLite BEFORE DELETE trigger to force the delete to fail, ensuring the server returns 500 with a generic
+// error body (no internal error text leaked), the orphan invite remains, and can be cleaned up via the API.
+func TestInviteRateLimitDeleteFailure(t *testing.T) {
+	var logs bytes.Buffer
+	cfg := Config{}
+	cfg.EmailPerHour = 10
+	cfg.EmailBurst = 1 // Burst of 1, so second email will hit rate limit
+	cfg.EmailRcptPerHour = 10
+	cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	dbPath := t.TempDir() + "/t.db"
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Open a second connection for trigger manipulation
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	prepareTestConfig(t, st, &cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawSrv.Stop()
+
+	srv := httptest.NewServer(rawSrv.Handler())
+	defer srv.Close()
+
+	alice := register(t, srv, "Alice")
+
+	// Create first email invite to consume the burst token
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "first@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
+	}
+
+	// Revoke the first invite so we have a clean slate
+	var firstInv struct {
+		PublicID string `json:"public_id"`
+	}
+	if err := json.Unmarshal(b, &firstInv); err != nil {
+		t.Fatal(err)
+	}
+	resp, b = alice.do("DELETE", "/v1/invites/"+firstInv.PublicID, nil, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("revoke first: %d %s", resp.StatusCode, b)
+	}
+
+	// Install a BEFORE DELETE trigger that raises an error
+	_, err = db.Exec(`CREATE TRIGGER fail_inv_del BEFORE DELETE ON invites BEGIN SELECT RAISE(ABORT, 'trigger_error'); END`)
+	if err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	// Attempt to create a second invite with email, which will hit rate limit and try to delete
+	resp, b = alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "test@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+
+	// Should get 500 (internal error), not 429
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("expected 500 when cleanup fails, got %d: %s", resp.StatusCode, b)
+	}
+
+	// Error body should be generic, not leak internal details
+	bodyStr := string(b)
+	if !strings.Contains(bodyStr, "internal error") {
+		t.Errorf("expected generic 'internal error' body, got: %s", bodyStr)
+	}
+	if strings.Contains(bodyStr, "trigger") || strings.Contains(bodyStr, "ABORT") {
+		t.Errorf("error body leaked internal details: %s", bodyStr)
+	}
+
+	// Should NOT have Retry-After header (this is a 500, not a 429)
+	if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+		t.Errorf("unexpected Retry-After header on 500: %s", retryAfter)
+	}
+
+	// Verify no email was sent for test@example.com (mailer is called after rate limit check passes,
+	// so the create succeeds but the email is never attempted because the delete failure happens first)
+	logOutput := logs.String()
+	firstEmailCount := strings.Count(logOutput, "first@example.com")
+	testEmailCount := strings.Count(logOutput, "test@example.com")
+	if firstEmailCount != 1 {
+		t.Errorf("expected exactly 1 email to first@example.com, found %d in logs", firstEmailCount)
+	}
+	if testEmailCount != 0 {
+		t.Errorf("expected 0 emails to test@example.com (rate limit + delete failure), found %d in logs", testEmailCount)
+	}
+
+	// Drop the trigger
+	_, err = db.Exec(`DROP TRIGGER fail_inv_del`)
+	if err != nil {
+		t.Fatalf("drop trigger: %v", err)
+	}
+
+	// Verify the orphan invite exists (cleanup failed, so it's still there)
+	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites: %d %s", resp.StatusCode, b)
+	}
+	var listResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(listResp.Invites) != 1 {
+		t.Errorf("orphan invite count: %d, want 1 (cleanup failed, invite remains)", len(listResp.Invites))
+	}
+
+	// Verify the orphan can be revoked through the API
+	if len(listResp.Invites) > 0 {
+		orphanID := listResp.Invites[0]["public_id"].(string)
+		resp, b := alice.do("DELETE", "/v1/invites/"+orphanID, nil, nil)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Errorf("revoke orphan: expected 204, got %d: %s", resp.StatusCode, b)
+		}
+
+		// Verify it's gone
+		resp, b = alice.do("GET", "/v1/invites", nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("list after revoke: %d %s", resp.StatusCode, b)
+		}
+		var finalList struct {
+			Invites []map[string]any `json:"invites"`
+		}
+		if err := json.Unmarshal(b, &finalList); err != nil {
+			t.Fatal(err)
+		}
+		if len(finalList.Invites) != 0 {
+			t.Errorf("after revoke: %d invites, want 0", len(finalList.Invites))
+		}
+	}
+}
+
+// TestBarrierTimeout verifies the barrier timeout path by calling it with insufficient goroutines
+// and checking that the timeout error is reported correctly.
+func TestBarrierTimeout(t *testing.T) {
+	fake := &fakeTB{TB: t}
+	barrier := newBarrier(fake, 2, 50*time.Millisecond)
+
+	// Call barrier only once (never reaching the expected count of 2)
+	done := make(chan struct{})
+	go func() {
+		barrier()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("barrier should have completed after timeout")
+	}
+
+	// Verify exactly one error was recorded
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.errs) != 1 {
+		t.Fatalf("expected exactly 1 error, got %d: %v", len(fake.errs), fake.errs)
+	}
+
+	// Verify the error message format
+	if !strings.Contains(fake.errs[0], "1/2 goroutines arrived") {
+		t.Errorf("error message: got %q, want substring '1/2 goroutines arrived'", fake.errs[0])
+	}
+}
+
+// fakeTB embeds testing.TB and overrides Errorf to record errors for inspection.
+type fakeTB struct {
+	testing.TB
+	mu   sync.Mutex
+	errs []string
+}
+
+func (f *fakeTB) Helper() {}
+
+func (f *fakeTB) Errorf(format string, args ...interface{}) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.errs = append(f.errs, fmt.Sprintf(format, args...))
 }
 
 // TestSingleLogLineUnauthenticatedPairing verifies exactly one log line (#54)
