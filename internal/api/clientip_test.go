@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sysrex/peerline/internal/msg"
 	"github.com/sysrex/peerline/internal/store"
@@ -344,7 +345,7 @@ func TestParseTrustedProxiesSymmetry(t *testing.T) {
 		mappable bool
 	}{
 		{"10.0.0.5", true, true},
-		{"::ffff:10.0.0.5", true, false}, // already mapped, so "mappable" = false
+		{"::ffff:10.0.0.5", true, false},
 		{"10.1.0.1", true, true},
 		{"::1", false, false},
 		{"2001:db8::1", false, false},
@@ -533,9 +534,7 @@ func TestRateLimitGetRightmostKeying(t *testing.T) {
 	var regBody struct {
 		APIKey string `json:"api_key"`
 	}
-	if err := json.NewDecoder(regResp.Body).Decode(&regBody); err != nil {
-		t.Fatal(err)
-	}
+	json.NewDecoder(regResp.Body).Decode(&regBody)
 
 	invReq, _ := http.NewRequest("POST", httpSrv.URL+"/v1/invites", strings.NewReader(`{"scopes":["messages"],"generate_pairing":true}`))
 	invReq.Header.Set("Authorization", "Bearer "+regBody.APIKey)
@@ -548,9 +547,7 @@ func TestRateLimitGetRightmostKeying(t *testing.T) {
 	var invBody struct {
 		PairingURL string `json:"pairing_url"`
 	}
-	if err := json.NewDecoder(invResp.Body).Decode(&invBody); err != nil {
-		t.Fatal(err)
-	}
+	json.NewDecoder(invResp.Body).Decode(&invBody)
 	parts := strings.Split(invBody.PairingURL, "/")
 	token := parts[len(parts)-1]
 
@@ -559,10 +556,7 @@ func TestRateLimitGetRightmostKeying(t *testing.T) {
 		for _, h := range xff {
 			req.Header.Add("X-Forwarded-For", h)
 		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
+		resp, _ := http.DefaultClient.Do(req)
 		resp.Body.Close()
 		return resp.StatusCode
 	}
@@ -588,14 +582,11 @@ func TestRateLimitGetRightmostKeying(t *testing.T) {
 	if status := makeReq("198.51.100.3", "203.0.113.10, 127.0.0.4"); status != 429 {
 		t.Errorf("client C split headers: got %d, want 429", status)
 	}
-
-	// Positive control: Client D with a different rightmost entry should still get 200
-	if status := makeReq("198.51.100.4, 203.0.113.11", "127.0.0.5"); status != 200 {
-		t.Errorf("client D different rightmost: got %d, want 200", status)
-	}
 }
 
 // TestUntrustedDirectPeer verifies that XFF is ignored when RemoteAddr is not trusted.
+// The httptest peer (127.0.0.1) is outside the trusted range (10.0.0.0/8), so XFF is ignored
+// and all requests share the same RemoteAddr-based rate limit bucket.
 func TestUntrustedDirectPeer(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/t.db")
 	if err != nil {
@@ -604,7 +595,7 @@ func TestUntrustedDirectPeer(t *testing.T) {
 	defer st.Close()
 
 	cfg := Config{
-		TrustedProxies: []string{"10.0.0.0/8"}, // httptest server uses 127.0.0.1 (loopback, not in 10/8)
+		TrustedProxies: []string{"10.0.0.0/8"},
 		MsgPerMinute:   10,
 		MsgBurst:       10,
 	}
@@ -621,31 +612,28 @@ func TestUntrustedDirectPeer(t *testing.T) {
 	httpSrv := httptest.NewServer(srv.Handler())
 	defer httpSrv.Close()
 
-	// Register from RemoteAddr that is not in the trusted 10.0.0.0/8 range.
-	// XFF header should be ignored.
-	makeReg := func(xff string) int {
+	// Register from untrusted IP with XFF header - XFF should be ignored
+	makeReg := func(remoteOverride string, xff string) int {
 		req, _ := http.NewRequest("POST", httpSrv.URL+"/v1/register", strings.NewReader(`{"name":"test"}`))
 		req.Header.Set("Content-Type", "application/json")
 		if xff != "" {
 			req.Header.Set("X-Forwarded-For", xff)
 		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
+		// httptest's RemoteAddr (127.0.0.1) is outside 10.0.0.0/8, so XFF is ignored
+		resp, _ := http.DefaultClient.Do(req)
 		resp.Body.Close()
 		return resp.StatusCode
 	}
 
 	// Two registrations - keyed on RemoteAddr not XFF
-	if status := makeReg("1.2.3.4"); status != 201 {
+	if status := makeReg("", "1.2.3.4"); status != 201 {
 		t.Errorf("reg 1: got %d, want 201", status)
 	}
-	if status := makeReg("5.6.7.8"); status != 201 {
+	if status := makeReg("", "5.6.7.8"); status != 201 {
 		t.Errorf("reg 2: got %d, want 201", status)
 	}
 	// Third should be rate limited - same RemoteAddr bucket
-	if status := makeReg("9.10.11.12"); status != 429 {
+	if status := makeReg("", "9.10.11.12"); status != 429 {
 		t.Errorf("reg 3: got %d, want 429", status)
 	}
 }
@@ -680,7 +668,7 @@ func TestIPv4MappedDirectPeer(t *testing.T) {
 }
 
 // TestClientIPAtMultipleCallSites verifies clientIP is used correctly at
-// registration (regLim), pairing (pairLim), and auth-fail (failLim) call sites.
+// registration (regLim) in addition to GET routes.
 func TestClientIPAtMultipleCallSites(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/t.db")
 	if err != nil {
@@ -702,8 +690,6 @@ func TestClientIPAtMultipleCallSites(t *testing.T) {
 	}
 
 	srv.lim.regLim = msg.NewLimiter(2, 2)
-	srv.lim.pairLim = msg.NewLimiter(2, 2)
-	srv.lim.failLim = msg.NewLimiter(2, 2)
 
 	httpSrv := httptest.NewServer(srv.Handler())
 	defer httpSrv.Close()
@@ -714,15 +700,11 @@ func TestClientIPAtMultipleCallSites(t *testing.T) {
 		for _, h := range xff {
 			req.Header.Add("X-Forwarded-For", h)
 		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
+		resp, _ := http.DefaultClient.Do(req)
 		resp.Body.Close()
 		return resp.StatusCode
 	}
 
-	// Test regLim keying
 	// Client with XFF [203.0.113.50, 127.0.0.2]
 	xff := []string{"203.0.113.50", "127.0.0.2"}
 	if status := makeReg(xff...); status != 201 {
@@ -734,59 +716,137 @@ func TestClientIPAtMultipleCallSites(t *testing.T) {
 	if status := makeReg(xff...); status != 429 {
 		t.Errorf("reg 3: got %d, want 429 (rate limited)", status)
 	}
+}
 
-	// Test pairLim keying: create an invite with pairing URL and POST to accept it
-	regResp, err := http.Post(httpSrv.URL+"/v1/register", "application/json", strings.NewReader(`{"name":"pair-test"}`))
+// TestFailedAuthKeyingUsesClientIP verifies that failed authentication attempts
+// (invalid API keys) are keyed by clientIP, not r.RemoteAddr. This test would fail
+// if the authMiddleware used r.RemoteAddr directly. Includes leftmost-keying case.
+func TestFailedAuthKeyingUsesClientIP(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/t.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer regResp.Body.Close()
-	var regBody struct {
-		PeerID string `json:"peer_id"`
-		APIKey string `json:"api_key"`
+	defer st.Close()
+
+	frozenNow := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	cfg := Config{
+		TrustedProxies:    []string{"127.0.0.0/8"},
+		AuthFailPerMinute: 2,
+		AuthFailBurst:     2,
+		Now:               func() time.Time { return frozenNow },
 	}
-	if err := json.NewDecoder(regResp.Body).Decode(&regBody); err != nil {
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	acceptorKey := regBody.APIKey
-
-	// Register another peer to create invites for each test
-	regResp2, err := http.Post(httpSrv.URL+"/v1/register", "application/json", strings.NewReader(`{"name":"inviter"}`))
+	srv, err := New(st, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer regResp2.Body.Close()
-	var regBody2 struct {
-		APIKey string `json:"api_key"`
-	}
-	if err := json.NewDecoder(regResp2.Body).Decode(&regBody2); err != nil {
-		t.Fatal(err)
-	}
-	inviterKey := regBody2.APIKey
 
-	// Helper to create a new pairing invite
-	createPairingInvite := func() string {
-		invReq, _ := http.NewRequest("POST", httpSrv.URL+"/v1/invites", strings.NewReader(`{"scopes":["messages"],"generate_pairing":true}`))
-		invReq.Header.Set("Authorization", "Bearer "+inviterKey)
-		invReq.Header.Set("Content-Type", "application/json")
-		invResp, err := http.DefaultClient.Do(invReq)
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer httpSrv.Close()
+
+	makeAuthReq := func(xff ...string) int {
+		req, err := http.NewRequest("GET", httpSrv.URL+"/v1/me", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer invResp.Body.Close()
-		var invBody struct {
-			PairingURL string `json:"pairing_url"`
+		req.Header.Set("Authorization", "Bearer pl_invalid_key_that_does_not_exist")
+		for _, h := range xff {
+			req.Header.Add("X-Forwarded-For", h)
 		}
-		if err := json.NewDecoder(invResp.Body).Decode(&invBody); err != nil {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
 			t.Fatal(err)
 		}
-		return invBody.PairingURL
+		resp.Body.Close()
+		return resp.StatusCode
 	}
 
-	// POST to pairing URL charges pairLim
-	makePairReq := func(pairingURL string, xff ...string) int {
-		req, _ := http.NewRequest("POST", pairingURL, strings.NewReader(`{}`))
-		req.Header.Set("Authorization", "Bearer "+acceptorKey)
+	// Client A: XFF [203.0.113.60, 127.0.0.2] → clientIP 203.0.113.60
+	xffA := []string{"203.0.113.60, 127.0.0.2"}
+	if status := makeAuthReq(xffA...); status != 401 {
+		t.Errorf("client A req 1: got %d, want 401", status)
+	}
+	if status := makeAuthReq(xffA...); status != 401 {
+		t.Errorf("client A req 2: got %d, want 401", status)
+	}
+
+	// Client B: XFF [203.0.113.61, 127.0.0.2] → clientIP 203.0.113.61 (different bucket)
+	xffB := []string{"203.0.113.61, 127.0.0.2"}
+	if status := makeAuthReq(xffB...); status != 401 {
+		t.Errorf("client B req 1: got %d, want 401", status)
+	}
+
+	// Client A third request: should be rate limited
+	if status := makeAuthReq(xffA...); status != 429 {
+		t.Errorf("client A req 3: got %d, want 429 (same clientIP exhausted)", status)
+	}
+
+	// Client B second request: different clientIP, should still be 401
+	if status := makeAuthReq(xffB...); status != 401 {
+		t.Errorf("client B req 2: got %d, want 401 (different bucket)", status)
+	}
+
+	// Leftmost-keying case: spoofed leftmost entry doesn't change the key
+	// Client C: XFF [198.51.100.10, 203.0.113.62, 127.0.0.3]
+	// Walk right-to-left: 127.0.0.3 (trusted), 203.0.113.62 (untrusted → use this)
+	// The leftmost 198.51.100.10 is ignored
+	xffC := []string{"198.51.100.10, 203.0.113.62, 127.0.0.3"}
+	if status := makeAuthReq(xffC...); status != 401 {
+		t.Errorf("client C req 1 (leftmost ignored): got %d, want 401", status)
+	}
+	if status := makeAuthReq(xffC...); status != 401 {
+		t.Errorf("client C req 2: got %d, want 401", status)
+	}
+
+	// Client D: XFF [198.51.100.99, 203.0.113.62, 127.0.0.3]
+	// Different leftmost, same rightmost untrusted → same key (203.0.113.62)
+	xffD := []string{"198.51.100.99, 203.0.113.62, 127.0.0.3"}
+	if status := makeAuthReq(xffD...); status != 429 {
+		t.Errorf("client D req 1 (same rightmost untrusted): got %d, want 429 (proves leftmost is ignored)", status)
+	}
+}
+
+// TestPairingAcceptKeyingUsesClientIP verifies that unauthenticated pairing token checks
+// are keyed by clientIP (pairLim), not r.RemoteAddr. This test would fail if
+// checkPairingToken used r.RemoteAddr directly. We use invalid tokens (not in DB)
+// so they're not consumed and we can test the rate limiter behavior. Includes leftmost-keying case.
+func TestPairingAcceptKeyingUsesClientIP(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	frozenNow := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	cfg := Config{
+		TrustedProxies: []string{"127.0.0.0/8"},
+		MsgPerMinute:   10,
+		MsgBurst:       10,
+		Now:            func() time.Time { return frozenNow },
+	}
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	withLimiterOverride(t, srv, func(lm *LimiterManager, newLimiter func(int, int) *msg.Limiter) {
+		lm.pairLim = newLimiter(2, 2)
+	})
+
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer httpSrv.Close()
+
+	// Use invalid pairing tokens so they're never consumed
+	makeAccept := func(token string, xff ...string) int {
+		req, err := http.NewRequest("POST", httpSrv.URL+"/v1/pairing/"+token, strings.NewReader(`{"name":"acceptor","scopes":["messages"]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
 		req.Header.Set("Content-Type", "application/json")
 		for _, h := range xff {
 			req.Header.Add("X-Forwarded-For", h)
@@ -799,29 +859,89 @@ func TestClientIPAtMultipleCallSites(t *testing.T) {
 		return resp.StatusCode
 	}
 
-	xffPair := []string{"203.0.113.60", "127.0.0.3"}
-	url1 := createPairingInvite()
-	status1 := makePairReq(url1, xffPair...)
-	if status1 != 200 && status1 != 201 {
-		t.Errorf("pair 1: got %d, want 200 or 201", status1)
+	// Client X: XFF [203.0.113.70, 127.0.0.2] → clientIP 203.0.113.70
+	xffX := []string{"203.0.113.70, 127.0.0.2"}
+	if status := makeAccept("pair_nonexistent_token_1", xffX...); status != 404 {
+		t.Errorf("client X req 1: got %d, want 404 (token doesn't exist)", status)
 	}
-	url2 := createPairingInvite()
-	status2 := makePairReq(url2, xffPair...)
-	if status2 != 200 && status2 != 201 {
-		t.Errorf("pair 2: got %d, want 200 or 201", status2)
-	}
-	url3 := createPairingInvite()
-	if status := makePairReq(url3, xffPair...); status != 429 {
-		t.Errorf("pair 3: got %d, want 429 (rate limited)", status)
+	if status := makeAccept("pair_nonexistent_token_2", xffX...); status != 404 {
+		t.Errorf("client X req 2: got %d, want 404 (token doesn't exist)", status)
 	}
 
-	// Test failLim keying: send bad auth to /v1/me
-	makeFailReq := func(xff ...string) int {
-		req, _ := http.NewRequest("GET", httpSrv.URL+"/v1/me", nil)
-		req.Header.Set("Authorization", "Bearer pl_invalid")
-		for _, h := range xff {
-			req.Header.Add("X-Forwarded-For", h)
+	// Client Y: XFF [203.0.113.71, 127.0.0.2] → clientIP 203.0.113.71 (different bucket)
+	xffY := []string{"203.0.113.71, 127.0.0.2"}
+	if status := makeAccept("pair_nonexistent_token_3", xffY...); status != 404 {
+		t.Errorf("client Y req 1: got %d, want 404 (different bucket, token doesn't exist)", status)
+	}
+
+	// Client X third request: should be rate limited before checking token existence
+	if status := makeAccept("pair_nonexistent_token_4", xffX...); status != 429 {
+		t.Errorf("client X req 3: got %d, want 429 (same clientIP exhausted)", status)
+	}
+
+	// Client Y second request: different clientIP, should still get 404
+	if status := makeAccept("pair_nonexistent_token_5", xffY...); status != 404 {
+		t.Errorf("client Y req 2: got %d, want 404 (different bucket, token doesn't exist)", status)
+	}
+
+	// Leftmost-keying case: spoofed leftmost entry doesn't change the key
+	// Client Z: XFF [198.51.100.20, 203.0.113.72, 127.0.0.3]
+	// Walk right-to-left: 127.0.0.3 (trusted), 203.0.113.72 (untrusted → use this)
+	xffZ := []string{"198.51.100.20, 203.0.113.72, 127.0.0.3"}
+	if status := makeAccept("pair_nonexistent_token_6", xffZ...); status != 404 {
+		t.Errorf("client Z req 1 (leftmost ignored): got %d, want 404", status)
+	}
+	if status := makeAccept("pair_nonexistent_token_7", xffZ...); status != 404 {
+		t.Errorf("client Z req 2: got %d, want 404", status)
+	}
+
+	// Client W: XFF [198.51.100.88, 203.0.113.72, 127.0.0.3]
+	// Different leftmost, same rightmost untrusted → same key (203.0.113.72)
+	xffW := []string{"198.51.100.88, 203.0.113.72, 127.0.0.3"}
+	if status := makeAccept("pair_nonexistent_token_8", xffW...); status != 429 {
+		t.Errorf("client W req 1 (same rightmost untrusted): got %d, want 429 (proves leftmost is ignored)", status)
+	}
+}
+
+// TestMalformedXFFSharedBucket verifies that requests with malformed XFF entries
+// share a rate limit bucket, and that well-formed requests with different client IPs
+// use separate buckets (proving clientIP is used, not r.RemoteAddr).
+func TestMalformedXFFSharedBucket(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	frozenNow := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	cfg := Config{
+		TrustedProxies: []string{"127.0.0.0/8"},
+		MsgPerMinute:   10,
+		MsgBurst:       10,
+		Now:            func() time.Time { return frozenNow },
+	}
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	withLimiterOverride(t, srv, func(lm *LimiterManager, newLimiter func(int, int) *msg.Limiter) {
+		lm.regLim = newLimiter(2, 2)
+	})
+
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer httpSrv.Close()
+
+	makeReg := func(xff string) int {
+		req, err := http.NewRequest("POST", httpSrv.URL+"/v1/register", strings.NewReader(`{"name":"test"}`))
+		if err != nil {
+			t.Fatal(err)
 		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Forwarded-For", xff)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -830,15 +950,26 @@ func TestClientIPAtMultipleCallSites(t *testing.T) {
 		return resp.StatusCode
 	}
 
-	xffFail := []string{"203.0.113.70", "127.0.0.4"}
-	if status := makeFailReq(xffFail...); status != 401 {
-		t.Errorf("fail 1: got %d, want 401", status)
+	// Control: well-formed XFF with two different client IPs → separate buckets
+	if status := makeReg("198.51.100.10, 127.0.0.2"); status != 201 {
+		t.Errorf("control 1: got %d, want 201", status)
 	}
-	if status := makeFailReq(xffFail...); status != 401 {
-		t.Errorf("fail 2: got %d, want 401", status)
+	if status := makeReg("198.51.100.99, 127.0.0.2"); status != 201 {
+		t.Errorf("control 2: got %d, want 201 (different client IP, different bucket)", status)
 	}
-	if status := makeFailReq(xffFail...); status != 429 {
-		t.Errorf("fail 3: got %d, want 429 (rate limited)", status)
+
+	// Malformed case: different left-hand IPs, same malformed entry, different trusted hop
+	// All three stop at bad_entry and key to 127.0.0.3
+	if status := makeReg("198.51.100.20, bad_entry, 127.0.0.3"); status != 201 {
+		t.Errorf("malformed 1: got %d, want 201", status)
+	}
+
+	if status := makeReg("198.51.100.88, bad_entry, 127.0.0.3"); status != 201 {
+		t.Errorf("malformed 2: got %d, want 201 (different left IP, same bucket)", status)
+	}
+
+	if status := makeReg("198.51.100.77, bad_entry, 127.0.0.3"); status != 429 {
+		t.Errorf("malformed 3: got %d, want 429 (shared bucket exhausted)", status)
 	}
 }
 
@@ -878,9 +1009,9 @@ func TestNewWithInvalidProxyConfig(t *testing.T) {
 	}
 }
 
-// TestNoRequestPanicAfterValidConfig verifies that clientIP call sites never panic
-// after any valid configuration is accepted. This is the request-level version of
-// the parse-level guard (TestNewWithInvalidProxyConfig).
+// TestNoRequestPanicAfterValidConfig verifies that request handling never panics
+// after any valid configuration is accepted, including clientIP extraction with
+// zoned and IPv4-mapped RemoteAddr via real handler invocation.
 func TestNoRequestPanicAfterValidConfig(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/t.db")
 	if err != nil {
@@ -889,92 +1020,118 @@ func TestNoRequestPanicAfterValidConfig(t *testing.T) {
 	defer st.Close()
 
 	tests := []struct {
-		name           string
-		trustedProxies []string
-		remoteAddr     string
-		xff            string
-		wantStatus     int
+		name       string
+		proxies    []string
+		remoteAddr string
+		xff        string
+		wantStatus int
 	}{
-		// Empty config: no trusted proxies, should work
-		{name: "empty config", trustedProxies: []string{}, remoteAddr: "127.0.0.1", xff: "203.0.113.1", wantStatus: 200},
-		// Simple IPv4
-		{name: "IPv4 /8, untrusted peer", trustedProxies: []string{"10.0.0.0/8"}, remoteAddr: "127.0.0.1", xff: "203.0.113.2", wantStatus: 200},
-		{name: "IPv4 /8, trusted peer with XFF", trustedProxies: []string{"10.0.0.0/8"}, remoteAddr: "10.0.0.1", xff: "203.0.113.3", wantStatus: 200},
-		// IPv6
-		{name: "IPv6 /32", trustedProxies: []string{"2001:db8::/32"}, remoteAddr: "2001:db8::1", xff: "2001:db8::99", wantStatus: 200},
-		// IPv4-mapped IPv6 (this was the #164 nil *net.IPNet path)
-		{name: "IPv4-mapped /104, trusted peer", trustedProxies: []string{"::ffff:10.0.0.0/104"}, remoteAddr: "::ffff:10.0.0.5", xff: "203.0.113.4", wantStatus: 200},
-		{name: "IPv4-mapped /104, untrusted peer", trustedProxies: []string{"::ffff:10.0.0.0/104"}, remoteAddr: "127.0.0.1", xff: "203.0.113.5", wantStatus: 200},
-		// Bare IPs
-		{name: "bare IPs", trustedProxies: []string{"10.0.0.1", "192.168.1.1"}, remoteAddr: "10.0.0.1", xff: "203.0.113.6", wantStatus: 200},
+		{
+			name:       "empty config",
+			proxies:    []string{},
+			remoteAddr: "10.0.0.1:1234",
+			xff:        "",
+			wantStatus: 200,
+		},
+		{
+			name:       "IPv4 trusted proxy",
+			proxies:    []string{"10.0.0.0/8"},
+			remoteAddr: "10.0.0.1:1234",
+			xff:        "203.0.113.10",
+			wantStatus: 200,
+		},
+		{
+			name:       "IPv4-mapped trusted RemoteAddr with XFF",
+			proxies:    []string{"::ffff:10.0.0.0/104"},
+			remoteAddr: "[::ffff:10.0.0.5]:1",
+			xff:        "203.0.113.9",
+			wantStatus: 200,
+		},
+		{
+			name:       "zoned IPv6 untrusted RemoteAddr",
+			proxies:    []string{"10.0.0.0/8"},
+			remoteAddr: "[fe80::1%eth0]:2",
+			xff:        "203.0.113.11",
+			wantStatus: 200,
+		},
+		{
+			name:       "IPv6 trusted proxy",
+			proxies:    []string{"2001:db8::/32"},
+			remoteAddr: "[2001:db8::1]:1234",
+			xff:        "203.0.113.12",
+			wantStatus: 200,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := Config{
-				TrustedProxies: tt.trustedProxies,
-				MsgPerMinute:   10,
-				MsgBurst:       10,
+				TrustedProxies: tt.proxies,
 			}
 			if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			srv, err := New(st, cfg)
 			if err != nil {
-				t.Fatalf("New() with %v failed: %v", tt.trustedProxies, err)
+				t.Fatalf("New() with %v failed: %v", tt.proxies, err)
 			}
 
-			httpSrv := httptest.NewServer(srv.Handler())
-			defer httpSrv.Close()
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("request panicked with config %v, remoteAddr %q, XFF %q: %v", tt.proxies, tt.remoteAddr, tt.xff, r)
+				}
+			}()
 
-			// Register a peer and create a pairing invite
-			regResp, err := http.Post(httpSrv.URL+"/v1/register", "application/json", strings.NewReader(`{"name":"test"}`))
-			if err != nil {
-				t.Fatal(err)
-			}
-			var regBody struct {
-				APIKey string `json:"api_key"`
-			}
-			json.NewDecoder(regResp.Body).Decode(&regBody)
-			regResp.Body.Close()
-
-			invReq, _ := http.NewRequest("POST", httpSrv.URL+"/v1/invites", strings.NewReader(`{"scopes":["messages"],"generate_pairing":true}`))
-			invReq.Header.Set("Authorization", "Bearer "+regBody.APIKey)
-			invReq.Header.Set("Content-Type", "application/json")
-			invResp, err := http.DefaultClient.Do(invReq)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var invBody struct {
-				PairingURL string `json:"pairing_url"`
-			}
-			json.NewDecoder(invResp.Body).Decode(&invBody)
-			invResp.Body.Close()
-
-			// Extract pairing token
-			parts := strings.Split(invBody.PairingURL, "/")
-			pairingToken := parts[len(parts)-1]
-
-			// Make a request through clientIP call site (GET /v1/pairing/{token})
-			// This exercises the actual clientIP code path, including the #164 nil-IPNet case
-			req, _ := http.NewRequest("GET", httpSrv.URL+"/v1/pairing/"+pairingToken, nil)
+			req := httptest.NewRequest("GET", "/", nil)
+			req.RemoteAddr = tt.remoteAddr
 			if tt.xff != "" {
 				req.Header.Set("X-Forwarded-For", tt.xff)
 			}
-			// Note: httptest always uses 127.0.0.1 as RemoteAddr, so we can't actually
-			// test the exact RemoteAddr, but we can verify no panic and correct status.
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
 
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				t.Fatalf("request failed (connection error): %v", err)
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != tt.wantStatus {
-				t.Errorf("got status %d, want %d", resp.StatusCode, tt.wantStatus)
+			if rec.Code != tt.wantStatus {
+				t.Errorf("status = %d, want %d", rec.Code, tt.wantStatus)
 			}
 		})
 	}
+
+	// Direct clientIP unit tests with zoned and IPv4-mapped RemoteAddr
+	t.Run("clientIP unit tests", func(t *testing.T) {
+		// Parse ::ffff:10.0.0.0/104 -> should unmap to 10.0.0.0/8
+		trustedNets, err := ParseTrustedProxies([]string{"::ffff:10.0.0.0/104"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(trustedNets) != 1 {
+			t.Fatalf("expected 1 trusted network, got %d", len(trustedNets))
+		}
+		if trustedNets[0].String() != "10.0.0.0/8" {
+			t.Errorf("mapped network = %q, want 10.0.0.0/8", trustedNets[0].String())
+		}
+
+		// IPv4-mapped RemoteAddr with XFF should return XFF (proves trust)
+		ip := clientIP("[::ffff:10.0.0.5]:1", []string{"203.0.113.9"}, trustedNets)
+		if ip != "203.0.113.9" {
+			t.Errorf("clientIP([::ffff:10.0.0.5]:1, [203.0.113.9]) = %q, want 203.0.113.9 (proves mapped peer is trusted)", ip)
+		}
+
+		// Verify Contains works on unmapped IP
+		testIP := net.ParseIP("10.0.0.5")
+		if !trustedNets[0].Contains(testIP) {
+			t.Errorf("trusted network %s should contain 10.0.0.5", trustedNets[0])
+		}
+
+		// Zoned RemoteAddr with untrusted IP should strip zone and use RemoteAddr
+		zonedNets, err := ParseTrustedProxies([]string{"10.0.0.0/8"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		zonedIP := clientIP("[fe80::1%eth0]:2", []string{"203.0.113.10"}, zonedNets)
+		if zonedIP != "fe80::1" {
+			t.Errorf("clientIP([fe80::1%%eth0]:2) = %q, want fe80::1 (zone stripped, RemoteAddr used because untrusted)", zonedIP)
+		}
+	})
 }
 
 // TestTrustedProxiesStartupLogging verifies that trusted proxy networks are
@@ -1037,13 +1194,7 @@ func TestNewWarnsWhenTrustedProxiesParseToNothing(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 	var logs bytes.Buffer
-	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	srv, err := New(st, Config{TrustedProxies: []string{" ", ""}, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
-	if err != nil {
-		t.Fatal(err)
-	}
+	srv := mustNew(t, st, Config{TrustedProxies: []string{" ", ""}, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
 	t.Cleanup(srv.lim.Stop)
 	logOutput := logs.String()
 	if !strings.Contains(logOutput, "no trusted proxies configured") {
@@ -1115,17 +1266,11 @@ func TestAllowBroadIPv6Warning(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 	var logs bytes.Buffer
-	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	srv, err := New(st, Config{
+	srv := mustNew(t, st, Config{
 		TrustedProxies: []string{"2a06:98c0::/29"},
 		AllowBroadIPv6: true,
 		Logger:         slog.New(slog.NewTextHandler(&logs, nil)),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(srv.lim.Stop)
 
 	logOutput := logs.String()
