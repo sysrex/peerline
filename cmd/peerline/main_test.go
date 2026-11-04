@@ -328,20 +328,18 @@ func (h *captureHandler) WithGroup(string) slog.Handler {
 	return h
 }
 
-// TestBuildAPIConfig verifies that buildAPIConfig returns the exact config
-// main() passes to api.New, with no field assignments in between.
-func TestBuildAPIConfig(t *testing.T) {
+// TestBuildTrustedProxySettings verifies that buildTrustedProxySettings parses
+// the proxy environment variables exactly once and emits warnings correctly.
+func TestBuildTrustedProxySettings(t *testing.T) {
 	tests := []struct {
-		name               string
-		proxiesEnv         string
-		allowBroadEnv      string
-		wantProxies        []string
-		wantAllowBroad     bool
-		wantWarnCount      int
-		wantWarnMsg        string
-		wantBuildErr       bool
-		wantNewErr         bool
-		wantNewErrContains string
+		name           string
+		proxiesEnv     string
+		allowBroadEnv  string
+		wantProxies    []string
+		wantAllowBroad bool
+		wantWarnCount  int
+		wantWarnMsg    string
+		wantErr        bool
 	}{
 		{
 			name:           "opt-in enabled without proxies warns once",
@@ -361,6 +359,14 @@ func TestBuildAPIConfig(t *testing.T) {
 			wantWarnCount:  0,
 		},
 		{
+			name:           "proxies with opt-in true",
+			proxiesEnv:     "127.0.0.0/8",
+			allowBroadEnv:  "true",
+			wantProxies:    []string{"127.0.0.0/8"},
+			wantAllowBroad: true,
+			wantWarnCount:  0,
+		},
+		{
 			name:           "proxies with opt-in disabled",
 			proxiesEnv:     "127.0.0.0/8",
 			allowBroadEnv:  "0",
@@ -369,10 +375,18 @@ func TestBuildAPIConfig(t *testing.T) {
 			wantWarnCount:  0,
 		},
 		{
-			name:          "invalid opt-in value",
-			proxiesEnv:    "127.0.0.0/8",
+			name:           "proxies with opt-in false",
+			proxiesEnv:     "192.168.0.0/16",
+			allowBroadEnv:  "false",
+			wantProxies:    []string{"192.168.0.0/16"},
+			wantAllowBroad: false,
+			wantWarnCount:  0,
+		},
+		{
+			name:        "invalid opt-in value",
+			proxiesEnv:  "127.0.0.0/8",
 			allowBroadEnv: "yes",
-			wantBuildErr:  true,
+			wantErr:     true,
 		},
 		{
 			name:           "both unset no warn",
@@ -383,21 +397,11 @@ func TestBuildAPIConfig(t *testing.T) {
 			wantWarnCount:  0,
 		},
 		{
-			name:               "/29 without opt-in rejected by api.New",
-			proxiesEnv:         "2a06:98c0::/29",
-			allowBroadEnv:      "0",
-			wantProxies:        []string{"2a06:98c0::/29"},
-			wantAllowBroad:     false,
-			wantWarnCount:      0,
-			wantNewErr:         true,
-			wantNewErrContains: "must be at least /32",
-		},
-		{
-			name:           "/29 with opt-in accepted",
-			proxiesEnv:     "2a06:98c0::/29",
-			allowBroadEnv:  "1",
-			wantProxies:    []string{"2a06:98c0::/29"},
-			wantAllowBroad: true,
+			name:           "no proxies with opt-in false no warn",
+			proxiesEnv:     "",
+			allowBroadEnv:  "false",
+			wantProxies:    nil,
+			wantAllowBroad: false,
 			wantWarnCount:  0,
 		},
 	}
@@ -417,58 +421,24 @@ func TestBuildAPIConfig(t *testing.T) {
 
 			h := &captureHandler{}
 			log := slog.New(h)
-
-			// Build config exactly as main() does
-			cfg, err := buildAPIConfig(getenv, log, nil, nil, "minimal", "", 0, 0, 0)
-			if tt.wantBuildErr {
+			proxies, allowBroad, err := buildTrustedProxySettings(getenv, log)
+			if tt.wantErr {
 				if err == nil {
-					t.Errorf("buildAPIConfig() succeeded, want error")
+					t.Errorf("buildTrustedProxySettings() succeeded, want error")
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("buildAPIConfig() error = %v, want nil", err)
+				t.Fatalf("buildTrustedProxySettings() error = %v, want nil", err)
+			}
+			if allowBroad != tt.wantAllowBroad {
+				t.Errorf("allowBroad = %v, want %v", allowBroad, tt.wantAllowBroad)
+			}
+			if !equalStringSlices(proxies, tt.wantProxies) {
+				t.Errorf("proxies = %v, want %v", proxies, tt.wantProxies)
 			}
 
-			// Assert the exact config values before api.New sees them
-			if cfg.AllowBroadIPv6 != tt.wantAllowBroad {
-				t.Errorf("cfg.AllowBroadIPv6 = %v, want %v (mutation: opt-in dropped or flipped in main)", cfg.AllowBroadIPv6, tt.wantAllowBroad)
-			}
-			if !equalStringSlices(cfg.TrustedProxies, tt.wantProxies) {
-				t.Errorf("cfg.TrustedProxies = %v, want %v (mutation: proxies dropped in main)", cfg.TrustedProxies, tt.wantProxies)
-			}
-
-			// Verify that api.New sees the same values
-			st, stErr := store.Open(":memory:")
-			if stErr != nil {
-				t.Fatal(stErr)
-			}
-			defer st.Close()
-			if _, _, stErr := st.LoadKeyIndex(context.Background()); stErr != nil {
-				t.Fatal(stErr)
-			}
-
-			// Set Logger for api.New
-			var logBuf bytes.Buffer
-			cfg.Logger = slog.New(slog.NewTextHandler(&logBuf, nil))
-
-			srv, newErr := api.New(st, cfg)
-			if tt.wantNewErr {
-				if newErr == nil {
-					t.Errorf("api.New succeeded, want error containing %q", tt.wantNewErrContains)
-				} else if !strings.Contains(newErr.Error(), tt.wantNewErrContains) {
-					t.Errorf("api.New error = %q, want error containing %q", newErr.Error(), tt.wantNewErrContains)
-				}
-			} else {
-				if newErr != nil {
-					t.Errorf("api.New failed: %v", newErr)
-				}
-			}
-			if srv != nil {
-				defer srv.Stop()
-			}
-
-			// Check warning count from buildAPIConfig
+			// Check warning count
 			warnCount := 0
 			for _, r := range h.records {
 				if r.Level == slog.LevelWarn {
@@ -480,6 +450,203 @@ func TestBuildAPIConfig(t *testing.T) {
 			}
 			if warnCount != tt.wantWarnCount {
 				t.Errorf("got %d warnings, want %d", warnCount, tt.wantWarnCount)
+			}
+		})
+	}
+}
+
+// TestBuildAPIConfig verifies that buildAPIConfig returns the exact config
+// main() passes to api.New, with no field assignments in between.
+func TestBuildAPIConfig(t *testing.T) {
+	tests := []struct {
+		name               string
+		envVars            map[string]string
+		trustedProxies     []string
+		allowBroadIPv6     bool
+		wantRegisterToken  string
+		wantCodePepper     string
+		wantEmailPerHour   int
+		wantNotifyPerHour  int
+		wantMaxOutstanding int
+		wantAuthFailMin    int
+		wantAuthFailBurst  int
+		wantWriteMin       int
+		wantWriteBurst     int
+		wantKeyIndexRebuild int
+		wantBuildErr       bool
+		wantNewErr         bool
+		wantNewErrContains string
+	}{
+		{
+			name: "all fields set",
+			envVars: map[string]string{
+				"PEERLINE_REGISTER_TOKEN":           "test_reg_token_abc123",
+				"PEERLINE_CODE_PEPPER":              "test_pepper_xyz789",
+				"PEERLINE_EMAIL_PER_HOUR":           "50",
+				"PEERLINE_NOTIFY_PER_HOUR":          "30",
+				"PEERLINE_MAX_OUTSTANDING_INVITES":  "15",
+				"PEERLINE_AUTH_FAIL_PER_MINUTE":     "20",
+				"PEERLINE_AUTH_FAIL_BURST":          "8",
+				"PEERLINE_WRITE_PER_MINUTE":         "15",
+				"PEERLINE_WRITE_BURST":              "5",
+				"PEERLINE_KEY_INDEX_REBUILD_HOURS":  "12",
+			},
+			trustedProxies:      []string{"10.0.0.0/8"},
+			allowBroadIPv6:      true,
+			wantRegisterToken:   "test_reg_token_abc123",
+			wantCodePepper:      "test_pepper_xyz789",
+			wantEmailPerHour:    50,
+			wantNotifyPerHour:   30,
+			wantMaxOutstanding:  15,
+			wantAuthFailMin:     20,
+			wantAuthFailBurst:   8,
+			wantWriteMin:        15,
+			wantWriteBurst:      5,
+			wantKeyIndexRebuild: 12,
+		},
+		{
+			name: "invalid auth fail per minute",
+			envVars: map[string]string{
+				"PEERLINE_AUTH_FAIL_PER_MINUTE": "not_a_number",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			wantBuildErr:   true,
+		},
+		{
+			name: "invalid write burst",
+			envVars: map[string]string{
+				"PEERLINE_WRITE_BURST": "abc",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			wantBuildErr:   true,
+		},
+		{
+			name:                "/29 without opt-in rejected by api.New",
+			envVars:             map[string]string{},
+			trustedProxies:      []string{"2a06:98c0::/29"},
+			allowBroadIPv6:      false,
+			wantNewErr:          true,
+			wantNewErrContains:  "must be at least /32",
+		},
+		{
+			name:           "/29 with opt-in accepted",
+			envVars:        map[string]string{},
+			trustedProxies: []string{"2a06:98c0::/29"},
+			allowBroadIPv6: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			getenv := func(key string) string {
+				if val, ok := tt.envVars[key]; ok {
+					return val
+				}
+				return ""
+			}
+
+			h := &captureHandler{}
+			log := slog.New(h)
+
+			// Build config exactly as main() does
+			cfg, err := buildAPIConfig(getenv, log, nil, nil, "minimal", "", 0, 0, 0, tt.trustedProxies, tt.allowBroadIPv6)
+			if tt.wantBuildErr {
+				if err == nil {
+					t.Errorf("buildAPIConfig() succeeded, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("buildAPIConfig() error = %v, want nil", err)
+			}
+
+			// Assert the exact config values
+			if cfg.RegisterToken != tt.wantRegisterToken {
+				t.Errorf("cfg.RegisterToken = %q, want %q (mutation: RegisterToken dropped)", cfg.RegisterToken, tt.wantRegisterToken)
+			}
+			if string(cfg.CodePepper) != tt.wantCodePepper {
+				t.Errorf("cfg.CodePepper = %q, want %q (mutation: CodePepper dropped)", string(cfg.CodePepper), tt.wantCodePepper)
+			}
+			if tt.wantEmailPerHour != 0 && cfg.EmailPerHour != tt.wantEmailPerHour {
+				t.Errorf("cfg.EmailPerHour = %d, want %d", cfg.EmailPerHour, tt.wantEmailPerHour)
+			}
+			if tt.wantNotifyPerHour != 0 && cfg.NotifyPerHour != tt.wantNotifyPerHour {
+				t.Errorf("cfg.NotifyPerHour = %d, want %d", cfg.NotifyPerHour, tt.wantNotifyPerHour)
+			}
+			if tt.wantMaxOutstanding != 0 && cfg.MaxOutstandingInvites != tt.wantMaxOutstanding {
+				t.Errorf("cfg.MaxOutstandingInvites = %d, want %d", cfg.MaxOutstandingInvites, tt.wantMaxOutstanding)
+			}
+			if tt.wantAuthFailMin != 0 && cfg.AuthFailPerMinute != tt.wantAuthFailMin {
+				t.Errorf("cfg.AuthFailPerMinute = %d, want %d", cfg.AuthFailPerMinute, tt.wantAuthFailMin)
+			}
+			if tt.wantAuthFailBurst != 0 && cfg.AuthFailBurst != tt.wantAuthFailBurst {
+				t.Errorf("cfg.AuthFailBurst = %d, want %d (mutation: WriteBurst dropped)", cfg.AuthFailBurst, tt.wantAuthFailBurst)
+			}
+			if tt.wantWriteMin != 0 && cfg.WritePerMinute != tt.wantWriteMin {
+				t.Errorf("cfg.WritePerMinute = %d, want %d", cfg.WritePerMinute, tt.wantWriteMin)
+			}
+			if tt.wantWriteBurst != 0 && cfg.WriteBurst != tt.wantWriteBurst {
+				t.Errorf("cfg.WriteBurst = %d, want %d (mutation: WriteBurst dropped)", cfg.WriteBurst, tt.wantWriteBurst)
+			}
+			if tt.wantKeyIndexRebuild != 0 && cfg.KeyIndexRebuildHours != tt.wantKeyIndexRebuild {
+				t.Errorf("cfg.KeyIndexRebuildHours = %d, want %d", cfg.KeyIndexRebuildHours, tt.wantKeyIndexRebuild)
+			}
+			if cfg.AllowBroadIPv6 != tt.allowBroadIPv6 {
+				t.Errorf("cfg.AllowBroadIPv6 = %v, want %v", cfg.AllowBroadIPv6, tt.allowBroadIPv6)
+			}
+			if !equalStringSlices(cfg.TrustedProxies, tt.trustedProxies) {
+				t.Errorf("cfg.TrustedProxies = %v, want %v", cfg.TrustedProxies, tt.trustedProxies)
+			}
+
+			// Verify that api.New works with the config (only for non-error cases)
+			if !tt.wantNewErr {
+				st, stErr := store.Open(":memory:")
+				if stErr != nil {
+					t.Fatal(stErr)
+				}
+				defer st.Close()
+				if _, _, stErr := st.LoadKeyIndex(context.Background()); stErr != nil {
+					t.Fatal(stErr)
+				}
+
+				// Set Logger for api.New
+				var logBuf bytes.Buffer
+				cfg.Logger = slog.New(slog.NewTextHandler(&logBuf, nil))
+
+				srv, newErr := api.New(st, cfg)
+				if newErr != nil {
+					t.Errorf("api.New failed: %v", newErr)
+				}
+				if srv != nil {
+					defer srv.Stop()
+				}
+			}
+
+			// For wantNewErr cases, test that api.New rejects the config
+			if tt.wantNewErr {
+				st, stErr := store.Open(":memory:")
+				if stErr != nil {
+					t.Fatal(stErr)
+				}
+				defer st.Close()
+				if _, _, stErr := st.LoadKeyIndex(context.Background()); stErr != nil {
+					t.Fatal(stErr)
+				}
+
+				var logBuf bytes.Buffer
+				cfg.Logger = slog.New(slog.NewTextHandler(&logBuf, nil))
+
+				srv, newErr := api.New(st, cfg)
+				if newErr == nil {
+					t.Errorf("api.New succeeded, want error containing %q", tt.wantNewErrContains)
+				} else if !strings.Contains(newErr.Error(), tt.wantNewErrContains) {
+					t.Errorf("api.New error = %q, want error containing %q", newErr.Error(), tt.wantNewErrContains)
+				}
+				if srv != nil {
+					srv.Stop()
+				}
 			}
 		})
 	}

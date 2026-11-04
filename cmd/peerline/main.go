@@ -81,16 +81,14 @@ func describeTLSMode(smtp *mailer.SMTP) string {
 	return "STARTTLS required"
 }
 
-// buildAPIConfig constructs the api.Config that main() passes to api.New.
-// It parses all environment variables, validates them, emits startup warnings,
-// and returns the exact config. Called once from main(); the returned config
-// is passed verbatim to api.New with no field assignments in between.
-func buildAPIConfig(getenv func(string) string, log *slog.Logger, clk clock.Clock, ml mailer.Sender, versionDetail, publicURL string, maxBagsPerPeer int, maxBagBytesPerPeer, retentionSeconds int64) (api.Config, error) {
-	// Parse trusted proxy config first (before SMTP probe, so it fails fast)
+// buildTrustedProxySettings extracts and validates trusted proxy configuration from environment.
+// It parses PEERLINE_TRUSTED_PROXIES and PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD exactly once,
+// emits startup warnings, and returns the values. Called from main before mailer.FromEnv.
+func buildTrustedProxySettings(getenv func(string) string, log *slog.Logger) (proxies []string, allowBroad bool, err error) {
 	tp := getenv("PEERLINE_TRUSTED_PROXIES")
-	allowBroad, err := parseBoolStrict(getenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD"))
+	allowBroad, err = parseBoolStrict(getenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD"))
 	if err != nil {
-		return api.Config{}, fmt.Errorf("invalid PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD value: %w", err)
+		return nil, false, fmt.Errorf("invalid PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD value: %w", err)
 	}
 
 	// Warn if opt-in is enabled but no proxies configured
@@ -98,10 +96,16 @@ func buildAPIConfig(getenv func(string) string, log *slog.Logger, clk clock.Cloc
 		log.Warn("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled but PEERLINE_TRUSTED_PROXIES is unset; the opt-in has no effect")
 	}
 
-	var trustedProxies []string
 	if tp != "" {
-		trustedProxies = strings.Split(tp, ",")
+		proxies = strings.Split(tp, ",")
 	}
+	return proxies, allowBroad, nil
+}
+
+// buildAPIConfig constructs the api.Config that main() passes to api.New.
+// It parses all environment variables, validates them, and returns the exact config.
+// Called once from main(); the returned config is passed verbatim to api.New with no field assignments in between.
+func buildAPIConfig(getenv func(string) string, log *slog.Logger, clk clock.Clock, ml mailer.Sender, versionDetail, publicURL string, maxBagsPerPeer int, maxBagBytesPerPeer, retentionSeconds int64, trustedProxies []string, allowBroadIPv6 bool) (api.Config, error) {
 
 	regTok := getenv("PEERLINE_REGISTER_TOKEN")
 	maxOutstandingInvites, _ := strconv.Atoi(getenv("PEERLINE_MAX_OUTSTANDING_INVITES"))
@@ -139,7 +143,7 @@ func buildAPIConfig(getenv func(string) string, log *slog.Logger, clk clock.Cloc
 		EmailPerHour:          emailPerHour,
 		NotifyPerHour:         notifyPerHour,
 		TrustedProxies:        trustedProxies,
-		AllowBroadIPv6:        allowBroad,
+		AllowBroadIPv6:        allowBroadIPv6,
 		Clock:                 clk,
 		MaxOutstandingInvites: maxOutstandingInvites,
 		RetentionSeconds:      retentionSeconds,
@@ -300,10 +304,10 @@ func main() {
 		log.Warn("key index size exceeds PEERLINE_KEY_INDEX_WARN", "keys", n, "warn_threshold", keyIndexWarn)
 	}
 
-	// Validate trusted proxy config before SMTP probe (fail-fast on typos)
-	_, err = parseBoolStrict(os.Getenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD"))
+	// Parse trusted proxy config before SMTP probe (fail-fast on typos)
+	trustedProxies, allowBroadIPv6, err := buildTrustedProxySettings(os.Getenv, log)
 	if err != nil {
-		log.Error("invalid PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD value", "err", err)
+		log.Error("trusted proxy config", "err", err)
 		os.Exit(1)
 	}
 
@@ -367,9 +371,9 @@ func main() {
 	}
 
 	// Build api.Config with all parsed environment variables
-	cfg, err := buildAPIConfig(os.Getenv, log, clk, ml, versionDetail, publicURL, maxBagsPerPeer, maxBagBytesPerPeer, retentionSeconds)
+	cfg, err := buildAPIConfig(os.Getenv, log, clk, ml, versionDetail, publicURL, maxBagsPerPeer, maxBagBytesPerPeer, retentionSeconds, trustedProxies, allowBroadIPv6)
 	if err != nil {
-		log.Error("api config", "err", err)
+		log.Error("invalid rate limiter config", "err", err)
 		os.Exit(1)
 	}
 
