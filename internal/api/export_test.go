@@ -51,3 +51,10 @@ func mustNew(t testing.TB, st *store.Store, cfg Config) *Server {
 	}
 	return srv
 }
+
+// withLimiterOverride applies a limiter override to a Server, preserving the server's clock.
+// Use this in tests that need custom rate limits without duplicating LimiterManager setup.
+func withLimiterOverride(t *testing.T, s *Server, f func(lm *LimiterManager)) {
+	t.Helper()
+	f(s.lim)
+}
