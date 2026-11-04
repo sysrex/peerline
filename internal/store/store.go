@@ -1676,7 +1676,7 @@ func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
-	
+
 	// If a grant exists and differs, return ErrConflict without touching the invite or grants
 	if existingScopes.Valid {
 		if !grantsEqual(scopes, bags, existingScopes.String, existingBags.String) {
@@ -1693,7 +1693,7 @@ func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
 		}
-		
+
 		if existingBackScopes.Valid {
 			if !grantsEqual(backScopesStr, backBagsStr, existingBackScopes.String, existingBackBags.String) {
 				return nil, ErrConflict
