@@ -23,6 +23,10 @@ import (
 	"time"
 )
 
+// dialContext is the default dialer for SMTP connections.
+// Tests can override this to redirect connections.
+var dialContext = (&net.Dialer{}).DialContext
+
 // ErrRelayUnreachable is returned by Probe when the SMTP server is unreachable
 // (connection refused, timeout, reset, or SMTP-level greeting/EHLO errors).
 // Startup logs a warning and continues; runtime Send will retry.
@@ -136,6 +140,10 @@ func FromEnv(lg *slog.Logger) (Sender, error) {
 		logBody := os.Getenv("PEERLINE_DEV_LOG_EMAIL_BODY") == "1"
 		return Log{Logger: lg, LogFullBody: logBody}, nil
 	}
+	// Reject IPv6 zone IDs (e.g. fe80::1%eth0) before building bracket hints
+	if strings.Contains(host, "%") {
+		return nil, errors.New("PEERLINE_SMTP_HOST: IPv6 zone IDs are not supported in PEERLINE_SMTP_HOST")
+	}
 	if strings.Contains(host, "[") || strings.Contains(host, "]") {
 		var suggested string
 		// Try to parse as [host]:port
@@ -154,10 +162,6 @@ func FromEnv(lg *slog.Logger) (Sender, error) {
 			suggested = "use a valid hostname or IP"
 		}
 		return nil, fmt.Errorf("PEERLINE_SMTP_HOST: bracketed address %q not allowed (%s)", host, suggested)
-	}
-	// Reject IPv6 zone IDs (e.g. fe80::1%eth0)
-	if strings.Contains(host, "%") {
-		return nil, errors.New("PEERLINE_SMTP_HOST: IPv6 zone IDs are not supported in PEERLINE_SMTP_HOST")
 	}
 	// Reject host:port syntax (port must be in PEERLINE_SMTP_PORT), but allow IPv6 addresses
 	if strings.Contains(host, ":") && net.ParseIP(host) == nil {
@@ -237,11 +241,11 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 	}
 
 	var conn net.Conn
-	d := &net.Dialer{}
 	if s.ImplicitTLS {
+		d := &net.Dialer{}
 		conn, err = (&tls.Dialer{NetDialer: d, Config: tlsCfg}).DialContext(ctx, "tcp", addr)
 	} else {
-		conn, err = d.DialContext(ctx, "tcp", addr)
+		conn, err = dialContext(ctx, "tcp", addr)
 	}
 	if err != nil {
 		return fmt.Errorf("smtp dial: %w", err)
@@ -319,8 +323,7 @@ func (s *SMTP) Probe(ctx context.Context) error {
 	}
 
 	// Always do TCP dial first
-	d := &net.Dialer{}
-	conn, err := d.DialContext(ctx, "tcp", addr)
+	conn, err := dialContext(ctx, "tcp", addr)
 	if err != nil {
 		// TCP dial failure: connection refused, timeout, no route, etc. - transient
 		return fmt.Errorf("%w: %v", ErrRelayUnreachable, err)
@@ -336,8 +339,8 @@ func (s *SMTP) Probe(ctx context.Context) error {
 		tlsConn := tls.Client(conn, tlsCfg)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			// Check for not-yet-valid certificate (fatal: clock skew or misconfiguration)
-			if isNotYetValid, msg := isNotYetValidError(err, tlsCfg, "TLS handshake failed on port 465"); isNotYetValid {
-				return errors.New(msg)
+			if isNotYetValid, wrappedErr := isNotYetValidError(err, tlsCfg, "TLS handshake failed on port 465"); isNotYetValid {
+				return wrappedErr
 			}
 			// Check for expiry-only error (transient: relay state, not Peerline config)
 			if s.isExpiryOnlyError(ctx, err, conn, tlsCfg) {
@@ -370,15 +373,17 @@ func (s *SMTP) Probe(ctx context.Context) error {
 		if err := s.checkSTARTTLS(hasSTARTTLS); err != nil {
 			return fmt.Errorf("smtp probe: %s:%d: %w", s.Host, s.Port, err)
 		}
-		if !hasSTARTTLS && s.User != "" && !IsLoopback(s.Host) {
+		// Use PlainAuth's exact literal set to predict what Send will do
+		isPlainAuthLoopback := s.Host == "localhost" || s.Host == "127.0.0.1" || s.Host == "::1"
+		if !hasSTARTTLS && s.User != "" && !isPlainAuthLoopback {
 			return fmt.Errorf("smtp probe: credentials are set but %s:%d offers no STARTTLS and is not loopback; PLAIN auth would be refused", s.Host, s.Port)
 		}
 		if hasSTARTTLS {
 			// Actually perform the handshake to verify certs
 			if err := c.StartTLS(tlsCfg); err != nil {
 				// Check for not-yet-valid certificate (fatal: clock skew or misconfiguration)
-				if isNotYetValid, msg := isNotYetValidError(err, tlsCfg, "STARTTLS handshake failed"); isNotYetValid {
-					return errors.New(msg)
+				if isNotYetValid, wrappedErr := isNotYetValidError(err, tlsCfg, "STARTTLS handshake failed"); isNotYetValid {
+					return wrappedErr
 				}
 				// Check for expiry-only error (transient: relay state, not Peerline config)
 				if s.isExpiryOnlyError(ctx, err, conn, tlsCfg) {
@@ -395,12 +400,12 @@ func (s *SMTP) Probe(ctx context.Context) error {
 }
 
 // isNotYetValidError returns true if err is a certificate not-yet-valid error (NotBefore in the future).
-// If true, it returns the error message to use (mentions "check the host clock" and includes the context).
-// The context describes where the error occurred (e.g., "port 465" or "STARTTLS handshake").
-func isNotYetValidError(err error, tlsCfg *tls.Config, context string) (bool, string) {
+// If true, it returns a wrapped error (mentions "check the host clock" and includes the stage).
+// The stage parameter describes where the error occurred (e.g., "port 465" or "STARTTLS handshake").
+func isNotYetValidError(err error, tlsCfg *tls.Config, stage string) (bool, error) {
 	var x509Invalid x509.CertificateInvalidError
 	if !errors.As(err, &x509Invalid) || x509Invalid.Reason != x509.Expired || x509Invalid.Cert == nil {
-		return false, ""
+		return false, nil
 	}
 	// Use tlsCfg.Time if set (for tests), otherwise use time.Now()
 	now := time.Now()
@@ -408,11 +413,10 @@ func isNotYetValidError(err error, tlsCfg *tls.Config, context string) (bool, st
 		now = tlsCfg.Time()
 	}
 	if now.Before(x509Invalid.Cert.NotBefore) {
-		msg := fmt.Sprintf("smtp probe: %s: certificate not yet valid (NotBefore=%v); check the host clock: %v",
-			context, x509Invalid.Cert.NotBefore.Format(time.RFC3339), err)
-		return true, msg
+		return true, fmt.Errorf("smtp probe: %s: certificate not yet valid (NotBefore=%v); check the host clock: %w",
+			stage, x509Invalid.Cert.NotBefore.Format(time.RFC3339), err)
 	}
-	return false, ""
+	return false, nil
 }
 
 // isTLSError returns true if err is a certificate validation error or TLS protocol error.
@@ -482,11 +486,11 @@ func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, 
 	recheckCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	d := &net.Dialer{}
 	addr := net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
 
 	if s.ImplicitTLS {
 		// For implicit TLS, dial with TLS directly
+		d := &net.Dialer{}
 		recheckConn, err := (&tls.Dialer{NetDialer: d, Config: recheckCfg}).DialContext(recheckCtx, "tcp", addr)
 		if err == nil {
 			recheckConn.Close()
@@ -496,7 +500,7 @@ func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, 
 	}
 
 	// For STARTTLS, dial plaintext then upgrade
-	recheckConn, err := d.DialContext(recheckCtx, "tcp", addr)
+	recheckConn, err := dialContext(recheckCtx, "tcp", addr)
 	if err != nil {
 		return false
 	}

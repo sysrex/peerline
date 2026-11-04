@@ -283,6 +283,7 @@ func TestFromEnvRejectsZonedHosts(t *testing.T) {
 	}{
 		{"fe80::1%eth0", "fe80::1%eth0"},
 		{"fe80::1%lo0", "fe80::1%lo0"},
+		{"[fe80::1%eth0]:25", "[fe80::1%eth0]:25"},
 	}
 
 	for _, tt := range tests {
@@ -310,6 +311,7 @@ type fakeServer struct {
 	t                 *testing.T
 	stallSecondConn   bool // if true, stall the second connection's greeting
 	connCount         int
+	closeCh           chan struct{} // closed when server closes
 }
 
 func newFakeServer(t *testing.T, advertiseSTARTTLS bool, cert *tls.Certificate) *fakeServer {
@@ -327,6 +329,7 @@ func newFakeServerWithOptions(t *testing.T, advertiseSTARTTLS bool, cert *tls.Ce
 		cert:              cert,
 		t:                 t,
 		stallSecondConn:   stallSecondConn,
+		closeCh:           make(chan struct{}),
 	}
 	go fs.serve()
 	return fs
@@ -355,9 +358,9 @@ func (fs *fakeServer) handleConn(c net.Conn) {
 	r, w := bufio.NewReader(c), bufio.NewWriter(c)
 	say := func(s string) { w.WriteString(s + "\r\n"); w.Flush() }
 
-	// Stall the second connection if requested
+	// Stall the second connection if requested (block until server closes)
 	if shouldStall {
-		time.Sleep(5 * time.Second)
+		<-fs.closeCh
 		return
 	}
 
@@ -430,6 +433,7 @@ func (fs *fakeServer) port() int {
 
 func (fs *fakeServer) close() {
 	fs.ln.Close()
+	close(fs.closeCh)
 }
 
 func (fs *fakeServer) receivedCommands() []string {
@@ -860,55 +864,51 @@ func TestFromEnvRejectsLegacyAllowPlaintext(t *testing.T) {
 
 func TestSMTPProbeCredentialsWithoutSTARTTLS(t *testing.T) {
 	// This test verifies that credentials without STARTTLS on a non-loopback host
-	// produces a fatal error. We use a loopback server but set Host to a non-loopback name.
-	srv := newFakeServer(t, false, nil) // no STARTTLS
-	defer srv.close()
-
-	// Use example.com (non-loopback) as the logical host, but with TLSConfig that
-	// allows the actual 127.0.0.1 connection to work
-	s := &SMTP{
-		Host:           "example.com",
-		Port:           srv.port(),
-		User:           "u",
-		Pass:           "p",
-		Timeout:        2 * time.Second,
-		AllowPlaintext: true,
-		// Override TLSConfig to connect to 127.0.0.1 (where the server actually is)
-		TLSConfig: &tls.Config{ServerName: "127.0.0.1"},
+	// produces a fatal error. Probe uses PlainAuth's exact three literals to predict
+	// what Send will do, so 127.0.0.2 and expanded ::1 are NOT considered loopback.
+	tests := []struct {
+		name string
+		host string
+	}{
+		{"non-loopback hostname", "relay.example.test"},
+		{"127.0.0.2 (not in PlainAuth's set)", "127.0.0.2"},
+		{"expanded ::1 (not in PlainAuth's set)", "0:0:0:0:0:0:0:1"},
 	}
 
-	// Wrap the connection to intercept and redirect to 127.0.0.1
-	// Actually, we can't easily do this. Let me use a different approach:
-	// Just test with localhost but set AllowPlaintext false
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newFakeServer(t, false, nil) // no STARTTLS
+			defer srv.close()
 
-	s = &SMTP{
-		Host:           "192.0.2.1", // non-loopback (TEST-NET-1)
-		Port:           srv.port(),
-		User:           "u",
-		Pass:           "p",
-		Timeout:        100 * time.Millisecond,
-		AllowPlaintext: true,
+			// Override dialContext to redirect to the local fake server
+			originalDialContext := dialContext
+			dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+				// Redirect to the fake server
+				return originalDialContext(ctx, network, srv.addr())
+			}
+			t.Cleanup(func() { dialContext = originalDialContext })
+
+			s := &SMTP{
+				Host:           tt.host,
+				Port:           srv.port(),
+				User:           "u",
+				Pass:           "p",
+				Timeout:        2 * time.Second,
+				AllowPlaintext: true,
+			}
+			err := s.Probe(context.Background())
+
+			if err == nil {
+				t.Fatal("Probe should return error for credentials without STARTTLS on non-loopback host")
+			}
+			if errors.Is(err, ErrRelayUnreachable) {
+				t.Fatalf("want fatal error, got ErrRelayUnreachable: %v", err)
+			}
+			if !strings.Contains(err.Error(), "PLAIN auth") {
+				t.Fatalf("error should mention PLAIN auth, got: %v", err)
+			}
+		})
 	}
-	err := s.Probe(context.Background())
-
-	// This will fail to connect (no route to 192.0.2.1), which is fine
-	// The point is we're testing that IsLoopback("192.0.2.1") == false
-	// and the credentials check would trigger. But we can't easily test this
-	// without a real non-loopback connection.
-	//
-	// Since the new IsLoopback correctly identifies 127.x.x.x as loopback,
-	// we can't use 127.1.2.3 anymore. Let's just verify IsLoopback is correct
-	// and trust the logic.
-
-	if !IsLoopback("localhost") || !IsLoopback("127.0.0.1") || !IsLoopback("127.1.2.3") {
-		t.Fatal("IsLoopback should recognize all 127.x.x.x addresses")
-	}
-	if IsLoopback("192.0.2.1") || IsLoopback("example.com") {
-		t.Fatal("IsLoopback should not match non-loopback addresses")
-	}
-
-	// The actual check happens in Probe - we trust it works given IsLoopback is correct
-	_ = err
 }
 
 func TestSMTPProbe(t *testing.T) {
@@ -1318,17 +1318,13 @@ func TestSMTPProbe(t *testing.T) {
 		}
 	})
 
-	t.Run("STARTTLS expired intermediate under untrusted root = fatal", func(t *testing.T) {
-		// Generate a chain with an expired intermediate under a self-signed root
-		now := time.Now()
-		leafCert, _ := genTestCertChain(t, "localhost",
-			now.Add(-time.Hour), now.Add(time.Hour), // leaf: valid
-			now.Add(-2*time.Hour), now.Add(-time.Hour)) // intermediate: expired
-
-		srv := newFakeServer(t, true, &leafCert)
+	t.Run("STARTTLS valid cert under untrusted root = fatal", func(t *testing.T) {
+		// A valid but self-signed cert (untrusted)
+		cert := genTestCert(t, "localhost")
+		srv := newFakeServer(t, true, &cert)
 		defer srv.close()
 
-		// Don't trust the root - use empty RootCAs pool
+		// Don't trust it - use empty RootCAs pool
 		s := &SMTP{
 			Host:      "127.0.0.1",
 			Port:      srv.port(),
@@ -1337,28 +1333,43 @@ func TestSMTPProbe(t *testing.T) {
 		}
 		err := s.Probe(context.Background())
 		if err == nil {
-			t.Fatal("probe should fail on expired intermediate under untrusted root")
+			t.Fatal("probe should fail on untrusted cert")
 		}
 		if errors.Is(err, ErrRelayUnreachable) {
-			t.Fatalf("expired intermediate under untrusted root should be fatal, not ErrRelayUnreachable: %v", err)
+			t.Fatalf("untrusted cert should be fatal, not ErrRelayUnreachable: %v", err)
+		}
+		// Positive control: assert STARTTLS was attempted
+		cmds := srv.receivedCommands()
+		hasSTARTTLS := false
+		for _, cmd := range cmds {
+			if cmd == "STARTTLS" {
+				hasSTARTTLS = true
+				break
+			}
+		}
+		if !hasSTARTTLS {
+			t.Fatalf("STARTTLS not attempted: %v", cmds)
+		}
+		// Positive control: assert the error is an x509 UnknownAuthorityError
+		var x509Unknown x509.UnknownAuthorityError
+		if !errors.As(err, &x509Unknown) {
+			t.Fatalf("error should be x509.UnknownAuthorityError, got: %T %v", err, err)
 		}
 	})
 
-	t.Run("STARTTLS expired intermediate under trusted root = warn path (expiry-only)", func(t *testing.T) {
-		// Generate a chain with an expired intermediate under a trusted root
-		// Note: Go's x509 verification may not always return CertificateInvalidError.Cert
-		// for intermediate certificate expiry, so this test documents current behavior.
-		now := time.Now()
-		leafCert, rootCert := genTestCertChain(t, "localhost",
-			now.Add(-time.Hour), now.Add(time.Hour), // leaf: valid
-			now.Add(-2*time.Hour), now.Add(-time.Hour)) // intermediate: expired
-
-		srv := newFakeServer(t, true, &leafCert)
+	t.Run("STARTTLS expired leaf under trusted root = ErrRelayUnreachable (expiry-only)", func(t *testing.T) {
+		// An expired leaf certificate under a trusted root tests the expiry-only path.
+		cert := genExpiredTestCert(t, "localhost")
+		srv := newFakeServer(t, true, &cert)
 		defer srv.close()
 
-		// Trust the root
+		// Trust it
 		certPool := x509.NewCertPool()
-		certPool.AddCert(rootCert)
+		parsed, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			t.Fatalf("failed to parse test cert: %v", err)
+		}
+		certPool.AddCert(parsed)
 
 		s := &SMTP{
 			Host:      "127.0.0.1",
@@ -1366,22 +1377,16 @@ func TestSMTPProbe(t *testing.T) {
 			Timeout:   2 * time.Second,
 			TLSConfig: &tls.Config{RootCAs: certPool, ServerName: "localhost"},
 		}
-		err := s.Probe(context.Background())
+		err = s.Probe(context.Background())
 		if err == nil {
-			t.Fatal("probe should fail on expired intermediate")
+			t.Fatal("probe should fail on expired cert")
 		}
-		// The error should be ErrRelayUnreachable (transient) if expiry is the only problem.
-		// If not, it means the re-check couldn't confirm expiry-only, which is acceptable
-		// (fail-safe: treat uncertain cases as fatal).
-		// For this test, we verify it's at least a certificate error and mentions expiry.
-		if !strings.Contains(err.Error(), "expired") && !strings.Contains(err.Error(), "not yet valid") {
-			t.Fatalf("error should mention certificate expiry, got: %v", err)
+		// The expiry-only error should be ErrRelayUnreachable (transient)
+		if !errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("expired leaf under trusted root should be ErrRelayUnreachable (transient), got: %v", err)
 		}
-		// Log whether it was classified as transient or fatal for documentation
-		if errors.Is(err, ErrRelayUnreachable) {
-			t.Logf("Expired intermediate classified as transient (expiry-only)")
-		} else {
-			t.Logf("Expired intermediate classified as fatal (re-check did not confirm expiry-only)")
+		if !strings.Contains(err.Error(), "relay") {
+			t.Fatalf("error should mention 'relay', got: %v", err)
 		}
 	})
 
@@ -1742,7 +1747,7 @@ func TestSMTPImplicitTLS(t *testing.T) {
 		}
 		defer ln.Close()
 
-		fs := &fakeServer{ln: ln, cert: &cert, t: t}
+		fs := &fakeServer{ln: ln, cert: &cert, t: t, closeCh: make(chan struct{})}
 		go fs.serve()
 
 		certPool := x509.NewCertPool()
@@ -1774,6 +1779,11 @@ func TestSMTPImplicitTLS(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "port 465") {
 			t.Fatalf("error should mention 'port 465', got: %v", err)
+		}
+		// Assert the underlying x509 error is still accessible
+		var x509Invalid x509.CertificateInvalidError
+		if !errors.As(err, &x509Invalid) {
+			t.Fatalf("error should wrap x509.CertificateInvalidError, got: %T %v", err, err)
 		}
 	})
 }
