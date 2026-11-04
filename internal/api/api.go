@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/sysrex/peerline/internal/auth"
+	"github.com/sysrex/peerline/internal/clock"
 	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/msg"
 	"github.com/sysrex/peerline/internal/pair"
@@ -51,8 +52,8 @@ type Config struct {
 	// Mailer sends invite and message-notification emails. Nil = dev mode
 	// (log the email, never fail the request).
 	Mailer mailer.Sender
-	// PublicURL is the externally reachable base URL used in emailed accept
-	// links (e.g. https://peerline.example.com). If empty, it is derived from
+	// PublicURL is the externally reachable base URL used in the accept_url
+	// landing page (e.g. https://peerline.example.com). If empty, it is derived from
 	// the request (fine for local dev; set it in production).
 	PublicURL string
 	// Email send limits: per inviting peer and per recipient address, per hour.
@@ -66,8 +67,8 @@ type Config struct {
 	// TrustedProxies is a list of CIDR ranges (e.g. "10.0.0.0/8") from which
 	// X-Forwarded-For headers are honored. If empty, X-Forwarded-For is ignored.
 	TrustedProxies []string
-	// Now is the clock for invite expiry and rate limiters; defaults to time.Now.
-	Now func() time.Time
+	// Clock is the time source for invite expiry and rate limiters; defaults to clock.Real{}.
+	Clock clock.Clock
 	// MaxOutstandingInvites is the per-peer limit on active (non-expired, unused) invites.
 	MaxOutstandingInvites int
 	// RetentionSeconds is how long (in seconds) to keep used invites before purging.
@@ -104,8 +105,8 @@ type Server struct {
 	maint       *MaintenanceManager
 	log         *slog.Logger
 	trustedNets []*net.IPNet
-	now         func() time.Time // clock for invite expiry; defaults to time.Now
-	claims      ClaimStore       // claim/confirm backend; nil = claim routes are not served
+	clk         clock.Clock // time source for invite expiry and rate limiters
+	claims      ClaimStore  // claim/confirm backend; nil = claim routes are not served
 
 	// For pruning verifyLim
 	pruneDone chan struct{}
@@ -179,9 +180,7 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 	}
 	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
 
-	if cfg.Now == nil {
-		cfg.Now = time.Now
-	}
+	clk := clock.Or(cfg.Clock)
 
 	trustedNets, err := ParseTrustedProxies(cfg.TrustedProxies)
 	if err != nil {
@@ -204,9 +203,9 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 		cfg:         cfg,
 		log:         cfg.Logger,
 		lim:         NewLimiterManager(cfg),
-		verifyLim:   msg.NewLimiterPerHour(3, 3), // 3 verification emails per peer/address per hour
+		verifyLim:   msg.NewLimiterPerHour(3, 3, msg.WithClock(clk.Now)), // 3 verification emails per peer/address per hour
 		trustedNets: trustedNets,
-		now:         cfg.Now,
+		clk:         clk,
 		pruneDone:   make(chan struct{}),
 	}
 
@@ -214,7 +213,7 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 	go s.pruneVerifyLoop()
 
 	// Start maintenance tasks
-	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, cfg.RetentionSeconds, cfg.KeyIndexRebuildHours)
+	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, clk, cfg.RetentionSeconds, cfg.KeyIndexRebuildHours)
 
 	return s, nil
 }
@@ -435,7 +434,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 			tokenWithExpiry = "" // Leave unverified
 		} else {
 			rawToken = auth.NewSecret(auth.EmailVerifyPrefix)
-			issuedAt := s.now().Unix()
+			issuedAt := s.clk.Now().Unix()
 			tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
 		}
 	}
@@ -558,7 +557,7 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 			return
 		} else {
 			rawToken = auth.NewSecret(auth.EmailVerifyPrefix)
-			issuedAt := s.now().Unix()
+			issuedAt := s.clk.Now().Unix()
 			tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
 		}
 	}
@@ -715,7 +714,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	code := auth.NewSecret("inv_")
-	exp := s.now().Add(ttl).UTC()
+	exp := s.clk.Now().Add(ttl).UTC()
 	var pairingToken string
 	var publicID string
 
@@ -919,11 +918,11 @@ func truncateUTF8(s string, max int) string {
 //
 // Note: Cross-script homoglyphs (e.g., Cyrillic а vs Latin a) are not fully solvable here
 // and require application-level awareness or visual similarity detection.
-func sanitizeInviterName(name string) string {
+// sanitizeInviterNameUncapped performs all sanitization steps except the 64-rune cap.
+// It returns the NFC-normalized, filtered result before length truncation.
+func sanitizeInviterNameUncapped(name string) string {
 	const (
-		maxRunes        = 64
-		maxMarksPerBase = 3 // Issue #84 specifies 3 marks per base (issue #63 asked for 2 but #84 is the live tracker)
-		fallbackName    = "A Peerline peer"
+		maxMarksPerBase = 3    // Issue #84 specifies 3 marks per base (issue #63 asked for 2 but #84 is the live tracker)
 		maxInputBytes   = 1024 // Guard against unbounded normalization work
 	)
 
@@ -1027,7 +1026,16 @@ func sanitizeInviterName(name string) string {
 
 	// Apply NFC (canonical composition) to the filtered result
 	// This recomposes base+mark sequences into precomposed forms where possible
-	result := norm.NFC.String(strings.TrimSpace(out.String()))
+	return norm.NFC.String(strings.TrimSpace(out.String()))
+}
+
+func sanitizeInviterName(name string) string {
+	const (
+		maxRunes     = 64
+		fallbackName = "A Peerline peer"
+	)
+
+	result := sanitizeInviterNameUncapped(name)
 
 	// Return fallback if result is empty
 	if result == "" {
@@ -1055,8 +1063,9 @@ func sanitizeInviterName(name string) string {
 			}
 		}
 
-		// Check if the last kept rune is a virama (CCC 9)
-		if len(truncated) > 0 {
+		// Check if the last kept rune is a virama (CCC 9) and it's mid-word.
+		// A word-final virama (followed by space) is complete and should not trigger back-off.
+		if len(truncated) > 0 && runes[maxRunes] != ' ' {
 			lastRune := truncated[len(truncated)-1]
 			// Check if it's a virama using Canonical_Combining_Class
 			props := norm.NFC.PropertiesString(string(lastRune))
@@ -1081,9 +1090,9 @@ func sanitizeInviterName(name string) string {
 			}
 		}
 
-		// Strip any trailing viramas (CCC 9) after truncation to handle stacked conjuncts
-		// (e.g., क्क्ष where multiple viramas chain, issue #206). Keep dropping entire
-		// clusters until no virama remains at the end.
+		// Drop trailing virama clusters only if the cut is inside a word.
+		// A virama at word end (followed by space in the full runes slice) is complete.
+		// Trim trailing spaces afterwards.
 		dropCluster := func(t []rune) []rune {
 			for i := len(t) - 1; i >= 0; i-- {
 				r := t[i]
@@ -1099,30 +1108,31 @@ func sanitizeInviterName(name string) string {
 		}
 
 		for len(truncated) > 0 {
-			if len(truncated) == 0 {
+			last := truncated[len(truncated)-1]
+			props := norm.NFC.PropertiesString(string(last))
+			// Stop if not a virama, or if it's a word-final virama (next rune is space).
+			// runes[len(truncated)] is always in range here because truncated is a strict
+			// prefix of runes on this path.
+			if props.CCC() != 9 || runes[len(truncated)] == ' ' {
 				break
 			}
-			lastRune := truncated[len(truncated)-1]
-			props := norm.NFC.PropertiesString(string(lastRune))
-			if props.CCC() == 9 {
-				n := len(truncated)
-				truncated = dropCluster(truncated)
-				if len(truncated) == n {
-					// No progress made, stop to avoid infinite loop
-					break
-				}
-			} else {
+			n := len(truncated)
+			truncated = dropCluster(truncated)
+			if len(truncated) == n {
+				// No progress made, stop to avoid infinite loop
 				break
 			}
+		}
+
+		// Trim trailing spaces after dropping virama clusters
+		for len(truncated) > 0 && truncated[len(truncated)-1] == ' ' {
+			truncated = truncated[:len(truncated)-1]
 		}
 
 		result = string(truncated)
 	}
 
-	// Trim trailing spaces that may have been left by the 64-rune truncation
-	result = strings.TrimRight(result, " ")
-
-	// Return fallback if result is now empty after trimming
+	// Apply empty-string fallback after cleanup
 	if result == "" {
 		return fallbackName
 	}
@@ -1152,7 +1162,7 @@ func inviteEmail(inviter, inviterID, to, code, publicBase string, scopes, bags [
 
 var inviteCodeRE = regexp.MustCompile(`^inv_[A-Za-z0-9_-]{16,64}$`)
 
-// acceptLanding answers an unauthenticated GET of the emailed link. It never
+// acceptLanding answers an unauthenticated GET of the accept_url landing page. It never
 // touches the invite (so mail scanners and previews cannot burn it).
 func (s *Server) acceptLanding(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")

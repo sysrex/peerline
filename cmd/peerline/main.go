@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/sysrex/peerline/internal/api"
+	"github.com/sysrex/peerline/internal/clock"
 	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/store"
 	"github.com/sysrex/peerline/internal/version"
@@ -149,12 +150,14 @@ func main() {
 	}
 
 	// Open database with explicit options
+	clk := clock.Real{}
 	opts := store.OpenOptions{
 		SkipMigrationBackup:  skipBackup,
 		BackupDir:            backupDir,
 		BackupRetentionCount: backupKeep,
 		BackupTimeout:        backupTimeout,
 		Logger:               log,
+		Clock:                clk,
 	}
 
 	st, err := store.OpenWithOptions(*dbPath, opts)
@@ -333,6 +336,7 @@ func main() {
 		EmailPerHour:          emailPerHour,
 		NotifyPerHour:         notifyPerHour,
 		TrustedProxies:        trustedProxies,
+		Clock:                 clk,
 		MaxOutstandingInvites: maxOutstandingInvites,
 		RetentionSeconds:      retentionSeconds,
 		AuthFailPerMinute:     authFailPerMinute,
