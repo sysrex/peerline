@@ -4328,10 +4328,10 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	var rateLimitLogs syncBuf
 	rateLimitLogger := slog.New(slog.NewJSONHandler(&rateLimitLogs, nil))
 	rateLimitSrv := newServer(t, Config{
-		Logger:          rateLimitLogger,
-		Mailer:          mailer.Log{Logger: rateLimitLogger},
-		EmailPerHour:    1,
-		EmailBurst:      1,
+		Logger:           rateLimitLogger,
+		Mailer:           mailer.Log{Logger: rateLimitLogger},
+		EmailPerHour:     1,
+		EmailBurst:       1,
 		EmailRcptPerHour: 10,
 	})
 	a3 := register(t, rateLimitSrv, "alice3")
