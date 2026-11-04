@@ -81,6 +81,27 @@ func describeTLSMode(smtp *mailer.SMTP) string {
 	return "STARTTLS required"
 }
 
+// buildTrustedProxyConfig extracts and validates trusted proxy configuration from environment.
+// It parses PEERLINE_TRUSTED_PROXIES and PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD, emits any
+// startup warnings, and returns the values to pass to api.Config. Called once from main.
+func buildTrustedProxyConfig(getenv func(string) string, log *slog.Logger) (proxies []string, allowBroad bool, err error) {
+	tp := getenv("PEERLINE_TRUSTED_PROXIES")
+	allowBroad, err = parseBoolStrict(getenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD"))
+	if err != nil {
+		return nil, false, fmt.Errorf("invalid PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD value: %w", err)
+	}
+
+	// Warn if opt-in is enabled but no proxies configured (P3 #1)
+	if allowBroad && tp == "" {
+		log.Warn("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled but PEERLINE_TRUSTED_PROXIES is unset; the opt-in has no effect")
+	}
+
+	if tp != "" {
+		proxies = strings.Split(tp, ",")
+	}
+	return proxies, allowBroad, nil
+}
+
 // describeSMTPMode returns the log level and message for SMTP startup logging.
 // Returns WARN for non-loopback non-implicit-TLS relays with plaintext allowed (invite codes unprotected in transit),
 // INFO otherwise.
@@ -233,15 +254,10 @@ func main() {
 	}
 
 	// Parse trusted proxy CIDRs and opt-in for broader IPv6
-	tp := os.Getenv("PEERLINE_TRUSTED_PROXIES")
-	allowBroadIPv6, err := parseBoolStrict(os.Getenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD"))
+	trustedProxies, allowBroadIPv6, err := buildTrustedProxyConfig(os.Getenv, log)
 	if err != nil {
-		log.Error("invalid PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD value", "err", err)
+		log.Error("trusted proxy config", "err", err)
 		os.Exit(1)
-	}
-	var trustedProxies []string
-	if tp != "" {
-		trustedProxies = strings.Split(tp, ",")
 	}
 
 	maxOutstandingInvites, _ := strconv.Atoi(os.Getenv("PEERLINE_MAX_OUTSTANDING_INVITES"))
