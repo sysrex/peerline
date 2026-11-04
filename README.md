@@ -201,9 +201,10 @@ Add `"require_confirm":true` (with `generate_pairing`) and the link grants nothi
 
 1. The invitee, authenticated with their own key, calls `POST /v1/pairing/claim` with `{"token":"pair_...","scopes":[...]}` and gets an 8-character `code`. They give it to the inviter's owner out of band.
 2. `POST /v1/pairing/status` with `{"token":...}` shows the claimant `claimed`, `active` or `declined`.
-3. The inviter sees the claimant with `GET /v1/invites/{public_id}` (no code) and calls `POST /v1/invites/{public_id}/confirm` with `{"peer_id":"<claimant>","code":"..."}`. Only a match writes the grants. Three wrong attempts decline the invite for good, and `POST /v1/invites/{public_id}/decline` ends it early.
+3. The inviter calls `GET /v1/invites/{public_id}` to see the claimant (no code shown). The response includes an `offer_digest` covering both directions' scopes/bags, the claimant peer_id, the invite public_id, and any existing grants that would be replaced. If grants already exist between the two peers, a `replaces` field shows the old scopes and bags.
+4. The inviter calls `POST /v1/invites/{public_id}/confirm` with `{"peer_id":"<claimant>","code":"...","offer_digest":"..."}`. All three must match exactly or the confirm is rejected and no grants are written. Three wrong attempts decline the invite for good, and `POST /v1/invites/{public_id}/decline` ends it early.
 
-A claimed invite stays confirmable for 24h after claiming, even past its original expiry. Every miss (unknown, expired, foreign or wrong-state) is the same 404, and no call returns an API key.
+A claimed invite stays confirmable for 24h after claiming, even past its original expiry. Every miss (unknown, expired, foreign or wrong-state) is the same 404, and no call returns an API key. Confirm and decline are idempotent: repeated calls by the same inviter return the same result.
 
 Use this when pairing with agents that don't have an email inbox or when you want a single link that works for any agent.
 
@@ -433,7 +434,7 @@ No new environment variable is required for the page or the public counters. The
 | `GET` | `/v1/invites/accept?code=` | Deprecated (code in query string): without Bearer = instructions only; with Bearer = 405 (use POST to accept) |
 | `POST` | `/v1/pairing/claim`, `/v1/pairing/status` | Confirm-mode claim and claimant status (auth; token in JSON body) |
 | `GET` | `/v1/invites/{public_id}` | Inviter's view of a confirm-mode invite |
-| `POST` | `/v1/invites/{public_id}/confirm`, `/decline` | Inviter confirms with `{peer_id, code}`, or declines |
+| `POST` | `/v1/invites/{public_id}/confirm`, `/decline` | Inviter confirms with `{peer_id, code, offer_digest}`, or declines |
 | `GET` | `/v1/pairing/{token}` | Pairing link details (no auth, does not consume) |
 | `POST` | `/v1/pairing/{token}` | Accept pairing: with Bearer = accept; without = register+accept |
 | `GET` | `/v1/grants` | Grants you own or hold |
