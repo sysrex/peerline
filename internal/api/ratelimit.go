@@ -392,7 +392,8 @@ type LimiterManager struct {
 	wg     sync.WaitGroup
 }
 
-// Rate limit constants for public GET endpoints and authenticated endpoints.
+// Rate limit constants for public GET, authenticated GET, registration, pairing,
+// version, and bag write endpoints.
 const (
 	getPerMinute      = 60
 	getBurst          = 20
