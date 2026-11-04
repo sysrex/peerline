@@ -225,10 +225,10 @@ func TestConfirmWithStaleDigestDoesNotDeadlock(t *testing.T) {
 
 	// Confirm with a wrong (well-formed) digest under a 2 second timeout
 	wrongDigest := "0000000000000000000000000000000000000000000000000000000000000000"
-	
+
 	// Create a client with timeout to ensure regression would fail fast
 	timeoutClient := &http.Client{Timeout: 2 * time.Second}
-	
+
 	body, _ := json.Marshal(map[string]string{
 		"peer_id":      claimant.id,
 		"code":         cl.Code,
@@ -237,11 +237,11 @@ func TestConfirmWithStaleDigestDoesNotDeadlock(t *testing.T) {
 	req, _ := http.NewRequest("POST", srv.URL+"/v1/invites/"+pub+"/confirm", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+inviter.key)
 	req.Header.Set("Content-Type", "application/json")
-	
+
 	start := time.Now()
 	resp, err := timeoutClient.Do(req)
 	elapsed := time.Since(start)
-	
+
 	if err != nil {
 		t.Fatalf("stale digest confirm failed: %v (elapsed %v)", err, elapsed)
 	}
@@ -252,7 +252,7 @@ func TestConfirmWithStaleDigestDoesNotDeadlock(t *testing.T) {
 	if resp.StatusCode != 409 {
 		t.Fatalf("stale digest: got %d, want 409: %s", resp.StatusCode, b)
 	}
-	
+
 	var staleResponse struct {
 		OfferDigest string                 `json:"offer_digest"`
 		Offer       map[string]interface{} `json:"offer"`
