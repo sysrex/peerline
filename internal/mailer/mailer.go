@@ -137,11 +137,18 @@ func FromEnv(lg *slog.Logger) (Sender, error) {
 		return Log{Logger: lg, LogFullBody: logBody}, nil
 	}
 	if strings.Contains(host, "[") || strings.Contains(host, "]") {
-		suggested := strings.Trim(host, "[]")
-		if suggested == "" {
-			suggested = "a valid hostname or IP"
+		var suggested string
+		// Try to parse as [host]:port
+		if bareHost, port, err := net.SplitHostPort(host); err == nil {
+			suggested = fmt.Sprintf("use %s with PEERLINE_SMTP_PORT=%s", bareHost, port)
+		} else if len(host) > 2 && host[0] == '[' && host[len(host)-1] == ']' {
+			// Exactly [addr] format
+			suggested = fmt.Sprintf("use %s", host[1:len(host)-1])
+		} else {
+			// Malformed brackets
+			suggested = "use a valid hostname or IP"
 		}
-		return nil, fmt.Errorf("PEERLINE_SMTP_HOST: bracketed address %q not allowed (use %s)", host, suggested)
+		return nil, fmt.Errorf("PEERLINE_SMTP_HOST: bracketed address %q not allowed (%s)", host, suggested)
 	}
 	// Reject IPv6 zone IDs (e.g. fe80::1%eth0)
 	if strings.Contains(host, "%") {

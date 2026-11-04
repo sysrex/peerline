@@ -187,15 +187,17 @@ func TestFromEnv(t *testing.T) {
 
 func TestFromEnvRejectsBracketedHosts(t *testing.T) {
 	tests := []struct {
-		name            string
-		host            string
-		wantErrContains string
+		name               string
+		host               string
+		wantSuggestedValue string
 	}{
-		{"[::1]", "[::1]", "bracketed"},
-		{"[::1", "[::1", "bracketed"},
-		{"::1]", "::1]", "bracketed"},
-		{"[]", "[]", "a valid hostname or IP"},
-		{"[::1]:25", "[::1]:25", "bracketed"},
+		{"[::1]:25", "[::1]:25", "use ::1 with PEERLINE_SMTP_PORT=25"},
+		{"[::1]", "[::1]", "use ::1"},
+		{"[::1", "[::1", "use a valid hostname or IP"},
+		{"::1]", "::1]", "use a valid hostname or IP"},
+		{"[]", "[]", "use a valid hostname or IP"},
+		{"[127.0.0.1]:587", "[127.0.0.1]:587", "use 127.0.0.1 with PEERLINE_SMTP_PORT=587"},
+		{"[127.0.0.1]", "[127.0.0.1]", "use 127.0.0.1"},
 	}
 
 	for _, tt := range tests {
@@ -206,8 +208,20 @@ func TestFromEnvRejectsBracketedHosts(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected error for host %q, got nil", tt.host)
 			}
-			if !strings.Contains(err.Error(), tt.wantErrContains) {
-				t.Fatalf("error %q should contain %q", err.Error(), tt.wantErrContains)
+			if !strings.Contains(err.Error(), "bracketed") {
+				t.Fatalf("error %q should mention 'bracketed'", err.Error())
+			}
+			if !strings.Contains(err.Error(), tt.wantSuggestedValue) {
+				t.Fatalf("error %q should contain suggestion %q", err.Error(), tt.wantSuggestedValue)
+			}
+			// Verify no error message suggests a value containing brackets
+			if strings.Contains(err.Error(), "[") && !strings.Contains(err.Error(), tt.host) {
+				// The error contains the input host (which has brackets), that's ok
+				// But if there are OTHER brackets (in the suggestion), that's bad
+				errWithoutInput := strings.ReplaceAll(err.Error(), tt.host, "")
+				if strings.Contains(errWithoutInput, "[") || strings.Contains(errWithoutInput, "]") {
+					t.Fatalf("error suggests a value with brackets: %q", err.Error())
+				}
 			}
 		})
 	}
@@ -215,15 +229,16 @@ func TestFromEnvRejectsBracketedHosts(t *testing.T) {
 
 func TestFromEnvRejectsHostWithPort(t *testing.T) {
 	tests := []struct {
-		name            string
-		host            string
-		wantErrContains []string
+		name               string
+		host               string
+		wantErrContains    []string
+		wantSuggestedValue string
 	}{
-		{"host:port", "mail.example.com:587", []string{"mail.example.com", "PEERLINE_SMTP_PORT"}},
-		{"host", "host:25", []string{"host", "PEERLINE_SMTP_PORT=25"}},
-		{"[::1]:25", "[::1]:25", []string{"bracketed"}},
-		{"[::1]", "[::1]", []string{"bracketed"}},
-		{"::1", "::1", nil}, // plain IPv6 is ok
+		{"host:port", "mail.example.com:587", []string{"mail.example.com", "PEERLINE_SMTP_PORT"}, "use mail.example.com with PEERLINE_SMTP_PORT=587"},
+		{"host", "host:25", []string{"host", "PEERLINE_SMTP_PORT=25"}, "use host with PEERLINE_SMTP_PORT=25"},
+		{"[::1]:25", "[::1]:25", []string{"bracketed"}, "use ::1 with PEERLINE_SMTP_PORT=25"},
+		{"[::1]", "[::1]", []string{"bracketed"}, "use ::1"},
+		{"::1", "::1", nil, ""}, // plain IPv6 is ok
 	}
 
 	for _, tt := range tests {
@@ -243,6 +258,16 @@ func TestFromEnvRejectsHostWithPort(t *testing.T) {
 			for _, want := range tt.wantErrContains {
 				if !strings.Contains(err.Error(), want) {
 					t.Fatalf("error %q should contain %q", err.Error(), want)
+				}
+			}
+			if tt.wantSuggestedValue != "" && !strings.Contains(err.Error(), tt.wantSuggestedValue) {
+				t.Fatalf("error %q should contain full suggestion %q", err.Error(), tt.wantSuggestedValue)
+			}
+			// Verify no error message suggests a value containing brackets
+			if strings.Contains(err.Error(), "[") || strings.Contains(err.Error(), "]") {
+				errWithoutInput := strings.ReplaceAll(err.Error(), tt.host, "")
+				if strings.Contains(errWithoutInput, "[") || strings.Contains(errWithoutInput, "]") {
+					t.Fatalf("error suggests a value with brackets: %q", err.Error())
 				}
 			}
 		})
