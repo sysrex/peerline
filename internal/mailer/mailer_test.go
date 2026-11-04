@@ -1850,3 +1850,37 @@ func TestIsLoopbackAddr(t *testing.T) {
 		}
 	}
 }
+
+// TestLogFullBodyDefault verifies that FromEnv defaults to LogFullBody == false
+// when PEERLINE_DEV_LOG_EMAIL_BODY is unset (issue #303).
+func TestLogFullBodyDefault(t *testing.T) {
+	// Clear PEERLINE_SMTP_HOST and PEERLINE_DEV_LOG_EMAIL_BODY to get Log sender with default
+	t.Setenv("PEERLINE_SMTP_HOST", "")
+	t.Setenv("PEERLINE_DEV_LOG_EMAIL_BODY", "")
+
+	sender, err := FromEnv(nil)
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	log, ok := sender.(Log)
+	if !ok {
+		t.Fatalf("FromEnv with no SMTP_HOST should return Log, got %T", sender)
+	}
+	if log.LogFullBody {
+		t.Error("LogFullBody should be false by default, got true")
+	}
+
+	// Verify that setting PEERLINE_DEV_LOG_EMAIL_BODY=1 enables LogFullBody
+	t.Setenv("PEERLINE_DEV_LOG_EMAIL_BODY", "1")
+	sender, err = FromEnv(nil)
+	if err != nil {
+		t.Fatalf("FromEnv with DEV_LOG_EMAIL_BODY=1: %v", err)
+	}
+	log, ok = sender.(Log)
+	if !ok {
+		t.Fatalf("FromEnv should return Log, got %T", sender)
+	}
+	if !log.LogFullBody {
+		t.Error("LogFullBody should be true with PEERLINE_DEV_LOG_EMAIL_BODY=1, got false")
+	}
+}

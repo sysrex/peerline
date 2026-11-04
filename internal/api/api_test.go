@@ -4203,7 +4203,7 @@ func TestInviteAcceptGETWithScopesReturns405(t *testing.T) {
 }
 
 // TestInviteAcceptPathsNeverLogCode verifies that invite codes never appear in
-// logs across all accept paths, including success, error, and failure cases (issue #28, #146, #174).
+// logs across all accept paths, including success, error, and failure cases (issue #28, #146, #174, #303).
 // This test captures only the slog logger; there is no http.Server.ErrorLog or access-log middleware today.
 func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	var logs syncBuf
@@ -4296,7 +4296,64 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	resp, body = c.do("POST", "/v1/invites/accept?code="+inv3.Code, map[string]any{"code": inv4.Code}, nil)
 	want(t, resp, body, 400)
 
-	// Positive control: assert logs captured expected events
+	// 10. Invalid to_email (rejected before code generation)
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "not-an-email"}, nil)
+	want(t, resp, body, 400)
+
+	// 11. Send-failure path with failMailer
+	// Create a separate server with a mailer that fails without embedding sensitive data
+	var failLogs syncBuf
+	failLogger := slog.New(slog.NewJSONHandler(&failLogs, nil))
+	failSrv := newServer(t, Config{Logger: failLogger, Mailer: failMailer{}})
+	a2 := register(t, failSrv, "alice2")
+	resp, body = a2.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "fail@example.com"}, nil)
+	want(t, resp, body, 201)
+	var inv6 struct{ Code string }
+	if err := json.Unmarshal(body, &inv6); err != nil || inv6.Code == "" {
+		t.Fatalf("inv6: %v %s", err, body)
+	}
+	failLogStr := failLogs.String()
+	if !strings.Contains(failLogStr, "invite email failed") {
+		t.Error("send-failure logs should contain 'invite email failed'")
+	}
+	if strings.Contains(failLogStr, inv6.Code) {
+		t.Error("send-failure: invite code [6] found in logs")
+	}
+	if len(inv6.Code) >= 10 && strings.Contains(failLogStr, inv6.Code[:10]) {
+		t.Error("send-failure: invite code prefix [6] found in logs")
+	}
+
+	// 12. Mail rate-limit (429) path
+	// Create a server with tight email rate limits to trigger 429
+	var rateLimitLogs syncBuf
+	rateLimitLogger := slog.New(slog.NewJSONHandler(&rateLimitLogs, nil))
+	rateLimitSrv := newServer(t, Config{
+		Logger:          rateLimitLogger,
+		Mailer:          mailer.Log{Logger: rateLimitLogger},
+		EmailPerHour:    1,
+		EmailBurst:      1,
+		EmailRcptPerHour: 10,
+	})
+	a3 := register(t, rateLimitSrv, "alice3")
+	// First invite succeeds
+	resp, body = a3.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "first@example.com"}, nil)
+	want(t, resp, body, 201)
+	var inv7 struct{ Code string }
+	if err := json.Unmarshal(body, &inv7); err != nil || inv7.Code == "" {
+		t.Fatalf("inv7: %v %s", err, body)
+	}
+	// Second invite hits rate limit (code is created but then deleted)
+	resp, body = a3.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "second@example.com"}, nil)
+	want(t, resp, body, 429)
+	rateLimitLogStr := rateLimitLogs.String()
+	if strings.Contains(rateLimitLogStr, inv7.Code) {
+		t.Error("rate-limit: first invite code found in logs")
+	}
+	if len(inv7.Code) >= 10 && strings.Contains(rateLimitLogStr, inv7.Code[:10]) {
+		t.Error("rate-limit: first invite code prefix found in logs")
+	}
+
+	// Positive control: assert logs captured expected events and plant a code to show detector fires
 	logStr := logs.String()
 	if !strings.Contains(logStr, "pairing accepted") {
 		t.Error("logs should contain 'pairing accepted' (positive control)")
@@ -4304,18 +4361,34 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	if !strings.Contains(logStr, "peer registered") {
 		t.Error("logs should contain 'peer registered' (positive control)")
 	}
+	// Tighten positive control: body_len should appear with status=logged on invite email line
+	if !strings.Contains(logStr, "invite email") || !strings.Contains(logStr, "status") {
+		t.Error("logs should contain 'invite email' with 'status' (positive control)")
+	}
 	if !strings.Contains(logStr, "body_len") {
 		t.Error("logs should contain mailer 'body_len' (positive control for to_email path)")
 	}
+	// Plant a code in logs to verify the detector fires
+	plantedCode := auth.NewSecret("inv_")
+	logger.Info("test planted code", "code", plantedCode)
+	logStr = logs.String()
+	if !strings.Contains(logStr, plantedCode) {
+		t.Error("positive control: planted code not found in logs (detector broken)")
+	}
 
 	// Check logs don't contain any of the codes or their prefixes
-	for _, code := range []string{inv1.Code, inv2.Code, inv3.Code, inv4.Code, inv5.Code, unknownCode} {
+	// Note: inv6 and inv7 are checked separately above in their respective server logs
+	for i, code := range []string{inv1.Code, inv2.Code, inv3.Code, inv4.Code, inv5.Code, unknownCode} {
 		if strings.Contains(logStr, code) {
-			t.Errorf("invite code %s found in logs", code)
+			t.Errorf("invite code [%d] found in logs", i)
 		}
 		if len(code) >= 10 && strings.Contains(logStr, code[:10]) {
-			t.Errorf("invite code prefix %s found in logs", code[:10])
+			t.Errorf("invite code prefix [%d] found in logs", i)
 		}
+	}
+	// Planted code should be detected (negative assertion: we expect it to be there)
+	if !strings.Contains(logStr, plantedCode) {
+		t.Error("positive control failed: planted code should be in logs but was not detected")
 	}
 }
 
@@ -4512,7 +4585,7 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 		if rsp.StatusCode != 405 {
 			t.Errorf("%s: want 405, got %d", method, rsp.StatusCode)
 		}
-		// Allow header includes DELETE because DELETE /v1/invites/{public_id} also matches
+		// Allow header includes DELETE because DELETE /v1/invites/{id} also matches
 		// the literal path segment "accept", and ServeMux lists all methods registered on that pattern.
 		if got := rsp.Header.Get("Allow"); got != "DELETE, POST" {
 			t.Errorf("%s: Allow = %q, want DELETE, POST", method, got)
