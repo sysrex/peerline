@@ -1400,6 +1400,47 @@ func TestSMTPProbe(t *testing.T) {
 		}
 	})
 
+	t.Run("STARTTLS valid cert under untrusted root = fatal", func(t *testing.T) {
+		// #335 item 2 and Architect P3: a currently valid but untrusted (self-signed) cert.
+		// This should be fatal (UnknownAuthorityError), not ErrRelayUnreachable.
+		cert := genTestCert(t, "localhost")
+		srv := newFakeServer(t, true, &cert)
+		defer srv.close()
+
+		// Don't trust it - use empty RootCAs pool
+		s := &SMTP{
+			Host:      "127.0.0.1",
+			Port:      srv.port(),
+			Timeout:   2 * time.Second,
+			TLSConfig: &tls.Config{RootCAs: x509.NewCertPool(), ServerName: "localhost"},
+		}
+		err := s.Probe(context.Background())
+		if err == nil {
+			t.Fatal("probe should fail on untrusted cert")
+		}
+		// Should be fatal, not ErrRelayUnreachable
+		if errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("untrusted cert should be fatal, not ErrRelayUnreachable: %v", err)
+		}
+		// Positive control: assert STARTTLS was attempted
+		cmds := srv.receivedCommands()
+		hasSTARTTLS := false
+		for _, cmd := range cmds {
+			if cmd == "STARTTLS" {
+				hasSTARTTLS = true
+				break
+			}
+		}
+		if !hasSTARTTLS {
+			t.Fatalf("STARTTLS not attempted: %v", cmds)
+		}
+		// Assert the error is an x509 UnknownAuthorityError
+		var x509Unknown x509.UnknownAuthorityError
+		if !errors.As(err, &x509Unknown) {
+			t.Fatalf("error should be x509.UnknownAuthorityError, got: %T %v", err, err)
+		}
+	})
+
 	t.Run("STARTTLS expired+untrusted-CA = fatal", func(t *testing.T) {
 		cert := genExpiredTestCert(t, "localhost")
 		srv := newFakeServer(t, true, &cert)
