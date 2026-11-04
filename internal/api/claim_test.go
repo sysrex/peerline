@@ -314,8 +314,22 @@ func TestConfirmRequiresOfferDigest(t *testing.T) {
 		t.Fatalf("claim failed: %d", st)
 	}
 
+	// Old clients: missing offer_digest gets actionable 400
+	resp, b := e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm",
+		map[string]string{"peer_id": e.real.id, "code": code}, nil)
+	if resp.StatusCode != 400 {
+		t.Errorf("missing offer_digest: got %d, want 400", resp.StatusCode)
+	}
+	body := string(b)
+	if !strings.Contains(body, "offer_digest required") {
+		t.Errorf("missing offer_digest error should mention field, got: %s", body)
+	}
+	if !strings.Contains(body, "GET /v1/invites/") {
+		t.Errorf("missing offer_digest error should point to GET endpoint, got: %s", body)
+	}
+
 	// Get the inviter view to see the offer_digest
-	resp, b := e.inviter.do("GET", "/v1/invites/"+e.pub, nil, nil)
+	resp, b = e.inviter.do("GET", "/v1/invites/"+e.pub, nil, nil)
 	want(t, resp, b, 200)
 
 	var view map[string]any

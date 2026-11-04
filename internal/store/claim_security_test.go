@@ -264,72 +264,265 @@ func TestDoubleDeclineIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestConcurrentConfirmDeclineRevokeExpiry verifies that concurrent operations
+// TestConcurrentConfirmDecline verifies that concurrent confirm and decline operations
 // produce exactly one terminal state and the state-guarded UPDATE prevents races (#80, requirement 4).
-func TestConcurrentConfirmDeclineRevokeExpiry(t *testing.T) {
+func TestConcurrentConfirmDecline(t *testing.T) {
 	const iterations = 50
 
-	// Test confirm vs decline - the key safety property is that only one succeeds
-	t.Run("confirm_vs_decline", func(t *testing.T) {
-		for i := 0; i < iterations; i++ {
-			s := claimStore(t)
-			ctx := context.Background()
-			exp := time.Unix(claimNow+3600, 0)
+	for i := 0; i < iterations; i++ {
+		// Use a file-backed DB so we can open it with two Store instances
+		dbPath := t.TempDir() + "/test.db"
 
-			if err := s.CreateInviteWithPairing(ctx, "code", "pair", "alice", []string{"messages"}, nil, exp); err != nil {
+		// First store creates the invite
+		s1, err := Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s1.now = func() int64 { return claimNow }
+		ctx := context.Background()
+		for _, id := range []string{"alice", "bob"} {
+			if err := s1.CreatePeer(ctx, id, id, "h"+id, "", ""); err != nil {
 				t.Fatal(err)
-			}
-			s.mustExec(t, `UPDATE invites SET require_confirm=1, nonce=x'abcd'`)
-			c, err := s.ClaimByToken(ctx, "pair", "bob", []byte{0xab, 0xcd}, []string{"messages"}, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			// Start barrier
-			start := make(chan struct{})
-			confirmDone := make(chan error, 1)
-			declineDone := make(chan error, 1)
-
-			// Launch both operations
-			go func() {
-				<-start
-				_, _, err := s.ConfirmClaim(ctx, c.PublicID, "alice", 3, func(cl *Claim) (CheckResult, *Claim) {
-					if cl.Claimant == "bob" {
-						return CheckOK, nil
-					}
-					return CheckPeerIDFail, nil
-				})
-				confirmDone <- err
-			}()
-			go func() {
-				<-start
-				declineDone <- s.DeclineClaim(ctx, c.PublicID, "alice")
-			}()
-
-			// Release both
-			close(start)
-
-			confirmErr := <-confirmDone
-			declineErr := <-declineDone
-
-			// At least one must succeed, and they can't both succeed
-			if confirmErr != nil && declineErr != nil {
-				t.Errorf("both operations failed: confirm=%v decline=%v", confirmErr, declineErr)
-			}
-			if confirmErr == nil && declineErr == nil {
-				t.Error("both confirm and decline succeeded")
-			}
-
-			// Check the final state is consistent
-			var state sql.NullString
-			var declinedAt sql.NullInt64
-			s.db.QueryRow(`SELECT used_by, declined_at FROM invites WHERE public_id=?`, c.PublicID).Scan(&state, &declinedAt)
-
-			if state.Valid && declinedAt.Valid {
-				t.Error("invite is both active and declined")
 			}
 		}
+
+		exp := time.Unix(claimNow+3600, 0)
+		if err := s1.CreateInviteWithPairing(ctx, "code", "pair", "alice", []string{"messages"}, nil, exp); err != nil {
+			t.Fatal(err)
+		}
+		s1.mustExec(t, `UPDATE invites SET require_confirm=1, nonce=x'abcd'`)
+		c, err := s1.ClaimByToken(ctx, "pair", "bob", []byte{0xab, 0xcd}, []string{"messages"}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		publicID := c.PublicID
+		s1.Close()
+
+		// Open two separate Store instances on the same DB file (simulates two replicas/processes)
+		s1, err = Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s1.now = func() int64 { return claimNow }
+		defer s1.Close()
+
+		s2, err := Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s2.now = func() int64 { return claimNow }
+		defer s2.Close()
+
+		// Start barrier
+		start := make(chan struct{})
+		confirmDone := make(chan error, 1)
+		declineDone := make(chan error, 1)
+
+		// Launch both operations on separate Store instances
+		go func() {
+			<-start
+			_, _, err := s1.ConfirmClaim(ctx, publicID, "alice", 3, func(cl *Claim) (CheckResult, *Claim) {
+				if cl.Claimant == "bob" {
+					return CheckOK, nil
+				}
+				return CheckPeerIDFail, nil
+			})
+			confirmDone <- err
+		}()
+		go func() {
+			<-start
+			declineDone <- s2.DeclineClaim(ctx, publicID, "alice")
+		}()
+
+		// Release both
+		close(start)
+
+		confirmErr := <-confirmDone
+		declineErr := <-declineDone
+
+		// At least one must succeed, and they can't both succeed
+		if confirmErr != nil && declineErr != nil {
+			t.Errorf("iteration %d: both operations failed: confirm=%v decline=%v", i, confirmErr, declineErr)
+		}
+		if confirmErr == nil && declineErr == nil {
+			t.Errorf("iteration %d: both confirm and decline succeeded", i)
+		}
+
+		// Check the final state is consistent
+		var usedBy sql.NullString
+		var declinedAt sql.NullInt64
+		if err := s1.db.QueryRow(`SELECT used_by, declined_at FROM invites WHERE public_id=?`, publicID).Scan(&usedBy, &declinedAt); err != nil {
+			t.Fatalf("iteration %d: failed to query final state: %v", i, err)
+		}
+
+		if usedBy.Valid && declinedAt.Valid {
+			t.Errorf("iteration %d: invite is both active and declined", i)
+		}
+
+		// Check grant count matches state
+		var grantCount int
+		if err := s1.db.QueryRow(`SELECT COUNT(*) FROM grants WHERE (owner='alice' AND grantee='bob') OR (owner='bob' AND grantee='alice')`).Scan(&grantCount); err != nil {
+			t.Fatalf("iteration %d: failed to count grants: %v", i, err)
+		}
+
+		if usedBy.Valid && !declinedAt.Valid {
+			// Active: should have 2 grants
+			if grantCount != 2 {
+				t.Errorf("iteration %d: active but %d grants, want 2", i, grantCount)
+			}
+		} else {
+			// Declined or still claimed: should have 0 grants
+			if grantCount != 0 {
+				t.Errorf("iteration %d: not active but %d grants, want 0", i, grantCount)
+			}
+		}
+	}
+}
+
+// TestConcurrentConfirmRevoke verifies that concurrent confirm and revoke produce exactly one outcome.
+func TestConcurrentConfirmRevoke(t *testing.T) {
+	const iterations = 50
+
+	for i := 0; i < iterations; i++ {
+		dbPath := t.TempDir() + "/test.db"
+
+		s1, err := Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s1.now = func() int64 { return claimNow }
+		ctx := context.Background()
+		for _, id := range []string{"alice", "bob"} {
+			if err := s1.CreatePeer(ctx, id, id, "h"+id, "", ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		exp := time.Unix(claimNow+3600, 0)
+		if err := s1.CreateInviteWithPairing(ctx, "code", "pair", "alice", []string{"messages"}, nil, exp); err != nil {
+			t.Fatal(err)
+		}
+		s1.mustExec(t, `UPDATE invites SET require_confirm=1, nonce=x'abcd'`)
+		c, err := s1.ClaimByToken(ctx, "pair", "bob", []byte{0xab, 0xcd}, []string{"messages"}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		publicID := c.PublicID
+		s1.Close()
+
+		s1, err = Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s1.now = func() int64 { return claimNow }
+		defer s1.Close()
+
+		s2, err := Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s2.now = func() int64 { return claimNow }
+		defer s2.Close()
+
+		start := make(chan struct{})
+		confirmDone := make(chan error, 1)
+		revokeDone := make(chan error, 1)
+
+		go func() {
+			<-start
+			_, _, err := s1.ConfirmClaim(ctx, publicID, "alice", 3, func(cl *Claim) (CheckResult, *Claim) {
+				if cl.Claimant == "bob" {
+					return CheckOK, nil
+				}
+				return CheckPeerIDFail, nil
+			})
+			confirmDone <- err
+		}()
+		go func() {
+			<-start
+			_, err := s2.db.ExecContext(ctx, `DELETE FROM invites WHERE public_id=? AND used_by IS NULL`, publicID)
+			revokeDone <- err
+		}()
+
+		close(start)
+
+		confirmErr := <-confirmDone
+		revokeErr := <-revokeDone
+
+		if revokeErr != nil {
+			t.Fatalf("iteration %d: revoke failed: %v", i, revokeErr)
+		}
+
+		// Check final state
+		var exists int
+		err = s1.db.QueryRow(`SELECT COUNT(*) FROM invites WHERE public_id=?`, publicID).Scan(&exists)
+		if err != nil {
+			t.Fatalf("iteration %d: failed to check existence: %v", i, err)
+		}
+
+		var grantCount int
+		if err := s1.db.QueryRow(`SELECT COUNT(*) FROM grants WHERE (owner='alice' AND grantee='bob') OR (owner='bob' AND grantee='alice')`).Scan(&grantCount); err != nil {
+			t.Fatalf("iteration %d: failed to count grants: %v", i, err)
+		}
+
+		if exists == 0 {
+			// Revoke won
+			if confirmErr == nil {
+				t.Errorf("iteration %d: invite deleted but confirm succeeded", i)
+			}
+			if grantCount != 0 {
+				t.Errorf("iteration %d: invite deleted but %d grants exist", i, grantCount)
+			}
+		} else {
+			// Confirm won
+			if confirmErr != nil {
+				t.Errorf("iteration %d: invite exists but confirm failed: %v", i, confirmErr)
+			}
+			if grantCount != 2 {
+				t.Errorf("iteration %d: invite exists but %d grants, want 2", i, grantCount)
+			}
+		}
+	}
+}
+
+// TestConfirmAfterExpiry verifies that confirm fails after confirm_by passes.
+func TestConfirmAfterExpiry(t *testing.T) {
+	s := claimStore(t)
+	ctx := context.Background()
+
+	// Create invite
+	exp := time.Unix(claimNow+3600, 0)
+	if err := s.CreateInviteWithPairing(ctx, "code", "pair", "alice", []string{"messages"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+	s.mustExec(t, `UPDATE invites SET require_confirm=1, nonce=x'abcd'`)
+	c, err := s.ClaimByToken(ctx, "pair", "bob", []byte{0xab, 0xcd}, []string{"messages"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Advance time past confirm_by (which is set to now() + 24h at claim time)
+	s.now = func() int64 { return claimNow + 86400 + 100 }
+
+	// Confirm should fail
+	_, _, err = s.ConfirmClaim(ctx, c.PublicID, "alice", 3, func(cl *Claim) (CheckResult, *Claim) {
+		if cl.Claimant == "bob" {
+			return CheckOK, nil
+		}
+		return CheckPeerIDFail, nil
 	})
+	if err != ErrNotFound {
+		t.Errorf("confirm after expiry: got %v, want ErrNotFound", err)
+	}
+
+	// Verify no grants written
+	var grantCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM grants`).Scan(&grantCount); err != nil {
+		t.Fatal(err)
+	}
+	if grantCount != 0 {
+		t.Errorf("confirm after expiry wrote %d grants", grantCount)
+	}
 }
 
 // TestNoApiKeyInResponse verifies that no response contains api_key (#80, requirement 4).
