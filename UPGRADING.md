@@ -5,6 +5,7 @@ This document describes how to safely upgrade Peerline across versions, with a f
 ## Table of Contents
 
 - [General Upgrade Process](#general-upgrade-process)
+- [Breaking Changes](#breaking-changes)
 - [Schema Migrations and Backups](#schema-migrations-and-backups)
 - [Backup Files](#backup-files)
 - [Rolling Deployments](#rolling-deployments)
@@ -20,6 +21,58 @@ This document describes how to safely upgrade Peerline across versions, with a f
 4. **Start the service** – schema migrations run automatically on the first Open()
 
 For zero-downtime deployments, see [Rolling Deployments](#rolling-deployments).
+
+## Breaking Changes
+
+### Confirm API requires offer_digest (Security Fix for #80)
+
+**Affected versions:** All versions upgrading to include the #80 fix
+
+**Impact:** The `POST /v1/invites/{public_id}/confirm` endpoint now requires an `offer_digest` parameter in the request body.
+
+**What changed:**
+- Old request: `{"peer_id": "...", "code": "..."}`
+- New request: `{"peer_id": "...", "code": "...", "offer_digest": "..."}`
+
+**Error if not updated:**
+```json
+{
+  "error": "offer_digest required: GET /v1/invites/{public_id} and echo offer_digest"
+}
+```
+
+**How to update your client:**
+
+1. Call `GET /v1/invites/{public_id}` to get the current state
+2. Extract the `offer_digest` from the response
+3. Include it in your confirm request
+
+Example:
+```bash
+# Step 1: Get the invite view
+VIEW=$(curl -H "Authorization: Bearer $KEY" \
+  https://peerline.example.com/v1/invites/$PUBLIC_ID)
+
+# Step 2: Extract offer_digest
+DIGEST=$(echo "$VIEW" | jq -r '.offer_digest')
+
+# Step 3: Confirm with digest
+curl -X POST -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  https://peerline.example.com/v1/invites/$PUBLIC_ID/confirm \
+  -d "{\"peer_id\":\"$CLAIMANT\",\"code\":\"$CODE\",\"offer_digest\":\"$DIGEST\"}"
+```
+
+**Why this change:** The `offer_digest` binds the confirm operation to exactly what the inviter reviewed, including:
+- Scopes and bags in both directions
+- The claimant's peer_id
+- Any existing grants being replaced
+
+This prevents time-of-check-time-of-use vulnerabilities and silent grant overwrites in confirm-mode invites (`require_confirm: true`).
+
+**Note:** A stale `offer_digest` (if the offer changed between GET and confirm) returns HTTP 409 with the fresh digest, and does not count toward the 3-strike auto-decline limit. Only code or peer_id mismatches count toward auto-decline.
+
+**Important:** This overwrite prevention applies only to confirm-mode invites. Legacy pairing paths (`POST /v1/pairing/{token}` with invite codes or pairing links) still silently overwrite existing grants between the two peers. See [issue #312](https://github.com/sysrex/peerline/issues/312) for details. For controlled re-pairing with review, use confirm-mode invites.
 
 ## Schema Migrations and Backups
 
