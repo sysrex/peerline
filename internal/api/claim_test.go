@@ -71,7 +71,17 @@ func (f *fakeClaims) ConfirmClaim(_ context.Context, pub, who string, max int, c
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	c := f.byPub(pub)
-	if c == nil || c.Inviter != who || c.State != claimStateClaimed {
+	if c == nil || c.Inviter != who {
+		return "", store.ErrNotFound
+	}
+	// Idempotent: already active
+	if c.State == claimStateActive {
+		if check(cp(c)) {
+			return claimStateActive, nil
+		}
+		return "", store.ErrNotFound
+	}
+	if c.State != claimStateClaimed {
 		return "", store.ErrNotFound
 	}
 	if check(cp(c)) {
@@ -88,11 +98,19 @@ func (f *fakeClaims) ConfirmClaim(_ context.Context, pub, who string, max int, c
 func (f *fakeClaims) DeclineClaim(_ context.Context, pub, who string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if c := f.byPub(pub); c != nil && c.Inviter == who && c.State != claimStateActive {
-		c.State = claimStateDeclined
+	c := f.byPub(pub)
+	if c == nil || c.Inviter != who {
+		return store.ErrNotFound
+	}
+	// Idempotent: already declined
+	if c.State == claimStateDeclined {
 		return nil
 	}
-	return store.ErrNotFound
+	if c.State == claimStateActive {
+		return store.ErrNotFound
+	}
+	c.State = claimStateDeclined
+	return nil
 }
 
 type claimEnv struct {
@@ -147,19 +165,27 @@ func TestClaimThiefCodeRejectedAndInviterViewHidesCode(t *testing.T) {
 	if strings.Contains(string(b), thiefCode) || strings.Contains(string(b), `"code"`) || !strings.Contains(string(b), e.thief.id) {
 		t.Fatalf("inviter view: %s", b)
 	}
-	for _, in := range []map[string]string{{"peer_id": e.real.id, "code": thiefCode}, {"peer_id": e.thief.id}} {
+	// Get offer digest for the thief's claim
+	var view map[string]any
+	json.Unmarshal(b, &view)
+	digest, ok := view["offer_digest"].(string)
+	if !ok || digest == "" {
+		t.Fatal("offer_digest missing")
+	}
+	
+	for _, in := range []map[string]string{{"peer_id": e.real.id, "code": thiefCode, "offer_digest": digest}, {"peer_id": e.thief.id, "offer_digest": digest}} {
 		resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm", in, nil)
 		want(t, resp, b, 400)
 	}
 	if len(e.fake.grant) != 0 {
 		t.Fatal("grant written on failed confirm")
 	}
-	resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm", map[string]string{"peer_id": e.thief.id, "code": "AAAA-AAAA"}, nil)
+	resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm", map[string]string{"peer_id": e.thief.id, "code": "AAAA-AAAA", "offer_digest": digest}, nil)
 	want(t, resp, b, 400)
 	if !strings.Contains(string(b), claimStateDeclined) {
 		t.Fatalf("want declined: %s", b)
 	}
-	resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm", map[string]string{"peer_id": e.thief.id, "code": thiefCode}, nil)
+	resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm", map[string]string{"peer_id": e.thief.id, "code": thiefCode, "offer_digest": digest}, nil)
 	want(t, resp, b, 404)
 }
 
@@ -171,7 +197,15 @@ func TestClaimConfirmHappyPathIdempotentAndLogsClean(t *testing.T) {
 		t.Fatalf("claim not idempotent: %d %q %q", st, c1, c2)
 	}
 	typed := strings.ToLower(strings.ReplaceAll(c1, "-", " "))
-	resp, b := e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm", map[string]string{"peer_id": e.real.id, "code": typed}, nil)
+	
+	// Get offer digest
+	resp, b := e.inviter.do("GET", "/v1/invites/"+e.pub, nil, nil)
+	want(t, resp, b, 200)
+	var view map[string]any
+	json.Unmarshal(b, &view)
+	digest := view["offer_digest"].(string)
+	
+	resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm", map[string]string{"peer_id": e.real.id, "code": typed, "offer_digest": digest}, nil)
 	want(t, resp, b, 200)
 	resp, b = e.real.do("POST", "/v1/pairing/status", map[string]string{"token": e.token}, nil)
 	want(t, resp, b, 200)
@@ -260,4 +294,126 @@ func TestLegacyJSONRoutesRequireJSON(t *testing.T) {
 	c := &client{t: t, srv: srv}
 	resp, b := c.do("POST", "/v1/register", []byte(`{"name":"x"}`), map[string]string{"Content-Type": "text/plain"})
 	want(t, resp, b, 415)
+}
+
+// TestConfirmRequiresOfferDigest verifies that confirm requires a valid offer_digest
+// and that a stale or wrong digest writes nothing (#80, requirement 1).
+func TestConfirmRequiresOfferDigest(t *testing.T) {
+	e := setupClaim(t)
+	st, code := e.claim(t, e.real)
+	if st != 200 || code == "" {
+		t.Fatalf("claim failed: %d", st)
+	}
+	
+	// Get the inviter view to see the offer_digest
+	resp, b := e.inviter.do("GET", "/v1/invites/"+e.pub, nil, nil)
+	want(t, resp, b, 200)
+	
+	var view map[string]any
+	if err := json.Unmarshal(b, &view); err != nil {
+		t.Fatal(err)
+	}
+	
+	digest, ok := view["offer_digest"].(string)
+	if !ok || digest == "" {
+		t.Fatalf("offer_digest missing from view: %v", view)
+	}
+	
+	// Try to confirm with wrong digest
+	resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm",
+		map[string]string{"peer_id": e.real.id, "code": code, "offer_digest": "wrong"}, nil)
+	if resp.StatusCode != 400 {
+		t.Errorf("wrong digest: got %d, want 400", resp.StatusCode)
+	}
+	
+	// Verify no grants were written
+	if len(e.fake.grant) != 0 {
+		t.Error("grant written with wrong digest")
+	}
+	
+	// Confirm with correct digest
+	resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm",
+		map[string]string{"peer_id": e.real.id, "code": code, "offer_digest": digest}, nil)
+	want(t, resp, b, 200)
+	
+	if len(e.fake.grant) != 1 {
+		t.Errorf("grants: %d, want 1", len(e.fake.grant))
+	}
+}
+
+// TestInviterViewShowsReplaces verifies that when grants exist, the inviter view
+// includes replaces information (#80, requirement 2).
+func TestInviterViewShowsReplaces(t *testing.T) {
+	e := setupClaim(t)
+	
+	// Simulate existing grants (in the fake store, we track this separately)
+	// In real usage, this would come from the store layer
+	existingGrant := &ClaimInvite{
+		PublicID: e.pub,
+		Inviter:  e.inviter.id,
+		State:    "claimed",
+		Claimant: e.real.id,
+		Scopes:   []string{"messages"},
+		Replaces: &store.ReplacedGrants{
+			InviterToClaimant: &store.Grant{
+				Owner: e.inviter.id, Grantee: e.real.id, Scopes: []string{"bags:read"}, Bags: []string{"old"},
+			},
+		},
+	}
+	e.fake.byTok[auth.Hash(e.token)] = existingGrant
+	
+	e.claim(t, e.real)
+	
+	resp, b := e.inviter.do("GET", "/v1/invites/"+e.pub, nil, nil)
+	want(t, resp, b, 200)
+	
+	var view map[string]any
+	json.Unmarshal(b, &view)
+	
+	replaces, ok := view["replaces"].(map[string]any)
+	if !ok {
+		t.Fatalf("replaces missing when grant exists: %v", view)
+	}
+	
+	inv, ok := replaces["inviter_to_claimant"].(map[string]any)
+	if !ok {
+		t.Fatalf("inviter_to_claimant missing: %v", replaces)
+	}
+	
+	scopes := inv["scopes"].([]any)
+	if len(scopes) == 0 || scopes[0].(string) != "bags:read" {
+		t.Errorf("wrong existing scopes: %v", inv)
+	}
+}
+
+// TestConfirmIdempotency verifies that repeated confirms return the same result (#80).
+func TestConfirmIdempotency(t *testing.T) {
+	e := setupClaim(t)
+	st, code := e.claim(t, e.real)
+	if st != 200 {
+		t.Fatal("claim failed")
+	}
+	
+	// Get digest
+	resp, b := e.inviter.do("GET", "/v1/invites/"+e.pub, nil, nil)
+	var view map[string]any
+	json.Unmarshal(b, &view)
+	digest := view["offer_digest"].(string)
+	
+	// First confirm
+	resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm",
+		map[string]string{"peer_id": e.real.id, "code": code, "offer_digest": digest}, nil)
+	want(t, resp, b, 200)
+	
+	// Second confirm (idempotent)
+	resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm",
+		map[string]string{"peer_id": e.real.id, "code": code, "offer_digest": digest}, nil)
+	want(t, resp, b, 200)
+	
+	// Verify result is the same
+	var result map[string]any
+	json.Unmarshal(b, &result)
+	if result["state"] != "active" {
+		t.Errorf("idempotent confirm state: %v", result)
+	}
 }

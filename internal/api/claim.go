@@ -70,6 +70,19 @@ func (s *Server) claimCode(c *ClaimInvite) string {
 	return pair.Code(s.cfg.CodePepper, c.PublicID, c.Inviter, c.Claimant, c.Nonce, c.Scopes, c.Bags, c.BackScopes, c.BackBags)
 }
 
+func (s *Server) offerDigest(c *ClaimInvite) string {
+	var eis, eib, ecs, ecb []string
+	if c.Replaces != nil {
+		if c.Replaces.InviterToClaimant != nil {
+			eis, eib = c.Replaces.InviterToClaimant.Scopes, c.Replaces.InviterToClaimant.Bags
+		}
+		if c.Replaces.ClaimantToInviter != nil {
+			ecs, ecb = c.Replaces.ClaimantToInviter.Scopes, c.Replaces.ClaimantToInviter.Bags
+		}
+	}
+	return pair.OfferDigest(c.PublicID, c.Inviter, c.Claimant, c.Scopes, c.Bags, c.BackScopes, c.BackBags, eis, eib, ecs, ecb)
+}
+
 // claimBody charges the per-IP pairing budget before any lookup, so a 429 never depends on the token.
 func (s *Server) claimBody(w http.ResponseWriter, r *http.Request, v any) bool {
 	if !s.lim.pairLim.Allow(rateLimitKey(clientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"), s.trustedNets))) {
@@ -140,14 +153,32 @@ func (s *Server) inviteView(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{"public_id": c.PublicID, "state": c.State}
 	if c.Claimant != "" {
 		out["claimant"] = map[string]any{"peer_id": c.Claimant, "untrusted": map[string]string{"name": sanitizeInviterName(c.ClaimantName)}}
+		out["offer_digest"] = s.offerDigest(c)
+		if c.Replaces != nil {
+			replaces := map[string]any{}
+			if c.Replaces.InviterToClaimant != nil {
+				replaces["inviter_to_claimant"] = map[string]any{
+					"scopes": c.Replaces.InviterToClaimant.Scopes,
+					"bags":   c.Replaces.InviterToClaimant.Bags,
+				}
+			}
+			if c.Replaces.ClaimantToInviter != nil {
+				replaces["claimant_to_inviter"] = map[string]any{
+					"scopes": c.Replaces.ClaimantToInviter.Scopes,
+					"bags":   c.Replaces.ClaimantToInviter.Bags,
+				}
+			}
+			out["replaces"] = replaces
+		}
 	}
 	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) confirmClaim(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		PeerID string `json:"peer_id"`
-		Code   string `json:"code"`
+		PeerID      string `json:"peer_id"`
+		Code        string `json:"code"`
+		OfferDigest string `json:"offer_digest"`
 	}
 	if !decode(w, r, &in) {
 		return
@@ -155,7 +186,9 @@ func (s *Server) confirmClaim(w http.ResponseWriter, r *http.Request) {
 	pub := r.PathValue("public_id")
 	state, err := s.claims.ConfirmClaim(r.Context(), pub, auth.PeerID(r.Context()), maxCodeFails, func(c *ClaimInvite) bool {
 		idOK := subtle.ConstantTimeCompare([]byte(in.PeerID), []byte(c.Claimant)) == 1
-		return pair.CodeMatches(s.claimCode(c), in.Code) && idOK
+		codeOK := pair.CodeMatches(s.claimCode(c), in.Code)
+		digestOK := pair.OfferDigestMatches(s.offerDigest(c), in.OfferDigest)
+		return idOK && codeOK && digestOK
 	})
 	if !s.claimResult(w, err) {
 		return
@@ -165,7 +198,7 @@ func (s *Server) confirmClaim(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"state": state})
 		return
 	}
-	writeJSON(w, http.StatusBadRequest, map[string]string{"error": "peer_id or code mismatch", "state": state})
+	writeJSON(w, http.StatusBadRequest, map[string]string{"error": "peer_id, code, or offer_digest mismatch", "state": state})
 }
 
 func (s *Server) declineClaim(w http.ResponseWriter, r *http.Request) {

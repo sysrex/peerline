@@ -61,8 +61,13 @@ func TestClaimEndToEndRealStore(t *testing.T) {
 	if strings.Contains(string(b), cl.Code) {
 		t.Fatal("inviter view leaks code")
 	}
+	var view struct{ OfferDigest string `json:"offer_digest"` }
+	json.Unmarshal(b, &view)
+	if view.OfferDigest == "" {
+		t.Fatal("offer_digest missing from inviter view")
+	}
 
-	resp, b = inviter.do("POST", "/v1/invites/"+pub+"/confirm", map[string]string{"peer_id": claimant.id, "code": cl.Code}, nil)
+	resp, b = inviter.do("POST", "/v1/invites/"+pub+"/confirm", map[string]string{"peer_id": claimant.id, "code": cl.Code, "offer_digest": view.OfferDigest}, nil)
 	want(t, resp, b, 200)
 	resp, b = claimant.do("POST", "/v1/pairing/status", map[string]string{"token": token}, nil)
 	want(t, resp, b, 200)
@@ -85,14 +90,20 @@ func TestClaimWrongCodeThriceDeclines(t *testing.T) {
 	var cl struct{ Code string }
 	json.Unmarshal(b, &cl)
 
+	// Get offer digest
+	resp, b = inviter.do("GET", "/v1/invites/"+pub, nil, nil)
+	want(t, resp, b, 200)
+	var view struct{ OfferDigest string `json:"offer_digest"` }
+	json.Unmarshal(b, &view)
+
 	for i := 0; i < maxCodeFails; i++ {
-		resp, b = inviter.do("POST", "/v1/invites/"+pub+"/confirm", map[string]string{"peer_id": claimant.id, "code": "AAAA-AAAA"}, nil)
+		resp, b = inviter.do("POST", "/v1/invites/"+pub+"/confirm", map[string]string{"peer_id": claimant.id, "code": "AAAA-AAAA", "offer_digest": view.OfferDigest}, nil)
 		want(t, resp, b, 400)
 	}
 	if !strings.Contains(string(b), "declined") {
 		t.Fatalf("want declined: %s", b)
 	}
-	resp, b = inviter.do("POST", "/v1/invites/"+pub+"/confirm", map[string]string{"peer_id": claimant.id, "code": cl.Code}, nil)
+	resp, b = inviter.do("POST", "/v1/invites/"+pub+"/confirm", map[string]string{"peer_id": claimant.id, "code": cl.Code, "offer_digest": view.OfferDigest}, nil)
 	want(t, resp, b, 404)
 	resp, b = claimant.do("GET", "/v1/grants", nil, nil)
 	want(t, resp, b, 200)
