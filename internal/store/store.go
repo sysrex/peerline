@@ -26,6 +26,7 @@ import (
 
 var ErrNotFound = errors.New("not found")
 var ErrConflict = errors.New("conflict")
+var ErrSelfPairing = errors.New("cannot pair with self")
 var ErrTooManyInvites = errors.New("too many outstanding invites")
 var ErrBagLimitExceeded = errors.New("bag limit exceeded")
 var ErrStorageQuotaExceeded = errors.New("storage quota exceeded")
@@ -1437,6 +1438,38 @@ func split(v string) []string {
 	return strings.Split(v, ",")
 }
 
+// normalizeScopesAndBags sorts and deduplicates scopes and bags to match writeGrantsInTx storage format.
+// This ensures grant comparison is order-insensitive and matches how grants are actually stored.
+func normalizeScopesAndBags(scopes, bags string) (string, string) {
+	normSlice := func(s string) string {
+		if s == "" {
+			return ""
+		}
+		parts := strings.Split(s, ",")
+		// Deduplicate
+		seen := make(map[string]bool)
+		var unique []string
+		for _, p := range parts {
+			if !seen[p] {
+				seen[p] = true
+				unique = append(unique, p)
+			}
+		}
+		// Sort
+		sort.Strings(unique)
+		return strings.Join(unique, ",")
+	}
+	return normSlice(scopes), normSlice(bags)
+}
+
+// grantsEqual compares two grants as sets (order-insensitive).
+// Normalizes before comparison to match writeGrantsInTx behavior.
+func grantsEqual(scopes1, bags1, scopes2, bags2 string) bool {
+	ns1, nb1 := normalizeScopesAndBags(scopes1, bags1)
+	ns2, nb2 := normalizeScopesAndBags(scopes2, bags2)
+	return ns1 == ns2 && nb1 == nb2
+}
+
 func (s *Store) CreateInvite(ctx context.Context, codeHash, from string, scopes, bags []string, expires time.Time) error {
 	publicID, err := generatePublicID()
 	if err != nil {
@@ -1864,7 +1897,8 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string, backScopes, backBags []string, now int64) (*Grant, error) {
 	var from, scopes, bags string
 	err := tx.QueryRowContext(ctx, `SELECT from_peer,scopes,bags FROM invites
-		WHERE code_hash=? AND require_confirm=0 AND claimed_by IS NULL AND declined_at IS NULL`, codeHash).
+		WHERE code_hash=? AND require_confirm=0 AND claimed_by IS NULL AND declined_at IS NULL
+		AND used_by IS NULL AND expires_at>=?`, codeHash, now).
 		Scan(&from, &scopes, &bags)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -1874,7 +1908,40 @@ func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string
 	}
 
 	if from == accepter {
-		return nil, ErrConflict
+		return nil, ErrSelfPairing
+	}
+
+	// Before upserting grants, check if grants already exist and differ (#312).
+	// Read existing grants inside the same transaction (never call Store methods in a write tx - #310).
+	var existingScopes, existingBags sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT scopes, bags FROM grants WHERE owner=? AND grantee=?`, from, accepter).
+		Scan(&existingScopes, &existingBags)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+
+	// If a grant exists and differs, return ErrConflict without touching the invite or grants
+	if existingScopes.Valid {
+		if !grantsEqual(scopes, bags, existingScopes.String, existingBags.String) {
+			return nil, ErrConflict
+		}
+	}
+
+	// If back scopes are present, also check the reverse grant
+	if len(backScopes) > 0 {
+		backScopesStr, backBagsStr := join(backScopes), join(backBags)
+		var existingBackScopes, existingBackBags sql.NullString
+		err = tx.QueryRowContext(ctx, `SELECT scopes, bags FROM grants WHERE owner=? AND grantee=?`, accepter, from).
+			Scan(&existingBackScopes, &existingBackBags)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+
+		if existingBackScopes.Valid {
+			if !grantsEqual(backScopesStr, backBagsStr, existingBackScopes.String, existingBackBags.String) {
+				return nil, ErrConflict
+			}
+		}
 	}
 
 	res, err := tx.ExecContext(ctx,
