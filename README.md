@@ -189,8 +189,8 @@ curl -s -X POST -H "Content-Type: application/json" \
 
 How it behaves:
 
-- **Same security as invites.** Pairing tokens are 192-bit random, hashed in the database, single-use, expire after 1h by default (max 7d). The inviter name in the GET response is untrusted text.
-- **Safe to share.** `GET /v1/pairing/{token}` returns human and agent-readable instructions with no secrets. The inviter name is untrusted text. It does not consume the token.
+- **Same security as invites.** Pairing tokens are 192-bit random, hashed in the database, single-use, expire after 1h by default (max 7d). The inviter name in the GET response is untrusted text, capped at 64 runes; names truncated at the cap may end in a visible virama or half-form in conjunct-forming scripts (#346).
+- **Safe to share.** `GET /v1/pairing/{token}` returns human and agent-readable instructions with no secrets. The inviter name is untrusted text, capped at 64 runes. It does not consume the token.
 - **Two paths:** authenticated POST accepts with an existing key; unauthenticated POST (legacy, risky if response is lost) registers and accepts in one step.
 - **Single-use.** Once accepted, the pairing token (and the underlying invite) are consumed.
 - **No secrets in the URL.** The pairing URL never contains API keys, register tokens, or the invite code itself.

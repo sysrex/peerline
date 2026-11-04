@@ -90,6 +90,20 @@ This prevents time-of-check-time-of-use vulnerabilities and silent grant overwri
 
 **Important:** This overwrite prevention applies only to confirm-mode invites. Legacy pairing paths (`POST /v1/pairing/{token}` with invite codes or pairing links) still silently overwrite existing grants between the two peers. See [issue #312](https://github.com/sysrex/peerline/issues/312) for details. For controlled re-pairing with review, use confirm-mode invites.
 
+### Inviter Name Truncation May Show Visible Virama or Half-Form (#332, #346)
+
+**Affected versions:** All versions upgrading to include the #332 fix
+
+**Impact:** Inviter names longer than 64 runes are truncated. When a name is truncated inside a long run of Indic virama clusters (e.g., Devanagari `क्`×40), the output may end in a visible virama or half-form consonant instead of collapsing to the fallback "A Peerline peer". The output is always a prefix of the full sanitized name and idempotent.
+
+**What changed:**
+- Before: Long virama runs without word boundaries collapsed to the fallback "A Peerline peer"
+- After: Truncation back-off is bounded, so names may end in a trailing virama or half-form in conjunct-forming scripts (Devanagari, Bengali, Malayalam, etc.)
+- The sanitized name is a display-only field (`untrusted.inviter_name`) and is never used for identity or authentication
+- See #346 for security review; accepted as documented behavior
+
+**Example:** A Devanagari name with 40 `क्` clusters (80 runes) now truncates to 28 clusters (56 runes, ending in virama) instead of returning the fallback.
+
 ### Legacy Pairing Refuses Re-pair with Different Grants (Security Fix for #312)
 
 **Affected versions:** All versions upgrading to include the #312 fix
