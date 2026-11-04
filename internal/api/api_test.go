@@ -3379,7 +3379,7 @@ func TestSanitizerUnicode(t *testing.T) {
 		// Issue #182/#206: Virama cut (CCC 9) - should not leave dangling virama
 		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62)},       // क + virama + ष cut before the conjunct
 		{"chained virama at 64", strings.Repeat("a", 60) + "क्ष्म" + "bbb", strings.Repeat("a", 60)}, // क्ष्म (stacked) -> dropCluster removes all
-		{"many chained viramas", strings.Repeat("क्", 32) + "का", "A Peerline peer"},                 // 32 क् pairs (all viramas) -> drops everything -> fallback
+		{"many chained viramas", strings.Repeat("क्", 32) + "का", strings.Repeat("क्", 29) + "क"},                 // 65 runes → 64 → backoff to 62 → tail cleanup to 60 → drop trailing virama → 59 (29 pairs + क)
 
 		// Issue #206: Stacked conjunct (C V C V | C) - dropCluster removes entire stacked conjunct
 		{"stacked conjunct at 64", strings.Repeat("a", 60) + "क्क्ष" + "bbb", strings.Repeat("a", 60)}, // 60 a + क्क्ष (stacked) -> 60 a (no trailing virama)
@@ -3392,6 +3392,11 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"word-final virama before comma", strings.Repeat("a", 62) + "क्," + "bbb", strings.Repeat("a", 62) + "क्"},
 		{"word-final virama before underscore", strings.Repeat("a", 62) + "ம்_" + "bbb", strings.Repeat("a", 62) + "ம்"},
 		{"word-final virama before apostrophe", strings.Repeat("a", 62) + "क्'" + "bbb", strings.Repeat("a", 62) + "क्"},
+
+		// Issue #332: Bounded back-off for long virama runs prevents collapse
+		{"40 க் clusters bounded backoff", strings.Repeat("க்", 40), strings.Repeat("க்", 29) + "க"},                                     // 80 runes → 64 → backoff to 62 → tail cleanup to 60 → drop trailing virama → 59 (29 க் + க)
+		{"40 க் + 70 ब bounded backoff", strings.Repeat("க்", 40) + strings.Repeat("ब", 70), strings.Repeat("க்", 29) + "க"},           // Same path and result
+		{"ab + 40 க் bounded backoff", "ab" + strings.Repeat("க்", 40), "ab" + strings.Repeat("க்", 28) + "க"},                        // 82 runes → 64 (ab+31 க்) → backoff to 62 → tail cleanup to 60 → drop trailing virama → 59 (ab+28 க் + க)
 	}
 
 	for _, tt := range tests {
@@ -3723,6 +3728,14 @@ func TestSanitizeInviterName(t *testing.T) {
 
 // checkSanitizeInvariants verifies all sanitizeInviterName invariants on an output.
 // checkVirama should be true only when checking a forced-truncation path.
+// isWordBoundaryTest is the test-side boundary definition, independent of the production code.
+// It matches the intended behavior: a rune is a word boundary if it's not a letter, number, or combining mark.
+// This is defined separately from the production isWordBoundary so the invariant can't drift with the code.
+func isWordBoundaryTest(r rune) bool {
+	return !(unicode.IsLetter(r) || unicode.IsNumber(r) ||
+		unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) || unicode.Is(unicode.Me, r))
+}
+
 func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama bool) {
 	t.Helper()
 
@@ -3788,9 +3801,24 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 		full := []rune(sanitizeInviterNameUncapped(input))
 		out := []rune(got)
 
-		// General assertion: capped output is a prefix of uncapped result
+		// General assertion: capped output is a prefix of uncapped result, or it's the fallback.
+		// If the fallback is returned, the uncapped result must not have any letters
+		// (otherwise the name collapsed when it shouldn't have).
+		const fallbackName = "A Peerline peer"
 		if len(out) > 0 && len(full) > 0 {
-			if !strings.HasPrefix(string(full), got) {
+			if got == fallbackName {
+				// Check if the uncapped result has at least one letter
+				hasLetter := false
+				for _, r := range full {
+					if unicode.IsLetter(r) {
+						hasLetter = true
+						break
+					}
+				}
+				if hasLetter {
+					t.Errorf("sanitizeInviterName(%q) [%s] returned fallback %q but uncapped has letters: full=%q", input, label, got, string(full))
+				}
+			} else if !strings.HasPrefix(string(full), got) {
 				t.Errorf("sanitizeInviterName(%q) [%s] capped output is not a prefix of uncapped: got=%q full=%q", input, label, got, string(full))
 			}
 		}
@@ -3819,7 +3847,7 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 
 					// Check (a): no word boundaries in the dropped region
 					for _, r := range droppedRegion {
-						if isWordBoundary(r) {
+						if isWordBoundaryTest(r) {
 							t.Errorf("sanitizeInviterName(%q) [%s] dropped runes before position 64 contain word boundary U+%04X (excluding leading spaces): output=%q full=%q dropped=%q", input, label, r, got, string(full), string(droppedRegion))
 							break
 						}
@@ -3861,7 +3889,7 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 			props := norm.NFC.PropertiesString(string(lastRune))
 			if props.CCC() == 9 {
 				nextRune := full[len(out)]
-				if !isWordBoundary(nextRune) {
+				if !isWordBoundaryTest(nextRune) {
 					t.Errorf("sanitizeInviterName(%q) [%s] ends in mid-word CCC 9 (virama) rune U+%04X, next rune is U+%04X (not a word boundary): output=%q full=%q", input, label, lastRune, nextRune, got, string(full))
 				}
 			}
@@ -3871,7 +3899,7 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 		// the output must equal string(full[:64]) (word-final virama kept).
 		if len(full) > 64 {
 			props := norm.NFC.PropertiesString(string(full[63]))
-			if props.CCC() == 9 && isWordBoundary(full[64]) {
+			if props.CCC() == 9 && isWordBoundaryTest(full[64]) {
 				expected := string(full[:64])
 				if got != expected {
 					t.Errorf("sanitizeInviterName(%q) [%s] should keep word-final virama at position 63: got=%q, expected=%q", input, label, got, expected)
@@ -3891,10 +3919,10 @@ func TestSanitizerWordFinalViramaWithSpace(t *testing.T) {
 	}{
 		{
 			name: "virama at 63, space at 64, forced path",
-			// 61 'a' + "क्" (2 runes) + " " (1 rune) = 64 runes total (virama at 63, space at 64)
+			// 62 'a' + "क्" (2 runes) + " " (1 rune) = 65 runes total (क at 62, virama at 63, space at 64)
 			// The virama is word-final (space follows), so it's kept, but trailing space is trimmed
-			input: strings.Repeat("a", 61) + "क् " + strings.Repeat("ब", 70),
-			want:  strings.Repeat("a", 61) + "क्",
+			input: strings.Repeat("a", 62) + "क् " + strings.Repeat("ब", 70),
+			want:  strings.Repeat("a", 62) + "क्",
 		},
 		{
 			name: "Tamil virama at 63, space at 64, forced path",
@@ -3935,6 +3963,10 @@ func FuzzSanitizeInviterName(f *testing.F) {
 	f.Add(strings.Repeat("a", 62) + "क् " + "bbbbbbbbbb") // virama at 63, space at 64
 	f.Add(strings.Repeat("a", 62) + "क்." + "bbbbbbbbbb") // virama at 63, dot at 64
 	f.Add(strings.Repeat("a", 62) + "ம்-" + "bbbbbbbbbb") // virama at 63, dash at 64
+	// Issue #332: Fuzz seeds for bounded back-off on long virama runs
+	f.Add(strings.Repeat("க்", 40))                                     // 40 க் clusters (80 runes)
+	f.Add(strings.Repeat("க்", 40) + strings.Repeat("ब", 70))          // 40 க் + 70 ब (110 runes total)
+	f.Add("ab" + strings.Repeat("க்", 40))                             // ab + 40 க் clusters (82 runes)
 
 	f.Fuzz(func(t *testing.T, input string) {
 		got := sanitizeInviterName(input)

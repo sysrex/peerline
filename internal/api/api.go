@@ -1054,6 +1054,11 @@ func sanitizeInviterName(name string) string {
 	const (
 		maxRunes     = 64
 		fallbackName = "A Peerline peer"
+		// maxViramaBackoff is the maximum number of trailing consonant+virama clusters
+		// to drop when the 64-rune cut lands inside a word. This prevents collapsing
+		// a name to the fallback when a long run of clusters (e.g. strings.Repeat("க்", 40))
+		// has no word boundary. Issue #332.
+		maxViramaBackoff = 1
 	)
 
 	result := sanitizeInviterNameUncapped(name)
@@ -1128,7 +1133,8 @@ func sanitizeInviterName(name string) string {
 			return t
 		}
 
-		for len(truncated) > 0 {
+		clustersDropped := 0
+		for len(truncated) > 0 && clustersDropped < maxViramaBackoff {
 			last := truncated[len(truncated)-1]
 			props := norm.NFC.PropertiesString(string(last))
 			// Stop if not a virama, or if it's a word-final virama (next rune is a word boundary).
@@ -1141,6 +1147,22 @@ func sanitizeInviterName(name string) string {
 			truncated = dropCluster(truncated)
 			if len(truncated) == n {
 				// No progress made, stop to avoid infinite loop
+				break
+			}
+			clustersDropped++
+		}
+
+		// If the bound was hit and we still have a trailing mid-word virama,
+		// drop trailing virama characters (not whole clusters) to avoid leaving
+		// a dangling half-form. This is the "stop at the last cluster whose tail
+		// isn't a virama" fallback.
+		for len(truncated) > 0 && len(truncated) < len(runes) {
+			last := truncated[len(truncated)-1]
+			props := norm.NFC.PropertiesString(string(last))
+			if props.CCC() == 9 && !isWordBoundary(runes[len(truncated)]) {
+				// Still a mid-word virama after bounded back-off; drop just the virama
+				truncated = truncated[:len(truncated)-1]
+			} else {
 				break
 			}
 		}
