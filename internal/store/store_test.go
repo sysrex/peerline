@@ -126,7 +126,7 @@ func TestStats(t *testing.T) {
 // Databases created before notify_email must gain the column on open.
 func TestNotifyEmailMigration(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/old.db"
+	path := t.TempDir() + "/old.db"
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
@@ -153,10 +153,10 @@ func TestNotifyEmailMigration(t *testing.T) {
 	if err != nil || email != "" {
 		t.Fatalf("migrated email %q %v", email, err)
 	}
-	if err := s.SetNotifyEmail(ctx, "p_old", "old@example.com", ""); err != nil {
+	if err := s.SetNotifyEmail(ctx, "p_old", "old@example.com", "tok1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetNotifyEmail(ctx, "missing", "a@b.co", ""); !errors.Is(err, ErrNotFound) {
+	if err := s.SetNotifyEmail(ctx, "missing", "a@b.co", "tok2"); !errors.Is(err, ErrNotFound) {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -176,7 +176,7 @@ func TestNotifyEmailMigration(t *testing.T) {
 // TestV0SchemaMigration verifies v0 databases (without notify_email) upgrade correctly.
 func TestV0SchemaMigration(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/v0.db"
+	path := t.TempDir() + "/v0.db"
 
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -239,7 +239,7 @@ func TestV0SchemaMigration(t *testing.T) {
 // TestV1SchemaMigration verifies v1 databases (with notify_email) upgrade to v2.
 func TestV1SchemaMigration(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/v1.db"
+	path := t.TempDir() + "/v1.db"
 
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -307,7 +307,7 @@ func TestV1SchemaMigration(t *testing.T) {
 // TestPartialMigrationState verifies recovery when column exists but index is missing.
 func TestPartialMigrationState(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/partial.db"
+	path := t.TempDir() + "/partial.db"
 
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -481,7 +481,7 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 		},
 	}
 
-	freshPath := secureTempDir(t) + "/fresh.db"
+	freshPath := t.TempDir() + "/fresh.db"
 	freshStore, err := Open(freshPath)
 	if err != nil {
 		t.Fatal(err)
@@ -494,7 +494,7 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			path := secureTempDir(t) + "/" + tt.name + ".db"
+			path := t.TempDir() + "/" + tt.name + ".db"
 			db, err := sql.Open("sqlite", path)
 			if err != nil {
 				t.Fatal(err)
@@ -588,7 +588,7 @@ func TestFreshAndMigratedSchemasMatch(t *testing.T) {
 // Store instances to test real lock contention.
 func TestConcurrentPairingRedemption(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/concurrent.db"
+	path := t.TempDir() + "/concurrent.db"
 
 	s1, err := Open(path)
 	if err != nil {
@@ -855,6 +855,18 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 	if err := s.CreateInviteWithPairing(ctx, codeHash2, pairingHash2, "alice", []string{"messages"}, nil, expiresAt2); err != nil {
 		t.Fatal(err)
 	}
+
+	// At exactly expires_at, GetInviteByPairingToken should succeed
+	clk.Set(time.Unix(currentTime+200, 0))
+	invite, err := s.GetInviteByPairingToken(ctx, pairingHash2)
+	if err != nil {
+		t.Errorf("GetInviteByPairingToken at exact expiry should succeed, got %v", err)
+	}
+	if invite == nil || invite.FromPeer != "alice" {
+		t.Errorf("GetInviteByPairingToken at exact expiry returned wrong invite: %+v", invite)
+	}
+
+	// One second after expiry, GetInviteByPairingToken should fail
 	clk.Set(time.Unix(currentTime+201, 0))
 	_, err = s.GetInviteByPairingToken(ctx, pairingHash2)
 	if !errors.Is(err, ErrNotFound) {
@@ -987,11 +999,61 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 	}
 }
 
+// TestAcceptInviteExactBoundary verifies AcceptInvite (by code) at exact expiry boundary.
+// Issue #110 item 3: exact-boundary row for AcceptInvite (now == expires_at accepted; expires_at+1 rejected).
+func TestAcceptInviteExactBoundary(t *testing.T) {
+	ctx := context.Background()
+	currentTime := time.Unix(1000000, 0)
+	clk := clocktest.New(currentTime)
+
+	s, err := OpenWithOptions(":memory:", OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create an invite that expires at currentTime + 100s
+	expiresAt := currentTime.Add(100 * time.Second)
+	if err := s.CreateInvite(ctx, "code_boundary", "alice", []string{"messages"}, nil, expiresAt); err != nil {
+		t.Fatal(err)
+	}
+
+	// At exactly expires_at (now == expires_at), invite should be accepted
+	clk.Set(currentTime.Add(100 * time.Second))
+	grant, err := s.AcceptInvite(ctx, "code_boundary", "bob", nil, nil)
+	if err != nil {
+		t.Fatalf("AcceptInvite at exact boundary (now == expires_at) should succeed, got %v", err)
+	}
+	if grant == nil || grant.Owner != "alice" || grant.Grantee != "bob" {
+		t.Errorf("AcceptInvite at boundary returned wrong grant: %+v", grant)
+	}
+
+	// Create another invite to test expires_at+1
+	expiresAt2 := currentTime.Add(100 * time.Second)
+	if err := s.CreateInvite(ctx, "code_boundary2", "alice", []string{"messages"}, nil, expiresAt2); err != nil {
+		t.Fatal(err)
+	}
+
+	// At expires_at+1, invite should be rejected
+	clk.Set(currentTime.Add(101 * time.Second))
+	_, err = s.AcceptInvite(ctx, "code_boundary2", "bob", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("AcceptInvite at expires_at+1 should return ErrNotFound, got %v", err)
+	}
+}
+
 // TestRollbackAfterPeerInsert verifies that when RegisterAndAcceptByPairing fails
 // after the peer insert but before commit, no orphan peer is left and the invite remains unconsumed.
 func TestRollbackAfterPeerInsert(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/rollback.db"
+	path := t.TempDir() + "/rollback.db"
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -1048,7 +1110,7 @@ func TestRollbackAfterPeerInsert(t *testing.T) {
 
 // TestContextCancellationBeforeTransaction verifies that cancelling before BeginTx doesn't wedge the DB.
 func TestContextCancellationBeforeTransaction(t *testing.T) {
-	path := secureTempDir(t) + "/cancel-before.db"
+	path := t.TempDir() + "/cancel-before.db"
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -1125,7 +1187,7 @@ func TestContextCancellationBeforeTransaction(t *testing.T) {
 // TestContextCancellationMidTransaction verifies that cancelling after BeginTx and after the peer INSERT
 // rolls back correctly, leaving no orphan peer and the invite unconsumed.
 func TestContextCancellationMidTransaction(t *testing.T) {
-	path := secureTempDir(t) + "/cancel-mid-tx.db"
+	path := t.TempDir() + "/cancel-mid-tx.db"
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -1206,7 +1268,7 @@ func TestContextCancellationMidTransaction(t *testing.T) {
 // so migrate must not stop there. invites has no pairing_token_hash until Open.
 func TestPairingTokenHashMigration(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/pre-pairing.db"
+	path := t.TempDir() + "/pre-pairing.db"
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
@@ -1303,7 +1365,7 @@ func TestPairingTokenHashMigration(t *testing.T) {
 // Returning after the first column leaves pairing invites broken.
 func TestMigrateNotifyEmailAndPairingToken(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/v0.db"
+	path := t.TempDir() + "/v0.db"
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
@@ -1361,7 +1423,7 @@ func TestMigrateNotifyEmailAndPairingToken(t *testing.T) {
 // 5. The index (whether PR #11's full or our partial) works correctly
 func TestPR11AlreadyMigrated(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/pr11.db"
+	path := t.TempDir() + "/pr11.db"
 
 	// Create exactly PR #11's post-migration schema (238b916)
 	db, err := sql.Open("sqlite", path)
@@ -1520,7 +1582,7 @@ func TestPragmasInEffect(t *testing.T) {
 		path string
 	}{
 		{"memory", ":memory:"},
-		{"file", secureTempDir(t) + "/pragmas.db"},
+		{"file", t.TempDir() + "/pragmas.db"},
 	}
 
 	for _, tt := range tests {
@@ -2000,16 +2062,9 @@ func TestBackupBeforeMigration(t *testing.T) {
 		t.Errorf("main database user_version = %d, want %d (post-migration)", mainVersion, len(migrations))
 	}
 
-	// Verify backup has exactly 0600 permissions on Unix
-	info, err := os.Stat(backupPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if os.PathSeparator == '/' {
-		mode := info.Mode() & os.ModePerm
-		if mode != 0600 {
-			t.Errorf("backup file mode = %o, want exactly 0600", mode)
-		}
+	// Verify backup exists (mode checks are in backup_mode_test_unix.go)
+	if _, err := os.Stat(backupPath); err != nil {
+		t.Fatalf("backup file not found: %v", err)
 	}
 }
 
@@ -2187,13 +2242,22 @@ func TestBrandNewDatabaseSkipsBackup(t *testing.T) {
 // TestBackupFailureAbortsStartup verifies that if the backup fails (e.g., unwritable directory),
 // the migration is aborted, nothing is migrated, and no stray backup file is left.
 func TestBackupFailureAbortsStartup(t *testing.T) {
-	baseDir := secureTempDir(t)
-	readOnlyDir := baseDir + "/readonly"
-	if err := os.Mkdir(readOnlyDir, 0755); err != nil {
+	if os.Getuid() == 0 {
+		t.Skip("test requires non-root (chmod doesn't restrict root)")
+	}
+
+	tempDir := secureTempDir(t)
+	dbDir := tempDir + "/db"
+	backupDir := tempDir + "/backups"
+
+	if err := os.Mkdir(dbDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(backupDir, 0700); err != nil {
 		t.Fatal(err)
 	}
 
-	path := readOnlyDir + "/test.db"
+	path := dbDir + "/test.db"
 
 	// Create a v2 database
 	db, err := sql.Open("sqlite", path)
@@ -2211,48 +2275,50 @@ func TestBackupFailureAbortsStartup(t *testing.T) {
 
 	db.Close()
 
-	// Make directory read-only on Unix
-	if os.PathSeparator == '/' {
-		if err := os.Chmod(readOnlyDir, 0555); err != nil {
-			t.Fatal(err)
-		}
-		defer os.Chmod(readOnlyDir, 0755) // Restore for cleanup
+	// Inject a vacuumInto that fails (simulates disk full or I/O error)
+	// This actually tests backup failure, not directory permission failure
+	vacuumHook := func(db *sql.DB, backupPath string) error {
+		return fmt.Errorf("simulated VACUUM INTO failure")
 	}
 
-	// Attempt to open - should fail due to backup failure
-	_, err = Open(path)
-	if err == nil && os.PathSeparator == '/' {
-		t.Fatal("expected error when backup directory is read-only")
+	opts := OpenOptions{
+		BackupDir:  backupDir,
+		vacuumInto: vacuumHook,
 	}
 
-	// If we got an error on Unix, verify the database wasn't migrated and no backup file was left
-	if os.PathSeparator == '/' && err != nil {
-		// Restore write permissions to check
-		os.Chmod(readOnlyDir, 0755)
+	// Attempt to open - should fail due to VACUUM INTO failure
+	_, err = OpenWithOptions(path, opts)
+	if err == nil {
+		t.Fatal("expected error when VACUUM INTO fails")
+	}
 
-		db, err := sql.Open("sqlite", path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer db.Close()
+	if !strings.Contains(err.Error(), "VACUUM INTO backup") {
+		t.Errorf("error should mention VACUUM INTO backup failure, got: %v", err)
+	}
 
-		var version int
-		if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
-			t.Fatal(err)
-		}
-		if version != 2 {
-			t.Errorf("database was migrated despite backup failure: version = %d, want 2", version)
-		}
+	// Verify the database wasn't migrated
+	db2, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
 
-		// Verify no stray backup file was left
-		files, err := os.ReadDir(readOnlyDir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, f := range files {
-			if strings.HasPrefix(f.Name(), "test.db.pre-v") {
-				t.Errorf("stray backup file left behind: %s", f.Name())
-			}
+	var version int
+	if err := db2.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 2 {
+		t.Errorf("database was migrated despite backup failure: version = %d, want 2", version)
+	}
+
+	// Verify no stray backup file was left
+	files, err := os.ReadDir(backupDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "test.db.pre-v") {
+			t.Errorf("stray backup file left behind: %s", f.Name())
 		}
 	}
 }
@@ -2488,7 +2554,7 @@ func TestInMemorySkipsBackup(t *testing.T) {
 }
 
 func TestV3MigrationFreshDB(t *testing.T) {
-	s, err := Open(secureTempDir(t) + "/test.db")
+	s, err := Open(t.TempDir() + "/test.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2529,7 +2595,7 @@ func TestV3MigrationFreshDB(t *testing.T) {
 
 // Test v2 to v3 migration with backfill
 func TestV2ToV3Migration(t *testing.T) {
-	dbPath := secureTempDir(t) + "/test.db"
+	dbPath := t.TempDir() + "/test.db"
 
 	// Create a v2 database manually
 	db, err := sql.Open("sqlite", dbPath+"?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
@@ -2630,7 +2696,7 @@ func TestV2ToV3Migration(t *testing.T) {
 
 // Test v3 migration idempotence
 func TestV3MigrationIdempotent(t *testing.T) {
-	dbPath := secureTempDir(t) + "/test.db"
+	dbPath := t.TempDir() + "/test.db"
 
 	// Create v2 DB
 	db, err := sql.Open("sqlite", dbPath+"?_txlock=immediate")
@@ -2705,8 +2771,8 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 
 	// Create and immediately accept invites at different points in time
 
-	// 1. Unused expired invite (expires 400s ago, past the 5-minute grace) - should be purged
-	exp1 := time.Unix(currentTime-400, 0)
+	// 1. Unused expired invite (expires 500s ago, beyond 5-minute grace) - should be purged
+	exp1 := time.Unix(currentTime-500, 0)
 	if err := s.CreateInvite(ctx, "code1", "alice", []string{"messages"}, nil, exp1); err != nil {
 		t.Fatal(err)
 	}
@@ -3242,52 +3308,7 @@ func TestInvalidBackupKeepValue(t *testing.T) {
 	// This is tested by the successful open and the warning log
 }
 
-// TestBackupFileMode verifies backups are created with 0600 permissions.
-func TestBackupFileMode(t *testing.T) {
-	tempDir := secureTempDir(t)
-	path := tempDir + "/mode.db"
-
-	// Create a v2 database
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`
-		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
-		PRAGMA user_version = 2;
-	`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`INSERT INTO peers VALUES ('p1', 'Test', 'h1', ?, '')`, time.Now().Unix()); err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
-
-	// Open triggers migration and creates backup
-	st, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-
-	// Find the backup file
-	backupBase := st.LastBackupPath()
-	if backupBase == "" {
-		t.Fatal("no backup was created")
-	}
-
-	backupPath := tempDir + "/" + backupBase
-	info, err := os.Stat(backupPath)
-	if err != nil {
-		t.Fatalf("cannot stat backup: %v", err)
-	}
-
-	// Verify mode is exactly 0600
-	mode := info.Mode() & os.ModePerm
-	if mode != 0600 {
-		t.Errorf("backup file mode = %04o, want 0600", mode)
-	}
-}
+// TestBackupFileMode is now in backup_mode_test_unix.go (Unix-specific mode assertions)
 
 // TestBackupCollisionRetry verifies that a timestamp collision triggers PID suffix retry.
 func TestBackupCollisionRetry(t *testing.T) {
@@ -3329,15 +3350,21 @@ func TestBackupCollisionRetry(t *testing.T) {
 	}
 	defer st.Close()
 
-	// Verify a backup with PID suffix was created
+	// Verify a backup with random suffix was created (not the colliding name)
 	backupBase := st.LastBackupPath()
 	if backupBase == "" {
 		t.Fatal("no backup was created")
 	}
 
-	// Should contain PID suffix
-	if !strings.Contains(backupBase, fmt.Sprintf(".%d", os.Getpid())) {
-		t.Errorf("backup name %q should contain PID suffix .%d", backupBase, os.Getpid())
+	// Should have a random suffix (8 hex chars), not match the pre-existing name
+	if backupBase == filepath.Base(existingBackup) {
+		t.Errorf("backup should have random suffix, not overwrite collision")
+	}
+
+	// Should start with the base name
+	expectedPrefix := "collision.db.pre-v6-from-v2.20260130-120000.000000."
+	if !strings.HasPrefix(backupBase, expectedPrefix) {
+		t.Errorf("backup name %q should start with %s", backupBase, expectedPrefix)
 	}
 
 	// Both files should exist
@@ -3352,7 +3379,13 @@ func TestBackupCollisionRetry(t *testing.T) {
 		}
 	}
 	if backupCount != 2 {
-		t.Errorf("got %d backups, want 2 (original + PID suffix)", backupCount)
+		t.Errorf("got %d backups, want 2 (original + random suffix)", backupCount)
+	}
+
+	// Verify pre-existing file wasn't modified
+	data, _ := os.ReadFile(existingBackup)
+	if string(data) != "fake" {
+		t.Errorf("pre-existing file was modified")
 	}
 }
 

@@ -56,6 +56,21 @@ func parseVersionDetail(raw string) (string, error) {
 	}
 }
 
+// parseBoolStrict validates boolean environment variables strictly.
+// Accepts: "", "0", "false" (false) or "1", "true" (true), case-insensitive, whitespace-trimmed.
+// Returns an error for any other value to fail-closed on typos.
+func parseBoolStrict(raw string) (bool, error) {
+	normalized := strings.ToLower(strings.TrimSpace(raw))
+	switch normalized {
+	case "", "0", "false":
+		return false, nil
+	case "1", "true":
+		return true, nil
+	default:
+		return false, fmt.Errorf("must be '0', '1', 'false', or 'true', got: %q", raw)
+	}
+}
+
 // describeTLSMode returns a human-readable description of the SMTP TLS mode.
 func describeTLSMode(smtp *mailer.SMTP) string {
 	if smtp.ImplicitTLS {
@@ -89,6 +104,9 @@ func smtpProbeAction(err error) (fatal bool, level slog.Level, message string) {
 }
 
 func main() {
+	// Set restrictive umask on Unix platforms (0600 for files, 0700 for directories)
+	setRestrictiveUmask()
+
 	showVersion := flag.Bool("version", false, "print version and exit")
 	addr := flag.String("addr", env("PEERLINE_ADDR", "127.0.0.1:8787"), "listen address")
 	dbPath := flag.String("db", env("PEERLINE_DB", "peerline.db"), "SQLite database path")
@@ -116,6 +134,7 @@ func main() {
 	skipBackup := os.Getenv("PEERLINE_SKIP_MIGRATION_BACKUP") == "1"
 	backupDir := os.Getenv("PEERLINE_BACKUP_DIR")
 	backupKeep := 3
+	backupTimeout := 5 * time.Minute // Default: 5 minutes
 
 	if keepEnv := os.Getenv("PEERLINE_BACKUP_KEEP"); keepEnv != "" {
 		if n, err := strconv.Atoi(keepEnv); err == nil {
@@ -129,6 +148,18 @@ func main() {
 		}
 	}
 
+	if timeoutEnv := os.Getenv("PEERLINE_BACKUP_TIMEOUT"); timeoutEnv != "" {
+		if n, err := strconv.Atoi(timeoutEnv); err == nil {
+			if n > 0 {
+				backupTimeout = time.Duration(n) * time.Second
+			} else {
+				log.Warn("PEERLINE_BACKUP_TIMEOUT must be > 0, using default", "invalid_value", timeoutEnv, "default_seconds", 300)
+			}
+		} else {
+			log.Warn("PEERLINE_BACKUP_TIMEOUT must be a number (seconds), using default", "invalid_value", timeoutEnv, "default_seconds", 300)
+		}
+	}
+
 	if skipBackup {
 		log.Warn("PEERLINE_SKIP_MIGRATION_BACKUP is enabled, pre-migration backups are disabled")
 	}
@@ -139,6 +170,7 @@ func main() {
 		SkipMigrationBackup:  skipBackup,
 		BackupDir:            backupDir,
 		BackupRetentionCount: backupKeep,
+		BackupTimeout:        backupTimeout,
 		Logger:               log,
 		Clock:                clk,
 	}
@@ -200,23 +232,16 @@ func main() {
 		log.Warn("PEERLINE_REGISTER_TOKEN unset: registration is open to anyone who can reach this server")
 	}
 
-	// Parse trusted proxy CIDRs
+	// Parse trusted proxy CIDRs and opt-in for broader IPv6
 	tp := os.Getenv("PEERLINE_TRUSTED_PROXIES")
-	warnTrustedProxies(log, tp)
+	allowBroadIPv6, err := parseBoolStrict(os.Getenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD"))
+	if err != nil {
+		log.Error("invalid PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD value", "err", err)
+		os.Exit(1)
+	}
 	var trustedProxies []string
 	if tp != "" {
 		trustedProxies = strings.Split(tp, ",")
-		// Validate at startup
-		nets, err := api.ParseTrustedProxies(trustedProxies)
-		if err != nil {
-			log.Error("invalid PEERLINE_TRUSTED_PROXIES CIDR", "err", err)
-			os.Exit(1)
-		}
-		if len(nets) == 0 {
-			log.Warn("PEERLINE_TRUSTED_PROXIES set but contains no entries: X-Forwarded-For headers are ignored")
-		} else {
-			log.Info("trusted proxies", "count", len(nets), "cidrs", nets)
-		}
 	}
 
 	maxOutstandingInvites, _ := strconv.Atoi(os.Getenv("PEERLINE_MAX_OUTSTANDING_INVITES"))
@@ -319,6 +344,7 @@ func main() {
 		EmailPerHour:          emailPerHour,
 		NotifyPerHour:         notifyPerHour,
 		TrustedProxies:        trustedProxies,
+		AllowBroadIPv6:        allowBroadIPv6,
 		Clock:                 clk,
 		MaxOutstandingInvites: maxOutstandingInvites,
 		RetentionSeconds:      retentionSeconds,
