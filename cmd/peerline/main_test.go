@@ -151,6 +151,52 @@ func TestParseVersionDetail(t *testing.T) {
 	}
 }
 
+func TestParseBoolStrict(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    bool
+		wantErr bool
+	}{
+		{"empty string", "", false, false},
+		{"0", "0", false, false},
+		{"false lowercase", "false", false, false},
+		{"false uppercase", "FALSE", false, false},
+		{"false mixed case", "False", false, false},
+		{"1", "1", true, false},
+		{"true lowercase", "true", true, false},
+		{"true uppercase", "TRUE", true, false},
+		{"true mixed case", "True", true, false},
+		{"with whitespace 0", "  0  ", false, false},
+		{"with whitespace 1", "  1  ", true, false},
+		{"with whitespace true", "  true  ", true, false},
+		{"invalid yes", "yes", false, true},
+		{"invalid no", "no", false, true},
+		{"invalid on", "on", false, true},
+		{"invalid off", "off", false, true},
+		{"invalid 2", "2", false, true},
+		{"invalid t", "t", false, true},
+		{"invalid f", "f", false, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseBoolStrict(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("parseBoolStrict(%q) = %v, nil; want error", tt.input, got)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("parseBoolStrict(%q) = %v, %v; want %v, nil", tt.input, got, err, tt.want)
+				} else if got != tt.want {
+					t.Errorf("parseBoolStrict(%q) = %v; want %v", tt.input, got, tt.want)
+				}
+			}
+		})
+	}
+}
+
 func TestDescribeTLSMode(t *testing.T) {
 	tests := []struct {
 		name string

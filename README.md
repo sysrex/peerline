@@ -380,15 +380,18 @@ This trusts only requests from that Docker network (where Traefik runs). Peerlin
 
 **⚠️ Warning:** Do NOT blindly trust all RFC1918 private ranges (`10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`) unless you control every host in those ranges. Trusting a range means any host in it can spoof X-Forwarded-For. Only trust the specific network where your reverse proxy resides.
 
-**Prefix length restrictions:** To prevent misconfiguration, Peerline enforces minimum prefix lengths: `/8` for IPv4 and `/32` for IPv6. The following are rejected at startup:
+**Prefix length restrictions:** To prevent misconfiguration, Peerline enforces minimum prefix lengths: `/8` for IPv4 and `/32` for IPv6 (or `/29` with opt-in, see below). The following are rejected at startup:
 - Overly broad prefixes: `0.0.0.0/0`, `::/0`, and any prefix shorter than the floor
 - IPv4-mapped IPv6 prefixes shorter than `/96` (e.g., `::ffff:0:0/80` would also trust `::1`)
 - IPv4-mapped prefixes `/96` through `/103` (would map to IPv4 prefixes broader than `/8`)
 - Zone identifiers in any form (e.g., `fe80::1%eth0`)
+- `0.0.0.0/8` ("this network") and its IPv4-mapped form `::ffff:0.0.0.0/104`
 
 IPv4-mapped IPv6 prefixes meeting the floor (e.g., `::ffff:10.0.0.0/104`) are automatically unmapped to their native IPv4 equivalent (`10.0.0.0/8`) and treated as IPv4. A bare IPv4-mapped address like `::ffff:10.0.0.1` becomes `10.0.0.1/32`.
 
 **IPv6 trusted proxy floor:** The `/32` floor for IPv6 allows up to 2^96 addresses (e.g., `2001:db8::/32` trusts all addresses in that allocation). Trusting a public IPv6 prefix is acceptable only when you control all hosts in that range; trusting a public prefix (such as a cloud provider's entire region) means any host in that range can spoof X-Forwarded-For and is trusted at the operator's risk.
+
+**Broader IPv6 ranges (opt-in):** Set `PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD=1` (or `true`) to lower the IPv6 floor from `/32` to `/29`, allowing Cloudflare's `2a06:98c0::/29` and permitting ULA ranges `fc00::/7` and `fd00::/8`. Accepted values: `1`, `true` (opt-in), `0`, `false`, or empty string (default, opt-in off); any other value causes startup failure. Even with the opt-in, `::/0` and broader-than-/7 ULA ranges are rejected. **⚠️ Security warning:** Trusting a public `/32` or `/29` lets anyone inside that range spoof `X-Forwarded-For`. Only use this when you trust the entire range (e.g., when Cloudflare is your only ingress) and understand the risk.
 
 **Only X-Forwarded-For is honored.** Peerline does not read `X-Real-IP` or `Forwarded` (RFC 7239). Use a proxy that sets X-Forwarded-For, or leave `PEERLINE_TRUSTED_PROXIES` unset and accept that all clients share the proxy's RemoteAddr for rate limiting.
 
@@ -400,7 +403,7 @@ IPv4-mapped IPv6 prefixes meeting the floor (e.g., `::ffff:10.0.0.0/104`) are au
 
 Peerline runs a background maintenance task hourly (and once at startup) that purges:
 
-- **Unused expired invites:** Deleted when `expires_at < now - 300` (a fixed 5-minute grace window, not configurable). They are already rejected at `expires_at`; the grace only delays deletion and does not extend validity.
+- **Unused expired invites:** Deleted when `expires_at < now - 300` (a fixed 5-minute grace window, not configurable). They are rejected once `now > expires_at` (still valid at exactly `expires_at`); the grace only delays deletion and does not extend validity.
 - **Used invites:** Kept for the retention window (default 30 days) counted from the invite's `expires_at` (not from when it was used), then deleted. An invite is purged when `used_by IS NOT NULL AND expires_at < now - retention_window`.
 
 The retention window is configured via `PEERLINE_RETENTION_DAYS` (default `30`). Set it to `0` to use the default. Examples:
