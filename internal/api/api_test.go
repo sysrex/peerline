@@ -3311,10 +3311,10 @@ func TestSanitizerUnicode(t *testing.T) {
 
 		// Issue #84: Combining marks constraints
 		// Mark limit is checked in NFD (decomposed) form to ensure visible result has max 3 marks per base
-		{"3 marks allowed", "a\u0301\u0302\u0303", "á\u0302\u0303"},                         // a + 3 marks -> á + 2 marks (NFC composition)
-		{"20 marks capped at 3", "a" + strings.Repeat("\u0301", 20), "á́́"},                 // a + 20 marks -> a + 3 marks (may compose)
+		{"3 marks allowed", "a\u0301\u0302\u0303", "á\u0302\u0303"},                          // a + 3 marks -> á + 2 marks (NFC composition)
+		{"20 marks capped at 3", "a" + strings.Repeat("\u0301", 20), "á́́"},                  // a + 20 marks -> a + 3 marks (may compose)
 		{"64 marks alone becomes fallback", strings.Repeat("\u0301", 64), "A Peerline peer"}, // No base -> fallback (issue #68)
-		{"100 marks capped at 3", "a" + strings.Repeat("\u0301", 100), "á́́"},               // a + 100 marks -> a + 3 marks
+		{"100 marks capped at 3", "a" + strings.Repeat("\u0301", 100), "á́́"},                // a + 100 marks -> a + 3 marks
 		{"Mark after space dropped", "a \u0301b", "a b"},
 		{"Mark at start dropped", "\u0301abc", "abc"},
 		{"Mark after punctuation dropped", "a.\u0301b", "a.b"},
@@ -3416,13 +3416,13 @@ func TestSanitizerUnicode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-		got := sanitizeInviterName(tt.input)
-		if got != tt.want {
-			t.Errorf("sanitizeInviterName(%q) = %q, want %q", tt.input, got, tt.want)
-		}
+			got := sanitizeInviterName(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeInviterName(%q) = %q, want %q", tt.input, got, tt.want)
+			}
 
-		// Check all invariants (idempotence, prefix, ≤64 runes, no Cf)
-		checkSanitizeInvariants(t, tt.input, got, "table", true)
+			// Check all invariants (idempotence, prefix, ≤64 runes, no Cf)
+			checkSanitizeInvariants(t, tt.input, got, "table", true)
 
 			// For tests involving combining marks, verify that NFD form has at most 3 marks per base
 			if strings.Contains(tt.name, "marks") || strings.Contains(tt.name, "Devanagari") || strings.Contains(tt.name, "Thai") || strings.Contains(tt.name, "Hindi") {
