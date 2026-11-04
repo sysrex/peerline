@@ -333,18 +333,18 @@ type LimiterManager struct {
 
 // Rate limit constants for public GET endpoints and authenticated endpoints.
 const (
-	getPerMinute       = 60
-	getBurst           = 20
-	authGetPerMinute   = 120
-	authGetBurst       = 40
-	regPerMinute       = 10
-	regBurst           = 5
-	pairPerMinute      = 10
-	pairBurst          = 5
-	versionPerMinute   = 120
-	versionBurst       = 30
-	bagWritePerMinute  = 30
-	bagWriteBurst      = 10
+	getPerMinute      = 60
+	getBurst          = 20
+	authGetPerMinute  = 120
+	authGetBurst      = 40
+	regPerMinute      = 10
+	regBurst          = 5
+	pairPerMinute     = 10
+	pairBurst         = 5
+	versionPerMinute  = 120
+	versionBurst      = 30
+	bagWritePerMinute = 30
+	bagWriteBurst     = 10
 )
 
 // NewLimiterManager creates and starts a new limiter manager.
