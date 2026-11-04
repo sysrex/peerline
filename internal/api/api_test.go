@@ -2671,16 +2671,21 @@ func TestReadyAllowRaceSharedRecipient(t *testing.T) {
 	const concurrent = 10
 	sharedRecipient := "shared@example.com"
 	barrier := newBarrier(t, concurrent, 5*time.Second)
+	var armed atomic.Bool
 
 	// Use testAfterEmailReadyHook to synchronize after Ready checks, before Allow calls
 	rawSrv.testAfterEmailReadyHook = func(peerID string) {
-		barrier()
+		if armed.Load() {
+			barrier()
+		}
 	}
 
 	srv := httptest.NewServer(rawSrv.Handler())
 	defer srv.Close()
 
 	alice := register(t, srv, "Alice")
+
+	armed.Store(true)
 
 	results := make(chan int, concurrent)
 	var wg sync.WaitGroup
@@ -2717,7 +2722,7 @@ func TestReadyAllowRaceSharedRecipient(t *testing.T) {
 		t.Errorf("concurrent rejects: %d, want %d", rejected, concurrent-1)
 	}
 
-	rawSrv.testAfterEmailReadyHook = nil
+	armed.Store(false)
 
 	// Verify exactly 1 invite exists (the others were cleaned up during rejection)
 	var inviteCount int
@@ -2772,24 +2777,24 @@ func TestInviteRateLimitDeleteFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	t.Cleanup(func() { st.Close() })
 
 	// Open a second connection for trigger manipulation
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	t.Cleanup(func() { db.Close() })
 
 	prepareTestConfig(t, st, &cfg)
 	rawSrv, err := New(st, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rawSrv.Stop()
+	t.Cleanup(rawSrv.Stop)
 
 	srv := httptest.NewServer(rawSrv.Handler())
-	defer srv.Close()
+	t.Cleanup(srv.Close)
 
 	alice := register(t, srv, "Alice")
 
@@ -2820,7 +2825,9 @@ func TestInviteRateLimitDeleteFailure(t *testing.T) {
 		t.Fatalf("create trigger: %v", err)
 	}
 	t.Cleanup(func() {
-		db.Exec(`DROP TRIGGER IF EXISTS fail_inv_del`)
+		if _, err := db.Exec(`DROP TRIGGER IF EXISTS fail_inv_del`); err != nil {
+			t.Errorf("drop trigger: %v", err)
+		}
 	})
 
 	// Attempt to create a second invite with email, which will hit rate limit and try to delete
@@ -2924,26 +2931,27 @@ func TestInviteRateLimitDeleteFailure(t *testing.T) {
 // succeeds and one hits the rcptLim failure path with refund.
 func TestRecipientLimitRefundDeleteFailure(t *testing.T) {
 	frozenTime := time.Unix(1000000000, 0)
+	clk := clocktest.New(frozenTime)
 	capture := &captureMailer{}
 	cfg := Config{}
 	cfg.EmailPerHour = 10
 	cfg.EmailBurst = 2       // Burst of 2 to test refund logic
 	cfg.EmailRcptPerHour = 1 // Only 1 email per recipient per hour
 	cfg.Mailer = capture
-	cfg.Clock = clocktest.New(frozenTime)
+	cfg.Clock = clk
 
 	dbPath := t.TempDir() + "/t.db"
-	st, err := store.OpenWithOptions(dbPath, store.OpenOptions{Clock: clocktest.New(frozenTime)})
+	st, err := store.OpenWithOptions(dbPath, store.OpenOptions{Clock: clk})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	t.Cleanup(func() { st.Close() })
 
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	t.Cleanup(func() { db.Close() })
 
 	// Install BEFORE DELETE trigger to force cleanup failure
 	_, err = db.Exec(`CREATE TRIGGER fail_inv_del BEFORE DELETE ON invites BEGIN SELECT RAISE(ABORT, 'trigger_error'); END`)
@@ -2951,7 +2959,9 @@ func TestRecipientLimitRefundDeleteFailure(t *testing.T) {
 		t.Fatalf("create trigger: %v", err)
 	}
 	t.Cleanup(func() {
-		db.Exec(`DROP TRIGGER IF EXISTS fail_inv_del`)
+		if _, err := db.Exec(`DROP TRIGGER IF EXISTS fail_inv_del`); err != nil {
+			t.Errorf("drop trigger: %v", err)
+		}
 	})
 
 	prepareTestConfig(t, st, &cfg)
@@ -2959,7 +2969,7 @@ func TestRecipientLimitRefundDeleteFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rawSrv.Stop()
+	t.Cleanup(rawSrv.Stop)
 
 	const concurrent = 2
 	barrier := newBarrier(t, concurrent, 5*time.Second)
@@ -2971,7 +2981,7 @@ func TestRecipientLimitRefundDeleteFailure(t *testing.T) {
 	}
 
 	srv := httptest.NewServer(rawSrv.Handler())
-	defer srv.Close()
+	t.Cleanup(srv.Close)
 
 	alice := register(t, srv, "Alice")
 
