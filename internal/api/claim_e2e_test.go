@@ -317,7 +317,8 @@ func TestConfirmWithStaleDigestDoesNotDeadlock(t *testing.T) {
 }
 
 // TestActiveReplayWithDifferentPeerReturns404 verifies that replaying an active invite
-// with a different peer_id and stale digest returns 404 (#311 item 1, P1-2).
+// with a different peer_id and stale digest returns 404 indistinguishable from a miss
+// (same body and Content-Type as confirming an unknown public_id) (#311 item 1, P1-2).
 func TestActiveReplayWithDifferentPeerReturns404(t *testing.T) {
 	srv, _ := claimServer(t)
 	inviter, claimant, other := register(t, srv, "inviter"), register(t, srv, "claimant"), register(t, srv, "other")
@@ -358,15 +359,36 @@ func TestActiveReplayWithDifferentPeerReturns404(t *testing.T) {
 		t.Fatalf("replay with same peer: %s", b)
 	}
 
-	// Replay with different peer + any digest should return 404
+	// Get a known miss response (confirm on an unknown public_id) to compare
+	unknownPub := "inv_0000000000000000000000000000"
 	wrongDigest := "1111111111111111111111111111111111111111111111111111111111111111"
-	resp, b = inviter.do("POST", "/v1/invites/"+pub+"/confirm", map[string]string{
+	missResp, missBody := inviter.do("POST", "/v1/invites/"+unknownPub+"/confirm", map[string]string{
+		"peer_id":      claimant.id,
+		"code":         "AAAA-AAAA",
+		"offer_digest": wrongDigest,
+	}, nil)
+	if missResp.StatusCode != 404 {
+		t.Fatalf("known miss: got %d, want 404", missResp.StatusCode)
+	}
+	missContentType := missResp.Header.Get("Content-Type")
+
+	// Replay with different peer + any digest should return 404 indistinguishable from the miss
+	replayResp, replayBody := inviter.do("POST", "/v1/invites/"+pub+"/confirm", map[string]string{
 		"peer_id":      other.id,
 		"code":         cl.Code,
 		"offer_digest": wrongDigest,
 	}, nil)
-	if resp.StatusCode != 404 {
-		t.Fatalf("replay with different peer: got %d %s, want 404", resp.StatusCode, b)
+	if replayResp.StatusCode != 404 {
+		t.Fatalf("replay with different peer: got %d %s, want 404", replayResp.StatusCode, replayBody)
+	}
+	replayContentType := replayResp.Header.Get("Content-Type")
+
+	// Assert the 404 responses are byte-for-byte identical
+	if !bytes.Equal(replayBody, missBody) {
+		t.Errorf("replay 404 body differs from miss 404:\nreplay: %s\nmiss:   %s", replayBody, missBody)
+	}
+	if replayContentType != missContentType {
+		t.Errorf("replay Content-Type %q != miss Content-Type %q", replayContentType, missContentType)
 	}
 
 	// Verify grants unchanged (still 2 bidirectional for inviter<->claimant)

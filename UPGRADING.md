@@ -72,6 +72,8 @@ This prevents time-of-check-time-of-use vulnerabilities and silent grant overwri
 
 **Note:** A stale `offer_digest` (if the offer changed between GET and confirm) returns HTTP 409 with the fresh digest, and does not count toward the 3-strike auto-decline limit. Only code or peer_id mismatches count toward auto-decline.
 
+**Repeat decline now succeeds (idempotent):** As of PR #241, calling `POST /v1/invites/{public_id}/decline` on an already-declined invite returns HTTP 200 success instead of HTTP 404. This makes decline idempotent, consistent with the behavior of repeated confirm operations on active invites. Clients that relied on 404 for already-declined invites should update their logic.
+
 **Important:** This overwrite prevention applies only to confirm-mode invites. Legacy pairing paths (`POST /v1/pairing/{token}` with invite codes or pairing links) still silently overwrite existing grants between the two peers. See [issue #312](https://github.com/sysrex/peerline/issues/312) for details. For controlled re-pairing with review, use confirm-mode invites.
 
 ## Schema Migrations and Backups

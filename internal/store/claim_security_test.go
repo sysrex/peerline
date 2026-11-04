@@ -86,7 +86,10 @@ func TestConfirmWithStaleDigestWritesNothing(t *testing.T) {
 }
 
 // TestConfirmStaleDigestNoDeadlock verifies that confirming with a stale digest does not
-// deadlock the single-connection store pool (#310).
+// deadlock the single-connection store pool and that the stale-digest closure can safely
+// call a real Store method under the deadline (#310). The closure calls InviterView on the
+// same store instance to prove that returning CheckDigestStale with a Claim does not hold
+// a connection that would block other queries.
 func TestConfirmStaleDigestNoDeadlock(t *testing.T) {
 	s, _ := claimStore(t)
 	ctx := context.Background()
@@ -110,7 +113,19 @@ func TestConfirmStaleDigestNoDeadlock(t *testing.T) {
 
 	start := time.Now()
 	staleCheck := func(claim *Claim) (CheckResult, *Claim) {
-		// Return stale digest - this would trigger InviterView call in broken code
+		// Call InviterView under the deadline to prove the stale-digest path doesn't hold
+		// a connection (regression test for #310 where a second query would deadlock with SetMaxOpenConns(1))
+		viewCtx, viewCancel := context.WithTimeout(ctx, 1*time.Second)
+		defer viewCancel()
+		view, err := s.InviterView(viewCtx, claim.PublicID, "alice")
+		if err != nil {
+			t.Errorf("InviterView in stale closure: %v", err)
+			return CheckDigestStale, claim
+		}
+		if view == nil {
+			t.Error("InviterView returned nil in stale closure")
+		}
+		// Return stale digest - the InviterView call proves we didn't deadlock
 		return CheckDigestStale, claim
 	}
 	state, freshClaim, err := s.ConfirmClaim(timeoutCtx, c.PublicID, "alice", "bob", 3, staleCheck)
@@ -127,22 +142,9 @@ func TestConfirmStaleDigestNoDeadlock(t *testing.T) {
 		t.Fatal("freshClaim is nil, want fresh claim")
 	}
 
-	// Should finish well under the deadline (under 500ms is generous for a single tx)
+	// Should finish well under the deadline (under 500ms is generous for a single tx + one extra query)
 	if elapsed > 500*time.Millisecond {
 		t.Errorf("ConfirmClaim took %v, want < 500ms (possible connection starvation)", elapsed)
-	}
-
-	// A subsequent store call should succeed immediately (proves no connection leaked)
-	viewCtx, viewCancel := context.WithTimeout(ctx, 1*time.Second)
-	defer viewCancel()
-	viewStart := time.Now()
-	view, err := s.InviterView(viewCtx, c.PublicID, "alice")
-	viewElapsed := time.Since(viewStart)
-	if err != nil {
-		t.Fatalf("InviterView after stale digest: %v (elapsed %v)", err, viewElapsed)
-	}
-	if view == nil {
-		t.Fatal("InviterView returned nil")
 	}
 
 	// Verify code_fails is still 0
@@ -460,7 +462,8 @@ func TestConcurrentConfirmDecline(t *testing.T) {
 	}
 }
 
-// TestConcurrentConfirmRevoke verifies that concurrent confirm and revoke produce exactly one outcome.
+// TestConcurrentConfirmRevoke verifies that concurrent confirm and revoke produce exactly one outcome,
+// and that exactly one operation succeeds with the loser receiving ErrNotFound (not SQLITE_BUSY or any other error).
 func TestConcurrentConfirmRevoke(t *testing.T) {
 	const iterations = 50
 
@@ -528,10 +531,25 @@ func TestConcurrentConfirmRevoke(t *testing.T) {
 			close(start)
 
 			confirmErr := <-confirmDone
-			_ = <-revokeDone // revokeErr not needed - we check final state below
+			revokeErr := <-revokeDone
 
-			// Both operations can fail (if they race and both lose to a third thing), or one succeeds
-			// Check final state
+			// Exactly one of confirm and revoke must succeed
+			if confirmErr != nil && revokeErr != nil {
+				t.Errorf("both operations failed: confirm=%v revoke=%v", confirmErr, revokeErr)
+			}
+			if confirmErr == nil && revokeErr == nil {
+				t.Error("both confirm and revoke succeeded")
+			}
+
+			// The loser must get ErrNotFound (not SQLITE_BUSY or any other error)
+			if confirmErr != nil && !errors.Is(confirmErr, ErrNotFound) {
+				t.Errorf("confirm failed with %v, want ErrNotFound", confirmErr)
+			}
+			if revokeErr != nil && !errors.Is(revokeErr, ErrNotFound) {
+				t.Errorf("revoke failed with %v, want ErrNotFound", revokeErr)
+			}
+
+			// Check final state is consistent
 			var exists int
 			err = s1.db.QueryRow(`SELECT COUNT(*) FROM invites WHERE public_id=?`, publicID).Scan(&exists)
 			if err != nil {
