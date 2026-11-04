@@ -3312,10 +3312,10 @@ func TestSanitizerUnicode(t *testing.T) {
 
 		// Issue #84: Combining marks constraints
 		// Mark limit is checked in NFD (decomposed) form to ensure visible result has max 3 marks per base
-		{"3 marks allowed", "a\u0301\u0302\u0303", "á\u0302\u0303", false},                          // a + 3 marks -> á + 2 marks (NFC composition)
-		{"20 marks capped at 3", "a" + strings.Repeat("\u0301", 20), "á́́", false},                  // a + 20 marks -> a + 3 marks (may compose)
+		{"3 marks allowed", "a\u0301\u0302\u0303", "á\u0302\u0303", false},                         // a + 3 marks -> á + 2 marks (NFC composition)
+		{"20 marks capped at 3", "a" + strings.Repeat("\u0301", 20), "á́́", false},                 // a + 20 marks -> a + 3 marks (may compose)
 		{"64 marks alone becomes fallback", strings.Repeat("\u0301", 64), "A Peerline peer", true}, // No base -> fallback (issue #68); skip invariants
-		{"100 marks capped at 3", "a" + strings.Repeat("\u0301", 100), "á́́", false},                // a + 100 marks -> a + 3 marks
+		{"100 marks capped at 3", "a" + strings.Repeat("\u0301", 100), "á́́", false},               // a + 100 marks -> a + 3 marks
 		{"Mark after space dropped", "a \u0301b", "a b", false},
 		{"Mark at start dropped", "\u0301abc", "abc", false},
 		{"Mark after punctuation dropped", "a.\u0301b", "a.b", false},
@@ -3328,9 +3328,9 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Tab with spaces", "Alice  \t  Smith", "Alice Smith", false},
 
 		// Issue #68: Empty result fallback
-		{"Only symbols becomes fallback", "★★★", "A Peerline peer", true},               // Skip invariants (no base)
-		{"Only filtered chars", "\u200B\u200C\uFEFF", "A Peerline peer", true},           // Skip invariants (all filtered)
-		{"Only marks becomes fallback", "\u0301\u0302\u0303", "A Peerline peer", true},   // Skip invariants (no base)
+		{"Only symbols becomes fallback", "★★★", "A Peerline peer", true},              // Skip invariants (no base)
+		{"Only filtered chars", "\u200B\u200C\uFEFF", "A Peerline peer", true},         // Skip invariants (all filtered)
+		{"Only marks becomes fallback", "\u0301\u0302\u0303", "A Peerline peer", true}, // Skip invariants (no base)
 
 		// NFKC normalization
 		{"Fullwidth ASCII", "Ａｌｉｃｅ", "Alice", false},  // Fullwidth → ASCII
@@ -3349,8 +3349,8 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"Symbol removed", "Alice ★ Smith", "Alice Smith", false},
 
 		// Edge cases
-		{"Empty string", "", "A Peerline peer", true},       // Skip invariants (empty)
-		{"Only spaces", "   ", "A Peerline peer", true},     // Skip invariants (only spaces)
+		{"Empty string", "", "A Peerline peer", true},   // Skip invariants (empty)
+		{"Only spaces", "   ", "A Peerline peer", true}, // Skip invariants (only spaces)
 
 		// Issue #68: Length tests (64 runes max, counted on final NFC output)
 		{"70 ASCII letters", strings.Repeat("a", 70), strings.Repeat("a", 64), false},
