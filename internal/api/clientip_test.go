@@ -1335,6 +1335,7 @@ func TestAllowBroadIPv6Warning(t *testing.T) {
 		wantPublic         bool
 		wantULA            bool
 		wantRelaxedEntries []string
+		wantNotOnRelaxed   []string
 	}{
 		{
 			name:               "both public and ULA",
@@ -1349,6 +1350,7 @@ func TestAllowBroadIPv6Warning(t *testing.T) {
 			wantPublic:         true,
 			wantULA:            false,
 			wantRelaxedEntries: []string{"2a06:98c0::/29"},
+			wantNotOnRelaxed:   []string{"2001:db8::/32"},
 		},
 		{
 			name:               "ULA only",
@@ -1410,6 +1412,11 @@ func TestAllowBroadIPv6Warning(t *testing.T) {
 				for _, entry := range tt.wantRelaxedEntries {
 					if !strings.Contains(relaxedLine, entry) {
 						t.Errorf("expected relaxed log line to list %q, got: %q", entry, relaxedLine)
+					}
+				}
+				for _, entry := range tt.wantNotOnRelaxed {
+					if strings.Contains(relaxedLine, entry) {
+						t.Errorf("expected relaxed log line NOT to list %q (non-relaxed entry), got: %q", entry, relaxedLine)
 					}
 				}
 			}
