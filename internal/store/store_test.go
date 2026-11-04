@@ -2346,7 +2346,7 @@ func TestPreExistingBackupNotOverwritten(t *testing.T) {
 
 	// Pin clock to a known time to make backup names deterministic
 	fixedTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
-	
+
 	// Pre-create files at the base backup name to force collision
 	baseName := "test.db.pre-v6-from-v2.20260101-120000.000000"
 	basePath := tempDir + "/" + baseName
