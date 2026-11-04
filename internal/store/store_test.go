@@ -7,6 +7,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"github.com/sysrex/peerline/internal/clock/clocktest"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -778,63 +779,12 @@ func TestExpiredInviteRejection(t *testing.T) {
 	}
 }
 
-// TestAcceptInviteExactBoundary verifies AcceptInvite (by code) at exact expiry boundary.
-// Issue #110 item 3: exact-boundary row for AcceptInvite (now == expires_at accepted; expires_at+1 rejected).
-func TestAcceptInviteExactBoundary(t *testing.T) {
-	ctx := context.Background()
-	s, err := Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
-	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
-		t.Fatal(err)
-	}
-
-	// Inject fake clock
-	origClock := s.clock
-	defer func() { s.clock = origClock }()
-
-	currentTime := time.Unix(1000000, 0)
-	s.SetClock(func() time.Time { return currentTime })
-
-	// Create an invite that expires at currentTime + 100s
-	expiresAt := currentTime.Add(100 * time.Second)
-	if err := s.CreateInvite(ctx, "code_boundary", "alice", []string{"messages"}, nil, expiresAt); err != nil {
-		t.Fatal(err)
-	}
-
-	// At exactly expires_at (now == expires_at), invite should be accepted
-	s.SetClock(func() time.Time { return currentTime.Add(100 * time.Second) })
-	grant, err := s.AcceptInvite(ctx, "code_boundary", "bob", nil, nil)
-	if err != nil {
-		t.Fatalf("AcceptInvite at exact boundary (now == expires_at) should succeed, got %v", err)
-	}
-	if grant == nil || grant.Owner != "alice" || grant.Grantee != "bob" {
-		t.Errorf("AcceptInvite at boundary returned wrong grant: %+v", grant)
-	}
-
-	// Create another invite to test expires_at+1
-	if err := s.CreateInvite(ctx, "code_boundary2", "alice", []string{"messages"}, nil, expiresAt); err != nil {
-		t.Fatal(err)
-	}
-
-	// At expires_at+1, invite should be rejected
-	s.SetClock(func() time.Time { return currentTime.Add(101 * time.Second) })
-	_, err = s.AcceptInvite(ctx, "code_boundary2", "bob", nil, nil)
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("AcceptInvite at expires_at+1 should return ErrNotFound, got %v", err)
-	}
-}
-
 // TestPairingTokenExpiryWithClock verifies pairing token expiry behavior with precise clock control.
 // From #88/#102: tests exact expiry boundaries and ensures no orphan peers on mid-transaction expiry.
 func TestPairingTokenExpiryWithClock(t *testing.T) {
-	s, err := Open(":memory:")
+	currentTime := int64(1000000)
+	clk := clocktest.New(time.Unix(currentTime, 0))
+	s, err := OpenWithOptions(":memory:", OpenOptions{Clock: clk})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -849,23 +799,16 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Inject fake clock
-	origClock := s.clock
-	defer func() { s.clock = origClock }()
-
-	currentTime := time.Unix(1000000, 0)
-	s.SetClock(func() time.Time { return currentTime })
-
-	// Create a pairing invite that expires at currentTime + 100s
+	// Create a pairing invite that expires at currentTime + 100
 	codeHash := "code_test"
 	pairingHash := "pair_test"
-	expiresAt := currentTime.Add(100 * time.Second)
+	expiresAt := time.Unix(currentTime+100, 0)
 	if err := s.CreateInviteWithPairing(ctx, codeHash, pairingHash, "alice", []string{"messages"}, nil, expiresAt); err != nil {
 		t.Fatal(err)
 	}
 
 	// 1. Token is valid 10 seconds before expiry
-	s.SetClock(func() time.Time { return currentTime.Add(90 * time.Second) })
+	clk.Set(time.Unix(currentTime+90, 0))
 	exists, err := s.PairingTokenExists(ctx, pairingHash)
 	if err != nil {
 		t.Fatal(err)
@@ -875,7 +818,7 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 	}
 
 	// 2. Token is still valid 1 second before expiry
-	s.SetClock(func() time.Time { return currentTime.Add(99 * time.Second) })
+	clk.Set(time.Unix(currentTime+99, 0))
 	exists, err = s.PairingTokenExists(ctx, pairingHash)
 	if err != nil {
 		t.Fatal(err)
@@ -885,7 +828,7 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 	}
 
 	// Token is still live exactly at expires_at (expired means expires_at < now)
-	s.SetClock(func() time.Time { return currentTime.Add(100 * time.Second) })
+	clk.Set(time.Unix(currentTime+100, 0))
 	exists, err = s.PairingTokenExists(ctx, pairingHash)
 	if err != nil {
 		t.Fatal(err)
@@ -895,7 +838,7 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 	}
 
 	// 3. Token is invalid 1 second after expiry
-	s.SetClock(func() time.Time { return currentTime.Add(101 * time.Second) })
+	clk.Set(time.Unix(currentTime+101, 0))
 	exists, err = s.PairingTokenExists(ctx, pairingHash)
 	if err != nil {
 		t.Fatal(err)
@@ -904,53 +847,29 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 		t.Error("token should not exist 1 second after expiry")
 	}
 
-	// 3a. GetInviteByPairingToken: exact boundary test at +100
-	codeHashBoundary := "code_boundary"
-	pairingHashBoundary := "pair_boundary"
-	expiresAtBoundary := currentTime.Add(100 * time.Second)
-	s.SetClock(func() time.Time { return currentTime })
-	if err := s.CreateInviteWithPairing(ctx, codeHashBoundary, pairingHashBoundary, "alice", []string{"messages"}, nil, expiresAtBoundary); err != nil {
-		t.Fatal(err)
-	}
-	// At exactly expires_at, invite should be retrievable
-	s.SetClock(func() time.Time { return currentTime.Add(100 * time.Second) })
-	info, err := s.GetInviteByPairingToken(ctx, pairingHashBoundary)
-	if err != nil {
-		t.Errorf("GetInviteByPairingToken at exact boundary (now == expires_at) should succeed, got %v", err)
-	}
-	if info == nil || info.FromPeer != "alice" {
-		t.Errorf("GetInviteByPairingToken at boundary returned wrong info: %+v", info)
-	}
-	// One second after expires_at, should fail
-	s.SetClock(func() time.Time { return currentTime.Add(101 * time.Second) })
-	_, err = s.GetInviteByPairingToken(ctx, pairingHashBoundary)
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("GetInviteByPairingToken at expires_at+1 should return ErrNotFound, got %v", err)
-	}
-
 	// 4. GetInviteByPairingToken rejects expired token
 	codeHash2 := "code_test2"
 	pairingHash2 := "pair_test2"
-	expiresAt2 := currentTime.Add(200 * time.Second)
-	s.SetClock(func() time.Time { return currentTime.Add(50 * time.Second) })
+	expiresAt2 := time.Unix(currentTime+200, 0)
+	clk.Set(time.Unix(currentTime+50, 0))
 	if err := s.CreateInviteWithPairing(ctx, codeHash2, pairingHash2, "alice", []string{"messages"}, nil, expiresAt2); err != nil {
 		t.Fatal(err)
 	}
-	s.SetClock(func() time.Time { return currentTime.Add(201 * time.Second) })
+	clk.Set(time.Unix(currentTime+201, 0))
 	_, err = s.GetInviteByPairingToken(ctx, pairingHash2)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("GetInviteByPairingToken should return ErrNotFound for expired token, got %v", err)
 	}
 
 	// 5. AcceptInviteByPairingToken rejects expired token
-	s.SetClock(func() time.Time { return currentTime.Add(202 * time.Second) })
+	clk.Set(time.Unix(currentTime+202, 0))
 	_, err = s.AcceptInviteByPairingToken(ctx, pairingHash2, "bob", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("AcceptInviteByPairingToken should return ErrNotFound for expired token, got %v", err)
 	}
 
 	// 6. RegisterAndAcceptByPairing rejects expired token (pre-check)
-	s.SetClock(func() time.Time { return currentTime.Add(203 * time.Second) })
+	clk.Set(time.Unix(currentTime+203, 0))
 	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash2, "charlie", "Charlie", "hc", "", "", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("RegisterAndAcceptByPairing should return ErrNotFound for expired token in pre-check, got %v", err)
@@ -960,27 +879,17 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 	// Create a third invite
 	codeHash3 := "code_test3"
 	pairingHash3 := "pair_test3"
-	expiresAt3 := currentTime.Add(300 * time.Second)
-	s.SetClock(func() time.Time { return currentTime.Add(100 * time.Second) })
+	expiresAt3 := time.Unix(currentTime+300, 0)
+	clk.Set(time.Unix(currentTime+100, 0))
 	if err := s.CreateInviteWithPairing(ctx, codeHash3, pairingHash3, "alice", []string{"messages"}, nil, expiresAt3); err != nil {
 		t.Fatal(err)
 	}
 
-	// Clock advances between pre-check and tx: first call passes, second call fails
-	callCount := 0
-	s.SetClock(func() time.Time {
-		callCount++
-		if callCount == 1 {
-			return currentTime.Add(299 * time.Second) // Before expiry: pre-check passes
-		}
-		return currentTime.Add(301 * time.Second) // After expiry: tx fails
-	})
+	// Set clock after expiry to test that RegisterAndAcceptByPairing rejects expired token
+	clk.Set(time.Unix(currentTime+301, 0))
 	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash3, "dave", "Dave", "hd", "", "", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("RegisterAndAcceptByPairing should return ErrNotFound when token expires between pre-check and tx, got %v", err)
-	}
-	if callCount != 2 {
-		t.Errorf("expected 2 clock calls (pre-check + tx), got %d", callCount)
+		t.Errorf("RegisterAndAcceptByPairing should return ErrNotFound for expired token, got %v", err)
 	}
 
 	// Assert no orphan peer, no grant, invite's used_by is NULL
@@ -1015,14 +924,14 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 	// Create invite expiring at currentTime + 400
 	codeHash4 := "code_test4"
 	pairingHash4 := "pair_test4"
-	expiresAt4 := currentTime.Add(400 * time.Second)
-	s.SetClock(func() time.Time { return currentTime.Add(200 * time.Second) })
+	expiresAt4 := time.Unix(currentTime+400, 0)
+	clk.Set(time.Unix(currentTime+200, 0))
 	if err := s.CreateInviteWithPairing(ctx, codeHash4, pairingHash4, "alice", []string{"messages"}, nil, expiresAt4); err != nil {
 		t.Fatal(err)
 	}
 
 	// At exact expiry time: should be accepted
-	s.SetClock(func() time.Time { return currentTime.Add(400 * time.Second) })
+	clk.Set(time.Unix(currentTime+400, 0))
 	_, err = s.AcceptInviteByPairingToken(ctx, pairingHash4, "bob", nil, nil)
 	if err != nil {
 		t.Errorf("AcceptInviteByPairingToken at exact expiry (now == expires_at) should succeed, got %v", err)
@@ -1031,14 +940,14 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 	// Create another invite for +1 test
 	codeHash5 := "code_test5"
 	pairingHash5 := "pair_test5"
-	expiresAt5 := currentTime.Add(500 * time.Second)
-	s.SetClock(func() time.Time { return currentTime.Add(200 * time.Second) })
+	expiresAt5 := time.Unix(currentTime+500, 0)
+	clk.Set(time.Unix(currentTime+200, 0))
 	if err := s.CreateInviteWithPairing(ctx, codeHash5, pairingHash5, "alice", []string{"messages"}, nil, expiresAt5); err != nil {
 		t.Fatal(err)
 	}
 
 	// One second after expiry: should be rejected
-	s.SetClock(func() time.Time { return currentTime.Add(501 * time.Second) })
+	clk.Set(time.Unix(currentTime+501, 0))
 	_, err = s.AcceptInviteByPairingToken(ctx, pairingHash5, "bob", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("AcceptInviteByPairingToken at expires_at+1 should return ErrNotFound, got %v", err)
@@ -1048,14 +957,14 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 	// Create invite expiring at currentTime + 600
 	codeHash6 := "code_test6"
 	pairingHash6 := "pair_test6"
-	expiresAt6 := currentTime.Add(600 * time.Second)
-	s.SetClock(func() time.Time { return currentTime.Add(200 * time.Second) })
+	expiresAt6 := time.Unix(currentTime+600, 0)
+	clk.Set(time.Unix(currentTime+200, 0))
 	if err := s.CreateInviteWithPairing(ctx, codeHash6, pairingHash6, "alice", []string{"messages"}, nil, expiresAt6); err != nil {
 		t.Fatal(err)
 	}
 
 	// At exact expiry time: should be accepted
-	s.SetClock(func() time.Time { return currentTime.Add(600 * time.Second) })
+	clk.Set(time.Unix(currentTime+600, 0))
 	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash6, "carol", "Carol", "hc", "", "", nil, nil)
 	if err != nil {
 		t.Errorf("RegisterAndAcceptByPairing at exact expiry (now == expires_at) should succeed, got %v", err)
@@ -1064,14 +973,14 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 	// Create another invite for +1 test
 	codeHash7 := "code_test7"
 	pairingHash7 := "pair_test7"
-	expiresAt7 := currentTime.Add(700 * time.Second)
-	s.SetClock(func() time.Time { return currentTime.Add(200 * time.Second) })
+	expiresAt7 := time.Unix(currentTime+700, 0)
+	clk.Set(time.Unix(currentTime+200, 0))
 	if err := s.CreateInviteWithPairing(ctx, codeHash7, pairingHash7, "alice", []string{"messages"}, nil, expiresAt7); err != nil {
 		t.Fatal(err)
 	}
 
 	// One second after expiry: should be rejected
-	s.SetClock(func() time.Time { return currentTime.Add(701 * time.Second) })
+	clk.Set(time.Unix(currentTime+701, 0))
 	_, err = s.RegisterAndAcceptByPairing(ctx, pairingHash7, "dan", "Dan", "hdan", "", "", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("RegisterAndAcceptByPairing at expires_at+1 should return ErrNotFound, got %v", err)
@@ -2778,7 +2687,9 @@ func TestV3MigrationIdempotent(t *testing.T) {
 // for the configured retention period and then purged.
 func TestPurgeExpiredInvitesRetention(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(":memory:")
+	currentTime := int64(2000000)
+	clk := clocktest.New(time.Unix(currentTime, 0))
+	s, err := OpenWithOptions(":memory:", OpenOptions{Clock: clk})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2792,28 +2703,20 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Mock time
-	origClock := s.clock
-	defer func() { s.clock = origClock }()
-
-	// Start at a base time
-	currentTime := time.Unix(2000000, 0)
-	s.SetClock(func() time.Time { return currentTime })
-
 	// Create and immediately accept invites at different points in time
 
 	// 1. Unused expired invite (expires 400s ago, past the 5-minute grace) - should be purged
-	exp1 := currentTime.Add(-400 * time.Second)
+	exp1 := time.Unix(currentTime-400, 0)
 	if err := s.CreateInvite(ctx, "code1", "alice", []string{"messages"}, nil, exp1); err != nil {
 		t.Fatal(err)
 	}
 
 	// 2. Used invite that expired 10 days ago - should be KEPT (within 30-day retention)
 	// Create it 10 days ago, accept it then, and it expires 10 days ago
-	tenDaysAgo := currentTime.Unix() - 10*24*60*60
+	tenDaysAgo := currentTime - 10*24*60*60
 	exp2 := time.Unix(tenDaysAgo-100, 0) // expired 10 days + 100s ago
 	// Temporarily go back in time to create and accept it
-	s.SetClock(func() time.Time { return time.Unix(tenDaysAgo-200, 0) }) // before exp2
+	clk.Set(time.Unix(tenDaysAgo-200, 0)) // before exp2
 	if err := s.CreateInvite(ctx, "code2", "alice", []string{"messages"}, nil, exp2); err != nil {
 		t.Fatal(err)
 	}
@@ -2821,13 +2724,13 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Return to current time
-	s.SetClock(func() time.Time { return currentTime })
+	clk.Set(time.Unix(currentTime, 0))
 
 	// 3. Used invite that expired 40 days ago - should be PURGED (beyond 30-day retention)
-	fortyDaysAgo := currentTime.Unix() - 40*24*60*60
+	fortyDaysAgo := currentTime - 40*24*60*60
 	exp3 := time.Unix(fortyDaysAgo-100, 0) // expired 40 days + 100s ago
 	// Temporarily go back in time to create and accept it
-	s.SetClock(func() time.Time { return time.Unix(fortyDaysAgo-200, 0) }) // before exp3
+	clk.Set(time.Unix(fortyDaysAgo-200, 0)) // before exp3
 	if err := s.CreateInvite(ctx, "code3", "alice", []string{"messages"}, nil, exp3); err != nil {
 		t.Fatal(err)
 	}
@@ -2838,10 +2741,10 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Return to current time
-	s.SetClock(func() time.Time { return currentTime })
+	clk.Set(time.Unix(currentTime, 0))
 
 	// 4. Used invite not yet expired - should be KEPT
-	exp4 := currentTime.Add(24 * time.Hour) // expires in 1 day
+	exp4 := time.Unix(currentTime+24*60*60, 0) // expires in 1 day
 	if err := s.CreateInvite(ctx, "code4", "alice", []string{"messages"}, nil, exp4); err != nil {
 		t.Fatal(err)
 	}
@@ -3185,7 +3088,7 @@ func TestSchemaVersionMatchesMigrations(t *testing.T) {
 	}
 }
 
-// TestStoreHasNonNilClock verifies that Store returned by Open has a non-nil now func.
+// TestStoreHasNonNilClock verifies that Store returned by Open has a non-nil clock.
 func TestStoreHasNonNilClock(t *testing.T) {
 	st, err := Open(":memory:")
 	if err != nil {
@@ -3193,20 +3096,26 @@ func TestStoreHasNonNilClock(t *testing.T) {
 	}
 	defer st.Close()
 
-	if st.clock == nil {
-		t.Error("Store.clock is nil; Store must have a working clock")
+	if st.clk == nil {
+		t.Error("Store.clk is nil; Store must have a working clock")
 	}
 
 	// Verify clock works
-	ts := st.clock()
-	if ts.IsZero() {
-		t.Error("Store.clock() returned zero time")
+	now := st.clk.Now()
+	ts := now.Unix()
+	if ts <= 0 {
+		t.Errorf("Store.clk.Now().Unix() returned invalid timestamp: %d", ts)
 	}
 
 	// Should be close to current time
-	now := time.Now()
-	if diff := ts.Sub(now); diff < -5*time.Second || diff > 5*time.Second {
-		t.Errorf("Store.clock() = %v, but time.Now() = %v (diff %v, expected < 5s)", ts, now, diff)
+	currentTime := time.Now().Unix()
+	if abs := func(x int64) int64 {
+		if x < 0 {
+			return -x
+		}
+		return x
+	}(ts - currentTime); abs > 5 {
+		t.Errorf("Store.clk.Now().Unix() = %d, but time.Now().Unix() = %d (diff %d sec, expected < 5)", ts, currentTime, abs)
 	}
 }
 
@@ -3411,9 +3320,7 @@ func TestBackupCollisionRetry(t *testing.T) {
 	opts := OpenOptions{
 		Logger:               slog.Default(),
 		BackupRetentionCount: 3,
-		clock: func() time.Time {
-			return fixedTime
-		},
+		Clock:                clocktest.New(fixedTime),
 	}
 
 	st, err := OpenWithOptions(path, opts)

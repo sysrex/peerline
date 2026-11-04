@@ -18,15 +18,14 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/sysrex/peerline/internal/auth"
+	"github.com/sysrex/peerline/internal/clock/clocktest"
 	"github.com/sysrex/peerline/internal/store"
-	"github.com/sysrex/peerline/internal/store/storetest"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -37,9 +36,39 @@ type client struct {
 	id  string
 }
 
+// newBarrier creates an N-party barrier for concurrent test synchronization.
+// All n callers block in the returned function until all arrive, then all are released together.
+// If not all arrive within timeout, the test fails.
+// Note: arrivalCount == n allows the barrier to pass; a caller arriving after release passes through immediately.
+func newBarrier(t testing.TB, n int, timeout time.Duration) func() {
+	t.Helper()
+	var arrivalCount int
+	var mu sync.Mutex
+	allArrived := make(chan struct{})
+	var closeOnce sync.Once
+
+	return func() {
+		mu.Lock()
+		arrivalCount++
+		if arrivalCount == n {
+			closeOnce.Do(func() { close(allArrived) })
+		}
+		mu.Unlock()
+
+		select {
+		case <-allArrived:
+		case <-time.After(timeout):
+			mu.Lock()
+			arrived := arrivalCount
+			mu.Unlock()
+			t.Errorf("barrier timeout: %d/%d goroutines arrived", arrived, n)
+		}
+	}
+}
+
 func newServer(t *testing.T, cfg Config) *httptest.Server {
 	t.Helper()
-	st, err := store.Open(t.TempDir() + "/t.db")
+	st, err := store.OpenWithOptions(t.TempDir()+"/t.db", store.OpenOptions{Clock: cfg.Clock})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +88,7 @@ func newServer(t *testing.T, cfg Config) *httptest.Server {
 func newServerWithAccess(t *testing.T, cfg Config) (*httptest.Server, *Server, *store.Store) {
 	t.Helper()
 	dbPath := t.TempDir() + "/t.db"
-	st, err := store.Open(dbPath)
+	st, err := store.OpenWithOptions(dbPath, store.OpenOptions{Clock: cfg.Clock})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +108,7 @@ func newServerWithAccess(t *testing.T, cfg Config) (*httptest.Server, *Server, *
 func newServerWithDB(t *testing.T, cfg Config) (*httptest.Server, *Server, *store.Store, *sql.DB) {
 	t.Helper()
 	dbPath := t.TempDir() + "/t.db"
-	st, err := store.Open(dbPath)
+	st, err := store.OpenWithOptions(dbPath, store.OpenOptions{Clock: cfg.Clock})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,6 +200,15 @@ func assertSecurityHeaders(t *testing.T, hdr http.Header, context string) {
 	}
 	if got := hdr.Get("Referrer-Policy"); got != "no-referrer" {
 		t.Errorf("%s: Referrer-Policy = %q, want no-referrer", context, got)
+	}
+	if got := hdr.Get("X-Frame-Options"); got != "DENY" {
+		t.Errorf("%s: X-Frame-Options = %q, want DENY", context, got)
+	}
+	csp := hdr.Get("Content-Security-Policy")
+	if csp == "" {
+		t.Errorf("%s: missing Content-Security-Policy header", context)
+	} else if !strings.Contains(csp, "default-src 'none'") {
+		t.Errorf("%s: CSP missing default-src 'none': %s", context, csp)
 	}
 }
 
@@ -1985,7 +2023,7 @@ func TestMaintenanceManagerStops(t *testing.T) {
 
 	ctx := context.Background()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	mgr := NewMaintenanceManager(ctx, st, logger, 30*24*60*60, 6)
+	mgr := NewMaintenanceManager(ctx, st, logger, nil, 30*24*60*60, 6)
 
 	// Let it run a bit
 	time.Sleep(100 * time.Millisecond)
@@ -2256,9 +2294,9 @@ func TestDeletedInviteCannotBeAccepted(t *testing.T) {
 
 // TestConcurrentInviteCapRace verifies the concurrent cap check race is fixed (#53).
 //
-// The barrier holds all requests before the atomic cap check. The created count
-// (> 1) catches a count-then-insert regression in CreateInviteAtomic, and the final
-// email budget assertion (4 of 6 left) catches charging the limiter before the create.
+// The barrier (via testInviteCreatedHook) holds all requests before CreateInviteAtomic.
+// The "created == 1" assertion catches a count-then-insert regression in the atomic cap check.
+// The "budgetSucceeded == 4" assertion catches charging the email limiter before the create succeeds.
 func TestConcurrentInviteCapRace(t *testing.T) {
 	cfg := Config{}
 	cfg.MaxOutstandingInvites = 2
@@ -2277,12 +2315,13 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	srv := httptest.NewServer(rawSrv.Handler())
 	defer srv.Close()
 
 	alice := register(t, srv, "Alice")
 
-	// Create first invite to get close to cap (1/2)
+	// Create first invite to get close to cap (1/2), before setting the hook
 	resp, b := alice.do("POST", "/v1/invites", map[string]any{
 		"scopes": []string{"messages"},
 	}, nil)
@@ -2290,27 +2329,10 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
 	}
 
-	// Set up N-party barrier: all 5 goroutines wait until all arrive, then release together
 	const concurrent = 5
-	var arrivalCount int
-	var arrivalMu sync.Mutex
-	allArrived := make(chan struct{})
-	var closeOnce sync.Once
-
+	barrier := newBarrier(t, concurrent, 5*time.Second)
 	rawSrv.testInviteCreatedHook = func(peerID string) {
-		arrivalMu.Lock()
-		arrivalCount++
-		if arrivalCount == concurrent {
-			closeOnce.Do(func() { close(allArrived) })
-		}
-		arrivalMu.Unlock()
-
-		select {
-		case <-allArrived:
-			// All arrived, proceed
-		case <-time.After(5 * time.Second):
-			t.Error("barrier timeout: not all goroutines arrived")
-		}
+		barrier()
 	}
 
 	// Launch concurrent requests at the cap with to_email
@@ -2405,6 +2427,501 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 		t.Errorf("budget check: %d email invites succeeded, want 4 (5 total tokens - 1 consumed in race)", budgetSucceeded)
 		t.Errorf("this proves email budget was over-consumed during concurrent cap rejection")
 	}
+}
+
+// TestConcurrentInviteCapRacePairing verifies the concurrent cap check race through the generate_pairing path.
+// The hook runs before both CreateInviteAtomic and CreateInviteWithPairingAtomic, so both paths need testing.
+func TestConcurrentInviteCapRacePairing(t *testing.T) {
+	cfg := Config{}
+	cfg.MaxOutstandingInvites = 2
+
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	prepareTestConfig(t, st, &cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(rawSrv.Handler())
+	defer srv.Close()
+
+	alice := register(t, srv, "Alice")
+
+	// Create first invite to get close to cap (1/2), before setting the hook
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"scopes":           []string{"messages"},
+		"generate_pairing": true,
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
+	}
+
+	const concurrent = 5
+	barrier := newBarrier(t, concurrent, 5*time.Second)
+	rawSrv.testInviteCreatedHook = func(peerID string) {
+		barrier()
+	}
+
+	results := make(chan int, concurrent)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, _ := alice.do("POST", "/v1/invites", map[string]any{
+				"scopes":           []string{"messages"},
+				"generate_pairing": true,
+			}, nil)
+			results <- resp.StatusCode
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	var created, rejected int
+	for status := range results {
+		if status == http.StatusCreated {
+			created++
+		} else if status == http.StatusTooManyRequests {
+			rejected++
+		} else {
+			t.Errorf("unexpected status: %d", status)
+		}
+	}
+
+	if created != 1 {
+		t.Errorf("concurrent creates: %d succeeded, want 1", created)
+	}
+	if rejected != concurrent-1 {
+		t.Errorf("concurrent rejects: %d, want %d", rejected, concurrent-1)
+	}
+
+	rawSrv.testInviteCreatedHook = nil
+
+	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites: %d %s", resp.StatusCode, b)
+	}
+	var listResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(listResp.Invites) != 2 {
+		t.Errorf("final invite count: %d, want 2 (at cap)", len(listResp.Invites))
+	}
+}
+
+// TestConcurrentInviteCapRaceConfirm verifies the concurrent cap check race through the require_confirm path.
+// The hook runs before CreateConfirmInviteAtomic (when require_confirm is true), so this path needs coverage too.
+func TestConcurrentInviteCapRaceConfirm(t *testing.T) {
+	cfg := Config{}
+	cfg.MaxOutstandingInvites = 2
+	cfg.CodePepper = []byte("test-pepper")
+
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	prepareTestConfig(t, st, &cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawSrv.SetClaimStore(st)
+
+	srv := httptest.NewServer(rawSrv.Handler())
+	defer srv.Close()
+
+	alice := register(t, srv, "Alice")
+
+	// Create first invite to get close to cap (1/2), before setting the hook
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"scopes":           []string{"messages"},
+		"generate_pairing": true,
+		"require_confirm":  true,
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
+	}
+
+	const concurrent = 5
+	barrier := newBarrier(t, concurrent, 5*time.Second)
+	rawSrv.testInviteCreatedHook = func(peerID string) {
+		barrier()
+	}
+
+	results := make(chan int, concurrent)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, _ := alice.do("POST", "/v1/invites", map[string]any{
+				"scopes":           []string{"messages"},
+				"generate_pairing": true,
+				"require_confirm":  true,
+			}, nil)
+			results <- resp.StatusCode
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	var created, rejected int
+	for status := range results {
+		if status == http.StatusCreated {
+			created++
+		} else if status == http.StatusTooManyRequests {
+			rejected++
+		} else {
+			t.Errorf("unexpected status: %d", status)
+		}
+	}
+
+	if created != 1 {
+		t.Errorf("concurrent creates: %d succeeded, want 1", created)
+	}
+	if rejected != concurrent-1 {
+		t.Errorf("concurrent rejects: %d, want %d", rejected, concurrent-1)
+	}
+
+	rawSrv.testInviteCreatedHook = nil
+
+	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites: %d %s", resp.StatusCode, b)
+	}
+	var listResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(listResp.Invites) != 2 {
+		t.Errorf("final invite count: %d, want 2 (at cap)", len(listResp.Invites))
+	}
+}
+
+// TestReadyAllowRaceSharedRecipient verifies the Ready→Allow race with concurrent requests to the same recipient.
+// Ready does not consume tokens, so multiple requests can pass Ready together, but only the first Allow succeeds.
+// The test uses a frozen clock and a test seam (testAfterEmailReadyHook) to deterministically verify that losers
+// of the rcptLim race get their mailLim tokens refunded.
+func TestReadyAllowRaceSharedRecipient(t *testing.T) {
+	frozenTime := time.Unix(1000000000, 0)
+	cfg := Config{}
+	cfg.MaxOutstandingInvites = 20
+	cfg.EmailPerHour = 10
+	cfg.EmailBurst = 10
+	cfg.EmailRcptPerHour = 1
+	cfg.Clock = clocktest.New(frozenTime)
+
+	dbPath := t.TempDir() + "/t.db"
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	prepareTestConfig(t, st, &cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawSrv.Stop()
+
+	const concurrent = 10
+	sharedRecipient := "shared@example.com"
+	barrier := newBarrier(t, concurrent, 5*time.Second)
+
+	// Use testAfterEmailReadyHook to synchronize after Ready checks, before Allow calls
+	rawSrv.testAfterEmailReadyHook = func(peerID string) {
+		barrier()
+	}
+
+	srv := httptest.NewServer(rawSrv.Handler())
+	defer srv.Close()
+
+	alice := register(t, srv, "Alice")
+
+	results := make(chan int, concurrent)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, _ := alice.do("POST", "/v1/invites", map[string]any{
+				"to_email": sharedRecipient,
+				"scopes":   []string{"messages"},
+			}, nil)
+			results <- resp.StatusCode
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	var created, rejected int
+	for status := range results {
+		if status == http.StatusCreated {
+			created++
+		} else if status == http.StatusTooManyRequests {
+			rejected++
+		} else {
+			t.Errorf("unexpected status: %d", status)
+		}
+	}
+
+	// With EmailRcptPerHour = 1 (burst also 1), only one request should succeed
+	if created != 1 {
+		t.Errorf("concurrent creates to same recipient: %d succeeded, want 1", created)
+	}
+	if rejected != concurrent-1 {
+		t.Errorf("concurrent rejects: %d, want %d", rejected, concurrent-1)
+	}
+
+	rawSrv.testAfterEmailReadyHook = nil
+
+	// Verify exactly 1 invite exists (the others were cleaned up during rejection)
+	var inviteCount int
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL`,
+		alice.id).Scan(&inviteCount); err != nil {
+		t.Fatalf("count invites: %v", err)
+	}
+	if inviteCount != 1 {
+		t.Errorf("invite count: %d, want 1 (others should be cleaned up)", inviteCount)
+	}
+
+	// Verify sender budget was refunded: with EmailBurst=10 and 1 consumed, alice should send 9 more
+	// invites to distinct recipients (total 10 consumed), then the 11th should fail at 429.
+	for i := 0; i < 9; i++ {
+		resp, b := alice.do("POST", "/v1/invites", map[string]any{
+			"to_email": fmt.Sprintf("distinct%d@example.com", i),
+			"scopes":   []string{"messages"},
+		}, nil)
+		if resp.StatusCode != http.StatusCreated {
+			t.Errorf("budget check invite %d: expected 201, got %d: %s", i, resp.StatusCode, b)
+			t.Errorf("this proves the sender's mailLim tokens were NOT refunded after losing the rcptLim race")
+			break
+		}
+	}
+
+	// The 11th email invite should fail at 429 (burst exhausted)
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "should-fail@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("expected 429 after exhausting EmailBurst=10, got %d: %s", resp.StatusCode, b)
+	}
+}
+
+// TestInviteRateLimitDeleteFailure verifies behavior when the compensating delete fails after email rate limit rejection.
+// Uses a SQLite BEFORE DELETE trigger to force the delete to fail, ensuring the server returns 500 with a generic
+// error body (no internal error text leaked), the orphan invite remains, and can be cleaned up via the API.
+func TestInviteRateLimitDeleteFailure(t *testing.T) {
+	var logs bytes.Buffer
+	cfg := Config{}
+	cfg.EmailPerHour = 10
+	cfg.EmailBurst = 1 // Burst of 1, so second email will hit rate limit
+	cfg.EmailRcptPerHour = 10
+	cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	dbPath := t.TempDir() + "/t.db"
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Open a second connection for trigger manipulation
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	prepareTestConfig(t, st, &cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawSrv.Stop()
+
+	srv := httptest.NewServer(rawSrv.Handler())
+	defer srv.Close()
+
+	alice := register(t, srv, "Alice")
+
+	// Create first email invite to consume the burst token
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "first@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
+	}
+
+	// Revoke the first invite so we have a clean slate
+	var firstInv struct {
+		PublicID string `json:"public_id"`
+	}
+	if err := json.Unmarshal(b, &firstInv); err != nil {
+		t.Fatal(err)
+	}
+	resp, b = alice.do("DELETE", "/v1/invites/"+firstInv.PublicID, nil, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("revoke first: %d %s", resp.StatusCode, b)
+	}
+
+	// Install a BEFORE DELETE trigger that raises an error
+	_, err = db.Exec(`CREATE TRIGGER fail_inv_del BEFORE DELETE ON invites BEGIN SELECT RAISE(ABORT, 'trigger_error'); END`)
+	if err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	// Attempt to create a second invite with email, which will hit rate limit and try to delete
+	resp, b = alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "test@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+
+	// Should get 500 (internal error), not 429
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("expected 500 when cleanup fails, got %d: %s", resp.StatusCode, b)
+	}
+
+	// Error body should be generic, not leak internal details
+	bodyStr := string(b)
+	if !strings.Contains(bodyStr, "internal error") {
+		t.Errorf("expected generic 'internal error' body, got: %s", bodyStr)
+	}
+	if strings.Contains(bodyStr, "trigger") || strings.Contains(bodyStr, "ABORT") {
+		t.Errorf("error body leaked internal details: %s", bodyStr)
+	}
+
+	// Should NOT have Retry-After header (this is a 500, not a 429)
+	if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+		t.Errorf("unexpected Retry-After header on 500: %s", retryAfter)
+	}
+
+	// Verify no email was sent for test@example.com (mailer is called after rate limit check passes,
+	// so the create succeeds but the email is never attempted because the delete failure happens first)
+	logOutput := logs.String()
+	firstEmailCount := strings.Count(logOutput, "first@example.com")
+	testEmailCount := strings.Count(logOutput, "test@example.com")
+	if firstEmailCount != 1 {
+		t.Errorf("expected exactly 1 email to first@example.com, found %d in logs", firstEmailCount)
+	}
+	if testEmailCount != 0 {
+		t.Errorf("expected 0 emails to test@example.com (rate limit + delete failure), found %d in logs", testEmailCount)
+	}
+
+	// Drop the trigger
+	_, err = db.Exec(`DROP TRIGGER fail_inv_del`)
+	if err != nil {
+		t.Fatalf("drop trigger: %v", err)
+	}
+
+	// Verify the orphan invite exists (cleanup failed, so it's still there)
+	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites: %d %s", resp.StatusCode, b)
+	}
+	var listResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(listResp.Invites) != 1 {
+		t.Errorf("orphan invite count: %d, want 1 (cleanup failed, invite remains)", len(listResp.Invites))
+	}
+
+	// Verify the orphan can be revoked through the API
+	if len(listResp.Invites) > 0 {
+		orphanID := listResp.Invites[0]["public_id"].(string)
+		resp, b := alice.do("DELETE", "/v1/invites/"+orphanID, nil, nil)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Errorf("revoke orphan: expected 204, got %d: %s", resp.StatusCode, b)
+		}
+
+		// Verify it's gone
+		resp, b = alice.do("GET", "/v1/invites", nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("list after revoke: %d %s", resp.StatusCode, b)
+		}
+		var finalList struct {
+			Invites []map[string]any `json:"invites"`
+		}
+		if err := json.Unmarshal(b, &finalList); err != nil {
+			t.Fatal(err)
+		}
+		if len(finalList.Invites) != 0 {
+			t.Errorf("after revoke: %d invites, want 0", len(finalList.Invites))
+		}
+	}
+}
+
+// TestBarrierTimeout verifies the barrier timeout path by calling it with insufficient goroutines
+// and checking that the timeout error is reported correctly.
+func TestBarrierTimeout(t *testing.T) {
+	fake := &fakeTB{TB: t}
+	barrier := newBarrier(fake, 2, 50*time.Millisecond)
+
+	// Call barrier only once (never reaching the expected count of 2)
+	done := make(chan struct{})
+	go func() {
+		barrier()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("barrier should have completed after timeout")
+	}
+
+	// Verify exactly one error was recorded
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.errs) != 1 {
+		t.Fatalf("expected exactly 1 error, got %d: %v", len(fake.errs), fake.errs)
+	}
+
+	// Verify the error message format
+	if !strings.Contains(fake.errs[0], "1/2 goroutines arrived") {
+		t.Errorf("error message: got %q, want substring '1/2 goroutines arrived'", fake.errs[0])
+	}
+}
+
+// fakeTB embeds testing.TB and overrides Errorf to record errors for inspection.
+type fakeTB struct {
+	testing.TB
+	mu   sync.Mutex
+	errs []string
+}
+
+func (f *fakeTB) Helper() {}
+
+func (f *fakeTB) Errorf(format string, args ...interface{}) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.errs = append(f.errs, fmt.Sprintf(format, args...))
 }
 
 // TestSingleLogLineUnauthenticatedPairing verifies exactly one log line (#54)
@@ -2871,116 +3388,214 @@ func TestSanitizerTrailingSpaceTrim(t *testing.T) {
 	}
 }
 
+// TestSanitizeInviterName verifies specific sanitization cases
+func TestSanitizeInviterName(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "basic ASCII",
+			input: "Alice",
+			want:  "Alice",
+		},
+		{
+			name:  "word-final virama kept: Devanagari halant before space",
+			input: "00000!000000000000000000000000000000000000000000000000000000क्ष् 00000" + strings.Repeat("ब", 70),
+			want:  "00000000000000000000000000000000000000000000000000000000000क्ष्", // word-final क्ष् kept (63 runes)
+		},
+		{
+			name:  "word-final virama kept: single syllable before space",
+			input: strings.Repeat("a", 61) + "क् " + strings.Repeat("b", 10),
+			want:  strings.Repeat("a", 61) + "क्", // word-final क् kept (63 runes)
+		},
+		{
+			name:  "word-final viramas kept: two words ending in virama",
+			input: strings.Repeat("a", 59) + "क् ष्" + strings.Repeat("b", 10),
+			want:  strings.Repeat("a", 59) + "क्", // truncates after क्, word-final so kept (61 runes)
+		},
+		{
+			name:  "mid-word virama dropped: cut inside a conjunct",
+			input: strings.Repeat("a", 60) + "क्ष्म" + "bbb",
+			want:  strings.Repeat("a", 60), // क्ष्म cut mid-word, virama clusters dropped (60 runes)
+		},
+		{
+			name:  "Tamil pulli: many word-final viramas",
+			input: strings.Repeat("ம் ", 40),                                        // 40 Tamil words ending in pulli
+			want:  "ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம்", // 62 runes, keeps words
+		},
+		{
+			name:  "Tamil pulli at exactly position 64",
+			input: "xx" + strings.Repeat("ம் ", 40),                                   // Rune 63 is ் (virama), rune 64 is space
+			want:  "xxம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம்", // 64 runes, word-final virama kept
+		},
+		{
+			name:  "Devanagari halant at exactly position 64",
+			input: strings.Repeat("a", 62) + "क् " + strings.Repeat("b", 10),
+			want:  strings.Repeat("a", 62) + "क्", // 64 runes, word-final virama kept
+		},
+		{
+			name:  "Tamil word kept whole: மரம் not cut",
+			input: strings.Repeat("a", 58) + " மரம் zz" + strings.Repeat("b", 10),
+			want:  strings.Repeat("a", 58) + " மரம்", // 63 runes, மரம் kept whole
+		},
+		{
+			name:  "empty after cleanup falls back",
+			input: "!@#$%",
+			want:  "A Peerline peer",
+		},
+		{
+			name:  "only spaces falls back",
+			input: "     ",
+			want:  "A Peerline peer",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeInviterName(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeInviterName(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// checkSanitizeInvariants verifies all sanitizeInviterName invariants on an output.
+// checkVirama should be true only when checking a forced-truncation path.
+func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama bool) {
+	t.Helper()
+
+	// Invariant 1: Output is valid UTF-8
+	if !utf8.ValidString(got) {
+		t.Errorf("sanitizeInviterName(%q) [%s] returned invalid UTF-8: %q", input, label, got)
+	}
+
+	// Invariant 2: Output is NFC normalized
+	if !norm.NFC.IsNormalString(got) {
+		t.Errorf("sanitizeInviterName(%q) [%s] returned non-NFC string: %q", input, label, got)
+	}
+
+	// Invariant 3: At most 64 runes
+	runeCount := utf8.RuneCountInString(got)
+	if runeCount > 64 {
+		t.Errorf("sanitizeInviterName(%q) [%s] returned %d runes (> 64): %q", input, label, runeCount, got)
+	}
+
+	// Invariant 4: Non-empty (fallback applied if needed)
+	if got == "" {
+		t.Errorf("sanitizeInviterName(%q) [%s] returned empty string", input, label)
+	}
+
+	// Invariant 5: No leading/trailing space
+	if strings.TrimSpace(got) != got {
+		t.Errorf("sanitizeInviterName(%q) [%s] has leading/trailing space: %q", input, label, got)
+	}
+
+	// Invariant 6: No leading combining mark
+	runes := []rune(got)
+	if len(runes) > 0 {
+		firstRune := runes[0]
+		if unicode.Is(unicode.Mn, firstRune) || unicode.Is(unicode.Mc, firstRune) {
+			t.Errorf("sanitizeInviterName(%q) [%s] starts with combining mark: %q", input, label, got)
+		}
+	}
+
+	// Invariant 7: Idempotent
+	got2 := sanitizeInviterName(got)
+	if got != got2 {
+		t.Errorf("sanitizeInviterName [%s] not idempotent for input %q: first=%q, second=%q", label, input, got, got2)
+	}
+
+	// Invariant 8: Every output rune is in the allowlist (L*, N*, Mn, Mc, space, . , - _ ')
+	// and no U+FFFD
+	for _, r := range got {
+		if r == '\uFFFD' {
+			t.Errorf("sanitizeInviterName(%q) [%s] contains U+FFFD: %q", input, label, got)
+		}
+		isAllowed := unicode.IsLetter(r) || unicode.IsNumber(r) ||
+			unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) ||
+			r == ' ' || r == '.' || r == ',' || r == '-' || r == '_' || r == '\''
+		if !isAllowed {
+			t.Errorf("sanitizeInviterName(%q) [%s] contains disallowed rune %U (%c): %q", input, label, r, r, got)
+		}
+	}
+
+	// Invariant 9: Truncated output may end in CCC 9 (virama) only if word-final.
+	// For truncated paths, compare against the uncapped result.
+	if checkVirama {
+		// Get the uncapped result
+		full := []rune(sanitizeInviterNameUncapped(input))
+		out := []rune(got)
+
+		// (a) If the output ends in CCC 9 and is shorter than full,
+		// the next rune in full must be a space (word-final virama).
+		if len(out) > 0 && len(out) < len(full) {
+			lastRune := out[len(out)-1]
+			props := norm.NFC.PropertiesString(string(lastRune))
+			if props.CCC() == 9 {
+				nextRune := full[len(out)]
+				if nextRune != ' ' {
+					t.Errorf("sanitizeInviterName(%q) [%s] ends in mid-word CCC 9 (virama) rune U+%04X, next rune is U+%04X (not space): output=%q full=%q", input, label, lastRune, nextRune, got, string(full))
+				}
+			}
+		}
+
+		// (b) If full is >64 runes, full[63] has CCC 9, and full[64] is a space,
+		// the output must equal string(full[:64]) (word-final virama kept).
+		if len(full) > 64 {
+			props := norm.NFC.PropertiesString(string(full[63]))
+			if props.CCC() == 9 && full[64] == ' ' {
+				expected := string(full[:64])
+				if got != expected {
+					t.Errorf("sanitizeInviterName(%q) [%s] should keep word-final virama at position 63: got=%q, expected=%q", input, label, got, expected)
+				}
+			}
+		}
+	}
+}
+
 // FuzzSanitizeInviterName verifies invariants over random inputs
 func FuzzSanitizeInviterName(f *testing.F) {
 	// Seed corpus with edge cases
 	f.Add("Alice")
 	f.Add(strings.Repeat("a", 70))
-	f.Add("e\u0300\u0316")                           // non-composing marks
-	f.Add("\uFDFA")                                  // NFKC expands
-	f.Add("\xf0\u00b2")                              // invalid byte + NFKC char
-	f.Add(strings.Repeat("a", 1022) + "日")           // 3-byte rune at 1024
-	f.Add("क्ष")                                     // Indic conjunct (virama)
-	f.Add(strings.Repeat("a", 60) + "क्ष्म" + "bbb") // Chained virama (force CCC 9 strip)
-	f.Add(strings.Repeat("ब", 70))                   // Force 64-rune cap path
+	f.Add("e\u0300\u0316")                                 // non-composing marks
+	f.Add("\uFDFA")                                        // NFKC expands
+	f.Add("\xf0\u00b2")                                    // invalid byte + NFKC char
+	f.Add(strings.Repeat("a", 1022) + "日")                 // 3-byte rune at 1024
+	f.Add("क्ष")                                           // Indic conjunct (virama)
+	f.Add(strings.Repeat("a", 60) + "क्ष्म" + "bbb")       // Mid-word virama: cut inside conjunct
+	f.Add(strings.Repeat("ब", 70))                         // Force 64-rune cap path
+	f.Add(strings.Repeat("a", 59) + "क् ष्" + "bbbbbbbbb") // Word-final virama: keep complete words
 
 	f.Fuzz(func(t *testing.T, input string) {
 		got := sanitizeInviterName(input)
 
-		// Invariant 1: Output is valid UTF-8
-		if !utf8.ValidString(got) {
-			t.Errorf("sanitizeInviterName(%q) returned invalid UTF-8: %q", input, got)
-		}
+		// Check all invariants on the direct output (Invariant 9 not checked here)
+		checkSanitizeInvariants(t, input, got, "direct", false)
 
-		// Invariant 2: Output is NFC normalized
-		if !norm.NFC.IsNormalString(got) {
-			t.Errorf("sanitizeInviterName(%q) returned non-NFC string: %q", input, got)
-		}
-
-		// Invariant 3: At most 64 runes
-		runeCount := utf8.RuneCountInString(got)
-		if runeCount > 64 {
-			t.Errorf("sanitizeInviterName(%q) returned %d runes (> 64): %q", input, runeCount, got)
-		}
-
-		// Invariant 4: Non-empty (fallback applied if needed)
-		if got == "" {
-			t.Errorf("sanitizeInviterName(%q) returned empty string", input)
-		}
-
-		// Invariant 5: No leading/trailing space
-		if strings.TrimSpace(got) != got {
-			t.Errorf("sanitizeInviterName(%q) has leading/trailing space: %q", input, got)
-		}
-
-		// Invariant 6: No leading combining mark
-		runes := []rune(got)
-		if len(runes) > 0 {
-			firstRune := runes[0]
-			if unicode.Is(unicode.Mn, firstRune) || unicode.Is(unicode.Mc, firstRune) {
-				t.Errorf("sanitizeInviterName(%q) starts with combining mark: %q", input, got)
-			}
-		}
-
-		// Invariant 7: Idempotent
-		got2 := sanitizeInviterName(got)
-		if got != got2 {
-			t.Errorf("sanitizeInviterName not idempotent for input %q: first=%q, second=%q", input, got, got2)
-		}
-
-		// Invariant 8: Every output rune is in the allowlist (L*, N*, Mn, Mc, space, . , - _ ')
-		// and no U+FFFD
-		for _, r := range got {
-			if r == '\uFFFD' {
-				t.Errorf("sanitizeInviterName(%q) contains U+FFFD: %q", input, got)
-			}
-			isAllowed := unicode.IsLetter(r) || unicode.IsNumber(r) ||
-				unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) ||
-				r == ' ' || r == '.' || r == ',' || r == '-' || r == '_' || r == '\''
-			if !isAllowed {
-				t.Errorf("sanitizeInviterName(%q) contains disallowed rune %U (%c): %q", input, r, r, got)
-			}
-		}
-
-		// Invariant 9: Truncated output never ends in CCC 9 (virama) unless it's the only rune
-		// This only applies when the 64-rune cap was hit (force truncation by appending text)
+		// Force truncation by appending ब×70 and check all invariants on that path too.
+		// This is the only path that exercises the tail cleanup loop.
 		truncationTest := input + strings.Repeat("ब", 70)
 		gotTruncated := sanitizeInviterName(truncationTest)
-		runesTruncated := []rune(gotTruncated)
-		if len(runesTruncated) > 1 && utf8.RuneCountInString(gotTruncated) == 64 {
-			lastRune := runesTruncated[len(runesTruncated)-1]
-			props := norm.NFC.PropertiesString(string(lastRune))
-			if props.CCC() == 9 {
-				t.Errorf("sanitizeInviterName(%q+...70×ब) truncated output ends in CCC 9 (virama) rune %U: %q", input, lastRune, gotTruncated)
-			}
-		}
+		checkSanitizeInvariants(t, truncationTest, gotTruncated, "truncated", true)
 	})
 }
 
-// TestAPIClock verifies that the API uses the store's clock for invite expiry.
-// The store's clock is the single source of time for both API and store layers.
+// TestAPIClock verifies that api.Server.clk is used in createInvite.
 func TestAPIClock(t *testing.T) {
 	fixedTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	clk := clocktest.New(fixedTime)
 
-	// Create store with fake clock (use atomic for safe concurrent access)
-	var currentTimeUnix atomic.Int64
-	currentTimeUnix.Store(fixedTime.Unix())
-
-	st, err := storetest.OpenWithClock(
-		t.TempDir()+"/t.db",
-		func() time.Time { return time.Unix(currentTimeUnix.Load(), 0).UTC() },
-	)
+	st, err := store.Open(t.TempDir() + "/t.db")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
 
-	// Verify store clock returns the fixed time
-	if !st.Now().Equal(fixedTime) {
-		t.Fatalf("store clock = %v, want %v", st.Now(), fixedTime)
-	}
-
-	bareCfg := Config{}
+	bareCfg := Config{Clock: clk}
 	prepareTestConfig(t, st, &bareCfg)
 	srv, err := New(st, bareCfg)
 	if err != nil {
@@ -2988,106 +3603,57 @@ func TestAPIClock(t *testing.T) {
 	}
 	defer srv.Stop()
 
-	// Verify that New defaults to a non-nil clock
-	// (the store clock is wired into cfg.Now, and from there into limiters)
-	if srv.cfg.Now == nil {
-		t.Fatal("New() should set cfg.Now to st.Now")
-	}
-	// Check that limiters use the shared clock by verifying st.Now and cfg.Now agree
-	stNow := st.Now()
-	cfgNow := srv.cfg.Now()
-	if !stNow.Equal(cfgNow) {
-		t.Errorf("st.Now() and cfg.Now() disagree: %v vs %v", stNow, cfgNow)
-	}
-
 	// Create test server and client
 	testSrv := httptest.NewServer(srv.Handler())
 	defer testSrv.Close()
 
-	// Register two peers
-	alice := &client{t: t, srv: testSrv}
-	resp, body := alice.do("POST", "/v1/register", map[string]string{"name": "alice"}, nil)
+	// Register a peer
+	c := &client{t: t, srv: testSrv}
+	resp, body := c.do("POST", "/v1/register", map[string]string{"name": "alice"}, nil)
+	want(t, resp, body, 201)
+	var reg struct{ PeerID, APIKey string }
+	if err := json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&reg.PeerID, &reg.APIKey}); err != nil {
+		t.Fatal(err)
+	}
+	c.id, c.key = reg.PeerID, reg.APIKey
+
+	// Create an invite with default TTL (1h)
+	resp, body = c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 
-	var aliceResp map[string]any
-	if err := json.Unmarshal(body, &aliceResp); err != nil {
-		t.Fatalf("unmarshal alice register response: %v", err)
+	var inv struct {
+		ExpiresAt string `json:"expires_at"`
 	}
-	aliceID, _ := aliceResp["peer_id"].(string)
-	aliceKey, _ := aliceResp["api_key"].(string)
-	if aliceID == "" || aliceKey == "" {
-		t.Fatal("register response missing peer_id or api_key")
-	}
-	alice.id, alice.key = aliceID, aliceKey
-
-	bob := &client{t: t, srv: testSrv}
-	resp, body = bob.do("POST", "/v1/register", map[string]string{"name": "bob"}, nil)
-	want(t, resp, body, 201)
-
-	var bobResp map[string]any
-	if err := json.Unmarshal(body, &bobResp); err != nil {
-		t.Fatalf("unmarshal bob register response: %v", err)
-	}
-	bobID, _ := bobResp["peer_id"].(string)
-	bobKey, _ := bobResp["api_key"].(string)
-	if bobID == "" || bobKey == "" {
-		t.Fatal("register response missing peer_id or api_key")
-	}
-	bob.id, bob.key = bobID, bobKey
-
-	// Create an invite via API at fixedTime with 100-second TTL
-	resp, body = alice.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 100}, nil)
-	want(t, resp, body, 201)
-
-	var invResp map[string]any
-	if err := json.Unmarshal(body, &invResp); err != nil {
-		t.Fatalf("unmarshal invite response: %v", err)
-	}
-	code, ok := invResp["code"].(string)
-	if !ok || code == "" {
-		t.Fatal("invite response missing code")
-	}
-	expiresAtStr, ok := invResp["expires_at"].(string)
-	if !ok || expiresAtStr == "" {
-		t.Fatal("invite response missing expires_at")
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
 	}
 
-	expTime, err := time.Parse(time.RFC3339, expiresAtStr)
+	expTime, err := time.Parse(time.RFC3339, inv.ExpiresAt)
 	if err != nil {
-		t.Fatalf("parse expires_at: %v", err)
+		t.Fatal(err)
 	}
-	expected := fixedTime.Add(100 * time.Second).UTC()
+	expected := fixedTime.Add(time.Hour).UTC()
 	if !expTime.Equal(expected) {
 		t.Errorf("expires_at = %v, want %v", expTime, expected)
 	}
 
-	// Advance time to exactly expires_at (now == expires_at, should be accepted)
-	currentTimeUnix.Store(fixedTime.Unix() + 100)
-
-	// Accept via API at exactly expires_at - should succeed
-	resp, body = bob.do("POST", "/v1/invites/accept", map[string]any{"code": code}, nil)
-	if resp.StatusCode != 200 {
-		t.Errorf("accept at exact boundary (now == expires_at): expected 200, got %d: %s", resp.StatusCode, body)
-	}
-
-	// Create another invite for expires_at+1 test
-	resp, body = alice.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 100}, nil)
+	// Boundary test: advance clock by 100 seconds and create another invite
+	clk.Advance(100 * time.Second)
+	resp, body = c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
-
-	if err := json.Unmarshal(body, &invResp); err != nil {
-		t.Fatalf("unmarshal second invite response: %v", err)
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
 	}
-	code2, ok := invResp["code"].(string)
-	if !ok || code2 == "" {
-		t.Fatal("second invite response missing code")
+	expTime, err = time.Parse(time.RFC3339, inv.ExpiresAt)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	// Advance time to expires_at+1 (should be rejected)
-	currentTimeUnix.Store(fixedTime.Unix() + 201)
-
-	resp, body = bob.do("POST", "/v1/invites/accept", map[string]any{"code": code2}, nil)
-	if resp.StatusCode != 404 {
-		t.Errorf("accept at expires_at+1: expected 404, got %d: %s", resp.StatusCode, body)
+	expected = fixedTime.Add(100*time.Second + time.Hour).UTC()
+	if !expTime.Equal(expected) {
+		t.Errorf("expires_at after +100s = %v, want %v", expTime, expected)
 	}
 }
 
@@ -3342,23 +3908,16 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 // TestInviteAccept405Comprehensive covers all the edge cases from issue #146 and #174.
 func TestInviteAccept405Comprehensive(t *testing.T) {
 	// Use fake clock to control invite expiry deterministically
-	var mu sync.Mutex
-	now := time.Now()
-	fakeClock := func() int64 {
-		mu.Lock()
-		defer mu.Unlock()
-		return now.Unix()
-	}
+	clk := clocktest.New(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 
-	// Create store with fake clock
-	dbPath := t.TempDir() + "/t.db"
-	st, err := storetest.OpenWithClock(dbPath, func() time.Time { return time.Unix(fakeClock(), 0).UTC() })
+	// Open store with fake clock so expiry checks use it
+	st, err := store.OpenWithOptions(t.TempDir()+"/t.db", store.OpenOptions{Clock: clk})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
 
-	cfg := Config{}
+	cfg := Config{Clock: clk}
 	prepareTestConfig(t, st, &cfg)
 	apiSrv, err := New(st, cfg)
 	if err != nil {
@@ -3384,11 +3943,12 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
 	want(t, resp, body, 201)
 	var inv3 struct{ Code string }
-	json.Unmarshal(body, &inv3)
-	// Advance clock past inv3's expiry (1 second TTL)
-	mu.Lock()
-	now = now.Add(2 * time.Second)
-	mu.Unlock()
+	if err := json.Unmarshal(body, &inv3); err != nil || inv3.Code == "" {
+		t.Fatalf("inv3: %v, code=%q", err, inv3.Code)
+	}
+	// Advance clock past inv3's expiry (1 second TTL). The store uses the same
+	// fake clock, so POST ?code= will see it as expired.
+	clk.Advance(2 * time.Second)
 
 	// Use inv2
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
@@ -3503,6 +4063,12 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 		if rsp.Header.Get("Allow") == "" {
 			t.Errorf("%s: missing Allow header", method)
 		}
+		if got := rsp.Header.Get("Deprecation"); got != wantDeprecation {
+			t.Errorf("%s with ?code=: Deprecation = %q, want %q", method, got, wantDeprecation)
+		}
+		if got := rsp.Header.Get("Link"); got != wantLink {
+			t.Errorf("%s with ?code=: Link = %q, want %q", method, got, wantLink)
+		}
 	}
 	// DELETE: no handler in authed mux, should get 404
 	r, _ := http.NewRequest("DELETE", srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
@@ -3514,6 +4080,12 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	rsp.Body.Close()
 	if rsp.StatusCode != 404 {
 		t.Errorf("DELETE: want 404, got %d", rsp.StatusCode)
+	}
+	if got := rsp.Header.Get("Deprecation"); got != wantDeprecation {
+		t.Errorf("DELETE with ?code=: Deprecation = %q, want %q", got, wantDeprecation)
+	}
+	if got := rsp.Header.Get("Link"); got != wantLink {
+		t.Errorf("DELETE with ?code=: Link = %q, want %q", got, wantLink)
 	}
 
 	// Test 7: Trailing slash returns 404 (strict, issue #174)
@@ -3550,6 +4122,77 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	want(t, resp, body, 400)
 	if !strings.Contains(string(body), "malformed") {
 		t.Errorf("bad code landing: %s", body)
+	}
+
+	// Test 10: Expired vs missing code: no oracle (issue #305)
+	// Create two invites with 1s TTL for expiry testing
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
+	want(t, resp, body, 201)
+	var inv4 struct{ Code string }
+	if err := json.Unmarshal(body, &inv4); err != nil || inv4.Code == "" {
+		t.Fatalf("inv4: %v, code=%q", err, inv4.Code)
+	}
+
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
+	want(t, resp, body, 201)
+	var inv5 struct{ Code string }
+	if err := json.Unmarshal(body, &inv5); err != nil || inv5.Code == "" {
+		t.Fatalf("inv5: %v, code=%q", err, inv5.Code)
+	}
+
+	// Positive control: inv4 is accepted before expiry
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv4.Code}, nil)
+	want(t, resp, body, 200)
+
+	// Advance clock past inv5's 1s TTL to expire it
+	clk.Advance(2 * time.Second)
+
+	// Compare expired vs missing for both forms: ?code= and body-only
+	for _, tc := range []struct {
+		name string
+		do   func(code string) (*http.Response, []byte)
+	}{
+		{"POST ?code=", func(code string) (*http.Response, []byte) {
+			return b.do("POST", "/v1/invites/accept?code="+code, nil, nil)
+		}},
+		{"POST body", func(code string) (*http.Response, []byte) {
+			return b.do("POST", "/v1/invites/accept", map[string]any{"code": code}, nil)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Expired code
+			respExp, bodyExp := tc.do(inv5.Code)
+			want(t, respExp, bodyExp, 404)
+
+			// Missing code
+			respMiss, bodyMiss := tc.do(missingCode)
+			want(t, respMiss, bodyMiss, 404)
+
+			// Bodies must be identical
+			if !bytes.Equal(bodyExp, bodyMiss) {
+				t.Errorf("404 body differs:\nexpired: %s\nmissing: %s", bodyExp, bodyMiss)
+			}
+
+			// Compare all headers except Date (varies per request)
+			for k := range respExp.Header {
+				if k == "Date" {
+					continue // Date legitimately varies per request
+				}
+				if respExp.Header.Get(k) != respMiss.Header.Get(k) {
+					t.Errorf("header %s differs: expired=%q missing=%q",
+						k, respExp.Header.Get(k), respMiss.Header.Get(k))
+				}
+			}
+			for k := range respMiss.Header {
+				if k == "Date" {
+					continue
+				}
+				if respMiss.Header.Get(k) != respExp.Header.Get(k) {
+					t.Errorf("header %s differs: missing=%q expired=%q",
+						k, respMiss.Header.Get(k), respExp.Header.Get(k))
+				}
+			}
+		})
 	}
 
 	// Verify inv1 is still pending after all the above
@@ -3764,46 +4407,33 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 
 	// 14. 429 (rate limit) with ?code=: should have deprecation headers
 	// Use fake clock to control rate limiter refill deterministically
-	var mu429 sync.Mutex
-	now429 := time.Now()
-	fakeClock429 := func() int64 {
-		mu429.Lock()
-		defer mu429.Unlock()
-		return now429.Unix()
-	}
-
-	// Create store with fake clock for rate limiting
-	dbPathLimited := t.TempDir() + "/t_limited.db"
-	stLimited, err := storetest.OpenWithClock(dbPathLimited, func() time.Time { return time.Unix(fakeClock429(), 0).UTC() })
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { stLimited.Close() })
-
-	cfgLimited := Config{WritePerMinute: 60, WriteBurst: 1}
-	prepareTestConfig(t, stLimited, &cfgLimited)
-	apiSrvLimited, err := New(stLimited, cfgLimited)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(apiSrvLimited.Stop)
-	srvLimited := httptest.NewServer(apiSrvLimited.Handler())
-	t.Cleanup(srvLimited.Close)
+	clk429 := clocktest.New(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	srvLimited := newServer(t, Config{WritePerMinute: 60, WriteBurst: 1, Clock: clk429})
 	c := register(t, srvLimited, "charlie")
 	d := register(t, srvLimited, "dave")
 	respInv, bodyInv := c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, respInv, bodyInv, 201)
 	var inv4 struct{ Code string }
-	json.Unmarshal(bodyInv, &inv4)
+	if err := json.Unmarshal(bodyInv, &inv4); err != nil || inv4.Code == "" {
+		t.Fatalf("inv4: %v, code=%q", err, inv4.Code)
+	}
 	// Advance clock to allow rate limiter refill (60/min = 1 token per second)
-	mu429.Lock()
-	now429 = now429.Add(1100 * time.Millisecond)
-	mu429.Unlock()
+	clk429.Advance(1100 * time.Millisecond)
 	// Create another invite after bucket refill
 	respInv2, bodyInv2 := c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, respInv2, bodyInv2, 201)
 	var inv5 struct{ Code string }
-	json.Unmarshal(bodyInv2, &inv5)
+	if err := json.Unmarshal(bodyInv2, &inv5); err != nil || inv5.Code == "" {
+		t.Fatalf("inv5: %v, code=%q", err, inv5.Code)
+	}
+	// Create one more invite for body-only 429 test
+	clk429.Advance(1100 * time.Millisecond)
+	respInv3, bodyInv3 := c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, respInv3, bodyInv3, 201)
+	var inv6 struct{ Code string }
+	if err := json.Unmarshal(bodyInv3, &inv6); err != nil || inv6.Code == "" {
+		t.Fatalf("inv6: %v, code=%q", err, inv6.Code)
+	}
 	// Exhaust Dave's write rate limit by accepting first invite (uses burst token)
 	resp429, body429 := d.do("POST", "/v1/invites/accept?code="+inv4.Code, nil, nil)
 	want(t, resp429, body429, 200)
@@ -3816,10 +4446,24 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 	if got := resp429.Header.Get("Link"); got != wantLink {
 		t.Errorf("POST 429 rate limit: Link = %q, want %q", got, wantLink)
 	}
-	if got := resp429.Header.Get("Retry-After"); got == "" {
-		t.Error("POST 429 rate limit: missing Retry-After header")
+	if got := resp429.Header.Get("Retry-After"); got != "2" {
+		t.Errorf("POST 429 rate limit: Retry-After = %q, want \"2\"", got)
 	}
 	assertSecurityHeaders(t, resp429.Header, "POST 429 rate limit")
+
+	// 15. Body-only 429 should NOT have deprecation headers (negative control)
+	resp429, body429 = d.do("POST", "/v1/invites/accept", map[string]any{"code": inv6.Code}, nil)
+	want(t, resp429, body429, 429)
+	if got := resp429.Header.Get("Deprecation"); got != "" {
+		t.Errorf("body-only POST 429: unexpected Deprecation = %q", got)
+	}
+	if got := resp429.Header.Get("Link"); got != "" {
+		t.Errorf("body-only POST 429: unexpected Link = %q", got)
+	}
+	if got := resp429.Header.Get("Retry-After"); got != "2" {
+		t.Errorf("body-only POST 429: Retry-After = %q, want \"2\"", got)
+	}
+	assertSecurityHeaders(t, resp429.Header, "body-only POST 429")
 }
 
 func TestPairingLookupsBoundedPerIP(t *testing.T) {

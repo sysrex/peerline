@@ -346,6 +346,8 @@ curl -X POST https://peerline.example.com/v1/invites/accept \
 
 Responses to requests with `?code=` carry RFC 9745 `Deprecation` and `Link` headers. Query-string acceptance will be removed in a future release.
 
+As of PR #225 ([#145](https://github.com/sysrex/peerline/issues/145)), `accept_url` in invite responses no longer contains the code — it is the bare endpoint URL. The `?code=` GET landing page and POST form remain for backward compatibility with already-sent emails but are deprecated. A future release may remove the `?code=` forms entirely and drop `accept_url` from invite responses, since the endpoint URL is fixed and documented in the API table.
+
 **Reverse proxy operators:** see [Reverse proxy logging](#reverse-proxy-logging) for working redaction configs.
 
 ---
@@ -385,9 +387,11 @@ This trusts only requests from that Docker network (where Traefik runs). Peerlin
 
 IPv4-mapped IPv6 prefixes meeting the floor (e.g., `::ffff:10.0.0.0/104`) are automatically unmapped to their native IPv4 equivalent (`10.0.0.0/8`) and treated as IPv4. A bare IPv4-mapped address like `::ffff:10.0.0.1` becomes `10.0.0.1/32`.
 
+**IPv6 trusted proxy floor:** The `/32` floor for IPv6 allows up to 2^96 addresses (e.g., `2001:db8::/32` trusts all addresses in that allocation). Trusting a public IPv6 prefix is acceptable only when you control all hosts in that range; trusting a public prefix (such as a cloud provider's entire region) means any host in that range can spoof X-Forwarded-For and is trusted at the operator's risk.
+
 **Only X-Forwarded-For is honored.** Peerline does not read `X-Real-IP` or `Forwarded` (RFC 7239). Use a proxy that sets X-Forwarded-For, or leave `PEERLINE_TRUSTED_PROXIES` unset and accept that all clients share the proxy's RemoteAddr for rate limiting.
 
-**Multiple X-Forwarded-For entries:** Peerline walks the header right-to-left and uses the first address that is not in a trusted CIDR. Entries that do not parse are skipped (known issue #61).
+**Multiple X-Forwarded-For entries:** Peerline walks the header right-to-left and uses the first address that is not in a trusted CIDR. If an entry does not parse, the walk stops and the last trusted hop is used as the client address (so malformed entries collapse into the proxy's bucket rather than letting a client choose its key).
 
 ---
 
@@ -534,3 +538,9 @@ skill/SKILL.md     Grok Bot skill stub
 Personal open-source project by [sysrex](https://github.com/sysrex). Built for visibility and real use: self-host first; a tiny hosted relay can come later.
 
 Issues and PRs welcome — especially Grok Bot skill wiring and multi-account demos.
+
+---
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

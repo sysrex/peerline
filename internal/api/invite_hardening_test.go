@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sysrex/peerline/internal/clock/clocktest"
 	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/store"
-	"github.com/sysrex/peerline/internal/store/storetest"
 )
 
 // TestRevokePreventsPairingGetAndPost verifies that after revoking a pairing
@@ -30,7 +30,7 @@ func TestRevokePreventsPairingGetAndPost(t *testing.T) {
 		Logger:                slog.Default(),
 		MaxOutstandingInvites: 10,
 	}
-	srv := httptest.NewServer(newTestServer(st, cfg).Handler())
+	srv := httptest.NewServer(newTestServer(st, cfg, time.Now).Handler())
 	defer srv.Close()
 
 	// Register a peer and create a pairing invite
@@ -118,7 +118,7 @@ func TestConcurrentInviteCapAtAPILevel(t *testing.T) {
 		Logger:                slog.Default(),
 		MaxOutstandingInvites: cap,
 	}
-	srv := httptest.NewServer(newTestServer(st, cfg).Handler())
+	srv := httptest.NewServer(newTestServer(st, cfg, time.Now).Handler())
 	defer srv.Close()
 
 	alice := register(t, srv, "alice")
@@ -208,7 +208,7 @@ func TestCapBeforeEmailBudget(t *testing.T) {
 		EmailRcptPerHour:      10,
 		Mailer:                capturer,
 	}
-	srv := httptest.NewServer(newTestServer(st, cfg).Handler())
+	srv := httptest.NewServer(newTestServer(st, cfg, time.Now).Handler())
 	defer srv.Close()
 
 	alice := register(t, srv, "alice")
@@ -277,9 +277,7 @@ func TestCapBeforeEmailBudget(t *testing.T) {
 // and the same client shares one bucket. Uses frozen clock for deterministic
 // behavior. Closes issue #168. Tests literal values: 60/min, burst 20, Retry-After "10".
 func TestGETLimiterSeparateBuckets(t *testing.T) {
-	// Freeze clock to avoid wall-clock refill
-	clock := time.Unix(1000, 0)
-	st, err := storetest.OpenWithClock(t.TempDir()+"/test.db", func() time.Time { return clock })
+	st, err := store.Open(t.TempDir() + "/test.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,9 +286,12 @@ func TestGETLimiterSeparateBuckets(t *testing.T) {
 	cfg := Config{
 		Logger:         slog.Default(),
 		TrustedProxies: []string{"10.0.0.0/8"},
+		Clock:          clocktest.New(time.Unix(1000, 0)),
 	}
 
-	srv := newTestServer(st, cfg)
+	// Freeze clock to avoid wall-clock refill
+	clock := time.Unix(1000, 0)
+	srv := newTestServer(st, cfg, func() time.Time { return clock })
 
 	handler := srv.Handler()
 
@@ -350,10 +351,7 @@ func TestGETLimiterSeparateBuckets(t *testing.T) {
 // TestGETLimiterTokenRefill verifies that after exhausting the GET limiter,
 // advancing the clock refills tokens and allows new requests. Closes issue #178.
 func TestGETLimiterTokenRefill(t *testing.T) {
-	// Use pointer clock so we can advance it
-	clock := time.Unix(1000, 0)
-	clockPtr := &clock
-	st, err := storetest.OpenWithClock(t.TempDir()+"/test.db", func() time.Time { return *clockPtr })
+	st, err := store.Open(t.TempDir() + "/test.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +361,10 @@ func TestGETLimiterTokenRefill(t *testing.T) {
 		Logger: slog.Default(),
 	}
 
-	srv := newTestServer(st, cfg)
+	// Freeze clock at epoch (use pointer so we can advance it)
+	clock := time.Unix(1000, 0)
+	clockPtr := &clock
+	srv := newTestServer(st, cfg, func() time.Time { return *clockPtr })
 
 	handler := srv.Handler()
 
@@ -401,9 +402,7 @@ func TestGETLimiterTokenRefill(t *testing.T) {
 // spoofed or rotating X-Forwarded-For headers does not get fresh buckets.
 // The limiter must key on the RemoteAddr, not the XFF. Closes issue #169.
 func TestUntrustedClientRotatingXFF(t *testing.T) {
-	// Freeze clock
-	clock := time.Unix(1000, 0)
-	st, err := storetest.OpenWithClock(t.TempDir()+"/test.db", func() time.Time { return clock })
+	st, err := store.Open(t.TempDir() + "/test.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -414,7 +413,9 @@ func TestUntrustedClientRotatingXFF(t *testing.T) {
 		TrustedProxies: []string{"10.0.0.0/8"}, // Only 10.0.0.0/8 is trusted
 	}
 
-	srv := newTestServer(st, cfg)
+	// Freeze clock
+	clock := time.Unix(1000, 0)
+	srv := newTestServer(st, cfg, func() time.Time { return clock })
 
 	handler := srv.Handler()
 
@@ -467,9 +468,7 @@ func TestUntrustedClientRotatingXFF(t *testing.T) {
 // TestUntrustedClientRotatingXFFDefaultConfig verifies XFF spoofing protection
 // even when TrustedProxies is empty (default config). RemoteAddr is always used.
 func TestUntrustedClientRotatingXFFDefaultConfig(t *testing.T) {
-	// Freeze clock
-	clock := time.Unix(1000, 0)
-	st, err := storetest.OpenWithClock(t.TempDir()+"/test.db", func() time.Time { return clock })
+	st, err := store.Open(t.TempDir() + "/test.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +479,9 @@ func TestUntrustedClientRotatingXFFDefaultConfig(t *testing.T) {
 		// TrustedProxies is empty (default)
 	}
 
-	srv := newTestServer(st, cfg)
+	// Freeze clock
+	clock := time.Unix(1000, 0)
+	srv := newTestServer(st, cfg, func() time.Time { return clock })
 
 	handler := srv.Handler()
 
@@ -515,9 +516,7 @@ func TestUntrustedClientRotatingXFFDefaultConfig(t *testing.T) {
 // client exhausting GET / does not cause 429 for authenticated peers polling
 // /v1/inbox. This closes the gap from issue #31/#129.
 func TestAnonymousGETDoesNotBlockAuthenticatedInbox(t *testing.T) {
-	// Freeze clock on the server's limiter manager
-	clock := time.Unix(1000, 0)
-	st, err := storetest.OpenWithClock(t.TempDir()+"/test.db", func() time.Time { return clock })
+	st, err := store.Open(t.TempDir() + "/test.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -527,7 +526,9 @@ func TestAnonymousGETDoesNotBlockAuthenticatedInbox(t *testing.T) {
 		Logger: slog.Default(),
 	}
 
-	s := newTestServer(st, cfg)
+	// Freeze clock on the server's limiter manager
+	clock := time.Unix(1000, 0)
+	s := newTestServer(st, cfg, func() time.Time { return clock })
 
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
@@ -577,9 +578,7 @@ func TestAnonymousGETDoesNotBlockAuthenticatedInbox(t *testing.T) {
 // TestAuthenticatedLimiterDoesNotBlockAnonymousGET verifies the reverse direction:
 // exhausting the authenticated inbox limiter does not block anonymous GET /.
 func TestAuthenticatedLimiterDoesNotBlockAnonymousGET(t *testing.T) {
-	// Freeze clock
-	clock := time.Unix(1000, 0)
-	st, err := storetest.OpenWithClock(t.TempDir()+"/test.db", func() time.Time { return clock })
+	st, err := store.Open(t.TempDir() + "/test.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -589,7 +588,9 @@ func TestAuthenticatedLimiterDoesNotBlockAnonymousGET(t *testing.T) {
 		Logger: slog.Default(),
 	}
 
-	s := newTestServer(st, cfg)
+	// Freeze clock
+	clock := time.Unix(1000, 0)
+	s := newTestServer(st, cfg, func() time.Time { return clock })
 
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
@@ -622,9 +623,7 @@ func TestAuthenticatedLimiterDoesNotBlockAnonymousGET(t *testing.T) {
 // TestAuthenticatedGETLimiter verifies the authenticated GET endpoint limiter
 // with literal values: 120/min, burst 40, Retry-After "10". Closes issue #177.
 func TestAuthenticatedGETLimiter(t *testing.T) {
-	// Freeze clock
-	clock := time.Unix(1000, 0)
-	st, err := storetest.OpenWithClock(t.TempDir()+"/test.db", func() time.Time { return clock })
+	st, err := store.Open(t.TempDir() + "/test.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -634,7 +633,9 @@ func TestAuthenticatedGETLimiter(t *testing.T) {
 		Logger: slog.Default(),
 	}
 
-	s := newTestServer(st, cfg)
+	// Freeze clock
+	clock := time.Unix(1000, 0)
+	s := newTestServer(st, cfg, func() time.Time { return clock })
 
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
@@ -682,7 +683,7 @@ func TestAcceptByCodeAfterRevoke(t *testing.T) {
 		Logger:                slog.Default(),
 		MaxOutstandingInvites: 10,
 	}
-	srv := httptest.NewServer(newTestServer(st, cfg).Handler())
+	srv := httptest.NewServer(newTestServer(st, cfg, time.Now).Handler())
 	defer srv.Close()
 
 	// Register peers
@@ -727,7 +728,7 @@ func TestDeleteUsedInviteReturns404(t *testing.T) {
 		Logger:                slog.Default(),
 		MaxOutstandingInvites: 10,
 	}
-	srv := httptest.NewServer(newTestServer(st, cfg).Handler())
+	srv := httptest.NewServer(newTestServer(st, cfg, time.Now).Handler())
 	defer srv.Close()
 
 	// Register peers
@@ -777,7 +778,7 @@ func TestSingleLogRecordUnauthenticatedPairing(t *testing.T) {
 		Logger:                logger,
 		MaxOutstandingInvites: 10,
 	}
-	srv := httptest.NewServer(newTestServer(st, cfg).Handler())
+	srv := httptest.NewServer(newTestServer(st, cfg, time.Now).Handler())
 	defer srv.Close()
 
 	// Register a peer and create a pairing invite

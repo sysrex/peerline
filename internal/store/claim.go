@@ -40,7 +40,7 @@ func (s *Store) loadClaim(ctx context.Context, q rowQuerier, where string, args 
 	var scopes, bags, bs, bb string
 	var used bool
 	var declined, confirmBy, expires int64
-	now := s.clock().Unix()
+	now := s.nowUnix()
 	err := q.QueryRowContext(ctx, `SELECT i.code_hash,i.public_id,i.from_peer,i.scopes,i.bags,i.back_scopes,i.back_bags,i.nonce,
 		COALESCE(i.claimed_by,''),COALESCE(p.name,''),i.used_by IS NOT NULL,COALESCE(i.declined_at,0),COALESCE(i.confirm_by,0),i.expires_at
 		FROM invites i LEFT JOIN peers p ON p.id=i.claimed_by WHERE i.require_confirm=1 AND `+where,
@@ -93,7 +93,7 @@ func (s *Store) ClaimByToken(ctx context.Context, tokenHash, claimant string, no
 		if err := tx.QueryRowContext(ctx, `SELECT name FROM peers WHERE id=?`, claimant).Scan(&name); err != nil {
 			return nil, err
 		}
-		confirmBy := time.Unix(s.clock().Unix(), 0).Add(confirmWindow).Unix()
+		confirmBy := time.Unix(s.nowUnix(), 0).Add(confirmWindow).Unix()
 		if _, err := tx.ExecContext(ctx, `UPDATE invites SET claimed_by=?,nonce=?,back_scopes=?,back_bags=?,confirm_by=?
 			WHERE code_hash=? AND claimed_by IS NULL`,
 			claimant, nonce, join(backScopes), join(backBags), confirmBy, c.codeHash); err != nil {
@@ -126,7 +126,7 @@ func (s *Store) ConfirmClaim(ctx context.Context, publicID, inviter string, maxF
 	if err != nil {
 		return "", err
 	}
-	now := s.clock().Unix()
+	now := s.nowUnix()
 	if check(c) {
 		if _, err := tx.ExecContext(ctx, `UPDATE invites SET used_by=claimed_by WHERE code_hash=?`, c.codeHash); err != nil {
 			return "", err
@@ -154,7 +154,7 @@ func (s *Store) ConfirmClaim(ctx context.Context, publicID, inviter string, maxF
 // DeclineClaim ends a claimed, unconfirmed invite for good.
 func (s *Store) DeclineClaim(ctx context.Context, publicID, inviter string) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE invites SET declined_at=? WHERE require_confirm=1 AND public_id=? AND from_peer=?
-		AND claimed_by IS NOT NULL AND used_by IS NULL AND declined_at IS NULL`, s.clock().Unix(), publicID, inviter)
+		AND claimed_by IS NOT NULL AND used_by IS NULL AND declined_at IS NULL`, s.nowUnix(), publicID, inviter)
 	if err != nil {
 		return err
 	}

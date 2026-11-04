@@ -7,23 +7,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sysrex/peerline/internal/clock/clocktest"
 	"github.com/sysrex/peerline/internal/store"
-	"github.com/sysrex/peerline/internal/store/storetest"
 )
 
-type fakeClock struct{ t time.Time }
-
-func (c *fakeClock) now() time.Time { return c.t }
-func (c *fakeClock) unix() int64    { return c.t.Unix() }
-
-func newLimitedServer(t *testing.T, trusted []string, clk *fakeClock) http.Handler {
+func newLimitedServer(t *testing.T, trusted []string, clk *clocktest.Fake) http.Handler {
 	t.Helper()
-	st, err := storetest.OpenWithClock(":memory:", clk.now)
+	st, err := store.Open(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	srv := mustNew(t, st, Config{TrustedProxies: trusted})
+	srv := mustNew(t, st, Config{TrustedProxies: trusted, Clock: clk})
 	t.Cleanup(srv.lim.Stop)
 	return srv.Handler()
 }
@@ -50,7 +45,7 @@ var ipKeyedEndpoints = []struct {
 func TestIPKeyingPerEndpoint(t *testing.T) {
 	for _, ep := range ipKeyedEndpoints {
 		t.Run(ep.name, func(t *testing.T) {
-			clk := &fakeClock{time.Unix(1000, 0)}
+			clk := clocktest.New(time.Unix(1000, 0))
 			h := newLimitedServer(t, []string{"10.0.0.0/8"}, clk)
 
 			for i := 0; i < ep.burst; i++ {
@@ -81,7 +76,7 @@ func TestIPKeyingPerEndpoint(t *testing.T) {
 // A malformed right-most entry must fall back to the trusted hop, so two
 // clients differing only in the left-hand IP share one bucket (#61).
 func TestMalformedXFFSharesTrustedHopBucket(t *testing.T) {
-	clk := &fakeClock{time.Unix(1000, 0)}
+	clk := clocktest.New(time.Unix(1000, 0))
 	h := newLimitedServer(t, []string{"10.0.0.0/8"}, clk)
 
 	for i := 0; i < 20; i++ {
@@ -96,7 +91,7 @@ func TestMalformedXFFSharesTrustedHopBucket(t *testing.T) {
 }
 
 func TestMappedPeerAgainstMappedTrustEntry(t *testing.T) {
-	clk := &fakeClock{time.Unix(1000, 0)}
+	clk := clocktest.New(time.Unix(1000, 0))
 	h := newLimitedServer(t, []string{"::ffff:10.0.0.0/104"}, clk)
 	for i := 0; i < 20; i++ {
 		do(h, "GET", "/", "[::ffff:10.0.0.5]:1", "203.0.113.9")
@@ -110,7 +105,7 @@ func TestMappedPeerAgainstMappedTrustEntry(t *testing.T) {
 }
 
 func TestLimiter429ContractAndRefill(t *testing.T) {
-	clk := &fakeClock{time.Unix(1000, 0)}
+	clk := clocktest.New(time.Unix(1000, 0))
 	h := newLimitedServer(t, nil, clk)
 
 	for i := 0; i < 20; i++ {
@@ -126,7 +121,7 @@ func TestLimiter429ContractAndRefill(t *testing.T) {
 		t.Fatal("untrusted peer's XFF must be ignored when no proxies are trusted")
 	}
 
-	clk.t = clk.t.Add(time.Second) // 60/min refills exactly one token
+	clk.Advance(time.Second) // 60/min refills exactly one token
 	if rr := do(h, "GET", "/", "1.2.3.4:1"); rr.Code != 200 {
 		t.Fatalf("after refill: got %d, want 200", rr.Code)
 	}
