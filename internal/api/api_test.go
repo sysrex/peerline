@@ -3794,30 +3794,49 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 			}
 		}
 
-		// Assert that runes dropped between end of output and rune 64 contain no word boundary
-		// (i.e., back-off only trims inside the last word)
-		// Account for trailing space trimming: find the last non-space position in output
+		// Assert that back-off only drops virama clusters, not complete words.
+		// The dropped region (after legitimately trimmed trailing spaces from output and leading spaces
+		// from the dropped part) must only contain runes that are part of clusters ending in viramas.
+		// Every base letter/number must be immediately followed by a mark or virama (CCC 9), either
+		// within the dropped region or at position 64 (the boundary).
 		if len(out) > 0 && len(full) >= 64 {
 			// Find the last non-space rune in the output to account for trailing space trim
 			lastNonSpace := len(out) - 1
 			for lastNonSpace >= 0 && out[lastNonSpace] == ' ' {
 				lastNonSpace--
 			}
-			// Check from the position after the last non-space to position 64, excluding trailing spaces
+			// Check from the position after the last non-space to position 64, excluding leading spaces
 			if lastNonSpace >= 0 && lastNonSpace+1 < 64 {
 				startCheck := lastNonSpace + 1
-				// Skip any trailing spaces that were legitimately trimmed
+				// Skip any leading spaces that were legitimately trimmed
 				for startCheck < 64 && full[startCheck] == ' ' {
 					startCheck++
 				}
-				// Now check the remaining dropped runes (the actual virama cluster that was backed off)
+				// Now validate the dropped region: every base letter/number must be part of a virama cluster
 				if startCheck < 64 {
 					droppedRegion := full[startCheck:64]
-					droppedStr := string(droppedRegion)
-					for _, r := range droppedStr {
-						if isWordBoundary(r) {
-							t.Errorf("sanitizeInviterName(%q) [%s] dropped runes before position 64 contain word boundary U+%04X (excluding trailing spaces): output=%q full=%q dropped=%q", input, label, r, got, string(full), droppedStr)
-							break
+					for i, r := range droppedRegion {
+						// If this is a base character (letter or number)
+						if unicode.IsLetter(r) || unicode.IsNumber(r) {
+							// It must be followed by a mark or virama (CCC 9), either within the region or at position 64
+							var nextRune rune
+							if i+1 < len(droppedRegion) {
+								nextRune = droppedRegion[i+1]
+							} else if startCheck+i+1 == 64 && len(full) > 64 {
+								// The base is at position 63, check if position 64 is a mark/virama
+								nextRune = full[64]
+							} else {
+								// Base at end of dropped region with nothing after it - this is wrong
+								t.Errorf("sanitizeInviterName(%q) [%s] dropped base character U+%04X (%c) not followed by mark/virama: output=%q full=%q dropped=%q", input, label, r, r, got, string(full), string(droppedRegion))
+								break
+							}
+							isMark := unicode.Is(unicode.Mn, nextRune) || unicode.Is(unicode.Mc, nextRune) || unicode.Is(unicode.Me, nextRune)
+							props := norm.NFC.PropertiesString(string(nextRune))
+							isVirama := props.CCC() == 9
+							if !isMark && !isVirama {
+								t.Errorf("sanitizeInviterName(%q) [%s] dropped base character U+%04X (%c) not followed by mark/virama (next: U+%04X): output=%q full=%q dropped=%q", input, label, r, r, nextRune, got, string(full), string(droppedRegion))
+								break
+							}
 						}
 					}
 				}
@@ -3861,14 +3880,14 @@ func TestSanitizerWordFinalViramaWithSpace(t *testing.T) {
 	}{
 		{
 			name: "virama at 63, space at 64, forced path",
-			// 61 'a' + "क्" (2 runes: क + ्) + " " (1 rune) = 64 runes before trimming
+			// 61 'a' + "क्" (2 runes) + " " (1 rune) = 64 runes total (virama at 63, space at 64)
 			// The virama is word-final (space follows), so it's kept, but trailing space is trimmed
 			input: strings.Repeat("a", 61) + "क् " + strings.Repeat("ब", 70),
 			want:  strings.Repeat("a", 61) + "क्",
 		},
 		{
 			name: "Tamil virama at 63, space at 64, forced path",
-			// "xx" + 20×"ம் " + "ம்" + " " = 2 + 60 + 2 = 64 runes before trimming
+			// "xx" + 20×"ம் " + "ம்" + " " = 2 + 60 + 2 + 1 = 65 runes (virama at 63, space at 64)
 			// The virama is word-final (space follows), so it's kept, but trailing space is trimmed
 			input: "xx" + strings.Repeat("ம் ", 20) + "ம் " + strings.Repeat("ब", 70),
 			want:  "xx" + strings.Repeat("ம் ", 20) + "ம்",
@@ -3900,11 +3919,11 @@ func FuzzSanitizeInviterName(f *testing.F) {
 	f.Add(strings.Repeat("a", 60) + "क्ष्म" + "bbb")       // Mid-word virama: cut inside conjunct
 	f.Add(strings.Repeat("ब", 70))                         // Force 64-rune cap path
 	f.Add(strings.Repeat("a", 59) + "क् ष्" + "bbbbbbbbb") // Word-final virama: keep complete words
-	// Issue #315: Fuzz seeds for word-final virama before punctuation
-	f.Add("xx" + strings.Repeat("ம் ", 40))               // 40 × "ம் " → virama at 63, space at 64 (word-final)
-	f.Add(strings.Repeat("a", 62) + "क् " + "bbbbbbbbbb") // virama at 63, space at 64, then more text
-	f.Add(strings.Repeat("a", 62) + "क्." + "bbbbbbbbbb") // virama at 63, dot at 64 (word-final before punctuation)
-	f.Add(strings.Repeat("a", 62) + "ம்-" + "bbbbbbbbbb") // virama at 63, dash at 64 (word-final before punctuation)
+	// Issue #315: Fuzz seeds for word-final virama at rune 63 (before space or punctuation at rune 64)
+	f.Add("xx" + strings.Repeat("ம் ", 40))               // 40 × "ம் " → virama at 63, space at 64
+	f.Add(strings.Repeat("a", 62) + "क् " + "bbbbbbbbbb") // virama at 63, space at 64
+	f.Add(strings.Repeat("a", 62) + "क்." + "bbbbbbbbbb") // virama at 63, dot at 64
+	f.Add(strings.Repeat("a", 62) + "ம்-" + "bbbbbbbbbb") // virama at 63, dash at 64
 
 	f.Fuzz(func(t *testing.T, input string) {
 		got := sanitizeInviterName(input)
