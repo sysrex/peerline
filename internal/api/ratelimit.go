@@ -357,10 +357,18 @@ type LimiterManager struct {
 
 // Rate limit constants for public GET endpoints and authenticated endpoints.
 const (
-	getPerMinute     = 60
-	getBurst         = 20
-	authGetPerMinute = 120
-	authGetBurst     = 40
+	getPerMinute      = 60
+	getBurst          = 20
+	authGetPerMinute  = 120
+	authGetBurst      = 40
+	regPerMinute      = 10
+	regBurst          = 5
+	pairPerMinute     = 10
+	pairBurst         = 5
+	versionPerMinute  = 120
+	versionBurst      = 30
+	bagWritePerMinute = 30
+	bagWriteBurst     = 10
 )
 
 // NewLimiterManager creates and starts a new limiter manager.
@@ -369,14 +377,14 @@ func NewLimiterManager(cfg Config) *LimiterManager {
 	clk := msg.WithClock(clock.Or(cfg.Clock).Now)
 	lm := &LimiterManager{
 		msgLim:        msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst, clk),
-		regLim:        msg.NewLimiter(10, 5, clk),
-		pairLim:       msg.NewLimiter(10, 5, clk),
+		regLim:        msg.NewLimiter(regPerMinute, regBurst, clk),
+		pairLim:       msg.NewLimiter(pairPerMinute, pairBurst, clk),
 		failLim:       msg.NewLimiter(cfg.AuthFailPerMinute, cfg.AuthFailBurst, clk),
 		getLim:        msg.NewLimiter(getPerMinute, getBurst, clk),
-		versionLim:    msg.NewLimiter(120, 30, clk), // Separate limiter for /version to avoid monitor conflicts
+		versionLim:    msg.NewLimiter(versionPerMinute, versionBurst, clk), // Separate limiter for /version to avoid monitor conflicts
 		authLim:       msg.NewLimiter(authGetPerMinute, authGetBurst, clk),
 		writeLim:      msg.NewLimiter(cfg.WritePerMinute, cfg.WriteBurst, clk),
-		bagWriteLim:   msg.NewLimiter(30, 10, clk),
+		bagWriteLim:   msg.NewLimiter(bagWritePerMinute, bagWriteBurst, clk),
 		mailLim:       msg.NewLimiterPerHour(cfg.EmailPerHour, cfg.EmailBurst, clk),
 		rcptLim:       msg.NewLimiterPerHour(cfg.EmailRcptPerHour, cfg.EmailRcptPerHour, clk),
 		notifyLim:     msg.NewLimiterPerHour(cfg.NotifyPerHour, cfg.NotifyBurst, clk),
