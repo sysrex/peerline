@@ -1985,7 +1985,7 @@ func TestMaintenanceManagerStops(t *testing.T) {
 
 	ctx := context.Background()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	mgr := NewMaintenanceManager(ctx, st, logger, 30*24*60*60, 6)
+	mgr := NewMaintenanceManager(ctx, st, logger, nil, 30*24*60*60, 6)
 
 	// Let it run a bit
 	time.Sleep(100 * time.Millisecond)
@@ -2967,20 +2967,17 @@ func TestAPIClock(t *testing.T) {
 	}
 	defer st.Close()
 
-	bareCfg := Config{}
+	// Use fake clock to control time
+	fixedTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	clk := clocktest.New(fixedTime)
+	
+	bareCfg := Config{Clock: clk}
 	prepareTestConfig(t, st, &bareCfg)
 	srv, err := New(st, bareCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer srv.Stop()
-
-	// Stub the clock and verify non-nil default
-	if srv.now == nil {
-		t.Fatal("New() should set non-nil default clock")
-	}
-	fixedTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return fixedTime }
 
 	// Create test server and client
 	testSrv := httptest.NewServer(srv.Handler())
@@ -3020,7 +3017,7 @@ func TestAPIClock(t *testing.T) {
 	}
 
 	// Boundary test: advance clock by 100 seconds and create another invite
-	srv.now = func() time.Time { return fixedTime.Add(100 * time.Second) }
+	clk.Advance(100 * time.Second)
 	resp, body = c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	if err := json.Unmarshal(body, &inv); err != nil {
@@ -3779,14 +3776,8 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 
 	// 14. 429 (rate limit) with ?code=: should have deprecation headers
 	// Use fake clock to control rate limiter refill deterministically
-	var mu429 sync.Mutex
-	now429 := time.Now()
-	fakeClock429 := func() time.Time {
-		mu429.Lock()
-		defer mu429.Unlock()
-		return now429
-	}
-	srvLimited := newServer(t, Config{WritePerMinute: 60, WriteBurst: 1, Now: fakeClock429})
+	clk429 := clocktest.New(time.Now())
+	srvLimited := newServer(t, Config{WritePerMinute: 60, WriteBurst: 1, Clock: clk429})
 	c := register(t, srvLimited, "charlie")
 	d := register(t, srvLimited, "dave")
 	respInv, bodyInv := c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
@@ -3794,9 +3785,7 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 	var inv4 struct{ Code string }
 	json.Unmarshal(bodyInv, &inv4)
 	// Advance clock to allow rate limiter refill (60/min = 1 token per second)
-	mu429.Lock()
-	now429 = now429.Add(1100 * time.Millisecond)
-	mu429.Unlock()
+	clk429.Advance(1100 * time.Millisecond)
 	// Create another invite after bucket refill
 	respInv2, bodyInv2 := c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, respInv2, bodyInv2, 201)
