@@ -635,12 +635,11 @@ func deepEqual(a, b any) bool {
 }
 
 // TestDeclineIdempotentAndActiveReturns404 verifies that declining a claimed invite
-// twice returns 200 both times, and that declining an active (unclaimed) invite
+// twice returns 200 both times, and that declining an offered or active invite
 // returns 404 (#326 P3-2).
 func TestDeclineIdempotentAndActiveReturns404(t *testing.T) {
-	srv, _, _ := claimServer(t)
-
 	t.Run("decline claimed twice", func(t *testing.T) {
+		srv, _, _ := claimServer(t)
 		inviter := register(t, srv, "inviter_decline_twice")
 		claimant := register(t, srv, "claimant_decline_twice")
 		pub, token := confirmInvite(t, inviter)
@@ -687,17 +686,56 @@ func TestDeclineIdempotentAndActiveReturns404(t *testing.T) {
 		}
 	})
 
+	t.Run("decline offered returns 404", func(t *testing.T) {
+		srv, _, _ := claimServer(t)
+		inviter := register(t, srv, "inviter_decline_offered")
+		pub, _ := confirmInvite(t, inviter)
+
+		// Don't claim it, leave it in "offered" state
+		// Try to decline an offered invite
+		resp, b := inviter.do("POST", "/v1/invites/"+pub+"/decline", nil, nil)
+		if resp.StatusCode != 404 {
+			t.Fatalf("decline offered invite: got %d, want 404: %s", resp.StatusCode, b)
+		}
+		if resp.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("decline offered Content-Type: got %q, want application/json", resp.Header.Get("Content-Type"))
+		}
+	})
+
 	t.Run("decline active returns 404", func(t *testing.T) {
+		srv, _, _ := claimServer(t)
 		inviter := register(t, srv, "inviter_decline_active")
 		claimant := register(t, srv, "claimant_decline_active")
 		pub, token := confirmInvite(t, inviter)
 
-		// Don't claim it, leave it in "offered" state (active)
-		_ = token
-		_ = claimant
+		// Claim the invite
+		resp, b := claimant.do("POST", "/v1/pairing/claim", map[string]any{"token": token, "scopes": []string{"messages"}}, nil)
+		want(t, resp, b, 200)
+		var cl struct{ Code string }
+		if err := json.Unmarshal(b, &cl); err != nil {
+			t.Fatalf("unmarshal claim response: %v", err)
+		}
+
+		// Get offer digest
+		resp, b = inviter.do("GET", "/v1/invites/"+pub, nil, nil)
+		want(t, resp, b, 200)
+		var view struct {
+			OfferDigest string `json:"offer_digest"`
+		}
+		if err := json.Unmarshal(b, &view); err != nil {
+			t.Fatalf("unmarshal inviter view: %v", err)
+		}
+
+		// Confirm the invite to make it active
+		resp, b = inviter.do("POST", "/v1/invites/"+pub+"/confirm", map[string]string{
+			"peer_id":      claimant.id,
+			"code":         cl.Code,
+			"offer_digest": view.OfferDigest,
+		}, nil)
+		want(t, resp, b, 200)
 
 		// Try to decline an active invite
-		resp, b := inviter.do("POST", "/v1/invites/"+pub+"/decline", nil, nil)
+		resp, b = inviter.do("POST", "/v1/invites/"+pub+"/decline", nil, nil)
 		if resp.StatusCode != 404 {
 			t.Fatalf("decline active invite: got %d, want 404: %s", resp.StatusCode, b)
 		}
@@ -711,9 +749,8 @@ func TestDeclineIdempotentAndActiveReturns404(t *testing.T) {
 // claimed (pending-confirm) invites and returns 204, but returns 404 on active
 // (confirmed) invites (#80 docs).
 func TestDeleteClaimedInvite(t *testing.T) {
-	srv, _, _ := claimServer(t)
-
 	t.Run("delete claimed returns 204", func(t *testing.T) {
+		srv, _, _ := claimServer(t)
 		inviter := register(t, srv, "inviter_delete_claimed")
 		claimant := register(t, srv, "claimant_delete_claimed")
 		pub, token := confirmInvite(t, inviter)
@@ -738,7 +775,38 @@ func TestDeleteClaimedInvite(t *testing.T) {
 		}
 	})
 
+	t.Run("delete declined returns 204", func(t *testing.T) {
+		srv, _, _ := claimServer(t)
+		inviter := register(t, srv, "inviter_delete_declined")
+		claimant := register(t, srv, "claimant_delete_declined")
+		pub, token := confirmInvite(t, inviter)
+
+		// Claim the invite (but don't confirm)
+		resp, b := claimant.do("POST", "/v1/pairing/claim", map[string]any{"token": token, "scopes": []string{"messages"}}, nil)
+		want(t, resp, b, 200)
+
+		// Decline the invite
+		resp, b = inviter.do("POST", "/v1/invites/"+pub+"/decline", nil, nil)
+		want(t, resp, b, 200)
+
+		// DELETE should work on declined invites
+		resp, b = inviter.do("DELETE", "/v1/invites/"+pub, nil, nil)
+		if resp.StatusCode != 204 {
+			t.Fatalf("DELETE declined invite: got %d, want 204; body: %s", resp.StatusCode, b)
+		}
+		if len(b) != 0 {
+			t.Errorf("DELETE declined invite: expected empty body, got: %s", b)
+		}
+
+		// Verify the invite is gone
+		resp, b = inviter.do("GET", "/v1/invites/"+pub, nil, nil)
+		if resp.StatusCode != 404 {
+			t.Fatalf("GET after DELETE: got %d, want 404; body: %s", resp.StatusCode, b)
+		}
+	})
+
 	t.Run("delete active returns 404", func(t *testing.T) {
+		srv, _, _ := claimServer(t)
 		inviter := register(t, srv, "inviter_delete_active")
 		claimant := register(t, srv, "claimant_delete_active")
 		pub, token := confirmInvite(t, inviter)
