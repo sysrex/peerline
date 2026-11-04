@@ -28,6 +28,20 @@ func TestOr(t *testing.T) {
 	if got := clock.Or(fake); got != fake {
 		t.Errorf("Or(fake) = %v, want %v", got, fake)
 	}
+
+	// Or(typed-nil) passes through and will panic on Now()
+	var typedNil *testClock
+	var iface clock.Clock = typedNil
+	result := clock.Or(iface)
+	if result == nil {
+		t.Error("Or(typed-nil) returned nil, expected non-nil interface")
+	}
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("Or(typed-nil).Now() did not panic")
+		}
+	}()
+	result.Now() // should panic
 }
 
 type testClock struct {

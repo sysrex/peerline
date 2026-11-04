@@ -202,7 +202,7 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 		st:          st,
 		cfg:         cfg,
 		log:         cfg.Logger,
-		lim:         NewLimiterManager(cfg, clk.Now),
+		lim:         NewLimiterManager(cfg),
 		verifyLim:   msg.NewLimiterPerHour(3, 3, msg.WithClock(clk.Now)), // 3 verification emails per peer/address per hour
 		trustedNets: trustedNets,
 		clk:         clk,
@@ -213,7 +213,7 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 	go s.pruneVerifyLoop()
 
 	// Start maintenance tasks
-	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, cfg.RetentionSeconds, cfg.KeyIndexRebuildHours)
+	s.maint = NewMaintenanceManager(context.Background(), st, cfg.Logger, clk, cfg.RetentionSeconds, cfg.KeyIndexRebuildHours)
 
 	return s, nil
 }

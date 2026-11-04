@@ -68,7 +68,7 @@ func newBarrier(t testing.TB, n int, timeout time.Duration) func() {
 
 func newServer(t *testing.T, cfg Config) *httptest.Server {
 	t.Helper()
-	st, err := store.Open(t.TempDir() + "/t.db")
+	st, err := store.OpenWithOptions(t.TempDir()+"/t.db", store.OpenOptions{Clock: cfg.Clock})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func newServer(t *testing.T, cfg Config) *httptest.Server {
 func newServerWithAccess(t *testing.T, cfg Config) (*httptest.Server, *Server, *store.Store) {
 	t.Helper()
 	dbPath := t.TempDir() + "/t.db"
-	st, err := store.Open(dbPath)
+	st, err := store.OpenWithOptions(dbPath, store.OpenOptions{Clock: cfg.Clock})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func newServerWithAccess(t *testing.T, cfg Config) (*httptest.Server, *Server, *
 func newServerWithDB(t *testing.T, cfg Config) (*httptest.Server, *Server, *store.Store, *sql.DB) {
 	t.Helper()
 	dbPath := t.TempDir() + "/t.db"
-	st, err := store.Open(dbPath)
+	st, err := store.OpenWithOptions(dbPath, store.OpenOptions{Clock: cfg.Clock})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2002,7 +2002,7 @@ func TestLimiterManagerStops(t *testing.T) {
 		NotifyPerHour:    10,
 		NotifyBurst:      5,
 	}
-	mgr := NewLimiterManager(cfg, time.Now)
+	mgr := NewLimiterManager(cfg)
 
 	// Let it run a bit
 	time.Sleep(100 * time.Millisecond)
@@ -2023,7 +2023,7 @@ func TestMaintenanceManagerStops(t *testing.T) {
 
 	ctx := context.Background()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	mgr := NewMaintenanceManager(ctx, st, logger, 30*24*60*60, 6)
+	mgr := NewMaintenanceManager(ctx, st, logger, nil, 30*24*60*60, 6)
 
 	// Let it run a bit
 	time.Sleep(100 * time.Millisecond)
@@ -2622,7 +2622,7 @@ func TestReadyAllowRaceSharedRecipient(t *testing.T) {
 	cfg.EmailPerHour = 10
 	cfg.EmailBurst = 10
 	cfg.EmailRcptPerHour = 1
-	cfg.Now = func() time.Time { return frozenTime }
+	cfg.Clock = clocktest.New(frozenTime)
 
 	dbPath := t.TempDir() + "/t.db"
 	st, err := store.Open(dbPath)
@@ -3798,7 +3798,7 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 // TestInviteAccept405Comprehensive covers all the edge cases from issue #146 and #174.
 func TestInviteAccept405Comprehensive(t *testing.T) {
 	// Use fake clock to control invite expiry deterministically
-	clk := clocktest.New(time.Now())
+	clk := clocktest.New(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 
 	// Open store with fake clock so expiry checks use it
 	st, err := store.OpenWithOptions(t.TempDir()+"/t.db", store.OpenOptions{Clock: clk})
@@ -4297,7 +4297,7 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 
 	// 14. 429 (rate limit) with ?code=: should have deprecation headers
 	// Use fake clock to control rate limiter refill deterministically
-	clk429 := clocktest.New(time.Now())
+	clk429 := clocktest.New(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 	srvLimited := newServer(t, Config{WritePerMinute: 60, WriteBurst: 1, Clock: clk429})
 	c := register(t, srvLimited, "charlie")
 	d := register(t, srvLimited, "dave")

@@ -18,7 +18,7 @@ import (
 
 func TestLimiterManagerAllCoversEveryLimiter(t *testing.T) {
 	lm := NewLimiterManager(Config{Clock: clock.Real{}, MsgPerMinute: 1, MsgBurst: 1, AuthFailPerMinute: 1, AuthFailBurst: 1,
-		WritePerMinute: 1, WriteBurst: 1, EmailPerHour: 1, EmailBurst: 1, EmailRcptPerHour: 1, NotifyPerHour: 1, NotifyBurst: 1}, time.Now)
+		WritePerMinute: 1, WriteBurst: 1, EmailPerHour: 1, EmailBurst: 1, EmailRcptPerHour: 1, NotifyPerHour: 1, NotifyBurst: 1})
 	defer lm.Stop()
 	listed := map[unsafe.Pointer]bool{}
 	for _, l := range lm.all() {
@@ -36,7 +36,7 @@ func TestLimiterManagerAllCoversEveryLimiter(t *testing.T) {
 func TestVersionLimiterPruned(t *testing.T) {
 	clk := clocktest.New(time.Unix(1e9, 0))
 	lm := NewLimiterManager(Config{Clock: clk, MsgPerMinute: 1, MsgBurst: 1, AuthFailPerMinute: 1, AuthFailBurst: 1,
-		WritePerMinute: 1, WriteBurst: 1, EmailPerHour: 1, EmailBurst: 1, EmailRcptPerHour: 1, NotifyPerHour: 1, NotifyBurst: 1}, clk.Now)
+		WritePerMinute: 1, WriteBurst: 1, EmailPerHour: 1, EmailBurst: 1, EmailRcptPerHour: 1, NotifyPerHour: 1, NotifyBurst: 1})
 	defer lm.Stop()
 	lm.versionLim.Allow("1.2.3.4")
 	clk.Advance(time.Hour)

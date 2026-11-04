@@ -17,6 +17,8 @@ func (Real) Now() time.Time {
 }
 
 // Or returns c if non-nil, otherwise Real{}.
+// A typed nil (e.g. (*clocktest.Fake)(nil) stored in the interface) is not
+// detected as nil and will be returned as-is, causing a panic on Now().
 func Or(c Clock) Clock {
 	if c == nil {
 		return Real{}
