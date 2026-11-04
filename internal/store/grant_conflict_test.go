@@ -1588,6 +1588,7 @@ func TestConcurrentAcceptDifferentInvites(t *testing.T) {
 		})
 	}
 }
+
 // TestConcurrentAcceptDifferentInvitesDifferentGrants races two accepts of different
 // TestConcurrentAcceptDifferentInvitesDifferentGrants races two accepts of different
 // invites with DIFFERENT grants. Exactly one should succeed, the other gets ErrConflict,
