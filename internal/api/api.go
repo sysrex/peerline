@@ -910,7 +910,7 @@ func truncateUTF8(s string, max int) string {
 // It returns the NFC-normalized, filtered result before length truncation.
 func sanitizeInviterNameUncapped(name string) string {
 	const (
-		maxMarksPerBase = 3 // Issue #84 specifies 3 marks per base (issue #63 asked for 2 but #84 is the live tracker)
+		maxMarksPerBase = 3    // Issue #84 specifies 3 marks per base (issue #63 asked for 2 but #84 is the live tracker)
 		maxInputBytes   = 1024 // Guard against unbounded normalization work
 	)
 

@@ -2908,7 +2908,7 @@ func TestSanitizeInviterName(t *testing.T) {
 		},
 		{
 			name:  "Tamil pulli at exactly position 64",
-			input: "xx" + strings.Repeat("ம் ", 40),                                                    // Rune 63 is ் (virama), rune 64 is space
+			input: "xx" + strings.Repeat("ம் ", 40),                                   // Rune 63 is ் (virama), rune 64 is space
 			want:  "xxம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம்", // 64 runes, word-final virama kept
 		},
 		{
