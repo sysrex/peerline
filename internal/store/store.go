@@ -188,7 +188,8 @@ CREATE INDEX IF NOT EXISTS invites_expires_at ON invites(expires_at);
 `
 
 // checkDatabasePath refuses non-regular database files (FIFO, socket, device, directory).
-// Symlinks are refused following the same pattern as tightenDatabaseFilePermissions (#245/#323).
+// Symlinks are allowed if their target is a regular file or doesn't exist (dangling).
+// Symlinks to non-regular files (FIFO, socket, device, directory) are refused.
 // ":memory:" and SQLite URI paths are skipped.
 // A missing path is acceptable (will be created).
 func checkDatabasePath(path string) error {
@@ -197,7 +198,7 @@ func checkDatabasePath(path string) error {
 		return nil
 	}
 
-	// Lstat to not follow symlinks
+	// Lstat to detect symlinks
 	info, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -207,9 +208,19 @@ func checkDatabasePath(path string) error {
 		return pathless(err)
 	}
 
-	// Refuse symlinks (following #245/#323 pattern)
+	// If it's a symlink, check the target
 	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("database file %s must not be a symlink", filepath.Base(path))
+		// Stat the target (follows the symlink)
+		targetInfo, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Dangling symlink is OK (same as missing path)
+				return nil
+			}
+			return pathless(err)
+		}
+		// Check if target is a regular file
+		info = targetInfo
 	}
 
 	// Refuse non-regular files (FIFO, socket, device, directory)

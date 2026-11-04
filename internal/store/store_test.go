@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2323,8 +2324,8 @@ func TestBackupFailureAbortsStartup(t *testing.T) {
 	}
 }
 
-// TestPreExistingBackupNotOverwritten verifies that if a backup file already exists at the target path,
-// the migration aborts with a clear error instead of overwriting it.
+// TestPreExistingBackupNotOverwritten verifies that when a backup file already exists at the target path,
+// the collision retry creates a new backup with a random hex suffix without overwriting the pre-existing file.
 func TestPreExistingBackupNotOverwritten(t *testing.T) {
 	tempDir := secureTempDir(t)
 	path := tempDir + "/test.db"
@@ -2334,93 +2335,86 @@ func TestPreExistingBackupNotOverwritten(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	if _, err := db.Exec(`
 		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+		INSERT INTO peers VALUES ('p1','Test','h1',1,'');
 		PRAGMA user_version = 2;
 	`); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()
 
-	// Create a pre-existing file at a backup path that will be used
-	// We need to force a collision, which is tricky with nanosecond timestamps.
-	// Instead, we'll mock time by temporarily replacing now() or test backupBeforeMigration directly.
-	// For this test, let's create a file with a known name and trigger a collision via retry.
-
-	// First migration attempt
-	s1, err := Open(path)
-	if err != nil {
+	// Pin clock to a known time to make backup names deterministic
+	fixedTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	
+	// Pre-create files at the base backup name to force collision
+	baseName := "test.db.pre-v6-from-v2.20260101-120000.000000"
+	basePath := tempDir + "/" + baseName
+	if err := os.WriteFile(basePath, []byte("pre-existing base"), 0600); err != nil {
 		t.Fatal(err)
 	}
 
-	// Find the backup that was created
+	// Open with fixed clock - should detect collision and create backup with hex suffix
+	opts := OpenOptions{
+		BackupDir:            tempDir,
+		BackupRetentionCount: 10, // Keep all to verify both exist
+		Logger:               slog.Default(),
+		Clock:                clocktest.New(fixedTime),
+	}
+
+	st, err := OpenWithOptions(path, opts)
+	if err != nil {
+		t.Fatalf("Open should succeed by adding hex suffix: %v", err)
+	}
+	defer st.Close()
+
+	// Verify a backup was created
+	backupPath := st.LastBackupPath()
+	if backupPath == "" {
+		t.Fatal("no backup created")
+	}
+
+	backupName := filepath.Base(backupPath)
+
+	// The new backup must NOT be the base name (must have added hex suffix)
+	if backupName == baseName {
+		t.Errorf("backup overwrote base name without hex suffix: %s", backupName)
+	}
+
+	// Must have an 8-char hex suffix
+	hexSuffixPattern := regexp.MustCompile(`\.\d{8}-\d{6}\.\d{6}\.[0-9a-f]{8}$`)
+	if !hexSuffixPattern.MatchString(backupName) {
+		t.Errorf("backup name doesn't match hex suffix pattern: %s", backupName)
+	}
+
+	// Verify the pre-existing base file was not overwritten
+	if data, err := os.ReadFile(basePath); err != nil {
+		t.Errorf("pre-existing base file was deleted: %v", err)
+	} else if string(data) != "pre-existing base" {
+		t.Errorf("pre-existing base file was overwritten")
+	}
+
+	// Verify the new backup is valid
+	fullBackupPath := tempDir + "/" + backupName
+	if err := verifyBackup(fullBackupPath, 2); err != nil {
+		t.Errorf("new backup failed verification: %v", err)
+	}
+
+	// Count total backups (should have both the pre-existing and the new one)
 	files, err := os.ReadDir(tempDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var firstBackupPath string
-	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "test.db.pre-v6-from-v") {
-			firstBackupPath = tempDir + "/" + f.Name()
-			break
-		}
-	}
-	if firstBackupPath == "" {
-		t.Fatal("first backup not created")
-	}
-
-	// Read the backup content
-	firstBackupContent, err := os.ReadFile(firstBackupPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	s1.Close()
-
-	// Downgrade to v2
-	db, err = sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`PRAGMA user_version = 2; ALTER TABLE peers DROP COLUMN created_via_invite`); err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
-
-	// The first backup still exists. Second migration attempt should create a new backup
-	// with a different timestamp, not overwrite the first one.
-	s2, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s2.Close()
-
-	// Verify the first backup was not modified
-	currentBackupContent, err := os.ReadFile(firstBackupPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if string(currentBackupContent) != string(firstBackupContent) {
-		t.Error("first backup was modified during second migration")
-	}
-
-	// Verify a second backup was created
-	files, err = os.ReadDir(tempDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	backupCount := 0
 	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "test.db.pre-v6-from-v") {
+		if strings.Contains(f.Name(), ".pre-v") && !strings.HasSuffix(f.Name(), ".partial") {
 			backupCount++
 		}
 	}
+
 	if backupCount != 2 {
-		t.Errorf("got %d backups after retry, want 2", backupCount)
+		t.Errorf("got %d backups (pre-existing + new), want 2", backupCount)
 	}
 }
 
@@ -3291,21 +3285,60 @@ func TestBackupDirPermissionsCheck(t *testing.T) {
 	}
 }
 
-// TestInvalidBackupKeepValue verifies that invalid BackupRetentionCount values are rejected.
+// TestInvalidBackupKeepValue verifies that invalid BackupRetentionCount values are adjusted to default (3)
+// and that the adjusted value is actually used.
 func TestInvalidBackupKeepValue(t *testing.T) {
-	opts := OpenOptions{
-		BackupRetentionCount: 0,
-		Logger:               slog.Default(),
-	}
+	dir := secureTempDir(t)
+	dbPath := dir + "/test.db"
 
-	st, err := OpenWithOptions(":memory:", opts)
+	// Create a v2 database that will trigger migration
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.Exec(`
+		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+		INSERT INTO peers VALUES ('p1','T','h1',1,'');
+		PRAGMA user_version = 2;
+	`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// Open with invalid BackupRetentionCount (0)
+	opts := OpenOptions{
+		BackupRetentionCount: 0, // Invalid: should be adjusted to 3
+		BackupDir:            dir,
+		Logger:               slog.Default(),
+	}
+
+	st, err := OpenWithOptions(dbPath, opts)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
 	defer st.Close()
 
-	// OpenWithOptions should adjust invalid values to default (3)
-	// This is tested by the successful open and the warning log
+	// Verify a backup was created (proves the adjusted value was used for migration)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	backupCount := 0
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".pre-v") && !strings.HasSuffix(entry.Name(), ".partial") {
+			backupCount++
+		}
+	}
+
+	// Should have created exactly 1 backup (the migration backup)
+	if backupCount != 1 {
+		t.Errorf("expected 1 backup after migration with adjusted retention, got %d", backupCount)
+	}
+
+	// The open succeeded, which means the adjusted value (3) was valid
+	// Testing that retention actually keeps 3 is done in other retention tests
 }
 
 // TestBackupFileMode is now in backup_mode_test_unix.go (Unix-specific mode assertions)
@@ -3464,57 +3497,151 @@ func TestRetentionIgnoresLookalikeFiles(t *testing.T) {
 // TestNoAbsolutePathsInErrors verifies that error messages and logs use only base names.
 func TestNoAbsolutePathsInErrors(t *testing.T) {
 	tempDir := secureTempDir(t)
-	path := tempDir + "/pathtest.db"
 
-	// Create a v2 database
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`
-		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
-		PRAGMA user_version = 2;
-	`); err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
+	// Test 1: Backup directory permission error
+	t.Run("backup directory permission error", func(t *testing.T) {
+		path := tempDir + "/pathtest1.db"
 
-	// Open successfully to create backup
-	st, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	st.Close()
+		// Create a v2 database
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`
+			CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+			PRAGMA user_version = 2;
+		`); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
 
-	// Now test various error paths
+		// Create a backup dir with group/world access (will be refused)
+		badDir := tempDir + "/baddir1"
+		if err := os.Mkdir(badDir, 0770); err != nil {
+			t.Fatal(err)
+		}
 
-	// 1. Test backup directory permission error
-	badDir := tempDir + "/baddir"
-	if err := os.Mkdir(badDir, 0770); err != nil {
-		t.Fatal(err)
-	}
+		opts := OpenOptions{
+			BackupDir:            badDir,
+			Logger:               slog.Default(),
+			BackupRetentionCount: 3,
+		}
 
-	opts := OpenOptions{
-		BackupDir:            badDir,
-		Logger:               slog.Default(),
-		BackupRetentionCount: 3,
-	}
+		_, err = OpenWithOptions(path, opts)
+		if err == nil {
+			t.Fatal("expected error for insecure backup directory, got nil")
+		}
 
-	// Reset to v2 to trigger migration
-	db, err = sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.Exec(`PRAGMA user_version = 2`)
-	db.Close()
-
-	_, err = OpenWithOptions(path, opts)
-	if err != nil {
 		// Error should not contain the temp directory path
 		if strings.Contains(err.Error(), tempDir) {
 			t.Errorf("error contains temp directory path %q: %v", tempDir, err)
 		}
-	}
+	})
+
+	// Test 2: Backup directory creation error (parent doesn't exist and not writable)
+	t.Run("backup directory creation error", func(t *testing.T) {
+		path := tempDir + "/pathtest2.db"
+
+		// Create a v2 database
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`
+			CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+			PRAGMA user_version = 2;
+		`); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+
+		// Try to use a backup dir that can't be created (file in the way)
+		blockingFile := tempDir + "/blocker"
+		if err := os.WriteFile(blockingFile, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		opts := OpenOptions{
+			BackupDir:            blockingFile + "/subdir",
+			Logger:               slog.Default(),
+			BackupRetentionCount: 3,
+		}
+
+		_, err = OpenWithOptions(path, opts)
+		if err == nil {
+			t.Fatal("expected error for backup directory creation failure, got nil")
+		}
+
+		// Error should not contain the temp directory path
+		if strings.Contains(err.Error(), tempDir) {
+			t.Errorf("error contains temp directory path %q: %v", tempDir, err)
+		}
+	})
+
+	// Test 3: ReadDir failure during retention (unreadable directory)
+	// This is hard to trigger without root, so we skip it if we can't make the dir unreadable
+	t.Run("ReadDir failure during retention", func(t *testing.T) {
+		if os.Getuid() == 0 {
+			t.Skip("test requires non-root to test unreadable directory")
+		}
+
+		path := tempDir + "/pathtest3.db"
+		retentionDir := tempDir + "/retentiontest"
+		if err := os.Mkdir(retentionDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create a v2 database
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`
+			CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+			PRAGMA user_version = 2;
+		`); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+
+		// First migration succeeds
+		opts := OpenOptions{
+			BackupDir:            retentionDir,
+			Logger:               slog.Default(),
+			BackupRetentionCount: 1,
+		}
+
+		st, err := OpenWithOptions(path, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st.Close()
+
+		// Make the directory unreadable (chmod 000)
+		if err := os.Chmod(retentionDir, 0000); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Chmod(retentionDir, 0700) // Restore for cleanup
+
+		// Reset to v2 for another migration
+		db, err = sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.Exec(`PRAGMA user_version = 2`)
+		db.Close()
+
+		// This should fail when trying to read the directory for retention
+		// But the migration itself may succeed before retention is enforced
+		// So we accept either success or failure, but if there's an error, check path redaction
+		_, err = OpenWithOptions(path, opts)
+		if err != nil {
+			// Error should not contain the temp directory path
+			if strings.Contains(err.Error(), tempDir) {
+				t.Errorf("error contains temp directory path %q: %v", tempDir, err)
+			}
+		}
+	})
 }
 
 // TestVacuumIntoFailure verifies cleanup when VACUUM INTO fails.

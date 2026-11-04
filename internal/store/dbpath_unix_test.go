@@ -89,44 +89,152 @@ func TestDBPathRefusesDirectory(t *testing.T) {
 	}
 }
 
-// TestDBPathRefusesSymlink verifies that a symlink at the DB path is rejected.
-func TestDBPathRefusesSymlink(t *testing.T) {
+// TestDBPathAcceptsSymlinkToRegularFile verifies that a symlink to a regular file is accepted.
+func TestDBPathAcceptsSymlinkToRegularFile(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 	targetPath := filepath.Join(dir, "target.db")
 
-	// Create a target file
-	if err := os.WriteFile(targetPath, []byte("target"), 0644); err != nil {
+	// Create a symlink at the DB path pointing to a non-existent target
+	if err := os.Symlink(targetPath, dbPath); err != nil {
+		t.Skip("symlink not supported:", err)
+	}
+
+	// Open should succeed and create the database at the target
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed with symlink to regular file: %v", err)
+	}
+	defer s.Close()
+
+	// Verify it's usable
+	ctx := context.Background()
+	if err := s.CreatePeer(ctx, "peer1", "Test Peer", "hash1", "", ""); err != nil {
+		t.Fatalf("CreatePeer failed: %v", err)
+	}
+
+	// Verify the target file was created
+	if _, err := os.Stat(targetPath); err != nil {
+		t.Errorf("target file was not created: %v", err)
+	}
+}
+
+// TestDBPathRefusesSymlinkToFIFO verifies that a symlink pointing to a FIFO is rejected.
+func TestDBPathRefusesSymlinkToFIFO(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	fifoPath := filepath.Join(dir, "fifo")
+
+	// Create a FIFO
+	if err := syscall.Mkfifo(fifoPath, 0644); err != nil {
+		t.Skip("mkfifo not supported:", err)
+	}
+
+	// Create a symlink pointing to the FIFO
+	if err := os.Symlink(fifoPath, dbPath); err != nil {
+		t.Skip("symlink not supported:", err)
+	}
+
+	// Cleanup: unblock any goroutine that might be blocked
+	t.Cleanup(func() {
+		f, err := os.OpenFile(fifoPath, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err != nil && !errors.Is(err, syscall.ENXIO) {
+			t.Logf("cleanup: failed to unblock FIFO: %v", err)
+		}
+		if f != nil {
+			f.Close()
+		}
+	})
+
+	// Attempt to open should fail fast
+	done := make(chan error, 1)
+	go func() {
+		_, err := Open(dbPath)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Open succeeded with symlink to FIFO, expected error")
+		}
+		// Verify error message mentions FIFO or named pipe
+		errMsg := err.Error()
+		if !strings.Contains(errMsg, "named pipe") && !strings.Contains(errMsg, "FIFO") {
+			t.Errorf("error should mention FIFO or named pipe, got: %v", err)
+		}
+		if strings.Contains(errMsg, dir) {
+			t.Errorf("error leaked absolute path: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Open blocked on symlink to FIFO for >2s")
+	}
+}
+
+// TestDBPathRefusesSymlinkToDirectory verifies that a symlink pointing to a directory is rejected.
+func TestDBPathRefusesSymlinkToDirectory(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	dirPath := filepath.Join(dir, "subdir")
+
+	// Create a directory
+	if err := os.Mkdir(dirPath, 0755); err != nil {
 		t.Fatal(err)
 	}
 
-	// Create a symlink at the DB path
-	if err := os.Symlink(targetPath, dbPath); err != nil {
+	// Create a symlink pointing to the directory
+	if err := os.Symlink(dirPath, dbPath); err != nil {
 		t.Skip("symlink not supported:", err)
 	}
 
 	// Attempt to open should fail
 	_, err := Open(dbPath)
 	if err == nil {
-		t.Fatal("Open succeeded with symlink, expected error")
+		t.Fatal("Open succeeded with symlink to directory, expected error")
 	}
 
-	// Verify error message
+	// Verify error message mentions directory
 	errMsg := err.Error()
-	if !strings.Contains(errMsg, "symlink") {
-		t.Errorf("error should mention symlink, got: %v", err)
+	if !strings.Contains(errMsg, "directory") {
+		t.Errorf("error should mention directory, got: %v", err)
 	}
 	if strings.Contains(errMsg, dir) {
 		t.Errorf("error leaked absolute path: %v", err)
 	}
+}
 
-	// Verify target was not modified
-	content, err := os.ReadFile(targetPath)
-	if err != nil {
-		t.Fatal(err)
+// TestDBPathAcceptsDanglingSymlink verifies that a dangling symlink is accepted (same as missing path).
+func TestDBPathAcceptsDanglingSymlink(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	targetPath := filepath.Join(dir, "nonexistent.db")
+
+	// Create a dangling symlink
+	if err := os.Symlink(targetPath, dbPath); err != nil {
+		t.Skip("symlink not supported:", err)
 	}
-	if string(content) != "target" {
-		t.Errorf("symlink target was modified")
+
+	// Verify it's dangling
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatal("symlink should be dangling")
+	}
+
+	// Open should succeed and create the database at the target
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed with dangling symlink: %v", err)
+	}
+	defer s.Close()
+
+	// Verify it's usable
+	ctx := context.Background()
+	if err := s.CreatePeer(ctx, "peer1", "Test Peer", "hash1", "", ""); err != nil {
+		t.Fatalf("CreatePeer failed: %v", err)
+	}
+
+	// Verify the target file was created
+	if _, err := os.Stat(targetPath); err != nil {
+		t.Errorf("target file was not created: %v", err)
 	}
 }
 
