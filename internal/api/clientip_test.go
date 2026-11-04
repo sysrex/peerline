@@ -1245,11 +1245,11 @@ func TestNewWarnsWhenTrustedProxiesParseToNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	
+
 	h := &captureHandler{}
 	srv := mustNew(t, st, Config{TrustedProxies: []string{" ", ""}, Logger: slog.New(h)})
 	t.Cleanup(srv.lim.Stop)
-	
+
 	// Verify api.New emits exactly one warning for the empty proxy list
 	warnCount := 0
 	foundExpectedMsg := false
@@ -1261,7 +1261,7 @@ func TestNewWarnsWhenTrustedProxiesParseToNothing(t *testing.T) {
 			}
 		}
 	}
-	
+
 	if !foundExpectedMsg {
 		t.Fatalf("api.New must warn when the parsed list is empty")
 	}
