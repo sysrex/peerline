@@ -11,9 +11,17 @@ import (
 	"time"
 
 	"github.com/sysrex/peerline/internal/api"
+	"github.com/sysrex/peerline/internal/clock"
+	"github.com/sysrex/peerline/internal/clock/clocktest"
 	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/store"
 )
+
+// testMailerStub is a no-op mailer for testing config wiring.
+type testMailerStub struct{}
+
+func (testMailerStub) Send(ctx context.Context, m mailer.Message) error { return nil }
+func (testMailerStub) Mode() string                                     { return "test" }
 
 func TestParseNonNegativeInt(t *testing.T) {
 	tests := []struct {
@@ -458,11 +466,21 @@ func TestBuildTrustedProxySettings(t *testing.T) {
 // TestBuildAPIConfig verifies that buildAPIConfig returns the exact config
 // main() passes to api.New, with no field assignments in between.
 func TestBuildAPIConfig(t *testing.T) {
+	testClock := clocktest.New(time.Unix(1234567890, 0))
+	testMailer := &testMailerStub{}
+
 	tests := []struct {
 		name                string
 		envVars             map[string]string
 		trustedProxies      []string
 		allowBroadIPv6      bool
+		clock               clock.Clock
+		mailer              mailer.Sender
+		versionDetail       string
+		publicURL           string
+		maxBagsPerPeer      int
+		maxBagBytesPerPeer  int64
+		retentionSeconds    int64
 		wantRegisterToken   string
 		wantCodePepper      string
 		wantEmailPerHour    int
@@ -473,6 +491,11 @@ func TestBuildAPIConfig(t *testing.T) {
 		wantWriteMin        int
 		wantWriteBurst      int
 		wantKeyIndexRebuild int
+		wantVersionDetail   string
+		wantPublicURL       string
+		wantMaxBagsPerPeer  int
+		wantMaxBagBytes     int64
+		wantRetentionSec    int64
 		wantBuildErr        bool
 		wantNewErr          bool
 		wantNewErrContains  string
@@ -493,6 +516,13 @@ func TestBuildAPIConfig(t *testing.T) {
 			},
 			trustedProxies:      []string{"10.0.0.0/8"},
 			allowBroadIPv6:      true,
+			clock:               testClock,
+			mailer:              testMailer,
+			versionDetail:       "full",
+			publicURL:           "https://test.example.com",
+			maxBagsPerPeer:      200,
+			maxBagBytesPerPeer:  2097152,
+			retentionSeconds:    5184000,
 			wantRegisterToken:   "test_reg_token_abc123",
 			wantCodePepper:      "test_pepper_xyz789",
 			wantEmailPerHour:    50,
@@ -503,6 +533,18 @@ func TestBuildAPIConfig(t *testing.T) {
 			wantWriteMin:        15,
 			wantWriteBurst:      5,
 			wantKeyIndexRebuild: 12,
+			wantVersionDetail:   "full",
+			wantPublicURL:       "https://test.example.com",
+			wantMaxBagsPerPeer:  200,
+			wantMaxBagBytes:     2097152,
+			wantRetentionSec:    5184000,
+		},
+		{
+			name:                "key index rebuild default",
+			envVars:             map[string]string{},
+			trustedProxies:      nil,
+			allowBroadIPv6:      false,
+			wantKeyIndexRebuild: 6,
 		},
 		{
 			name: "invalid auth fail per minute",
@@ -551,7 +593,7 @@ func TestBuildAPIConfig(t *testing.T) {
 			log := slog.New(h)
 
 			// Build config exactly as main() does
-			cfg, err := buildAPIConfig(getenv, log, nil, nil, "minimal", "", 0, 0, 0, tt.trustedProxies, tt.allowBroadIPv6)
+			cfg, err := buildAPIConfig(getenv, log, tt.clock, tt.mailer, tt.versionDetail, tt.publicURL, tt.maxBagsPerPeer, tt.maxBagBytesPerPeer, tt.retentionSeconds, tt.trustedProxies, tt.allowBroadIPv6)
 			if tt.wantBuildErr {
 				if err == nil {
 					t.Errorf("buildAPIConfig() succeeded, want error")
@@ -598,6 +640,28 @@ func TestBuildAPIConfig(t *testing.T) {
 			}
 			if !equalStringSlices(cfg.TrustedProxies, tt.trustedProxies) {
 				t.Errorf("cfg.TrustedProxies = %v, want %v", cfg.TrustedProxies, tt.trustedProxies)
+			}
+			// Assert pass-through values
+			if tt.wantVersionDetail != "" && cfg.VersionDetail != tt.wantVersionDetail {
+				t.Errorf("cfg.VersionDetail = %q, want %q (mutation: VersionDetail dropped)", cfg.VersionDetail, tt.wantVersionDetail)
+			}
+			if tt.wantPublicURL != "" && cfg.PublicURL != tt.wantPublicURL {
+				t.Errorf("cfg.PublicURL = %q, want %q (mutation: PublicURL dropped)", cfg.PublicURL, tt.wantPublicURL)
+			}
+			if tt.wantMaxBagsPerPeer != 0 && cfg.MaxBagsPerPeer != tt.wantMaxBagsPerPeer {
+				t.Errorf("cfg.MaxBagsPerPeer = %d, want %d (mutation: MaxBagsPerPeer dropped)", cfg.MaxBagsPerPeer, tt.wantMaxBagsPerPeer)
+			}
+			if tt.wantMaxBagBytes != 0 && cfg.MaxBagBytesPerPeer != tt.wantMaxBagBytes {
+				t.Errorf("cfg.MaxBagBytesPerPeer = %d, want %d (mutation: MaxBagBytesPerPeer dropped)", cfg.MaxBagBytesPerPeer, tt.wantMaxBagBytes)
+			}
+			if tt.wantRetentionSec != 0 && cfg.RetentionSeconds != tt.wantRetentionSec {
+				t.Errorf("cfg.RetentionSeconds = %d, want %d (mutation: RetentionSeconds dropped)", cfg.RetentionSeconds, tt.wantRetentionSec)
+			}
+			if tt.clock != nil && cfg.Clock != tt.clock {
+				t.Errorf("cfg.Clock = %v, want %v (mutation: Clock dropped)", cfg.Clock, tt.clock)
+			}
+			if tt.mailer != nil && cfg.Mailer != tt.mailer {
+				t.Errorf("cfg.Mailer = %v, want %v (mutation: Mailer dropped)", cfg.Mailer, tt.mailer)
 			}
 
 			// Verify that api.New works with the config (only for non-error cases)
