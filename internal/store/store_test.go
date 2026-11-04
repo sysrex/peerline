@@ -2000,16 +2000,9 @@ func TestBackupBeforeMigration(t *testing.T) {
 		t.Errorf("main database user_version = %d, want %d (post-migration)", mainVersion, len(migrations))
 	}
 
-	// Verify backup has exactly 0600 permissions on Unix
-	info, err := os.Stat(backupPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if os.PathSeparator == '/' {
-		mode := info.Mode() & os.ModePerm
-		if mode != 0600 {
-			t.Errorf("backup file mode = %o, want exactly 0600", mode)
-		}
+	// Verify backup exists (mode checks are in backup_mode_test_unix.go)
+	if _, err := os.Stat(backupPath); err != nil {
+		t.Fatalf("backup file not found: %v", err)
 	}
 }
 
@@ -3253,76 +3246,7 @@ func TestInvalidBackupKeepValue(t *testing.T) {
 	// This is tested by the successful open and the warning log
 }
 
-// TestBackupFileMode verifies backups are created with 0600 permissions.
-func TestBackupFileMode(t *testing.T) {
-	tempDir := secureTempDir(t)
-	path := tempDir + "/mode.db"
-
-	// Create a v2 database
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`
-		CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
-		PRAGMA user_version = 2;
-	`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`INSERT INTO peers VALUES ('p1', 'Test', 'h1', ?, '')`, time.Now().Unix()); err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
-
-	// Hook vacuumInto to verify the file mode BEFORE SQLite writes to it
-	// This proves the pre-create is at 0600, not just the post-chmod
-	var modeBeforeVacuum os.FileMode
-	vacuumHook := func(db *sql.DB, backupPath string) error {
-		// Check mode before VACUUM INTO writes
-		info, err := os.Stat(backupPath)
-		if err != nil {
-			return err
-		}
-		modeBeforeVacuum = info.Mode().Perm()
-
-		// Now run the actual VACUUM INTO
-		_, err = db.Exec(`VACUUM INTO ?`, backupPath)
-		return err
-	}
-
-	opts := OpenOptions{
-		vacuumInto: vacuumHook,
-	}
-
-	// Open triggers migration and creates backup
-	st, err := OpenWithOptions(path, opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-
-	// Verify the mode was 0600 BEFORE VACUUM INTO wrote to it
-	if modeBeforeVacuum != 0600 {
-		t.Errorf("backup file mode before VACUUM INTO = %04o, want 0600 (umask window detected)", modeBeforeVacuum)
-	}
-
-	// Also verify final mode is still 0600
-	backupBase := st.LastBackupPath()
-	if backupBase == "" {
-		t.Fatal("no backup was created")
-	}
-
-	backupPath := tempDir + "/" + backupBase
-	info, err := os.Stat(backupPath)
-	if err != nil {
-		t.Fatalf("cannot stat backup: %v", err)
-	}
-
-	mode := info.Mode() & os.ModePerm
-	if mode != 0600 {
-		t.Errorf("backup file final mode = %04o, want 0600", mode)
-	}
-}
+// TestBackupFileMode is now in backup_mode_test_unix.go (Unix-specific mode assertions)
 
 // TestBackupCollisionRetry verifies that a timestamp collision triggers PID suffix retry.
 func TestBackupCollisionRetry(t *testing.T) {

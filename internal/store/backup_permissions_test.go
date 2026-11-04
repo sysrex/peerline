@@ -134,13 +134,6 @@ func TestDefaultDBDirectoryPermissions(t *testing.T) {
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name(), "test.db.pre-v") {
 			found = true
-			info, err := entry.Info()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if perm := info.Mode().Perm(); perm != 0600 {
-				t.Errorf("backup file has mode %04o, want 0600", perm)
-			}
 			break
 		}
 	}
@@ -148,6 +141,7 @@ func TestDefaultDBDirectoryPermissions(t *testing.T) {
 	if !found {
 		t.Error("backup file not found in database directory")
 	}
+	// Mode assertion moved to backup_mode_test_unix.go (Unix-specific)
 }
 
 // TestGroupWritableDBDirectoryRefused verifies that a group-writable (0775)

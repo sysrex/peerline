@@ -229,6 +229,11 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
 
+	// Tighten permissions on existing database files if needed (Unix only)
+	if absPath, err := filepath.Abs(path); err == nil && path != ":memory:" {
+		tightenDatabaseFilePermissions(absPath, opts.Logger)
+	}
+
 	// Guard: check version BEFORE executing schema
 	currentVersion, err := checkSchemaVersion(db)
 	if err != nil {
@@ -546,7 +551,7 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 	timestamp := clk.Now().UTC().Format("20060102-150405.000000")
 
 	// Sweep stale .partial files from previous interrupted backups (older than 2 minutes)
-	sweepPartialBackups(backupDir, dbBase, opts.Logger)
+	sweepPartialBackups(backupDir, dbBase, clk, opts.Logger)
 
 	backupName := fmt.Sprintf("%s.pre-v%d-from-v%d.%s", dbBase, targetVersion, currentVersion, timestamp)
 
@@ -555,12 +560,10 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 		return "", false, err
 	}
 
-	// Create a .partial temp file first, then atomically link it to the final name
-	// This ensures only complete backups have the final naming pattern
+	// Retry loop: try up to 10 times with random suffixes on collision
 	var finalPath string
-	var partialPath string
-	var partialFile *os.File
-	var partialFinfo os.FileInfo
+	var backupSize int64
+	var backupDuration time.Duration
 
 	for attempts := 0; attempts < 10; attempts++ {
 		tryName := backupName
@@ -574,119 +577,124 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 		}
 
 		finalPath = filepath.Join(backupDir, tryName)
-		partialPath = finalPath + ".partial"
+
+		// Check if final name already exists (collision)
+		if _, err := os.Lstat(finalPath); err == nil {
+			// Final name exists, try next random suffix
+			continue
+		} else if !os.IsNotExist(err) {
+			return "", false, fmt.Errorf("check backup file: %w", pathless(err))
+		}
+
+		partialPath := finalPath + ".partial"
 
 		// Create .partial file with O_EXCL|O_NOFOLLOW at 0600
 		f, err := openBackupFileExclusive(partialPath)
-		if err == nil {
-			partialFile = f
-			// Verify owner and mode on the open fd
-			finfo, err := f.Stat()
-			if err != nil {
-				f.Close()
-				os.Remove(partialPath)
-				return "", false, fmt.Errorf("stat created partial backup file: %w", pathless(err))
+		if err != nil {
+			if os.IsExist(err) {
+				// Partial file exists (stale or concurrent), try next suffix
+				continue
 			}
-
-			if !ownedByCurrentUser(finfo) {
-				f.Close()
-				os.Remove(partialPath)
-				return "", false, fmt.Errorf("partial backup file %q is not owned by the user running peerline", filepath.Base(partialPath))
-			}
-
-			// Mode should be 0600 from OpenFile, but verify
-			if perm := finfo.Mode().Perm(); perm != 0600 {
-				f.Close()
-				os.Remove(partialPath)
-				return "", false, fmt.Errorf("partial backup file %q has mode %04o, expected 0600", filepath.Base(partialPath), perm)
-			}
-
-			partialFinfo = finfo
-			f.Close()
-			break
-		}
-		if !os.IsExist(err) {
 			return "", false, fmt.Errorf("create partial backup file: %w", pathless(err))
 		}
-		// Partial file exists, retry with random suffix
-	}
 
-	if partialFile == nil {
-		return "", false, fmt.Errorf("create partial backup file: failed after 10 collision retries")
-	}
-
-	// Execute VACUUM INTO with context timeout
-	opts.Logger.Info("starting pre-migration backup", "backup", filepath.Base(finalPath), "size_bytes", "pending")
-	backupStart := time.Now()
-
-	timeout := opts.BackupTimeout
-	if timeout == 0 {
-		timeout = 5 * time.Minute // Default 5 minutes
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	vacuumFunc := opts.vacuumInto
-	if vacuumFunc == nil {
-		vacuumFunc = func(db *sql.DB, path string) error {
-			_, err := db.ExecContext(ctx, `VACUUM INTO ?`, path)
-			return err
-		}
-	}
-
-	if err := vacuumFunc(db, partialPath); err != nil {
-		os.Remove(partialPath)
-		return "", false, fmt.Errorf("VACUUM INTO backup: %w", pathless(err))
-	}
-
-	backupDuration := time.Since(backupStart)
-
-	// Verify the partial file hasn't been replaced (check inode)
-	afterVacuum, err := os.Lstat(partialPath)
-	if err != nil {
-		os.Remove(partialPath)
-		return "", false, fmt.Errorf("stat partial after VACUUM: %w", pathless(err))
-	}
-	if !os.SameFile(partialFinfo, afterVacuum) {
-		os.Remove(partialPath)
-		return "", false, fmt.Errorf("partial backup file was replaced during VACUUM")
-	}
-	if afterVacuum.Mode().Perm() != 0600 {
-		os.Remove(partialPath)
-		return "", false, fmt.Errorf("partial backup mode changed to %04o during VACUUM, expected 0600", afterVacuum.Mode().Perm())
-	}
-
-	// Fsync the backup file
-	if err := fsyncFile(partialPath, opts.Logger); err != nil {
-		opts.Logger.Warn("backup fsync failed", "backup", filepath.Base(partialPath), "error", pathless(err).Error())
-	}
-
-	// Verify backup before linking
-	if err := verifyBackup(partialPath, currentVersion); err != nil {
-		os.Remove(partialPath)
-		return "", false, fmt.Errorf("backup verification failed: %w", err)
-	}
-
-	// Atomically link the partial file to the final name
-	// os.Link fails if finalPath already exists, preserving the no-overwrite guarantee
-	// Note: This can fail if a file with this exact timestamp already exists (rare),
-	// but the backup is complete in the .partial file and can be manually renamed
-	if err := os.Link(partialPath, finalPath); err != nil {
-		if os.IsExist(err) {
-			// The final name exists (very rare with microsecond timestamps).
-			// Keep the .partial file as the backup since it's valid.
-			// The next backup will use a different timestamp or the sweep will clean old .partial files.
-			opts.Logger.Warn("backup link collision, keeping .partial file", "partial", filepath.Base(partialPath), "final", filepath.Base(finalPath))
-			// Don't delete partialPath - it's a valid backup
-			// Return it as the backup path (caller can use it)
-			finalPath = partialPath
-		} else {
+		// Verify owner and mode on the open fd
+		partialFinfo, err := f.Stat()
+		if err != nil {
+			f.Close()
 			os.Remove(partialPath)
+			return "", false, fmt.Errorf("stat created partial backup file: %w", pathless(err))
+		}
+
+		if !ownedByCurrentUser(partialFinfo) {
+			f.Close()
+			os.Remove(partialPath)
+			return "", false, fmt.Errorf("partial backup file %q is not owned by the user running peerline", filepath.Base(partialPath))
+		}
+
+		// Mode should be 0600 from OpenFile, but verify
+		if perm := partialFinfo.Mode().Perm(); perm != 0600 {
+			f.Close()
+			os.Remove(partialPath)
+			return "", false, fmt.Errorf("partial backup file %q has mode %04o, expected 0600", filepath.Base(partialPath), perm)
+		}
+		f.Close()
+
+		// Execute VACUUM INTO with context timeout
+		opts.Logger.Info("starting pre-migration backup", "backup", filepath.Base(tryName), "size_bytes", "pending")
+		backupStart := time.Now()
+
+		timeout := opts.BackupTimeout
+		if timeout == 0 {
+			timeout = 5 * time.Minute // Default 5 minutes
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+
+		vacuumFunc := opts.vacuumInto
+		if vacuumFunc == nil {
+			vacuumFunc = func(db *sql.DB, path string) error {
+				_, err := db.ExecContext(ctx, `VACUUM INTO ?`, path)
+				return err
+			}
+		}
+
+		err = vacuumFunc(db, partialPath)
+		cancel()
+		if err != nil {
+			os.Remove(partialPath)
+			return "", false, fmt.Errorf("VACUUM INTO backup: %w", pathless(err))
+		}
+
+		backupDuration = time.Since(backupStart)
+
+		// Verify the partial file hasn't been replaced (check inode)
+		afterVacuum, err := os.Lstat(partialPath)
+		if err != nil {
+			os.Remove(partialPath)
+			return "", false, fmt.Errorf("stat partial after VACUUM: %w", pathless(err))
+		}
+		if !os.SameFile(partialFinfo, afterVacuum) {
+			os.Remove(partialPath)
+			return "", false, fmt.Errorf("partial backup file was replaced during VACUUM")
+		}
+		if afterVacuum.Mode().Perm() != 0600 {
+			os.Remove(partialPath)
+			return "", false, fmt.Errorf("partial backup mode changed to %04o during VACUUM, expected 0600", afterVacuum.Mode().Perm())
+		}
+
+		// Fsync the backup file
+		if err := fsyncFile(partialPath, opts.Logger); err != nil {
+			opts.Logger.Warn("backup fsync failed", "backup", filepath.Base(partialPath), "error", pathless(err).Error())
+		}
+
+		// Verify backup before linking
+		// SQLite opens the .partial file by path and follows symlinks. This is acceptable
+		// because the setupBackupDir check ensures the directory owner matches the current user.
+		if err := verifyBackup(partialPath, currentVersion); err != nil {
+			os.Remove(partialPath)
+			return "", false, fmt.Errorf("backup verification failed: %w", err)
+		}
+
+		// Atomically link the partial file to the final name
+		// os.Link fails if finalPath already exists
+		if err := os.Link(partialPath, finalPath); err != nil {
+			os.Remove(partialPath)
+			if os.IsExist(err) {
+				// Final name now exists (race with another process or stale file), retry with new suffix
+				continue
+			}
 			return "", false, fmt.Errorf("link partial to final backup name: %w", pathless(err))
 		}
-	} else {
+
 		// Link succeeded, remove the .partial file (the final name now exists via hard link)
 		os.Remove(partialPath)
+		backupSize = afterVacuum.Size()
+		break
+	}
+
+	// If we exhausted all retries, fail
+	if backupSize == 0 {
+		return "", false, fmt.Errorf("backup failed after 10 collision retries")
 	}
 
 	// Fsync the backup directory to persist the final name
@@ -694,7 +702,6 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 		opts.Logger.Warn("backup directory fsync failed", "dir", backupDir, "error", pathless(err).Error())
 	}
 
-	backupSize := afterVacuum.Size()
 	opts.Logger.Info("pre-migration backup complete", "backup", filepath.Base(finalPath), "size_bytes", backupSize, "duration_seconds", backupDuration.Seconds())
 
 	// Enforce retention policy
@@ -897,14 +904,14 @@ func fsyncDirectory(path string, logger *slog.Logger) error {
 
 // sweepPartialBackups removes stale .partial files older than 2 minutes
 // from interrupted backups. Only removes files matching our naming pattern.
-func sweepPartialBackups(backupDir, dbBase string, logger *slog.Logger) {
+func sweepPartialBackups(backupDir, dbBase string, clk clock.Clock, logger *slog.Logger) {
 	entries, err := os.ReadDir(backupDir)
 	if err != nil {
 		// Silently skip if directory is unreadable
 		return
 	}
 
-	cutoff := time.Now().Add(-2 * time.Minute)
+	cutoff := clk.Now().Add(-2 * time.Minute)
 	// Match: <dbBase>.pre-vN-from-vM.<timestamp>[.<suffix>].partial
 	pattern := regexp.MustCompile(`^` + regexp.QuoteMeta(dbBase) + `\.pre-v\d+-from-v\d+\.` + `\d{8}-\d{6}\.\d{6}` + `(\.[0-9a-f]{8}|\.\d+)?\.partial$`)
 

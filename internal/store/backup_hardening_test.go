@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -186,8 +187,7 @@ func TestCollisionRetryWithRandomSuffix(t *testing.T) {
 	// Pin clock to 2026-01-01 12:00:00 UTC
 	clockTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 
-	// Pre-plant invalid file at the base timestamp to force collision
-	// (invalid so reuse scan skips it and the create loop runs)
+	// Pre-plant invalid file at the FINAL name (not .partial) to force collision
 	baseName := "x.db.pre-v6-from-v2.20260101-120000.000000"
 	basePath := filepath.Join(dir, baseName)
 	if err := os.WriteFile(basePath, []byte("invalid"), 0600); err != nil {
@@ -213,32 +213,26 @@ func TestCollisionRetryWithRandomSuffix(t *testing.T) {
 
 	backupName := filepath.Base(backupPath)
 
-	// The new backup must NOT be the base name (must have hex suffix or .partial)
+	// The new backup must NOT be the base name (must have 8-char hex suffix)
 	if backupName == baseName {
 		t.Errorf("backup used base name without hex suffix: %s", backupName)
 	}
 
-	// Verify the backup name has an 8-hex-digit suffix (or is .partial due to link collision)
-	hasHexSuffix := false
-	isPartial := strings.HasSuffix(backupName, ".partial")
-
-	if !isPartial && strings.HasPrefix(backupName, baseName+".") {
-		suffix := strings.TrimPrefix(backupName, baseName+".")
-		if len(suffix) == 8 {
-			// Check all chars are lowercase hex
-			allHex := true
-			for _, c := range suffix {
-				if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
-					allHex = false
-					break
-				}
-			}
-			hasHexSuffix = allHex
-		}
+	// Must NOT be a .partial file
+	if strings.HasSuffix(backupName, ".partial") {
+		t.Errorf("backup is a .partial file, should be final: %s", backupName)
 	}
 
-	if !hasHexSuffix && !isPartial {
-		t.Errorf("backup name doesn't have 8-char hex suffix or .partial: %s", backupName)
+	// Verify the backup name matches the pattern with 8-char hex suffix
+	hexSuffixPattern := regexp.MustCompile(`\.\d{8}-\d{6}\.\d{6}\.[0-9a-f]{8}$`)
+	if !hexSuffixPattern.MatchString(backupName) {
+		t.Errorf("backup name doesn't match hex suffix pattern: %s", backupName)
+	}
+
+	// Verify the backup passes verification (use fullpath = dir + backupName)
+	fullBackupPath := filepath.Join(dir, backupName)
+	if err := verifyBackup(fullBackupPath, 2); err != nil {
+		t.Errorf("backup failed verification: %v (path: %s)", err, fullBackupPath)
 	}
 
 	// Verify the pre-existing invalid base file still exists (not overwritten)
@@ -246,6 +240,169 @@ func TestCollisionRetryWithRandomSuffix(t *testing.T) {
 		t.Errorf("pre-existing file was deleted: %v", err)
 	} else if string(data) != "invalid" {
 		t.Errorf("pre-existing file was overwritten")
+	}
+
+	// Verify no .partial files remain in the directory
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".partial") {
+			t.Errorf("stale .partial file left in directory: %s", entry.Name())
+		}
+	}
+}
+
+func TestCollisionMultipleRetries(t *testing.T) {
+	dir := secureTempDir(t)
+
+	// Create a v2 database
+	dbPath := filepath.Join(dir, "x.db")
+	tempDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tempDB.Exec(`CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT, key_hash TEXT UNIQUE, created_at INTEGER, notify_email TEXT DEFAULT '');
+		INSERT INTO peers VALUES ('p1','T','h1',1,''); PRAGMA user_version = 2;`); err != nil {
+		t.Fatal(err)
+	}
+	tempDB.Close()
+
+	// Pin clock to 2026-01-01 12:00:00 UTC
+	clockTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// Pre-plant files at the base name and with a specific first random suffix
+	baseName := "x.db.pre-v6-from-v2.20260101-120000.000000"
+	basePath := filepath.Join(dir, baseName)
+	if err := os.WriteFile(basePath, []byte("invalid-base"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Also pre-plant a file with a hex suffix to force multiple retries
+	// Use a fixed suffix that might collide
+	collideName := baseName + ".deadbeef"
+	collidePath := filepath.Join(dir, collideName)
+	if err := os.WriteFile(collidePath, []byte("invalid-collide"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Use a deterministic random source to force collision on first suffix attempt
+	// Actually, we can't control rand.Read easily, so this test just verifies
+	// that if both files exist, a third suffix is chosen
+	opts := openOpts(dir)
+	opts.BackupRetentionCount = 10
+	opts.Clock = clocktest.New(clockTime)
+
+	s, err := OpenWithOptions(dbPath, opts)
+	if err != nil {
+		t.Fatalf("Open should succeed by finding unused suffix: %v", err)
+	}
+	defer s.Close()
+
+	backupPath := s.LastBackupPath()
+	if backupPath == "" {
+		t.Fatal("no backup created")
+	}
+
+	backupName := filepath.Base(backupPath)
+
+	// Verify the backup is not any of the pre-planted names
+	if backupName == baseName || backupName == collideName {
+		t.Errorf("backup used a pre-planted name: %s", backupName)
+	}
+
+	// Must NOT be a .partial file
+	if strings.HasSuffix(backupName, ".partial") {
+		t.Errorf("backup is a .partial file: %s", backupName)
+	}
+
+	// Must have an 8-char hex suffix
+	hexSuffixPattern := regexp.MustCompile(`\.\d{8}-\d{6}\.\d{6}\.[0-9a-f]{8}$`)
+	if !hexSuffixPattern.MatchString(backupName) {
+		t.Errorf("backup name doesn't match hex suffix pattern: %s", backupName)
+	}
+
+	// Verify the backup passes verification
+	fullBackupPath := filepath.Join(dir, backupName)
+	if err := verifyBackup(fullBackupPath, 2); err != nil {
+		t.Errorf("backup failed verification: %v", err)
+	}
+
+	// Verify both pre-existing files still exist
+	if data, err := os.ReadFile(basePath); err != nil {
+		t.Errorf("pre-existing base file was deleted: %v", err)
+	} else if string(data) != "invalid-base" {
+		t.Errorf("pre-existing base file was overwritten")
+	}
+
+	if data, err := os.ReadFile(collidePath); err != nil {
+		t.Errorf("pre-existing collide file was deleted: %v", err)
+	} else if string(data) != "invalid-collide" {
+		t.Errorf("pre-existing collide file was overwritten")
+	}
+
+	// Verify no .partial files remain
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".partial") {
+			t.Errorf("stale .partial file left in directory: %s", entry.Name())
+		}
+	}
+}
+
+func TestSweepPartialBackups(t *testing.T) {
+	dir := secureTempDir(t)
+
+	// Create some .partial files with different ages
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	clk := clocktest.New(now)
+
+	// Old .partial (>2 minutes old, should be swept)
+	oldPartial := filepath.Join(dir, "x.db.pre-v6-from-v2.20260101-115700.000000.partial")
+	if err := os.WriteFile(oldPartial, []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := now.Add(-3 * time.Minute)
+	if err := os.Chtimes(oldPartial, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fresh .partial (<2 minutes old, should be kept)
+	freshPartial := filepath.Join(dir, "x.db.pre-v6-from-v2.20260101-115830.000000.partial")
+	if err := os.WriteFile(freshPartial, []byte("fresh"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	freshTime := now.Add(-1 * time.Minute)
+	if err := os.Chtimes(freshPartial, freshTime, freshTime); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unrelated file (should be ignored)
+	unrelated := filepath.Join(dir, "other.partial")
+	if err := os.WriteFile(unrelated, []byte("other"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run sweep
+	sweepPartialBackups(dir, "x.db", clk, slog.Default())
+
+	// Check old .partial was removed
+	if _, err := os.Stat(oldPartial); !os.IsNotExist(err) {
+		t.Errorf("old .partial should have been swept: %v", err)
+	}
+
+	// Check fresh .partial still exists
+	if _, err := os.Stat(freshPartial); err != nil {
+		t.Errorf("fresh .partial should not have been swept: %v", err)
+	}
+
+	// Check unrelated file still exists
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Errorf("unrelated file should not have been swept: %v", err)
 	}
 }
 

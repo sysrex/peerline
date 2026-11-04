@@ -122,7 +122,9 @@ Docker volumes typically create directories with mode **0755** (world-readable).
 
 **What happens on upgrade with a 0755 /data directory:**
 - ✅ Startup succeeds. The 0755 directory passes the default-directory check (only writable bits 0022 are refused), backups are written at 0600, and migration proceeds normally.
-- Note: This release sets `umask(0077)` on Unix at startup (process-wide), so **all files** Peerline creates (database, WAL, SHM, backups, and any other files) are created at 0600 or 0700. This prevents other local users from reading the database even in a 0755 directory. On Windows, file permissions are handled via ACLs instead of umask.
+- **Automatic permission tightening**: On Unix, Peerline now tightens permissions on existing database files (database, -wal, -shm) at open if they are wider than 0600, removing group and other access. A warning is logged for each file that is tightened.
+- **New file creation**: This release sets `umask(0077)` on Unix at startup (process-wide), so new files Peerline creates (database, WAL, SHM, backups) are created at 0600 or 0700. This prevents other local users from reading the database even in a 0755 directory. On Windows, file permissions are handled via ACLs instead of umask.
+- **One-time manual step for backups**: After upgrading, run `chmod 600 peerline.db.pre-v*` to tighten permissions on existing backup files from earlier releases (the automatic tightening only applies to the main database files, not backups).
 
 **If startup still fails** with a directory permission error:
 1. Check the actual directory mode: `ls -ld /data`
@@ -200,8 +202,8 @@ If a migration fails or the new version has issues, you can roll back to a previ
    # Restore the pre-migration backup
    cp peerline.db.pre-v6-from-v5.20260130-120000.123456 peerline.db
    
-   # Ensure correct permissions (backups are created at 0600)
-   chmod 600 peerline.db
+   # Ensure correct permissions (newer Peerline versions create backups at 0600)
+   chmod 600 peerline.db*
    ```
 4. **Downgrade the Peerline binary** to the version that supports the backup's schema version
 5. **Start Peerline** with the older binary – it will open the restored database without attempting migration
