@@ -174,15 +174,18 @@ func rateLimitKey(ip string) string {
 // Rejects zone identifiers (e.g., fe80::1%eth0).
 // Rejects 0.0.0.0/8 ("this network") and its IPv4-mapped form.
 func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
-	return ParseTrustedProxiesWithOpts(cidrs, false)
+	nets, _, err := ParseTrustedProxiesWithOpts(cidrs, false)
+	return nets, err
 }
 
 // ParseTrustedProxiesWithOpts parses trusted proxies with optional broader IPv6 floor.
 // When allowBroadIPv6 is true, the IPv6 floor is /29 (allowing Cloudflare 2a06:98c0::/29,
 // and rejecting 2000::/3 and 2002::/16 as too broad), and ULA ranges contained in fc00::/7
 // (bits >= 7) are permitted. ::/0 is always rejected.
-func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IPNet, error) {
+// Returns the parsed networks and a list of entries that were accepted only because allowBroadIPv6 was true.
+func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IPNet, []string, error) {
 	var nets []*net.IPNet
+	var relaxed []string
 	for _, cidr := range cidrs {
 		cidr = strings.TrimSpace(cidr)
 		if cidr == "" {
@@ -191,7 +194,7 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 
 		// Reject zone identifiers
 		if strings.Contains(cidr, "%") {
-			return nil, fmt.Errorf("parsing %q: zone identifiers are not allowed", cidr)
+			return nil, nil, fmt.Errorf("parsing %q: zone identifiers are not allowed", cidr)
 		}
 
 		// Parse as prefix or bare IP
@@ -201,13 +204,13 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 			// CIDR notation
 			prefix, err = netip.ParsePrefix(cidr)
 			if err != nil {
-				return nil, fmt.Errorf("parsing %q: %w", cidr, err)
+				return nil, nil, fmt.Errorf("parsing %q: %w", cidr, err)
 			}
 		} else {
 			// Bare IP - convert to /32 or /128
 			addr, err := netip.ParseAddr(cidr)
 			if err != nil {
-				return nil, fmt.Errorf("parsing %q: %w", cidr, err)
+				return nil, nil, fmt.Errorf("parsing %q: %w", cidr, err)
 			}
 			// Bare IPv4-mapped IPv6 addresses like ::ffff:10.0.0.1 should unmap to IPv4/32
 			if addr.Is4In6() {
@@ -226,15 +229,15 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 			// This is an IPv4-mapped IPv6 prefix like ::ffff:10.0.0.0/104
 			bits := prefix.Bits()
 			if bits < 96 {
-				return nil, fmt.Errorf("parsing %q: IPv4-mapped IPv6 prefix must be at least /96", cidr)
+				return nil, nil, fmt.Errorf("parsing %q: IPv4-mapped IPv6 prefix must be at least /96", cidr)
 			}
 			ipv4PrefixLen := bits - 96
 			// Apply IPv4 rules: reject /0, require at least /8
 			if ipv4PrefixLen == 0 {
-				return nil, fmt.Errorf("parsing %q: IPv4-mapped prefix covers all of IPv4 (equivalent to 0.0.0.0/0)", cidr)
+				return nil, nil, fmt.Errorf("parsing %q: IPv4-mapped prefix covers all of IPv4 (equivalent to 0.0.0.0/0)", cidr)
 			}
 			if ipv4PrefixLen < 8 {
-				return nil, fmt.Errorf("parsing %q: IPv4-mapped prefix must map to at least /8 in IPv4 (need /%d or longer)", cidr, 96+8)
+				return nil, nil, fmt.Errorf("parsing %q: IPv4-mapped prefix must map to at least /8 in IPv4 (need /%d or longer)", cidr, 96+8)
 			}
 			// Unmap to native IPv4 prefix
 			unmapped := addr.Unmap()
@@ -247,15 +250,16 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 		// Check prefix length
 		bits := prefix.Bits()
 		if bits == 0 {
-			return nil, fmt.Errorf("parsing %q: prefix length /0 is too broad", cidr)
+			return nil, nil, fmt.Errorf("parsing %q: prefix length /0 is too broad", cidr)
 		}
 		if prefix.Addr().Is4() {
 			if bits < 8 {
-				return nil, fmt.Errorf("parsing %q: IPv4 prefix must be at least /8", cidr)
+				return nil, nil, fmt.Errorf("parsing %q: IPv4 prefix must be at least /8", cidr)
 			}
-			// Reject 0.0.0.0/8 ("this network")
-			if prefix.String() == "0.0.0.0/8" {
-				return nil, fmt.Errorf("parsing %q: 0.0.0.0/8 (this network) is not allowed", cidr)
+			// Reject any prefix that overlaps 0.0.0.0/8 ("this network")
+			thisNet := netip.MustParsePrefix("0.0.0.0/8")
+			if thisNet.Overlaps(prefix) {
+				return nil, nil, fmt.Errorf("parsing %q: overlaps 0.0.0.0/8 (this network)", cidr)
 			}
 		} else {
 			// IPv6: apply floor and additional checks
@@ -268,17 +272,29 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 			// Apply floor: /32 by default, /29 with allowBroadIPv6
 			// Exception: with opt-in, ULA contained in fc00::/7 is exempt from floor
 			minBits := 32
+			neededOptIn := false
 			if allowBroadIPv6 {
 				if isContainedULA {
 					// ULA ranges contained in fc00::/7 are exempt from floor with opt-in
+					if bits < 32 {
+						neededOptIn = true
+					}
 					minBits = 0 // no floor for contained ULA
 				} else {
+					// Public IPv6: floor is /29 with opt-in
+					if bits < 32 && bits >= 29 {
+						neededOptIn = true
+					}
 					minBits = 29
 				}
 			}
 
 			if bits < minBits {
-				return nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /%d", cidr, minBits)
+				return nil, nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /%d", cidr, minBits)
+			}
+
+			if neededOptIn {
+				relaxed = append(relaxed, prefix.String())
 			}
 		}
 
@@ -287,11 +303,11 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 		ipnetStr := prefix.String()
 		_, ipnet, err := net.ParseCIDR(ipnetStr)
 		if err != nil {
-			return nil, fmt.Errorf("converting %q to IPNet: %w", ipnetStr, err)
+			return nil, nil, fmt.Errorf("converting %q to IPNet: %w", ipnetStr, err)
 		}
 		nets = append(nets, ipnet)
 	}
-	return nets, nil
+	return nets, relaxed, nil
 }
 
 // LimiterManager manages multiple rate limiters with proper lifecycle and pruning.

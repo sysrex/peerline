@@ -185,7 +185,7 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 
 	clk := clock.Or(cfg.Clock)
 
-	trustedNets, err := ParseTrustedProxiesWithOpts(cfg.TrustedProxies, cfg.AllowBroadIPv6)
+	trustedNets, relaxed, err := ParseTrustedProxiesWithOpts(cfg.TrustedProxies, cfg.AllowBroadIPv6)
 	if err != nil {
 		return nil, fmt.Errorf("invalid trusted proxy configuration: %w", err)
 	}
@@ -198,7 +198,12 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 		}
 		cfg.Logger.Info("trusted proxy networks configured", "prefixes", strings.Join(prefixes, ", "))
 		if cfg.AllowBroadIPv6 {
-			cfg.Logger.Warn("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /32 or /29 lets anyone inside it spoof X-Forwarded-For")
+			if len(relaxed) > 0 {
+				cfg.Logger.Info("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD accepted entries that would have been rejected", "relaxed", strings.Join(relaxed, ", "))
+				cfg.Logger.Warn("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /29 lets anyone inside it spoof X-Forwarded-For; ULA (fc00::/7) ranges are also permitted and exempt from the /32 floor")
+			} else {
+				cfg.Logger.Warn("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled but no entries needed it; consider disabling")
+			}
 		}
 	} else {
 		cfg.Logger.Warn("no trusted proxies configured: X-Forwarded-For will be ignored", "entries", len(cfg.TrustedProxies))

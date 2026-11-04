@@ -226,7 +226,11 @@ func TestParseTrustedProxiesRejectsOverlyBroad(t *testing.T) {
 		{name: "mapped bare", input: []string{"::ffff:10.0.0.1"}},
 		{name: "mapped /104", input: []string{"::ffff:10.0.0.0/104"}},
 		{name: "0.0.0.0/8 (this network)", input: []string{"0.0.0.0/8"}, wantError: "this network"},
+		{name: "0.0.0.0/16 (inside this network)", input: []string{"0.0.0.0/16"}, wantError: "this network"},
+		{name: "0.1.0.0/16 (inside this network)", input: []string{"0.1.0.0/16"}, wantError: "this network"},
+		{name: "bare 0.0.0.0 (this network)", input: []string{"0.0.0.0"}, wantError: "this network"},
 		{name: "::ffff:0.0.0.0/104 (mapped this network)", input: []string{"::ffff:0.0.0.0/104"}, wantError: "this network"},
+		{name: "bare ::ffff:0.0.0.0 (mapped this network)", input: []string{"::ffff:0.0.0.0"}, wantError: "this network"},
 		{
 			name:      "zoned IPv6 address",
 			input:     []string{"fe80::1%eth0"},
@@ -354,10 +358,17 @@ func TestParseTrustedProxiesSymmetry(t *testing.T) {
 
 	for _, tt := range testAddrs {
 		addr := net.ParseIP(tt.addr)
-		contains := native[0].Contains(addr)
+		nativeContains := native[0].Contains(addr)
+		mappedContains := mapped[0].Contains(addr)
 
-		if contains != tt.inRange {
-			t.Errorf("Contains(%q) = %v, want %v", tt.addr, contains, tt.inRange)
+		if nativeContains != tt.inRange {
+			t.Errorf("native[0].Contains(%q) = %v, want %v", tt.addr, nativeContains, tt.inRange)
+		}
+		if mappedContains != tt.inRange {
+			t.Errorf("mapped[0].Contains(%q) = %v, want %v", tt.addr, mappedContains, tt.inRange)
+		}
+		if nativeContains != mappedContains {
+			t.Errorf("Contains(%q): native=%v mapped=%v, want same", tt.addr, nativeContains, mappedContains)
 		}
 	}
 
@@ -1241,6 +1252,12 @@ func TestIPv6FloorWithOptIn(t *testing.T) {
 		{name: "ULA fc00::/7 allowed (opt-in)", input: []string{"fc00::/7"}, allowBroad: true, wantNet: "fc00::/7"},
 		{name: "ULA fc00::/6 rejected (opt-in, too broad)", input: []string{"fc00::/6"}, allowBroad: true, wantError: "must be at least "},
 		{name: "ULA fd00::/8 allowed (opt-in)", input: []string{"fd00::/8"}, allowBroad: true, wantNet: "fd00::/8"},
+		{name: "ULA fc00::1/7 (unmasked) allowed (opt-in)", input: []string{"fc00::1/7"}, allowBroad: true, wantNet: "fc00::/7"},
+		{name: "ULA fdff::/7 (unmasked) allowed (opt-in)", input: []string{"fdff::/7"}, allowBroad: true, wantNet: "fc00::/7"},
+		{name: "ULA fd12::1/7 (unmasked) rejected (default)", input: []string{"fd12::1/7"}, allowBroad: false, wantError: "must be at least /32"},
+		{name: "ULA fd12::1/7 (unmasked) allowed (opt-in)", input: []string{"fd12::1/7"}, allowBroad: true, wantNet: "fc00::/7"},
+		{name: "fe00::/7 (near ULA) rejected (opt-in)", input: []string{"fe00::/7"}, allowBroad: true, wantError: "must be at least /29"},
+		{name: "fe80::/10 (link-local) rejected (opt-in)", input: []string{"fe80::/10"}, allowBroad: true, wantError: "must be at least /29"},
 		{name: "2000::/3 rejected (opt-in)", input: []string{"2000::/3"}, allowBroad: true, wantError: "must be at least /29"},
 		{name: "2002::/16 rejected (opt-in)", input: []string{"2002::/16"}, allowBroad: true, wantError: "must be at least /29"},
 
@@ -1250,7 +1267,7 @@ func TestIPv6FloorWithOptIn(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			nets, err := ParseTrustedProxiesWithOpts(tt.input, tt.allowBroad)
+			nets, _, err := ParseTrustedProxiesWithOpts(tt.input, tt.allowBroad)
 			if tt.wantError != "" {
 				if err == nil {
 					t.Errorf("ParseTrustedProxiesWithOpts(%v, %v) succeeded, want error containing %q", tt.input, tt.allowBroad, tt.wantError)
@@ -1280,7 +1297,7 @@ func TestAllowBroadIPv6Warning(t *testing.T) {
 	t.Cleanup(func() { st.Close() })
 	var logs bytes.Buffer
 	srv := mustNew(t, st, Config{
-		TrustedProxies: []string{"2a06:98c0::/29"},
+		TrustedProxies: []string{"2a06:98c0::/29", "fd00::/8"},
 		AllowBroadIPv6: true,
 		Logger:         slog.New(slog.NewTextHandler(&logs, nil)),
 	})
@@ -1292,5 +1309,59 @@ func TestAllowBroadIPv6Warning(t *testing.T) {
 	}
 	if !strings.Contains(logOutput, "spoof X-Forwarded-For") {
 		t.Errorf("expected security warning about spoofing, got logs: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "ULA (fc00::/7)") {
+		t.Errorf("expected warning to mention ULA exemption, got logs: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "relaxed") {
+		t.Errorf("expected log about relaxed entries, got logs: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "2a06:98c0::/29") {
+		t.Errorf("expected relaxed log to list 2a06:98c0::/29, got logs: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "fd00::/8") {
+		t.Errorf("expected relaxed log to list fd00::/8, got logs: %q", logOutput)
+	}
+}
+
+func TestAllowBroadIPv6NoEntriesNeeded(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	var logs bytes.Buffer
+	srv := mustNew(t, st, Config{
+		TrustedProxies: []string{"10.0.0.0/8", "2001:db8::/32"},
+		AllowBroadIPv6: true,
+		Logger:         slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	t.Cleanup(srv.lim.Stop)
+
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, "no entries needed it") {
+		t.Errorf("expected warning that no entries needed opt-in, got logs: %q", logOutput)
+	}
+	if strings.Contains(logOutput, "relaxed") {
+		t.Errorf("expected no relaxed log when no entries needed it, got logs: %q", logOutput)
+	}
+}
+
+func TestAllowBroadIPv6ConfigValue(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	srv := mustNew(t, st, Config{
+		TrustedProxies: []string{"2a06:98c0::/29"},
+		AllowBroadIPv6: true,
+		Logger:         slog.Default(),
+	})
+	t.Cleanup(srv.lim.Stop)
+
+	if !srv.cfg.AllowBroadIPv6 {
+		t.Errorf("srv.cfg.AllowBroadIPv6 = false, want true")
 	}
 }
