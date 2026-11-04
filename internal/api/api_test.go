@@ -2724,10 +2724,12 @@ func TestReadyAllowRaceSharedRecipient(t *testing.T) {
 // Uses a SQLite BEFORE DELETE trigger to force the delete to fail, ensuring the server returns 500 with a generic
 // error body (no internal error text leaked), the orphan invite remains, and can be cleaned up via the API.
 func TestInviteRateLimitDeleteFailure(t *testing.T) {
+	var logs bytes.Buffer
 	cfg := Config{}
 	cfg.EmailPerHour = 10
 	cfg.EmailBurst = 1 // Burst of 1, so second email will hit rate limit
 	cfg.EmailRcptPerHour = 10
+	cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
 
 	dbPath := t.TempDir() + "/t.db"
 	st, err := store.Open(dbPath)
@@ -2807,8 +2809,17 @@ func TestInviteRateLimitDeleteFailure(t *testing.T) {
 		t.Errorf("unexpected Retry-After header on 500: %s", retryAfter)
 	}
 
-	// Verify no email was sent (the mailer is called AFTER the rate limit check, not before)
-	// In dev mode, we'd see a log line if email was sent; we're using the default test config which logs emails
+	// Verify no email was sent for test@example.com (mailer is called after rate limit check passes,
+	// so the create succeeds but the email is never attempted because the delete failure happens first)
+	logOutput := logs.String()
+	firstEmailCount := strings.Count(logOutput, "first@example.com")
+	testEmailCount := strings.Count(logOutput, "test@example.com")
+	if firstEmailCount != 1 {
+		t.Errorf("expected exactly 1 email to first@example.com, found %d in logs", firstEmailCount)
+	}
+	if testEmailCount != 0 {
+		t.Errorf("expected 0 emails to test@example.com (rate limit + delete failure), found %d in logs", testEmailCount)
+	}
 
 	// Drop the trigger
 	_, err = db.Exec(`DROP TRIGGER fail_inv_del`)
@@ -2844,11 +2855,63 @@ func TestInviteRateLimitDeleteFailure(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("list after revoke: %d %s", resp.StatusCode, b)
 		}
-		json.Unmarshal(b, &listResp)
-		if len(listResp.Invites) != 0 {
-			t.Errorf("after revoke: %d invites, want 0", len(listResp.Invites))
+		var finalList struct {
+			Invites []map[string]any `json:"invites"`
+		}
+		if err := json.Unmarshal(b, &finalList); err != nil {
+			t.Fatal(err)
+		}
+		if len(finalList.Invites) != 0 {
+			t.Errorf("after revoke: %d invites, want 0", len(finalList.Invites))
 		}
 	}
+}
+
+// TestBarrierTimeout verifies the barrier timeout path by calling it with insufficient goroutines
+// and checking that the timeout error is reported correctly.
+func TestBarrierTimeout(t *testing.T) {
+	fake := &fakeTB{TB: t}
+	barrier := newBarrier(fake, 2, 50*time.Millisecond)
+
+	// Call barrier only once (never reaching the expected count of 2)
+	done := make(chan struct{})
+	go func() {
+		barrier()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("barrier should have completed after timeout")
+	}
+
+	// Verify exactly one error was recorded
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.errs) != 1 {
+		t.Fatalf("expected exactly 1 error, got %d: %v", len(fake.errs), fake.errs)
+	}
+
+	// Verify the error message format
+	if !strings.Contains(fake.errs[0], "1/2 goroutines arrived") {
+		t.Errorf("error message: got %q, want substring '1/2 goroutines arrived'", fake.errs[0])
+	}
+}
+
+// fakeTB embeds testing.TB and overrides Errorf to record errors for inspection.
+type fakeTB struct {
+	testing.TB
+	mu   sync.Mutex
+	errs []string
+}
+
+func (f *fakeTB) Helper() {}
+
+func (f *fakeTB) Errorf(format string, args ...interface{}) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.errs = append(f.errs, fmt.Sprintf(format, args...))
 }
 
 // TestSingleLogLineUnauthenticatedPairing verifies exactly one log line (#54)
