@@ -3329,18 +3329,40 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	var inv2 struct{ Code string }
 	json.Unmarshal(body, &inv2)
 
-	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv3 struct{ Code string }
 	json.Unmarshal(body, &inv3)
-	// Advance clock past inv3's expiry (1 second TTL)
-	mu.Lock()
-	now = now.Add(2 * time.Second)
-	mu.Unlock()
+
+	// Create two invites that will genuinely expire (1 second TTL relative to the store's real clock)
+	// One for the POST accept proof, one for the 405 equality check
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
+	want(t, resp, body, 201)
+	var invExpiredForPost struct{ Code string }
+	json.Unmarshal(body, &invExpiredForPost)
+
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
+	want(t, resp, body, 201)
+	var invExpiredFor405 struct{ Code string }
+	json.Unmarshal(body, &invExpiredFor405)
 
 	// Use inv2
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
 	want(t, resp, body, 200)
+
+	// Wait for expired invites to expire relative to the store's real clock (not the fake API clock).
+	// Store checks exp < s.now() where both are Unix timestamps (seconds), so need to wait >1 second
+	// past the boundary to ensure s.now() has incremented.
+	time.Sleep(2100 * time.Millisecond)
+
+	// Prove invExpiredForPost is expired: POST accept returns 404
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": invExpiredForPost.Code}, nil)
+	want(t, resp, body, 404)
+
+	// Advance fake clock for API-side time-based features (rate limiters, etc.)
+	mu.Lock()
+	now = now.Add(2 * time.Second)
+	mu.Unlock()
 
 	missingCode := auth.NewSecret("inv_")
 
@@ -3404,7 +3426,7 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	}
 	validBody, validHdr := get405(inv1.Code)
 	usedBody, usedHdr := get405(inv2.Code)
-	expiredBody, expiredHdr := get405(inv3.Code)
+	expiredBody, expiredHdr := get405(invExpiredFor405.Code)
 	missingBody, missingHdr := get405(missingCode)
 
 	for i, pair := range []struct {
