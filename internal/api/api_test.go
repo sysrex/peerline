@@ -3672,27 +3672,19 @@ func TestAPIClock(t *testing.T) {
 	want(t, resp, body, 201)
 
 	var inv2 struct {
-		Code      string `json:"code"`
-		ExpiresAt string `json:"expires_at"`
+		Code string `json:"code"`
 	}
 	if err := json.Unmarshal(body, &inv2); err != nil {
 		t.Fatal(err)
 	}
-	
-	expTime2, err := time.Parse(time.RFC3339, inv2.ExpiresAt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("inv2 expires at %v", expTime2)
 
 	// Advance clock to expires_at + 1 second
 	clk.Advance(101 * time.Second)
-	t.Logf("clock now at %v", clk.Now())
 
 	// Accept at expires_at+1 - should be rejected with 404
 	resp, body = bob.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
 	if resp.StatusCode != 404 {
-		t.Errorf("accept at expires_at+1: expected 404, got %d: %s (expires_at=%v, now=%v)", resp.StatusCode, body, expTime2, clk.Now())
+		t.Errorf("accept at expires_at+1: expected 404, got %d: %s", resp.StatusCode, body)
 	}
 }
 
