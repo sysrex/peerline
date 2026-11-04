@@ -816,8 +816,8 @@ func TestPairingAcceptKeyingUsesClientIP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	withLimiterOverride(t, srv, func(lm *LimiterManager) {
-		lm.pairLim = msg.NewLimiter(2, 2, msg.WithClock(cfg.Now))
+	withLimiterOverride(t, srv, func(lm *LimiterManager, newLimiter func(int, int) *msg.Limiter) {
+		lm.pairLim = newLimiter(2, 2)
 	})
 
 	httpSrv := httptest.NewServer(srv.Handler())
@@ -910,8 +910,8 @@ func TestMalformedXFFSharedBucket(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	withLimiterOverride(t, srv, func(lm *LimiterManager) {
-		lm.regLim = msg.NewLimiter(2, 2, msg.WithClock(cfg.Now))
+	withLimiterOverride(t, srv, func(lm *LimiterManager, newLimiter func(int, int) *msg.Limiter) {
+		lm.regLim = newLimiter(2, 2)
 	})
 
 	httpSrv := httptest.NewServer(srv.Handler())
@@ -1105,7 +1105,10 @@ func TestNoRequestPanicAfterValidConfig(t *testing.T) {
 		}
 
 		// Zoned RemoteAddr with untrusted IP should strip zone and use RemoteAddr
-		zonedNets, _ := ParseTrustedProxies([]string{"10.0.0.0/8"})
+		zonedNets, err := ParseTrustedProxies([]string{"10.0.0.0/8"})
+		if err != nil {
+			t.Fatal(err)
+		}
 		zonedIP := clientIP("[fe80::1%eth0]:2", []string{"203.0.113.10"}, zonedNets)
 		if zonedIP != "fe80::1" {
 			t.Errorf("clientIP([fe80::1%%eth0]:2) = %q, want fe80::1 (zone stripped, RemoteAddr used because untrusted)", zonedIP)

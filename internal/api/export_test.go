@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sysrex/peerline/internal/msg"
 	"github.com/sysrex/peerline/internal/store"
 )
 
@@ -53,8 +54,13 @@ func mustNew(t testing.TB, st *store.Store, cfg Config) *Server {
 }
 
 // withLimiterOverride applies a limiter override to a Server, preserving the server's clock.
+// The callback receives the LimiterManager and a constructor that builds limiters using the
+// server's clock, so callers cannot forget to pass WithClock.
 // Use this in tests that need custom rate limits without duplicating LimiterManager setup.
-func withLimiterOverride(t *testing.T, s *Server, f func(lm *LimiterManager)) {
+func withLimiterOverride(t *testing.T, s *Server, f func(lm *LimiterManager, newLimiter func(perMinute, burst int) *msg.Limiter)) {
 	t.Helper()
-	f(s.lim)
+	newLimiter := func(perMinute, burst int) *msg.Limiter {
+		return msg.NewLimiter(perMinute, burst, msg.WithClock(s.now))
+	}
+	f(s.lim, newLimiter)
 }
