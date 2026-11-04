@@ -229,24 +229,33 @@ func TestConfirmWithStaleDigestDoesNotDeadlock(t *testing.T) {
 	// Create a client with timeout to ensure regression would fail fast
 	timeoutClient := &http.Client{Timeout: 2 * time.Second}
 
-	body, _ := json.Marshal(map[string]string{
+	body, err := json.Marshal(map[string]string{
 		"peer_id":      claimant.id,
 		"code":         cl.Code,
 		"offer_digest": wrongDigest,
 	})
-	req, _ := http.NewRequest("POST", srv.URL+"/v1/invites/"+pub+"/confirm", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	req, err := http.NewRequest("POST", srv.URL+"/v1/invites/"+pub+"/confirm", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
 	req.Header.Set("Authorization", "Bearer "+inviter.key)
 	req.Header.Set("Content-Type", "application/json")
 
 	start := time.Now()
-	resp, err := timeoutClient.Do(req)
+	resp, err = timeoutClient.Do(req)
 	elapsed := time.Since(start)
 
 	if err != nil {
 		t.Fatalf("stale digest confirm failed: %v (elapsed %v)", err, elapsed)
 	}
 	defer resp.Body.Close()
-	b, _ = io.ReadAll(resp.Body)
+	b, errRead := io.ReadAll(resp.Body)
+	if errRead != nil {
+		t.Fatalf("read response body: %v", errRead)
+	}
 
 	// Should get 409 Conflict with fresh view in body
 	if resp.StatusCode != 409 {

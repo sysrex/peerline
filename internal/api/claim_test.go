@@ -152,7 +152,9 @@ func (e *claimEnv) claim(t *testing.T, c *client) (int, string) {
 	t.Helper()
 	resp, b := c.do("POST", "/v1/pairing/claim", map[string]string{"token": e.token}, nil)
 	var out struct{ Code string }
-	json.Unmarshal(b, &out)
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("unmarshal claim response: %v; body=%s", err, b)
+	}
 	if resp.Header.Get("Cache-Control") != "no-store" {
 		t.Fatal("claim response not no-store")
 	}
@@ -175,10 +177,12 @@ func TestClaimThiefCodeRejectedAndInviterViewHidesCode(t *testing.T) {
 	}
 	// Get offer digest for the thief's claim
 	var view map[string]any
-	json.Unmarshal(b, &view)
+	if err := json.Unmarshal(b, &view); err != nil {
+		t.Fatalf("unmarshal inviter view: %v; body=%s", err, b)
+	}
 	digest, ok := view["offer_digest"].(string)
 	if !ok || digest == "" {
-		t.Fatal("offer_digest missing")
+		t.Fatal("offer_digest missing or not a string")
 	}
 
 	for _, in := range []map[string]string{{"peer_id": e.real.id, "code": thiefCode, "offer_digest": digest}, {"peer_id": e.thief.id, "offer_digest": digest}} {
@@ -210,8 +214,13 @@ func TestClaimConfirmHappyPathIdempotentAndLogsClean(t *testing.T) {
 	resp, b := e.inviter.do("GET", "/v1/invites/"+e.pub, nil, nil)
 	want(t, resp, b, 200)
 	var view map[string]any
-	json.Unmarshal(b, &view)
-	digest := view["offer_digest"].(string)
+	if err := json.Unmarshal(b, &view); err != nil {
+		t.Fatalf("unmarshal inviter view: %v; body=%s", err, b)
+	}
+	digest, ok := view["offer_digest"].(string)
+	if !ok {
+		t.Fatal("offer_digest missing or not a string")
+	}
 
 	resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm", map[string]string{"peer_id": e.real.id, "code": typed, "offer_digest": digest}, nil)
 	want(t, resp, b, 200)
@@ -392,7 +401,9 @@ func TestInviterViewShowsReplaces(t *testing.T) {
 	want(t, resp, b, 200)
 
 	var view map[string]any
-	json.Unmarshal(b, &view)
+	if err := json.Unmarshal(b, &view); err != nil {
+		t.Fatalf("unmarshal inviter view: %v; body=%s", err, b)
+	}
 
 	replaces, ok := view["replaces"].(map[string]any)
 	if !ok {
@@ -421,8 +432,13 @@ func TestConfirmIdempotency(t *testing.T) {
 	// Get digest
 	resp, b := e.inviter.do("GET", "/v1/invites/"+e.pub, nil, nil)
 	var view map[string]any
-	json.Unmarshal(b, &view)
-	digest := view["offer_digest"].(string)
+	if err := json.Unmarshal(b, &view); err != nil {
+		t.Fatalf("unmarshal inviter view: %v; body=%s", err, b)
+	}
+	digest, ok := view["offer_digest"].(string)
+	if !ok {
+		t.Fatal("offer_digest missing or not a string")
+	}
 
 	// First confirm
 	resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm",
@@ -436,7 +452,9 @@ func TestConfirmIdempotency(t *testing.T) {
 
 	// Verify result is the same
 	var result map[string]any
-	json.Unmarshal(b, &result)
+	if err := json.Unmarshal(b, &result); err != nil {
+		t.Fatalf("unmarshal confirm response: %v; body=%s", err, b)
+	}
 	if result["state"] != "active" {
 		t.Errorf("idempotent confirm state: %v", result)
 	}
