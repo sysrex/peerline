@@ -346,6 +346,8 @@ curl -X POST https://peerline.example.com/v1/invites/accept \
 
 Responses to requests with `?code=` carry RFC 9745 `Deprecation` and `Link` headers. Query-string acceptance will be removed in a future release.
 
+As of PR #225 ([#145](https://github.com/sysrex/peerline/issues/145)), `accept_url` in invite responses no longer contains the code — it is the bare endpoint URL. The `?code=` GET landing page and POST form remain for backward compatibility with already-sent emails but are deprecated. A future release may remove the `?code=` forms entirely and drop `accept_url` from invite responses, since the endpoint URL is fixed and documented in the API table.
+
 **Reverse proxy operators:** see [Reverse proxy logging](#reverse-proxy-logging) for working redaction configs.
 
 ---

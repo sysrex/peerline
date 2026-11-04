@@ -110,11 +110,14 @@ type OpenOptions struct {
 	// Logger for warnings and info messages. Defaults to slog.Default().
 	Logger *slog.Logger
 
+	// Now is an injectable clock for testing. If nil, uses time.Now().Unix().
+	// Used for invite expiry checks and other time-based operations.
+	Now func() int64
+
 	// vacuumInto is an injectable hook for testing. If nil, uses db.Exec("VACUUM INTO ?", path).
 	vacuumInto func(db *sql.DB, backupPath string) error
 
-	// now is an injectable clock for testing. If nil, uses time.Now().Unix().
-	// Used for backup timestamps and other time-based operations.
+	// now is an internal alias for Now, used for backup timestamps.
 	now func() int64
 
 	// migrationStepHook is an injectable hook for testing migration step failures.
@@ -269,7 +272,11 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		return nil, fmt.Errorf("schema: %w", err)
 	}
 
-	nowFunc := opts.now
+	// Use Now if set, otherwise fall back to internal now for backward compat
+	nowFunc := opts.Now
+	if nowFunc == nil {
+		nowFunc = opts.now
+	}
 	if nowFunc == nil {
 		nowFunc = func() int64 { return time.Now().Unix() }
 	}
@@ -519,7 +526,10 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 	}
 
 	// Create new backup
-	nowFunc := opts.now
+	nowFunc := opts.Now
+	if nowFunc == nil {
+		nowFunc = opts.now
+	}
 	if nowFunc == nil {
 		nowFunc = func() int64 { return time.Now().Unix() }
 	}

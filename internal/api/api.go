@@ -51,8 +51,8 @@ type Config struct {
 	// Mailer sends invite and message-notification emails. Nil = dev mode
 	// (log the email, never fail the request).
 	Mailer mailer.Sender
-	// PublicURL is the externally reachable base URL used in emailed accept
-	// links (e.g. https://peerline.example.com). If empty, it is derived from
+	// PublicURL is the externally reachable base URL used in the accept_url
+	// landing page (e.g. https://peerline.example.com). If empty, it is derived from
 	// the request (fine for local dev; set it in production).
 	PublicURL string
 	// Email send limits: per inviting peer and per recipient address, per hour.
@@ -1139,7 +1139,7 @@ func inviteEmail(inviter, inviterID, to, code, publicBase string, scopes, bags [
 
 var inviteCodeRE = regexp.MustCompile(`^inv_[A-Za-z0-9_-]{16,64}$`)
 
-// acceptLanding answers an unauthenticated GET of the emailed link. It never
+// acceptLanding answers an unauthenticated GET of the accept_url landing page. It never
 // touches the invite (so mail scanners and previews cannot burn it).
 func (s *Server) acceptLanding(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")

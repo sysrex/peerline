@@ -170,6 +170,15 @@ func assertSecurityHeaders(t *testing.T, hdr http.Header, context string) {
 	if got := hdr.Get("Referrer-Policy"); got != "no-referrer" {
 		t.Errorf("%s: Referrer-Policy = %q, want no-referrer", context, got)
 	}
+	if got := hdr.Get("X-Frame-Options"); got != "DENY" {
+		t.Errorf("%s: X-Frame-Options = %q, want DENY", context, got)
+	}
+	csp := hdr.Get("Content-Security-Policy")
+	if csp == "" {
+		t.Errorf("%s: missing Content-Security-Policy header", context)
+	} else if !strings.Contains(csp, "default-src 'none'") {
+		t.Errorf("%s: CSP missing default-src 'none': %s", context, csp)
+	}
 }
 
 func pairUp(t *testing.T, a, b *client, scopes, bags []string, back []string) {
@@ -3292,7 +3301,27 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 		defer mu.Unlock()
 		return now
 	}
-	srv := newServer(t, Config{Now: fakeClock})
+	fakeClockUnix := func() int64 {
+		return fakeClock().Unix()
+	}
+
+	// Open store with fake clock so expiry checks use it
+	st, err := store.OpenWithOptions(t.TempDir()+"/t.db", store.OpenOptions{Now: fakeClockUnix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	cfg := Config{Now: fakeClock}
+	prepareTestConfig(t, st, &cfg)
+	apiSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(apiSrv.Stop)
+	srv := httptest.NewServer(apiSrv.Handler())
+	t.Cleanup(srv.Close)
+
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
 
 	// Create invites with different states: valid, used, expired, missing
@@ -3310,7 +3339,8 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	want(t, resp, body, 201)
 	var inv3 struct{ Code string }
 	json.Unmarshal(body, &inv3)
-	// Advance clock past inv3's expiry (1 second TTL)
+	// Advance clock past inv3's expiry (1 second TTL). The store uses the same
+	// fake clock, so POST ?code= will see it as expired.
 	mu.Lock()
 	now = now.Add(2 * time.Second)
 	mu.Unlock()
@@ -3428,6 +3458,12 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 		if rsp.Header.Get("Allow") == "" {
 			t.Errorf("%s: missing Allow header", method)
 		}
+		if got := rsp.Header.Get("Deprecation"); got != wantDeprecation {
+			t.Errorf("%s with ?code=: Deprecation = %q, want %q", method, got, wantDeprecation)
+		}
+		if got := rsp.Header.Get("Link"); got != wantLink {
+			t.Errorf("%s with ?code=: Link = %q, want %q", method, got, wantLink)
+		}
 	}
 	// DELETE: no handler in authed mux, should get 404
 	r, _ := http.NewRequest("DELETE", srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
@@ -3439,6 +3475,12 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	rsp.Body.Close()
 	if rsp.StatusCode != 404 {
 		t.Errorf("DELETE: want 404, got %d", rsp.StatusCode)
+	}
+	if got := rsp.Header.Get("Deprecation"); got != wantDeprecation {
+		t.Errorf("DELETE with ?code=: Deprecation = %q, want %q", got, wantDeprecation)
+	}
+	if got := rsp.Header.Get("Link"); got != wantLink {
+		t.Errorf("DELETE with ?code=: Link = %q, want %q", got, wantLink)
 	}
 
 	// Test 7: Trailing slash returns 404 (strict, issue #174)
@@ -3475,6 +3517,27 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	want(t, resp, body, 400)
 	if !strings.Contains(string(body), "malformed") {
 		t.Errorf("bad code landing: %s", body)
+	}
+
+	// Test 10: POST ?code= for expired and missing codes return identical 404 (no oracle)
+	resp, body = b.do("POST", "/v1/invites/accept?code="+inv3.Code, nil, nil)
+	want(t, resp, body, 404)
+	expiredBody404 := body
+	expiredHdr404 := resp.Header
+
+	resp, body = b.do("POST", "/v1/invites/accept?code="+missingCode, nil, nil)
+	want(t, resp, body, 404)
+	missingBody404 := body
+	missingHdr404 := resp.Header
+
+	if !bytes.Equal(expiredBody404, missingBody404) {
+		t.Errorf("POST 404 body differs:\nexpired: %s\nmissing: %s", expiredBody404, missingBody404)
+	}
+	for _, h := range []string{"Content-Type", "Deprecation", "Link", "Cache-Control"} {
+		if expiredHdr404.Get(h) != missingHdr404.Get(h) {
+			t.Errorf("POST 404 header %s differs: expired=%q missing=%q",
+				h, expiredHdr404.Get(h), missingHdr404.Get(h))
+		}
 	}
 
 	// Verify inv1 is still pending after all the above
@@ -3712,6 +3775,14 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 	want(t, respInv2, bodyInv2, 201)
 	var inv5 struct{ Code string }
 	json.Unmarshal(bodyInv2, &inv5)
+	// Create one more invite for body-only 429 test
+	mu429.Lock()
+	now429 = now429.Add(1100 * time.Millisecond)
+	mu429.Unlock()
+	respInv3, bodyInv3 := c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, respInv3, bodyInv3, 201)
+	var inv6 struct{ Code string }
+	json.Unmarshal(bodyInv3, &inv6)
 	// Exhaust Dave's write rate limit by accepting first invite (uses burst token)
 	resp429, body429 := d.do("POST", "/v1/invites/accept?code="+inv4.Code, nil, nil)
 	want(t, resp429, body429, 200)
@@ -3724,10 +3795,24 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 	if got := resp429.Header.Get("Link"); got != wantLink {
 		t.Errorf("POST 429 rate limit: Link = %q, want %q", got, wantLink)
 	}
-	if got := resp429.Header.Get("Retry-After"); got == "" {
-		t.Error("POST 429 rate limit: missing Retry-After header")
+	if got := resp429.Header.Get("Retry-After"); got != "2" {
+		t.Errorf("POST 429 rate limit: Retry-After = %q, want \"2\"", got)
 	}
 	assertSecurityHeaders(t, resp429.Header, "POST 429 rate limit")
+
+	// 15. Body-only 429 should NOT have deprecation headers (negative control)
+	resp429, body429 = d.do("POST", "/v1/invites/accept", map[string]any{"code": inv6.Code}, nil)
+	want(t, resp429, body429, 429)
+	if got := resp429.Header.Get("Deprecation"); got != "" {
+		t.Errorf("body-only POST 429: unexpected Deprecation = %q", got)
+	}
+	if got := resp429.Header.Get("Link"); got != "" {
+		t.Errorf("body-only POST 429: unexpected Link = %q", got)
+	}
+	if got := resp429.Header.Get("Retry-After"); got != "2" {
+		t.Errorf("body-only POST 429: Retry-After = %q, want \"2\"", got)
+	}
+	assertSecurityHeaders(t, resp429.Header, "body-only POST 429")
 }
 
 func TestPairingLookupsBoundedPerIP(t *testing.T) {

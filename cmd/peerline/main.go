@@ -200,8 +200,8 @@ func main() {
 		log.Warn("PEERLINE_SMTP_HOST unset: transactional emails (invites and message notifications) are logged, not sent (dev mode)")
 	}
 	if ml.Mode() != "log" && publicURL == "" {
-		// Emailed links must not be built from a client-supplied Host header.
-		log.Error("PEERLINE_PUBLIC_URL is required when SMTP is configured (used in emailed accept links)")
+		// The accept_url landing page must not be built from a client-supplied Host header.
+		log.Error("PEERLINE_PUBLIC_URL is required when SMTP is configured (used in accept_url landing page)")
 		os.Exit(1)
 	} else if smtp, ok := ml.(*mailer.SMTP); ok {
 		// Probe SMTP server at startup to fail fast if TLS is misconfigured.
