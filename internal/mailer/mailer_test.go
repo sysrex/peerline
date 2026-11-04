@@ -317,14 +317,14 @@ func (fs *fakeServer) serve() {
 
 func (fs *fakeServer) handleConn(c net.Conn) {
 	defer c.Close()
-	
+
 	// Track connection count and check if should stall
 	fs.mu.Lock()
 	fs.connCount++
 	connNum := fs.connCount
 	shouldStall := fs.stallSecondConn && connNum == 2
 	fs.mu.Unlock()
-	
+
 	r, w := bufio.NewReader(c), bufio.NewWriter(c)
 	say := func(s string) { w.WriteString(s + "\r\n"); w.Flush() }
 
@@ -333,7 +333,7 @@ func (fs *fakeServer) handleConn(c net.Conn) {
 		time.Sleep(5 * time.Second)
 		return
 	}
-	
+
 	say("220 test")
 	for {
 		line, err := r.ReadString('\n')
@@ -849,11 +849,11 @@ func TestSMTPProbeCredentialsWithoutSTARTTLS(t *testing.T) {
 		// Override TLSConfig to connect to 127.0.0.1 (where the server actually is)
 		TLSConfig: &tls.Config{ServerName: "127.0.0.1"},
 	}
-	
+
 	// Wrap the connection to intercept and redirect to 127.0.0.1
 	// Actually, we can't easily do this. Let me use a different approach:
 	// Just test with localhost but set AllowPlaintext false
-	
+
 	s = &SMTP{
 		Host:           "192.0.2.1", // non-loopback (TEST-NET-1)
 		Port:           srv.port(),
@@ -863,7 +863,7 @@ func TestSMTPProbeCredentialsWithoutSTARTTLS(t *testing.T) {
 		AllowPlaintext: true,
 	}
 	err := s.Probe(context.Background())
-	
+
 	// This will fail to connect (no route to 192.0.2.1), which is fine
 	// The point is we're testing that IsLoopback("192.0.2.1") == false
 	// and the credentials check would trigger. But we can't easily test this
@@ -872,14 +872,14 @@ func TestSMTPProbeCredentialsWithoutSTARTTLS(t *testing.T) {
 	// Since the new IsLoopback correctly identifies 127.x.x.x as loopback,
 	// we can't use 127.1.2.3 anymore. Let's just verify IsLoopback is correct
 	// and trust the logic.
-	
+
 	if !IsLoopback("localhost") || !IsLoopback("127.0.0.1") || !IsLoopback("127.1.2.3") {
 		t.Fatal("IsLoopback should recognize all 127.x.x.x addresses")
 	}
 	if IsLoopback("192.0.2.1") || IsLoopback("example.com") {
 		t.Fatal("IsLoopback should not match non-loopback addresses")
 	}
-	
+
 	// The actual check happens in Probe - we trust it works given IsLoopback is correct
 	_ = err
 }
@@ -1295,9 +1295,9 @@ func TestSMTPProbe(t *testing.T) {
 		// Generate a chain with an expired intermediate under a self-signed root
 		now := time.Now()
 		leafCert, _ := genTestCertChain(t, "localhost",
-			now.Add(-time.Hour), now.Add(time.Hour),           // leaf: valid
-			now.Add(-2*time.Hour), now.Add(-time.Hour))        // intermediate: expired
-		
+			now.Add(-time.Hour), now.Add(time.Hour), // leaf: valid
+			now.Add(-2*time.Hour), now.Add(-time.Hour)) // intermediate: expired
+
 		srv := newFakeServer(t, true, &leafCert)
 		defer srv.close()
 
@@ -1323,9 +1323,9 @@ func TestSMTPProbe(t *testing.T) {
 		// for intermediate certificate expiry, so this test documents current behavior.
 		now := time.Now()
 		leafCert, rootCert := genTestCertChain(t, "localhost",
-			now.Add(-time.Hour), now.Add(time.Hour),           // leaf: valid
-			now.Add(-2*time.Hour), now.Add(-time.Hour))        // intermediate: expired
-		
+			now.Add(-time.Hour), now.Add(time.Hour), // leaf: valid
+			now.Add(-2*time.Hour), now.Add(-time.Hour)) // intermediate: expired
+
 		srv := newFakeServer(t, true, &leafCert)
 		defer srv.close()
 
