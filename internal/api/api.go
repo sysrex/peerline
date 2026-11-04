@@ -105,8 +105,8 @@ type Server struct {
 	maint       *MaintenanceManager
 	log         *slog.Logger
 	trustedNets []*net.IPNet
-	clk         clock.Clock  // time source for invite expiry and rate limiters
-	claims      ClaimStore   // claim/confirm backend; nil = claim routes are not served
+	clk         clock.Clock // time source for invite expiry and rate limiters
+	claims      ClaimStore  // claim/confirm backend; nil = claim routes are not served
 
 	// For pruning verifyLim
 	pruneDone chan struct{}

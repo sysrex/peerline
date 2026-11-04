@@ -45,7 +45,7 @@ var ipKeyedEndpoints = []struct {
 func TestIPKeyingPerEndpoint(t *testing.T) {
 	for _, ep := range ipKeyedEndpoints {
 		t.Run(ep.name, func(t *testing.T) {
-			clk :=  clocktest.New(time.Unix(1000, 0))
+			clk := clocktest.New(time.Unix(1000, 0))
 			h := newLimitedServer(t, []string{"10.0.0.0/8"}, clk)
 
 			for i := 0; i < ep.burst; i++ {
@@ -76,7 +76,7 @@ func TestIPKeyingPerEndpoint(t *testing.T) {
 // A malformed right-most entry must fall back to the trusted hop, so two
 // clients differing only in the left-hand IP share one bucket (#61).
 func TestMalformedXFFSharesTrustedHopBucket(t *testing.T) {
-	clk :=  clocktest.New(time.Unix(1000, 0))
+	clk := clocktest.New(time.Unix(1000, 0))
 	h := newLimitedServer(t, []string{"10.0.0.0/8"}, clk)
 
 	for i := 0; i < 20; i++ {
@@ -91,7 +91,7 @@ func TestMalformedXFFSharesTrustedHopBucket(t *testing.T) {
 }
 
 func TestMappedPeerAgainstMappedTrustEntry(t *testing.T) {
-	clk :=  clocktest.New(time.Unix(1000, 0))
+	clk := clocktest.New(time.Unix(1000, 0))
 	h := newLimitedServer(t, []string{"::ffff:10.0.0.0/104"}, clk)
 	for i := 0; i < 20; i++ {
 		do(h, "GET", "/", "[::ffff:10.0.0.5]:1", "203.0.113.9")
@@ -105,7 +105,7 @@ func TestMappedPeerAgainstMappedTrustEntry(t *testing.T) {
 }
 
 func TestLimiter429ContractAndRefill(t *testing.T) {
-	clk :=  clocktest.New(time.Unix(1000, 0))
+	clk := clocktest.New(time.Unix(1000, 0))
 	h := newLimitedServer(t, nil, clk)
 
 	for i := 0; i < 20; i++ {

@@ -145,7 +145,7 @@ func TestInviteCapCountsClaimed(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.mustExec(t, `UPDATE invites SET claimed_by='carol', confirm_by=?`, claimNow+86400)
-	clk.Set(time.Unix(claimNow + 120, 0))
+	clk.Set(time.Unix(claimNow+120, 0))
 	if _, err := s.CreateInviteAtomic(ctx, "y", "alice", nil, nil, time.Unix(claimNow+9999, 0), 1); !errors.Is(err, ErrTooManyInvites) {
 		t.Fatalf("cap bypassed by claimed invite: %v", err)
 	}

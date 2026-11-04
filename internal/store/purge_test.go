@@ -36,7 +36,7 @@ func TestPurgeExpiredInvites_GrantsAndPeersSurvive(t *testing.T) {
 	thirtyOneDaysAgo := currentTime - 31*24*60*60
 
 	// Go back in time to create and accept the invite
-	clk.Set(time.Unix(thirtyOneDaysAgo - 100, 0))
+	clk.Set(time.Unix(thirtyOneDaysAgo-100, 0))
 
 	// Create invite that expires at thirtyOneDaysAgo
 	exp := time.Unix(thirtyOneDaysAgo, 0)
@@ -106,7 +106,7 @@ func TestPurgeExpiredInvites_RetentionDefault(t *testing.T) {
 	// Create a used invite that expired 29 days ago (within 30-day default)
 	twentyNineDaysAgo := currentTime - 29*24*60*60
 	exp := time.Unix(twentyNineDaysAgo, 0)
-	clk.Set(time.Unix(twentyNineDaysAgo - 100, 0))
+	clk.Set(time.Unix(twentyNineDaysAgo-100, 0))
 	if err := s.CreateInvite(ctx, "code1", "alice", []string{"messages"}, nil, exp); err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestPurgeExpiredInvites_RetentionDefault(t *testing.T) {
 	// Create a used invite that expired 31 days ago (beyond 30-day default)
 	thirtyOneDaysAgo := currentTime - 31*24*60*60
 	exp2 := time.Unix(thirtyOneDaysAgo, 0)
-	clk.Set(time.Unix(thirtyOneDaysAgo - 100, 0))
+	clk.Set(time.Unix(thirtyOneDaysAgo-100, 0))
 	if err := s.CreateInvite(ctx, "code2", "alice", []string{"messages"}, nil, exp2); err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func TestPurgeExpiredInvites_ExactCutoffBoundary(t *testing.T) {
 	// Used invite expired exactly retention ago (at boundary) - should NOT be purged (< not <=)
 	sevenDaysAgo := currentTime - retention
 	expAtRetention := time.Unix(sevenDaysAgo, 0)
-	clk.Set(time.Unix(sevenDaysAgo - 100, 0))
+	clk.Set(time.Unix(sevenDaysAgo-100, 0))
 	if err := s.CreateInvite(ctx, "ret-at", "alice", []string{"messages"}, nil, expAtRetention); err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestPurgeExpiredInvites_ExactCutoffBoundary(t *testing.T) {
 
 	// Used invite expired (retention - 1) ago (within retention) - should be kept
 	expWithinRetention := time.Unix(currentTime-retention+1, 0)
-	clk.Set(time.Unix(currentTime - retention - 100, 0))
+	clk.Set(time.Unix(currentTime-retention-100, 0))
 	if err := s.CreateInvite(ctx, "ret-within", "alice", []string{"messages"}, nil, expWithinRetention); err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestPurgeExpiredInvites_ExactCutoffBoundary(t *testing.T) {
 
 	// Used invite expired (retention + 1) ago (beyond retention) - should be purged
 	expBeyondRetention := time.Unix(currentTime-retention-1, 0)
-	clk.Set(time.Unix(currentTime - retention - 200, 0))
+	clk.Set(time.Unix(currentTime-retention-200, 0))
 	if err := s.CreateInvite(ctx, "ret-beyond", "alice", []string{"messages"}, nil, expBeyondRetention); err != nil {
 		t.Fatal(err)
 	}
@@ -502,4 +502,3 @@ func TestPurgeGraceDoesNotAffectAccept(t *testing.T) {
 		t.Fatalf("outstanding %d", n)
 	}
 }
-
