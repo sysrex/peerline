@@ -4319,11 +4319,16 @@ func TestInviteAcceptGETWithScopesReturns405(t *testing.T) {
 
 // TestInviteAcceptPathsNeverLogCode verifies that invite codes never appear in
 // logs across all accept paths, including success, error, and failure cases (issue #28, #146, #174, #303).
-// This test captures only the slog logger; there is no http.Server.ErrorLog or access-log middleware today.
+// This test captures both the explicit logger and slog.Default(); there is no http.Server.ErrorLog or access-log middleware today.
 func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	var logs syncBuf
 	// Share one logger with both API and mailer for a single unified log stream
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	// Capture slog.Default too, so code logging through the default is checked
+	oldDefault := slog.Default()
+	slog.SetDefault(logger)
+	t.Cleanup(func() { slog.SetDefault(oldDefault) })
+
 	srv := newServer(t, Config{Logger: logger, Mailer: mailer.Log{Logger: logger}})
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
 	c := register(t, srv, "carol")
@@ -4416,10 +4421,13 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	detectLeak := func(logs string, codes ...string) (leaked string, found bool) {
 		for _, code := range codes {
 			if strings.Contains(logs, code) {
-				return code, true
+				return fmt.Sprintf("inv_<redacted len=%d>", len(code)), true
 			}
 			if len(code) >= 10 && strings.Contains(logs, code[:10]) {
-				return code[:10], true
+				return fmt.Sprintf("inv_<redacted prefix len=10>"), true
+			}
+			if len(code) >= 10 && strings.Contains(logs, code[len(code)-10:]) {
+				return fmt.Sprintf("inv_<redacted suffix len=10>"), true
 			}
 		}
 		return "", false
@@ -4432,10 +4440,17 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	a2 := register(t, invalidEmailSrv, "alice2")
 	resp, body = a2.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "not-an-email"}, nil)
 	want(t, resp, body, 400)
-	// No code is generated, but assert no inv_ pattern appears
+	// Assert logs were captured (registration produces logs)
 	invalidEmailLogStr := invalidEmailLogs.String()
+	if invalidEmailLogStr == "" {
+		t.Error("invalid to_email: no logs captured (logging unwired)")
+	}
+	if !strings.Contains(invalidEmailLogStr, "peer registered") {
+		t.Error("invalid to_email: expected 'peer registered' log not found")
+	}
+	// No code is generated, but assert no inv_ pattern appears
 	if invCodeRegex.MatchString(invalidEmailLogStr) {
-		t.Errorf("invalid to_email: inv_ pattern found in logs: %v", invCodeRegex.FindString(invalidEmailLogStr))
+		t.Errorf("invalid to_email: inv_ pattern found in logs (regex matched)")
 	}
 
 	// 11. Send-failure path with failMailer
@@ -4481,10 +4496,17 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	// (code is created but then deleted before the response is sent)
 	resp, body = a4.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "second@example.com"}, nil)
 	want(t, resp, body, 429)
+	// Assert logs were captured
 	rateLimitLogStr := rateLimitLogs.String()
+	if rateLimitLogStr == "" {
+		t.Error("rate-limit: no logs captured (logging unwired)")
+	}
+	if !strings.Contains(rateLimitLogStr, "invite email") {
+		t.Error("rate-limit: expected 'invite email' log line not found")
+	}
 	// No code should appear (it was deleted)
 	if invCodeRegex.MatchString(rateLimitLogStr) {
-		t.Errorf("rate-limit: inv_ pattern found in logs: %v", invCodeRegex.FindString(rateLimitLogStr))
+		t.Errorf("rate-limit: inv_ pattern found in logs (regex matched)")
 	}
 
 	// Positive control: assert logs captured expected events
@@ -4522,7 +4544,12 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	logger.Info("test planted code", "code", plantedCode)
 	logStr = logs.String()
 
-	// Check logs don't contain any of the codes or their prefixes
+	// Verify the regex also matches the planted code
+	if !invCodeRegex.MatchString(logStr) {
+		t.Error("positive control: regex does not match planted code (regex broken)")
+	}
+
+	// Check logs don't contain any of the codes or their prefixes/suffixes
 	// The planted code is intentionally in the logs to verify the detector works
 	allCodes := []struct {
 		code     string
@@ -4542,9 +4569,25 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 			if tc.expected {
 				t.Errorf("positive control: %s code not detected (detector broken)", tc.name)
 			} else {
-				t.Errorf("%s code found in logs: %s", tc.name, leaked)
+				t.Errorf("%s code leaked: %s", tc.name, leaked)
 			}
 		}
+	}
+
+	// 13. Text-handler format test (optional: verify detector works on both JSON and text)
+	var textLogs syncBuf
+	textLogger := slog.New(slog.NewTextHandler(&textLogs, nil))
+	textSrv := newServer(t, Config{Logger: textLogger, Mailer: mailer.Log{Logger: textLogger}})
+	a5 := register(t, textSrv, "alice5")
+	resp, body = a5.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "text@example.com"}, nil)
+	want(t, resp, body, 201)
+	var inv7 struct{ Code string }
+	if err := json.Unmarshal(body, &inv7); err != nil || inv7.Code == "" {
+		t.Fatalf("inv7: %v %s", err, body)
+	}
+	textLogStr := textLogs.String()
+	if leaked, found := detectLeak(textLogStr, inv7.Code); found {
+		t.Errorf("text-handler: code leaked: %s", leaked)
 	}
 }
 

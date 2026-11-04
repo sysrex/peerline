@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -2147,9 +2148,11 @@ func TestIsLoopbackAddr(t *testing.T) {
 // TestLogFullBodyDefault verifies that FromEnv defaults to LogFullBody == false
 // when PEERLINE_DEV_LOG_EMAIL_BODY is unset (issue #303).
 func TestLogFullBodyDefault(t *testing.T) {
-	// Clear PEERLINE_SMTP_HOST and PEERLINE_DEV_LOG_EMAIL_BODY to get Log sender with default
+	// Unset PEERLINE_SMTP_HOST and PEERLINE_DEV_LOG_EMAIL_BODY to get Log sender with default
 	t.Setenv("PEERLINE_SMTP_HOST", "")
+	os.Unsetenv("PEERLINE_SMTP_HOST")
 	t.Setenv("PEERLINE_DEV_LOG_EMAIL_BODY", "")
+	os.Unsetenv("PEERLINE_DEV_LOG_EMAIL_BODY")
 
 	sender, err := FromEnv(nil)
 	if err != nil {
