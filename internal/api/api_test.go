@@ -2970,7 +2970,7 @@ func TestAPIClock(t *testing.T) {
 	// Use fake clock to control time
 	fixedTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
 	clk := clocktest.New(fixedTime)
-	
+
 	bareCfg := Config{Clock: clk}
 	prepareTestConfig(t, st, &bareCfg)
 	srv, err := New(st, bareCfg)
