@@ -1068,9 +1068,9 @@ func sanitizeInviterName(name string) string {
 			}
 		}
 
-		// Strip trailing whitespace and trailing virama clusters to a fixed point.
-		// Dropping a cluster can expose spaces, and trimming spaces can expose viramas,
-		// so we iterate until neither operation applies.
+		// Drop trailing virama clusters only if the cut is inside a word.
+		// A virama at word end (followed by space in the full runes slice) is complete.
+		// Trim trailing spaces afterwards.
 		dropCluster := func(t []rune) []rune {
 			for i := len(t) - 1; i >= 0; i-- {
 				r := t[i]
@@ -1086,31 +1086,25 @@ func sanitizeInviterName(name string) string {
 		}
 
 		for len(truncated) > 0 {
-			startLen := len(truncated)
-
-			// Trim trailing spaces
-			for len(truncated) > 0 && truncated[len(truncated)-1] == ' ' {
-				truncated = truncated[:len(truncated)-1]
-			}
-
-			// Drop trailing virama clusters
-			if len(truncated) > 0 {
-				lastRune := truncated[len(truncated)-1]
-				props := norm.NFC.PropertiesString(string(lastRune))
-				if props.CCC() == 9 {
-					n := len(truncated)
-					truncated = dropCluster(truncated)
-					if len(truncated) == n {
-						// No progress made, stop to avoid infinite loop
-						break
-					}
-				}
-			}
-
-			// If neither operation changed anything, we're done
-			if len(truncated) == startLen {
+			last := truncated[len(truncated)-1]
+			props := norm.NFC.PropertiesString(string(last))
+			// Stop if not a virama, or if it's a word-final virama (next rune is space).
+			// runes[len(truncated)] is always in range here because truncated is a strict
+			// prefix of runes on this path.
+			if props.CCC() != 9 || runes[len(truncated)] == ' ' {
 				break
 			}
+			n := len(truncated)
+			truncated = dropCluster(truncated)
+			if len(truncated) == n {
+				// No progress made, stop to avoid infinite loop
+				break
+			}
+		}
+
+		// Trim trailing spaces after dropping virama clusters
+		for len(truncated) > 0 && truncated[len(truncated)-1] == ' ' {
+			truncated = truncated[:len(truncated)-1]
 		}
 
 		result = string(truncated)

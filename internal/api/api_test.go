@@ -2882,19 +2882,34 @@ func TestSanitizeInviterName(t *testing.T) {
 			want:  "Alice",
 		},
 		{
-			name:  "fuzz corpus case: virama after space from truncation",
+			name:  "word-final virama kept: Devanagari halant before space",
 			input: "00000!000000000000000000000000000000000000000000000000000000क्ष् 00000" + strings.Repeat("ब", 70),
-			want:  "00000000000000000000000000000000000000000000000000000000000", // क्ष् dropped by back-off
+			want:  "00000000000000000000000000000000000000000000000000000000000क्ष्", // word-final क्ष् kept (63 runes)
 		},
 		{
-			name:  "virama behind a space after truncation",
+			name:  "word-final virama kept: single syllable before space",
 			input: strings.Repeat("a", 61) + "क् " + strings.Repeat("b", 10),
-			want:  strings.Repeat("a", 61), // truncates to ...क् space, drops क्, trims space
+			want:  strings.Repeat("a", 61) + "क्", // word-final क् kept (63 runes)
 		},
 		{
-			name:  "iterative cleanup: drop cluster exposes space, trim exposes virama",
+			name:  "word-final viramas kept: two words ending in virama",
 			input: strings.Repeat("a", 59) + "क् ष्" + strings.Repeat("b", 10),
-			want:  strings.Repeat("a", 59), // truncates to ...क् space ष्, drops ष्->space, drops क्
+			want:  strings.Repeat("a", 59) + "क्", // truncates after क्, word-final so kept (61 runes)
+		},
+		{
+			name:  "mid-word virama dropped: cut inside a conjunct",
+			input: strings.Repeat("a", 60) + "क्ष्म" + "bbb",
+			want:  strings.Repeat("a", 60), // क्ष्म cut mid-word, virama clusters dropped (60 runes)
+		},
+		{
+			name:  "Tamil pulli: many word-final viramas",
+			input: strings.Repeat("ம் ", 40), // 40 Tamil words ending in pulli
+			want:  "ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம்", // 62 runes, keeps words
+		},
+		{
+			name:  "Tamil word kept whole: மரம் not cut",
+			input: strings.Repeat("a", 58) + " மரம் zz" + strings.Repeat("b", 10),
+			want:  strings.Repeat("a", 58) + " மரம்", // 63 runes, மரம் kept whole
 		},
 		{
 			name:  "empty after cleanup falls back",
@@ -2978,12 +2993,26 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 		}
 	}
 
-	// Invariant 9: Truncated output never ends in CCC 9 (virama)
+	// Invariant 9: Truncated output may end in CCC 9 (virama) only if word-final.
+	// For truncated paths, compare against the uncapped result: if the capped output
+	// ends in a virama and there are more runes in the uncapped result, the next rune
+	// must be a space (indicating the virama is word-final, not mid-word).
 	if checkVirama && len(runes) > 0 {
 		lastRune := runes[len(runes)-1]
 		props := norm.NFC.PropertiesString(string(lastRune))
 		if props.CCC() == 9 {
-			t.Errorf("sanitizeInviterName(%q) [%s] output ends in CCC 9 (virama) rune %U: %q", input, label, lastRune, got)
+			// The output ends in virama. Get the uncapped result.
+			uncapped := sanitizeInviterName(input)
+			uncappedRunes := []rune(uncapped)
+			// If the capped output is shorter than uncapped, check the next rune.
+			if len(runes) < len(uncappedRunes) {
+				nextRune := uncappedRunes[len(runes)]
+				if nextRune != ' ' {
+					t.Errorf("sanitizeInviterName(%q) [%s] ends in mid-word CCC 9 (virama) rune U+%04X, next rune is U+%04X (not space): capped=%q uncapped=%q", input, label, lastRune, nextRune, got, uncapped)
+				}
+			}
+			// If capped == uncapped, the virama is at the very end, which is allowed
+			// (the loop only drops virama when followed by more content).
 		}
 	}
 }
@@ -2998,9 +3027,9 @@ func FuzzSanitizeInviterName(f *testing.F) {
 	f.Add("\xf0\u00b2")                                    // invalid byte + NFKC char
 	f.Add(strings.Repeat("a", 1022) + "日")                 // 3-byte rune at 1024
 	f.Add("क्ष")                                           // Indic conjunct (virama)
-	f.Add(strings.Repeat("a", 60) + "क्ष्म" + "bbb")       // Chained virama (force CCC 9 strip)
+	f.Add(strings.Repeat("a", 60) + "क्ष्म" + "bbb")       // Mid-word virama: cut inside conjunct
 	f.Add(strings.Repeat("ब", 70))                         // Force 64-rune cap path
-	f.Add(strings.Repeat("a", 59) + "क् ष्" + "bbbbbbbbb") // Iterative cleanup: drop ष्, expose space, drop क्
+	f.Add(strings.Repeat("a", 59) + "क् ष्" + "bbbbbbbbb") // Word-final virama: keep complete words
 
 	f.Fuzz(func(t *testing.T, input string) {
 		got := sanitizeInviterName(input)
