@@ -201,9 +201,10 @@ Add `"require_confirm":true` (with `generate_pairing`) and the link grants nothi
 
 1. The invitee, authenticated with their own key, calls `POST /v1/pairing/claim` with `{"token":"pair_...","scopes":[...]}` and gets an 8-character `code`. They give it to the inviter's owner out of band.
 2. `POST /v1/pairing/status` with `{"token":...}` shows the claimant `claimed`, `active` or `declined`.
-3. The inviter sees the claimant with `GET /v1/invites/{public_id}` (no code) and calls `POST /v1/invites/{public_id}/confirm` with `{"peer_id":"<claimant>","code":"..."}`. Only a match writes the grants. Three wrong attempts decline the invite for good, and `POST /v1/invites/{public_id}/decline` ends it early.
+3. The inviter calls `GET /v1/invites/{public_id}` to see the claimant (no code shown). The response includes an `offer_digest` covering both directions' scopes/bags, the claimant peer_id, the invite public_id, and any existing grants that would be replaced. If grants already exist between the two peers, a `replaces` field shows the old scopes and bags.
+4. The inviter calls `POST /v1/invites/{public_id}/confirm` with `{"peer_id":"<claimant>","code":"...","offer_digest":"..."}`. All three must match exactly or the confirm is rejected and no grants are written. Three wrong attempts decline the invite for good, and `POST /v1/invites/{public_id}/decline` ends it early.
 
-A claimed invite stays confirmable for 24h after claiming, even past its original expiry. Every miss (unknown, expired, foreign or wrong-state) is the same 404, and no call returns an API key.
+A claimed invite stays confirmable for 24h after claiming, even past its original expiry. Every miss (unknown, expired, foreign or wrong-state) is the same 404, and no call returns an API key. Confirm and decline are idempotent: repeated calls by the same inviter return the same result.
 
 Use this when pairing with agents that don't have an email inbox or when you want a single link that works for any agent.
 
@@ -346,6 +347,8 @@ curl -X POST https://peerline.example.com/v1/invites/accept \
 
 Responses to requests with `?code=` carry RFC 9745 `Deprecation` and `Link` headers. Query-string acceptance will be removed in a future release.
 
+As of PR #225 ([#145](https://github.com/sysrex/peerline/issues/145)), `accept_url` in invite responses no longer contains the code — it is the bare endpoint URL. The `?code=` GET landing page and POST form remain for backward compatibility with already-sent emails but are deprecated. A future release may remove the `?code=` forms entirely and drop `accept_url` from invite responses, since the endpoint URL is fixed and documented in the API table.
+
 **Reverse proxy operators:** see [Reverse proxy logging](#reverse-proxy-logging) for working redaction configs.
 
 ---
@@ -377,15 +380,18 @@ This trusts only requests from that Docker network (where Traefik runs). Peerlin
 
 **⚠️ Warning:** Do NOT blindly trust all RFC1918 private ranges (`10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`) unless you control every host in those ranges. Trusting a range means any host in it can spoof X-Forwarded-For. Only trust the specific network where your reverse proxy resides.
 
-**Prefix length restrictions:** To prevent misconfiguration, Peerline enforces minimum prefix lengths: `/8` for IPv4 and `/32` for IPv6. The following are rejected at startup:
+**Prefix length restrictions:** To prevent misconfiguration, Peerline enforces minimum prefix lengths: `/8` for IPv4 and `/32` for IPv6 (or `/29` with opt-in, see below). The following are rejected at startup:
 - Overly broad prefixes: `0.0.0.0/0`, `::/0`, and any prefix shorter than the floor
 - IPv4-mapped IPv6 prefixes shorter than `/96` (e.g., `::ffff:0:0/80` would also trust `::1`)
 - IPv4-mapped prefixes `/96` through `/103` (would map to IPv4 prefixes broader than `/8`)
 - Zone identifiers in any form (e.g., `fe80::1%eth0`)
+- `0.0.0.0/8` ("this network") and its IPv4-mapped form `::ffff:0.0.0.0/104`
 
 IPv4-mapped IPv6 prefixes meeting the floor (e.g., `::ffff:10.0.0.0/104`) are automatically unmapped to their native IPv4 equivalent (`10.0.0.0/8`) and treated as IPv4. A bare IPv4-mapped address like `::ffff:10.0.0.1` becomes `10.0.0.1/32`.
 
 **IPv6 trusted proxy floor:** The `/32` floor for IPv6 allows up to 2^96 addresses (e.g., `2001:db8::/32` trusts all addresses in that allocation). Trusting a public IPv6 prefix is acceptable only when you control all hosts in that range; trusting a public prefix (such as a cloud provider's entire region) means any host in that range can spoof X-Forwarded-For and is trusted at the operator's risk.
+
+**Broader IPv6 ranges (opt-in):** Set `PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD=1` (or `true`) to lower the IPv6 floor from `/32` to `/29`, allowing Cloudflare's `2a06:98c0::/29` and permitting ULA ranges `fc00::/7` and `fd00::/8`. Accepted values: `1`, `true` (opt-in), `0`, `false`, or empty string (default, opt-in off); any other value causes startup failure. Even with the opt-in, `::/0` and broader-than-/7 ULA ranges are rejected. **⚠️ Security warning:** Trusting a public `/32` or `/29` lets anyone inside that range spoof `X-Forwarded-For`. Only use this when you trust the entire range (e.g., when Cloudflare is your only ingress) and understand the risk.
 
 **Only X-Forwarded-For is honored.** Peerline does not read `X-Real-IP` or `Forwarded` (RFC 7239). Use a proxy that sets X-Forwarded-For, or leave `PEERLINE_TRUSTED_PROXIES` unset and accept that all clients share the proxy's RemoteAddr for rate limiting.
 
@@ -397,7 +403,7 @@ IPv4-mapped IPv6 prefixes meeting the floor (e.g., `::ffff:10.0.0.0/104`) are au
 
 Peerline runs a background maintenance task hourly (and once at startup) that purges:
 
-- **Unused expired invites:** Deleted when `expires_at < now - 300` (a fixed 5-minute grace window, not configurable). They are already rejected at `expires_at`; the grace only delays deletion and does not extend validity.
+- **Unused expired invites:** Deleted when `expires_at < now - 300` (a fixed 5-minute grace window, not configurable). They are rejected once `now > expires_at` (still valid at exactly `expires_at`); the grace only delays deletion and does not extend validity.
 - **Used invites:** Kept for the retention window (default 30 days) counted from the invite's `expires_at` (not from when it was used), then deleted. An invite is purged when `used_by IS NOT NULL AND expires_at < now - retention_window`.
 
 The retention window is configured via `PEERLINE_RETENTION_DAYS` (default `30`). Set it to `0` to use the default. Examples:
@@ -431,7 +437,7 @@ No new environment variable is required for the page or the public counters. The
 | `GET` | `/v1/invites/accept?code=` | Deprecated (code in query string): without Bearer = instructions only; with Bearer = 405 (use POST to accept) |
 | `POST` | `/v1/pairing/claim`, `/v1/pairing/status` | Confirm-mode claim and claimant status (auth; token in JSON body) |
 | `GET` | `/v1/invites/{public_id}` | Inviter's view of a confirm-mode invite |
-| `POST` | `/v1/invites/{public_id}/confirm`, `/decline` | Inviter confirms with `{peer_id, code}`, or declines |
+| `POST` | `/v1/invites/{public_id}/confirm`, `/decline` | Inviter confirms with `{peer_id, code, offer_digest}`, or declines |
 | `GET` | `/v1/pairing/{token}` | Pairing link details (no auth, does not consume) |
 | `POST` | `/v1/pairing/{token}` | Accept pairing: with Bearer = accept; without = register+accept |
 | `GET` | `/v1/grants` | Grants you own or hold |

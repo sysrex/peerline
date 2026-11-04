@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sysrex/peerline/internal/clock/clocktest"
 	"github.com/sysrex/peerline/internal/msg"
 	"github.com/sysrex/peerline/internal/store"
 )
@@ -224,6 +225,12 @@ func TestParseTrustedProxiesRejectsOverlyBroad(t *testing.T) {
 		{name: "mapped /95", input: []string{"::ffff:10.0.0.0/95"}, wantError: "at least /96"},
 		{name: "mapped bare", input: []string{"::ffff:10.0.0.1"}},
 		{name: "mapped /104", input: []string{"::ffff:10.0.0.0/104"}},
+		{name: "0.0.0.0/8 (this network)", input: []string{"0.0.0.0/8"}, wantError: "this network"},
+		{name: "0.0.0.0/16 (inside this network)", input: []string{"0.0.0.0/16"}, wantError: "this network"},
+		{name: "0.1.0.0/16 (inside this network)", input: []string{"0.1.0.0/16"}, wantError: "this network"},
+		{name: "bare 0.0.0.0 (this network)", input: []string{"0.0.0.0"}, wantError: "this network"},
+		{name: "::ffff:0.0.0.0/104 (mapped this network)", input: []string{"::ffff:0.0.0.0/104"}, wantError: "this network"},
+		{name: "bare ::ffff:0.0.0.0 (mapped this network)", input: []string{"::ffff:0.0.0.0"}, wantError: "this network"},
 		{
 			name:      "zoned IPv6 address",
 			input:     []string{"fe80::1%eth0"},
@@ -336,27 +343,39 @@ func TestParseTrustedProxiesSymmetry(t *testing.T) {
 		t.Errorf("native network = %q, want 10.0.0.0/8", native[0].String())
 	}
 
-	// Test with /16 as well
-	mapped16, err := ParseTrustedProxies([]string{"::ffff:192.168.0.0/112"})
-	if err != nil {
-		t.Fatalf("ParseTrustedProxies(mapped /112) failed: %v", err)
-	}
-	native16, err := ParseTrustedProxies([]string{"192.168.0.0/16"})
-	if err != nil {
-		t.Fatalf("ParseTrustedProxies(native /16) failed: %v", err)
-	}
-
-	if mapped16[0].String() != "192.168.0.0/16" {
-		t.Errorf("mapped /16 network = %q, want 192.168.0.0/16", mapped16[0].String())
-	}
-	if native16[0].String() != "192.168.0.0/16" {
-		t.Errorf("native /16 network = %q, want 192.168.0.0/16", native16[0].String())
+	// Verify Contains agrees for mapped and native forms of each address against the same net
+	testAddrs := []struct {
+		addr    string
+		inRange bool
+	}{
+		{"10.0.0.5", true},
+		{"::ffff:10.0.0.5", true},
+		{"10.1.0.1", true},
+		{"::1", false},
+		{"2001:db8::1", false},
+		{"203.0.113.1", false},
 	}
 
-	// Verify ::1 is NOT trusted by ::ffff:0:0/104 (would be by /80)
-	loopback := net.ParseIP("::1")
-	if mapped[0].Contains(loopback) {
-		t.Error("::ffff:10.0.0.0/104 should not trust ::1")
+	for _, tt := range testAddrs {
+		addr := net.ParseIP(tt.addr)
+		nativeContains := native[0].Contains(addr)
+		mappedContains := mapped[0].Contains(addr)
+
+		if nativeContains != tt.inRange {
+			t.Errorf("native[0].Contains(%q) = %v, want %v", tt.addr, nativeContains, tt.inRange)
+		}
+		if mappedContains != tt.inRange {
+			t.Errorf("mapped[0].Contains(%q) = %v, want %v", tt.addr, mappedContains, tt.inRange)
+		}
+		if nativeContains != mappedContains {
+			t.Errorf("Contains(%q): native=%v mapped=%v, want same", tt.addr, nativeContains, mappedContains)
+		}
+	}
+
+	// Test clientIP with a mapped peer and mapped XFF hop
+	ip := clientIP("[::ffff:10.0.0.5]:1234", []string{"::ffff:203.0.113.9"}, mapped)
+	if ip != "203.0.113.9" {
+		t.Errorf("clientIP with mapped peer and mapped XFF = %q, want 203.0.113.9", ip)
 	}
 }
 
@@ -544,7 +563,10 @@ func TestRateLimitGetRightmostKeying(t *testing.T) {
 		for _, h := range xff {
 			req.Header.Add("X-Forwarded-For", h)
 		}
-		resp, _ := http.DefaultClient.Do(req)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
 		resp.Body.Close()
 		return resp.StatusCode
 	}
@@ -569,6 +591,11 @@ func TestRateLimitGetRightmostKeying(t *testing.T) {
 	// Client C: same rightmost (203.0.113.10) split differently
 	if status := makeReq("198.51.100.3", "203.0.113.10, 127.0.0.4"); status != 429 {
 		t.Errorf("client C split headers: got %d, want 429", status)
+	}
+
+	// Positive control: Client D with a different rightmost entry should still get 200
+	if status := makeReq("198.51.100.5, 203.0.113.11", "127.0.0.5"); status != 200 {
+		t.Errorf("client D different rightmost: got %d, want 200", status)
 	}
 }
 
@@ -601,27 +628,30 @@ func TestUntrustedDirectPeer(t *testing.T) {
 	defer httpSrv.Close()
 
 	// Register from untrusted IP with XFF header - XFF should be ignored
-	makeReg := func(remoteOverride string, xff string) int {
+	makeReg := func(xff string) int {
 		req, _ := http.NewRequest("POST", httpSrv.URL+"/v1/register", strings.NewReader(`{"name":"test"}`))
 		req.Header.Set("Content-Type", "application/json")
 		if xff != "" {
 			req.Header.Set("X-Forwarded-For", xff)
 		}
 		// httptest's RemoteAddr (127.0.0.1) is outside 10.0.0.0/8, so XFF is ignored
-		resp, _ := http.DefaultClient.Do(req)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
 		resp.Body.Close()
 		return resp.StatusCode
 	}
 
 	// Two registrations - keyed on RemoteAddr not XFF
-	if status := makeReg("", "1.2.3.4"); status != 201 {
+	if status := makeReg("1.2.3.4"); status != 201 {
 		t.Errorf("reg 1: got %d, want 201", status)
 	}
-	if status := makeReg("", "5.6.7.8"); status != 201 {
+	if status := makeReg("5.6.7.8"); status != 201 {
 		t.Errorf("reg 2: got %d, want 201", status)
 	}
 	// Third should be rate limited - same RemoteAddr bucket
-	if status := makeReg("", "9.10.11.12"); status != 429 {
+	if status := makeReg("9.10.11.12"); status != 429 {
 		t.Errorf("reg 3: got %d, want 429", status)
 	}
 }
@@ -646,6 +676,12 @@ func TestIPv4MappedDirectPeer(t *testing.T) {
 	keyNative := rateLimitKey(ipv4Native)
 	if keyMapped != keyNative {
 		t.Errorf("rate limit keys differ: mapped=%q native=%q", keyMapped, keyNative)
+	}
+
+	// Test a trusted mapped peer with XFF: should extract the XFF hop
+	ipWithXFF := clientIP("[::ffff:10.0.0.5]:1234", []string{"203.0.113.9"}, trustedNets)
+	if ipWithXFF != "203.0.113.9" {
+		t.Errorf("clientIP with trusted mapped peer and XFF = %q, want 203.0.113.9", ipWithXFF)
 	}
 }
 
@@ -682,7 +718,10 @@ func TestClientIPAtMultipleCallSites(t *testing.T) {
 		for _, h := range xff {
 			req.Header.Add("X-Forwarded-For", h)
 		}
-		resp, _ := http.DefaultClient.Do(req)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
 		resp.Body.Close()
 		return resp.StatusCode
 	}
@@ -715,7 +754,7 @@ func TestFailedAuthKeyingUsesClientIP(t *testing.T) {
 		TrustedProxies:    []string{"127.0.0.0/8"},
 		AuthFailPerMinute: 2,
 		AuthFailBurst:     2,
-		Now:               func() time.Time { return frozenNow },
+		Clock:             clocktest.New(frozenNow),
 	}
 	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
 		t.Fatal(err)
@@ -806,7 +845,7 @@ func TestPairingAcceptKeyingUsesClientIP(t *testing.T) {
 		TrustedProxies: []string{"127.0.0.0/8"},
 		MsgPerMinute:   10,
 		MsgBurst:       10,
-		Now:            func() time.Time { return frozenNow },
+		Clock:          clocktest.New(frozenNow),
 	}
 	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
 		t.Fatal(err)
@@ -900,7 +939,7 @@ func TestMalformedXFFSharedBucket(t *testing.T) {
 		TrustedProxies: []string{"127.0.0.0/8"},
 		MsgPerMinute:   10,
 		MsgBurst:       10,
-		Now:            func() time.Time { return frozenNow },
+		Clock:          clocktest.New(frozenNow),
 	}
 	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1178,7 +1217,176 @@ func TestNewWarnsWhenTrustedProxiesParseToNothing(t *testing.T) {
 	var logs bytes.Buffer
 	srv := mustNew(t, st, Config{TrustedProxies: []string{" ", ""}, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
 	t.Cleanup(srv.lim.Stop)
-	if !strings.Contains(logs.String(), "no trusted proxies configured") {
-		t.Fatalf("a set-but-empty trusted proxy list must warn, got logs: %q", logs.String())
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, "no trusted proxies configured") {
+		t.Fatalf("api.New must warn when the parsed list is empty, got logs: %q", logOutput)
 	}
+	// Verify api.New emits exactly one warning (this test only calls api.New,
+	// so it cannot detect a duplicate warning added elsewhere, e.g. in main.go).
+	count := strings.Count(logOutput, "no trusted proxies configured")
+	if count != 1 {
+		t.Fatalf("api.New emitted %d warnings, want 1, in logs: %q", count, logOutput)
+	}
+}
+
+func TestIPv6FloorWithOptIn(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      []string
+		allowBroad bool
+		wantError  string
+		wantNet    string
+	}{
+		// Default floor /32
+		{name: "IPv6 /32 allowed (default)", input: []string{"2001:db8::/32"}, allowBroad: false},
+		{name: "IPv6 /31 rejected (default)", input: []string{"2001:db8::/31"}, allowBroad: false, wantError: "must be at least /32"},
+		{name: "IPv6 /29 rejected (default)", input: []string{"2a06:98c0::/29"}, allowBroad: false, wantError: "must be at least /32"},
+		{name: "ULA fc00::/7 rejected (default)", input: []string{"fc00::/7"}, allowBroad: false, wantError: "must be at least /32"},
+		{name: "ULA fd00::/8 rejected (default)", input: []string{"fd00::/8"}, allowBroad: false, wantError: "must be at least /32"},
+		{name: "ULA fd12:3456:789a::/48 allowed (default)", input: []string{"fd12:3456:789a::/48"}, allowBroad: false, wantNet: "fd12:3456:789a::/48"},
+		{name: "ULA bare fd00::1 allowed (default)", input: []string{"fd00::1"}, allowBroad: false, wantNet: "fd00::1/128"},
+
+		// Opt-in floor /29
+		{name: "IPv6 /29 allowed (opt-in)", input: []string{"2a06:98c0::/29"}, allowBroad: true, wantNet: "2a06:98c0::/29"},
+		{name: "IPv6 /32 allowed (opt-in)", input: []string{"2001:db8::/32"}, allowBroad: true},
+		{name: "IPv6 /28 rejected (opt-in)", input: []string{"2a06:98c0::/28"}, allowBroad: true, wantError: "must be at least /29"},
+		{name: "ULA fc00::/7 allowed (opt-in)", input: []string{"fc00::/7"}, allowBroad: true, wantNet: "fc00::/7"},
+		{name: "ULA fc00::/6 rejected (opt-in, too broad)", input: []string{"fc00::/6"}, allowBroad: true, wantError: "must be at least "},
+		{name: "ULA fd00::/8 allowed (opt-in)", input: []string{"fd00::/8"}, allowBroad: true, wantNet: "fd00::/8"},
+		{name: "ULA fc00::1/7 (unmasked) allowed (opt-in)", input: []string{"fc00::1/7"}, allowBroad: true, wantNet: "fc00::/7"},
+		{name: "ULA fdff::/7 (unmasked) allowed (opt-in)", input: []string{"fdff::/7"}, allowBroad: true, wantNet: "fc00::/7"},
+		{name: "ULA fd12::1/7 (unmasked) rejected (default)", input: []string{"fd12::1/7"}, allowBroad: false, wantError: "must be at least /32"},
+		{name: "ULA fd12::1/7 (unmasked) allowed (opt-in)", input: []string{"fd12::1/7"}, allowBroad: true, wantNet: "fc00::/7"},
+		{name: "fe00::/7 (near ULA) rejected (opt-in)", input: []string{"fe00::/7"}, allowBroad: true, wantError: "must be at least /29"},
+		{name: "fe80::/10 (link-local) rejected (opt-in)", input: []string{"fe80::/10"}, allowBroad: true, wantError: "must be at least /29"},
+		{name: "2000::/3 rejected (opt-in)", input: []string{"2000::/3"}, allowBroad: true, wantError: "must be at least /29"},
+		{name: "2002::/16 rejected (opt-in)", input: []string{"2002::/16"}, allowBroad: true, wantError: "must be at least /29"},
+
+		// Still rejected even with opt-in
+		{name: "::/0 rejected (opt-in)", input: []string{"::/0"}, allowBroad: true, wantError: "too broad"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nets, _, err := ParseTrustedProxiesWithOpts(tt.input, tt.allowBroad)
+			if tt.wantError != "" {
+				if err == nil {
+					t.Errorf("ParseTrustedProxiesWithOpts(%v, %v) succeeded, want error containing %q", tt.input, tt.allowBroad, tt.wantError)
+				} else if !strings.Contains(err.Error(), tt.wantError) {
+					t.Errorf("error = %q, want error containing %q", err.Error(), tt.wantError)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("ParseTrustedProxiesWithOpts(%v, %v) failed: %v", tt.input, tt.allowBroad, err)
+				} else if tt.wantNet != "" {
+					if len(nets) != 1 {
+						t.Errorf("got %d networks, want 1", len(nets))
+					} else if nets[0].String() != tt.wantNet {
+						t.Errorf("got network %q, want %q", nets[0].String(), tt.wantNet)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestAllowBroadIPv6Warning(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	var logs bytes.Buffer
+	srv := mustNew(t, st, Config{
+		TrustedProxies: []string{"2a06:98c0::/29", "fd00::/8"},
+		AllowBroadIPv6: true,
+		Logger:         slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	t.Cleanup(srv.lim.Stop)
+
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled") {
+		t.Errorf("expected warning about ALLOW_BROAD, got logs: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "spoof X-Forwarded-For") {
+		t.Errorf("expected security warning about spoofing, got logs: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "ULA (fc00::/7)") {
+		t.Errorf("expected warning to mention ULA exemption, got logs: %q", logOutput)
+	}
+	// Check that the relaxed log line contains both entries (not just the "trusted proxy networks configured" line)
+	lines := strings.Split(logOutput, "\n")
+	var relaxedLine string
+	for _, line := range lines {
+		if strings.Contains(line, "relaxed=") {
+			relaxedLine = line
+			break
+		}
+	}
+	if relaxedLine == "" {
+		t.Errorf("expected log line with relaxed= attribute, got logs: %q", logOutput)
+	} else {
+		if !strings.Contains(relaxedLine, "2a06:98c0::/29") {
+			t.Errorf("expected relaxed log line to list 2a06:98c0::/29, got: %q", relaxedLine)
+		}
+		if !strings.Contains(relaxedLine, "fd00::/8") {
+			t.Errorf("expected relaxed log line to list fd00::/8, got: %q", relaxedLine)
+		}
+	}
+}
+
+func TestAllowBroadIPv6NoEntriesNeeded(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	var logs bytes.Buffer
+	srv := mustNew(t, st, Config{
+		TrustedProxies: []string{"10.0.0.0/8", "2001:db8::/32"},
+		AllowBroadIPv6: true,
+		Logger:         slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	t.Cleanup(srv.lim.Stop)
+
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, "no entries needed it") {
+		t.Errorf("expected warning that no entries needed opt-in, got logs: %q", logOutput)
+	}
+	if strings.Contains(logOutput, "relaxed") {
+		t.Errorf("expected no relaxed log when no entries needed it, got logs: %q", logOutput)
+	}
+}
+
+func TestParseTrustedProxiesWithOptsRelaxedList(t *testing.T) {
+	// Mix of entries: public /29, broad ULA, narrow /32, specific ULA
+	input := []string{"2a06:98c0::/29", "fd00::/8", "2001:db8::/32", "fd12:3456:789a::/48"}
+	nets, relaxed, err := ParseTrustedProxiesWithOpts(input, true)
+	if err != nil {
+		t.Fatalf("ParseTrustedProxiesWithOpts failed: %v", err)
+	}
+	if len(nets) != 4 {
+		t.Errorf("got %d networks, want 4", len(nets))
+	}
+	// relaxed should contain exactly the entries that needed the opt-in:
+	// 2a06:98c0::/29 (public /29, would be rejected at /32 floor)
+	// fd00::/8 (broad ULA, would be rejected at /32 floor)
+	// NOT 2001:db8::/32 (meets /32 floor without opt-in)
+	// NOT fd12:3456:789a::/48 (ULA but meets /32 floor without opt-in)
+	want := []string{"2a06:98c0::/29", "fd00::/8"}
+	if len(relaxed) != len(want) {
+		t.Errorf("relaxed list has %d entries, want %d: got %v, want %v", len(relaxed), len(want), relaxed, want)
+	}
+	for i, w := range want {
+		if i >= len(relaxed) || relaxed[i] != w {
+			t.Errorf("relaxed[%d] = %q, want %q (full list: %v)", i, safeIndex(relaxed, i), w, relaxed)
+		}
+	}
+}
+
+func safeIndex(s []string, i int) string {
+	if i >= 0 && i < len(s) {
+		return s[i]
+	}
+	return "<out of range>"
 }

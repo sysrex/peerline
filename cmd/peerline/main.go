@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/sysrex/peerline/internal/api"
+	"github.com/sysrex/peerline/internal/clock"
 	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/store"
 	"github.com/sysrex/peerline/internal/version"
@@ -55,7 +56,57 @@ func parseVersionDetail(raw string) (string, error) {
 	}
 }
 
+// parseBoolStrict validates boolean environment variables strictly.
+// Accepts: "", "0", "false" (false) or "1", "true" (true), case-insensitive, whitespace-trimmed.
+// Returns an error for any other value to fail-closed on typos.
+func parseBoolStrict(raw string) (bool, error) {
+	normalized := strings.ToLower(strings.TrimSpace(raw))
+	switch normalized {
+	case "", "0", "false":
+		return false, nil
+	case "1", "true":
+		return true, nil
+	default:
+		return false, fmt.Errorf("must be '0', '1', 'false', or 'true', got: %q", raw)
+	}
+}
+
+// describeTLSMode returns a human-readable description of the SMTP TLS mode.
+func describeTLSMode(smtp *mailer.SMTP) string {
+	if smtp.ImplicitTLS {
+		return "implicit TLS (port 465)"
+	} else if smtp.AllowPlaintext {
+		return "STARTTLS optional (plaintext allowed)"
+	}
+	return "STARTTLS required"
+}
+
+// describeSMTPMode returns the log level and message for SMTP startup logging.
+// Returns WARN for non-loopback non-implicit-TLS relays with plaintext allowed (invite codes unprotected in transit),
+// INFO otherwise.
+func describeSMTPMode(smtp *mailer.SMTP) (slog.Level, string) {
+	if !smtp.ImplicitTLS && smtp.AllowPlaintext && !mailer.IsLoopback(smtp.Host) {
+		return slog.LevelWarn, "SMTP configured with plaintext allowed to non-loopback relay; invite codes and message previews are not protected in transit"
+	}
+	return slog.LevelInfo, "SMTP configured"
+}
+
+// smtpProbeAction decides whether a probe error should be fatal (exit 1) or a warning.
+// Returns (fatal=true, level, message) for config errors; (fatal=false, level, message) for transient errors.
+func smtpProbeAction(err error) (fatal bool, level slog.Level, message string) {
+	if err == nil {
+		return false, slog.LevelInfo, ""
+	}
+	if errors.Is(err, mailer.ErrRelayUnreachable) {
+		return false, slog.LevelWarn, "smtp relay unreachable at startup (will retry on send)"
+	}
+	return true, slog.LevelError, "smtp probe failed: configuration error"
+}
+
 func main() {
+	// Set restrictive umask on Unix platforms (0600 for files, 0700 for directories)
+	setRestrictiveUmask()
+
 	showVersion := flag.Bool("version", false, "print version and exit")
 	addr := flag.String("addr", env("PEERLINE_ADDR", "127.0.0.1:8787"), "listen address")
 	dbPath := flag.String("db", env("PEERLINE_DB", "peerline.db"), "SQLite database path")
@@ -83,6 +134,7 @@ func main() {
 	skipBackup := os.Getenv("PEERLINE_SKIP_MIGRATION_BACKUP") == "1"
 	backupDir := os.Getenv("PEERLINE_BACKUP_DIR")
 	backupKeep := 3
+	backupTimeout := 5 * time.Minute // Default: 5 minutes
 
 	if keepEnv := os.Getenv("PEERLINE_BACKUP_KEEP"); keepEnv != "" {
 		if n, err := strconv.Atoi(keepEnv); err == nil {
@@ -96,16 +148,31 @@ func main() {
 		}
 	}
 
+	if timeoutEnv := os.Getenv("PEERLINE_BACKUP_TIMEOUT"); timeoutEnv != "" {
+		if n, err := strconv.Atoi(timeoutEnv); err == nil {
+			if n > 0 {
+				backupTimeout = time.Duration(n) * time.Second
+			} else {
+				log.Warn("PEERLINE_BACKUP_TIMEOUT must be > 0, using default", "invalid_value", timeoutEnv, "default_seconds", 300)
+			}
+		} else {
+			log.Warn("PEERLINE_BACKUP_TIMEOUT must be a number (seconds), using default", "invalid_value", timeoutEnv, "default_seconds", 300)
+		}
+	}
+
 	if skipBackup {
 		log.Warn("PEERLINE_SKIP_MIGRATION_BACKUP is enabled, pre-migration backups are disabled")
 	}
 
 	// Open database with explicit options
+	clk := clock.Real{}
 	opts := store.OpenOptions{
 		SkipMigrationBackup:  skipBackup,
 		BackupDir:            backupDir,
 		BackupRetentionCount: backupKeep,
+		BackupTimeout:        backupTimeout,
 		Logger:               log,
+		Clock:                clk,
 	}
 
 	st, err := store.OpenWithOptions(*dbPath, opts)
@@ -165,23 +232,16 @@ func main() {
 		log.Warn("PEERLINE_REGISTER_TOKEN unset: registration is open to anyone who can reach this server")
 	}
 
-	// Parse trusted proxy CIDRs
+	// Parse trusted proxy CIDRs and opt-in for broader IPv6
 	tp := os.Getenv("PEERLINE_TRUSTED_PROXIES")
-	warnTrustedProxies(log, tp)
+	allowBroadIPv6, err := parseBoolStrict(os.Getenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD"))
+	if err != nil {
+		log.Error("invalid PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD value", "err", err)
+		os.Exit(1)
+	}
 	var trustedProxies []string
 	if tp != "" {
 		trustedProxies = strings.Split(tp, ",")
-		// Validate at startup
-		nets, err := api.ParseTrustedProxies(trustedProxies)
-		if err != nil {
-			log.Error("invalid PEERLINE_TRUSTED_PROXIES CIDR", "err", err)
-			os.Exit(1)
-		}
-		if len(nets) == 0 {
-			log.Warn("PEERLINE_TRUSTED_PROXIES set but contains no entries: X-Forwarded-For headers are ignored")
-		} else {
-			log.Info("trusted proxies", "count", len(nets), "cidrs", nets)
-		}
 	}
 
 	maxOutstandingInvites, _ := strconv.Atoi(os.Getenv("PEERLINE_MAX_OUTSTANDING_INVITES"))
@@ -206,27 +266,16 @@ func main() {
 	} else if smtp, ok := ml.(*mailer.SMTP); ok {
 		// Probe SMTP server at startup to fail fast if TLS is misconfigured.
 		// Network errors (connection refused, timeout) only warn; Send retries at runtime.
-		if err := smtp.Probe(context.Background(), log); err != nil {
-			if errors.Is(err, mailer.ErrRelayUnreachable) {
-				log.Warn("smtp relay unreachable at startup (will retry on send)", "host", smtp.Host, "port", smtp.Port, "err", err)
-			} else {
-				log.Error("smtp probe failed: TLS misconfiguration", "err", err)
+		probeErr := smtp.Probe(context.Background())
+		fatal, probeLevel, probeMsg := smtpProbeAction(probeErr)
+		if probeErr != nil {
+			log.Log(context.Background(), probeLevel, probeMsg, "host", smtp.Host, "port", smtp.Port, "err", probeErr)
+			if fatal {
 				os.Exit(1)
 			}
 		}
-		// Log TLS mode at startup
-		var tlsMode string
-		if smtp.ImplicitTLS {
-			tlsMode = "implicit TLS (port 465)"
-		} else if smtp.AllowPlaintext {
-			tlsMode = "STARTTLS optional (plaintext allowed)"
-			if !mailer.IsLoopback(smtp.Host) {
-				log.Warn("SMTP configured with plaintext allowed to non-loopback relay; invite codes and message previews are not protected in transit", "host", smtp.Host, "port", smtp.Port)
-			}
-		} else {
-			tlsMode = "STARTTLS required"
-		}
-		log.Info("SMTP configured", "host", smtp.Host, "port", smtp.Port, "tls", tlsMode, "authenticated", smtp.User != "")
+		level, msg := describeSMTPMode(smtp)
+		log.Log(context.Background(), level, msg, "host", smtp.Host, "port", smtp.Port, "tls", describeTLSMode(smtp), "authenticated", smtp.User != "")
 	}
 	if publicURL == "" {
 		log.Warn("PEERLINE_PUBLIC_URL unset: pairing links and base_url fall back to the request Host header; set it so clients never send keys to a forged origin")
@@ -295,6 +344,8 @@ func main() {
 		EmailPerHour:          emailPerHour,
 		NotifyPerHour:         notifyPerHour,
 		TrustedProxies:        trustedProxies,
+		AllowBroadIPv6:        allowBroadIPv6,
+		Clock:                 clk,
 		MaxOutstandingInvites: maxOutstandingInvites,
 		RetentionSeconds:      retentionSeconds,
 		AuthFailPerMinute:     authFailPerMinute,

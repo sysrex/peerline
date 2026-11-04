@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/sysrex/peerline/internal/auth"
 	"github.com/sysrex/peerline/internal/pair"
@@ -33,10 +34,11 @@ type ClaimStore interface {
 	ClaimStatus(ctx context.Context, tokenHash, claimant string) (*ClaimInvite, error)
 	// InviterView returns the invite only to its inviter.
 	InviterView(ctx context.Context, publicID, inviter string) (*ClaimInvite, error)
-	// ConfirmClaim runs check on a claimed invite in one transaction. On true it
-	// writes the grants and activates it; on false it counts a failure and declines
-	// at maxCodeFails. Returns the resulting state.
-	ConfirmClaim(ctx context.Context, publicID, inviter string, maxFails int, check func(*ClaimInvite) bool) (string, error)
+	// ConfirmClaim runs check on a claimed invite in one transaction. CheckOK writes
+	// the grants and activates it; CheckCodeFail/CheckPeerIDFail count toward maxFails;
+	// CheckDigestStale does not count. Returns the resulting state and optionally a fresh claim.
+	// claimantPeerID is used for constant-time comparison on active replay.
+	ConfirmClaim(ctx context.Context, publicID, inviter string, claimantPeerID string, maxFails int, check func(*ClaimInvite) (store.CheckResult, *ClaimInvite)) (string, *ClaimInvite, error)
 	DeclineClaim(ctx context.Context, publicID, inviter string) error
 }
 
@@ -68,6 +70,19 @@ func (s *Server) claimHandlers() http.Handler {
 
 func (s *Server) claimCode(c *ClaimInvite) string {
 	return pair.Code(s.cfg.CodePepper, c.PublicID, c.Inviter, c.Claimant, c.Nonce, c.Scopes, c.Bags, c.BackScopes, c.BackBags)
+}
+
+func (s *Server) offerDigest(c *ClaimInvite) string {
+	var eis, eib, ecs, ecb []string
+	if c.Replaces != nil {
+		if c.Replaces.InviterToClaimant != nil {
+			eis, eib = c.Replaces.InviterToClaimant.Scopes, c.Replaces.InviterToClaimant.Bags
+		}
+		if c.Replaces.ClaimantToInviter != nil {
+			ecs, ecb = c.Replaces.ClaimantToInviter.Scopes, c.Replaces.ClaimantToInviter.Bags
+		}
+	}
+	return pair.OfferDigest(c.PublicID, c.Inviter, c.Claimant, c.Scopes, c.Bags, c.BackScopes, c.BackBags, eis, eib, ecs, ecb)
 }
 
 // claimBody charges the per-IP pairing budget before any lookup, so a 429 never depends on the token.
@@ -131,6 +146,41 @@ func (s *Server) claimStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"public_id": c.PublicID, "state": c.State})
 }
 
+// buildInviterViewJSON builds the JSON representation of a claimed invite for the inviter,
+// including claimant details, offer_digest, the offered scopes/bags in both directions,
+// and (for claimed state only) any existing grants being replaced. Used by both GET
+// /v1/invites/{public_id} and the 409 stale-digest response.
+func (s *Server) buildInviterViewJSON(c *ClaimInvite) map[string]any {
+	out := map[string]any{
+		"public_id":    c.PublicID,
+		"state":        c.State,
+		"claimant":     map[string]any{"peer_id": c.Claimant, "untrusted": map[string]string{"name": sanitizeInviterName(c.ClaimantName)}},
+		"offer_digest": s.offerDigest(c),
+		"offer": map[string]any{
+			"inviter_to_claimant": map[string]any{"scopes": c.Scopes, "bags": c.Bags},
+			"claimant_to_inviter": map[string]any{"scopes": c.BackScopes, "bags": c.BackBags},
+		},
+	}
+	// Show replaces only for claimed invites (not active), since after activation it would show the just-written grants
+	if c.State == store.ClaimClaimed && c.Replaces != nil {
+		replaces := map[string]any{}
+		if c.Replaces.InviterToClaimant != nil {
+			replaces["inviter_to_claimant"] = map[string]any{
+				"scopes": c.Replaces.InviterToClaimant.Scopes,
+				"bags":   c.Replaces.InviterToClaimant.Bags,
+			}
+		}
+		if c.Replaces.ClaimantToInviter != nil {
+			replaces["claimant_to_inviter"] = map[string]any{
+				"scopes": c.Replaces.ClaimantToInviter.Scopes,
+				"bags":   c.Replaces.ClaimantToInviter.Bags,
+			}
+		}
+		out["replaces"] = replaces
+	}
+	return out
+}
+
 // inviteView never includes the code: the inviter must obtain it from the claimant's owner.
 func (s *Server) inviteView(w http.ResponseWriter, r *http.Request) {
 	c, err := s.claims.InviterView(r.Context(), r.PathValue("public_id"), auth.PeerID(r.Context()))
@@ -139,24 +189,80 @@ func (s *Server) inviteView(w http.ResponseWriter, r *http.Request) {
 	}
 	out := map[string]any{"public_id": c.PublicID, "state": c.State}
 	if c.Claimant != "" {
-		out["claimant"] = map[string]any{"peer_id": c.Claimant, "untrusted": map[string]string{"name": sanitizeInviterName(c.ClaimantName)}}
+		out = s.buildInviterViewJSON(c)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) confirmClaim(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		PeerID string `json:"peer_id"`
-		Code   string `json:"code"`
+		PeerID      string `json:"peer_id"`
+		Code        string `json:"code"`
+		OfferDigest string `json:"offer_digest"`
 	}
 	if !decode(w, r, &in) {
 		return
 	}
+
+	// Validate offer_digest is present and well-formed (64 hex chars) before evaluating code
+	if in.OfferDigest == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "offer_digest required: GET /v1/invites/{public_id} and echo offer_digest",
+		})
+		return
+	}
+	if len(in.OfferDigest) != 64 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "offer_digest must be 64 hex characters",
+		})
+		return
+	}
+	for _, c := range in.OfferDigest {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "offer_digest must be hex",
+			})
+			return
+		}
+	}
+
 	pub := r.PathValue("public_id")
-	state, err := s.claims.ConfirmClaim(r.Context(), pub, auth.PeerID(r.Context()), maxCodeFails, func(c *ClaimInvite) bool {
+	// Normalize offer_digest to lowercase for comparison
+	normalizedDigest := strings.ToLower(in.OfferDigest)
+
+	state, freshClaim, err := s.claims.ConfirmClaim(r.Context(), pub, auth.PeerID(r.Context()), in.PeerID, maxCodeFails, func(c *ClaimInvite) (store.CheckResult, *ClaimInvite) {
+		// Check digest FIRST, before evaluating code (prevents code oracle)
+		// Use normalized (lowercase) digest for comparison
+		digestOK := pair.OfferDigestMatches(s.offerDigest(c), normalizedDigest)
+		if !digestOK {
+			// Return c (already loaded in this transaction) for 409 response
+			// DO NOT call InviterView here - it would open a second transaction and deadlock with SetMaxOpenConns(1)
+			return store.CheckDigestStale, c
+		}
+
+		// Only check code and peer_id if digest matches
 		idOK := subtle.ConstantTimeCompare([]byte(in.PeerID), []byte(c.Claimant)) == 1
-		return pair.CodeMatches(s.claimCode(c), in.Code) && idOK
+		if !idOK {
+			return store.CheckPeerIDFail, nil
+		}
+
+		codeOK := pair.CodeMatches(s.claimCode(c), in.Code)
+		if !codeOK {
+			return store.CheckCodeFail, nil
+		}
+
+		return store.CheckOK, nil
 	})
+
+	// Handle stale digest (does not count toward failures)
+	if state == claimStateClaimed && freshClaim != nil {
+		s.log.Info("invite_confirm_stale_digest", "public_id", pub, "inviter", auth.PeerID(r.Context()))
+		resp := s.buildInviterViewJSON(freshClaim)
+		resp["error"] = "offer changed: GET /v1/invites/{public_id} for current offer_digest"
+		writeJSON(w, http.StatusConflict, resp)
+		return
+	}
+
 	if !s.claimResult(w, err) {
 		return
 	}

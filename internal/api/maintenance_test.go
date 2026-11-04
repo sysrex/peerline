@@ -57,7 +57,7 @@ func TestMaintenanceManager_PassesRetentionAndRunsAtStart(t *testing.T) {
 	}
 	retention := int64(7 * 24 * 60 * 60) // 7 days
 
-	m := NewMaintenanceManager(ctx, fake, log, retention, 6)
+	m := NewMaintenanceManager(ctx, fake, log, nil, retention, 6)
 	defer m.Stop()
 
 	// Wait for the startup purge to complete
@@ -91,7 +91,7 @@ func TestMaintenanceManager_RunsHourly(t *testing.T) {
 	}
 	retention := int64(30 * 24 * 60 * 60) // 30 days
 
-	m := NewMaintenanceManager(ctx, fake, log, retention, 6, WithTickInterval(50*time.Millisecond))
+	m := NewMaintenanceManager(ctx, fake, log, nil, retention, 6, WithTickInterval(50*time.Millisecond))
 	defer m.Stop()
 
 	// Wait for at least 2 calls (startup + at least one tick)
@@ -123,7 +123,7 @@ func TestMaintenanceManager_FollowUpAfterCappedRun(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	fake := &fakePurger{called: make(chan struct{}, 10)}
 	fake.moreOnce.Store(true)
-	m := NewMaintenanceManager(context.Background(), fake, log, 0, 6, WithFollowUpInterval(10*time.Millisecond))
+	m := NewMaintenanceManager(context.Background(), fake, log, nil, 0, 6, WithFollowUpInterval(10*time.Millisecond))
 	defer m.Stop()
 	for i := 0; i < 2; i++ {
 		select {
@@ -137,6 +137,6 @@ func TestMaintenanceManager_FollowUpAfterCappedRun(t *testing.T) {
 func TestWithTickIntervalIgnoresNonPositive(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	fake := &fakePurger{called: make(chan struct{}, 1)}
-	m := NewMaintenanceManager(context.Background(), fake, log, 0, 6, WithTickInterval(0))
+	m := NewMaintenanceManager(context.Background(), fake, log, nil, 0, 6, WithTickInterval(0))
 	m.Stop()
 }

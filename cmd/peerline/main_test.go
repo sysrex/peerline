@@ -1,8 +1,14 @@
 package main
 
 import (
+	"errors"
+	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/sysrex/peerline/internal/mailer"
 )
 
 func TestParseNonNegativeInt(t *testing.T) {
@@ -140,6 +146,235 @@ func TestParseVersionDetail(t *testing.T) {
 				} else if got != tt.want {
 					t.Errorf("parseVersionDetail(%q) = %q; want %q", tt.input, got, tt.want)
 				}
+			}
+		})
+	}
+}
+
+func TestParseBoolStrict(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    bool
+		wantErr bool
+	}{
+		{"empty string", "", false, false},
+		{"0", "0", false, false},
+		{"false lowercase", "false", false, false},
+		{"false uppercase", "FALSE", false, false},
+		{"false mixed case", "False", false, false},
+		{"1", "1", true, false},
+		{"true lowercase", "true", true, false},
+		{"true uppercase", "TRUE", true, false},
+		{"true mixed case", "True", true, false},
+		{"with whitespace 0", "  0  ", false, false},
+		{"with whitespace 1", "  1  ", true, false},
+		{"with whitespace true", "  true  ", true, false},
+		{"invalid yes", "yes", false, true},
+		{"invalid no", "no", false, true},
+		{"invalid on", "on", false, true},
+		{"invalid off", "off", false, true},
+		{"invalid 2", "2", false, true},
+		{"invalid t", "t", false, true},
+		{"invalid f", "f", false, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseBoolStrict(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("parseBoolStrict(%q) = %v, nil; want error", tt.input, got)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("parseBoolStrict(%q) = %v, %v; want %v, nil", tt.input, got, err, tt.want)
+				} else if got != tt.want {
+					t.Errorf("parseBoolStrict(%q) = %v; want %v", tt.input, got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func TestDescribeTLSMode(t *testing.T) {
+	tests := []struct {
+		name string
+		smtp *mailer.SMTP
+		want string
+	}{
+		{
+			name: "implicit TLS (port 465)",
+			smtp: &mailer.SMTP{
+				Host:        "mail.example.com",
+				Port:        465,
+				ImplicitTLS: true,
+			},
+			want: "implicit TLS (port 465)",
+		},
+		{
+			name: "STARTTLS optional (plaintext allowed)",
+			smtp: &mailer.SMTP{
+				Host:           "localhost",
+				Port:           587,
+				AllowPlaintext: true,
+			},
+			want: "STARTTLS optional (plaintext allowed)",
+		},
+		{
+			name: "STARTTLS required",
+			smtp: &mailer.SMTP{
+				Host:           "mail.example.com",
+				Port:           587,
+				AllowPlaintext: false,
+			},
+			want: "STARTTLS required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := describeTLSMode(tt.smtp); got != tt.want {
+				t.Errorf("describeTLSMode() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSMTPProbeAction(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		wantFatal bool
+		wantLevel slog.Level
+		wantMsg   string
+	}{
+		{
+			name:      "nil error = no action",
+			err:       nil,
+			wantFatal: false,
+			wantLevel: slog.LevelInfo,
+			wantMsg:   "",
+		},
+		{
+			name:      "ErrRelayUnreachable = warn, not fatal",
+			err:       mailer.ErrRelayUnreachable,
+			wantFatal: false,
+			wantLevel: slog.LevelWarn,
+			wantMsg:   "smtp relay unreachable at startup (will retry on send)",
+		},
+		{
+			name:      "wrapped ErrRelayUnreachable = warn, not fatal",
+			err:       fmt.Errorf("context: %w", mailer.ErrRelayUnreachable),
+			wantFatal: false,
+			wantLevel: slog.LevelWarn,
+			wantMsg:   "smtp relay unreachable at startup (will retry on send)",
+		},
+		{
+			name:      "TLS error = fatal",
+			err:       errors.New("x509: certificate signed by unknown authority"),
+			wantFatal: true,
+			wantLevel: slog.LevelError,
+			wantMsg:   "smtp probe failed: configuration error",
+		},
+		{
+			name:      "other error = fatal",
+			err:       errors.New("something else"),
+			wantFatal: true,
+			wantLevel: slog.LevelError,
+			wantMsg:   "smtp probe failed: configuration error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotFatal, gotLevel, gotMsg := smtpProbeAction(tt.err)
+			if gotFatal != tt.wantFatal {
+				t.Errorf("fatal = %v, want %v", gotFatal, tt.wantFatal)
+			}
+			if gotLevel != tt.wantLevel {
+				t.Errorf("level = %v, want %v", gotLevel, tt.wantLevel)
+			}
+			if gotMsg != tt.wantMsg {
+				t.Errorf("msg = %q, want %q", gotMsg, tt.wantMsg)
+			}
+		})
+	}
+}
+
+func TestDescribeSMTPMode(t *testing.T) {
+	tests := []struct {
+		name      string
+		smtp      *mailer.SMTP
+		wantLevel slog.Level
+		wantMsg   string
+	}{
+		{
+			name: "loopback with plaintext = INFO",
+			smtp: &mailer.SMTP{
+				Host:           "localhost",
+				Port:           587,
+				AllowPlaintext: true,
+				Timeout:        10 * time.Second,
+			},
+			wantLevel: slog.LevelInfo,
+			wantMsg:   "SMTP configured",
+		},
+		{
+			name: "non-loopback with STARTTLS required = INFO",
+			smtp: &mailer.SMTP{
+				Host:           "mail.example.com",
+				Port:           587,
+				AllowPlaintext: false,
+				Timeout:        10 * time.Second,
+			},
+			wantLevel: slog.LevelInfo,
+			wantMsg:   "SMTP configured",
+		},
+		{
+			name: "non-loopback with plaintext allowed = WARN",
+			smtp: &mailer.SMTP{
+				Host:           "192.168.1.1",
+				Port:           587,
+				AllowPlaintext: true,
+				Timeout:        10 * time.Second,
+			},
+			wantLevel: slog.LevelWarn,
+			wantMsg:   "SMTP configured with plaintext allowed to non-loopback relay; invite codes and message previews are not protected in transit",
+		},
+		{
+			name: "port 465 implicit TLS = INFO",
+			smtp: &mailer.SMTP{
+				Host:        "mail.example.com",
+				Port:        465,
+				ImplicitTLS: true,
+				Timeout:     10 * time.Second,
+			},
+			wantLevel: slog.LevelInfo,
+			wantMsg:   "SMTP configured",
+		},
+		{
+			name: "port 465 with AllowPlaintext on non-loopback = INFO (no spurious warn)",
+			smtp: &mailer.SMTP{
+				Host:           "mail.example.com",
+				Port:           465,
+				ImplicitTLS:    true,
+				AllowPlaintext: true,
+				Timeout:        10 * time.Second,
+			},
+			wantLevel: slog.LevelInfo,
+			wantMsg:   "SMTP configured",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotLevel, gotMsg := describeSMTPMode(tt.smtp)
+			if gotLevel != tt.wantLevel {
+				t.Errorf("describeSMTPMode() level = %v, want %v", gotLevel, tt.wantLevel)
+			}
+			if gotMsg != tt.wantMsg {
+				t.Errorf("describeSMTPMode() msg = %q, want %q", gotMsg, tt.wantMsg)
 			}
 		})
 	}

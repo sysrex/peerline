@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sysrex/peerline/internal/clock"
 	_ "modernc.org/sqlite"
 )
 
@@ -51,12 +53,17 @@ var memDBCounter uint64
 
 type Store struct {
 	db                 *sql.DB
-	now                func() int64
+	clk                clock.Clock
 	schemaVersionInUse int
 	lastBackupPath     string
 	backupReused       bool
 	keyIndex           *keyIndex
 	keyIndexLoaded     bool
+}
+
+// nowUnix returns the current Unix timestamp from the store's clock.
+func (s *Store) nowUnix() int64 {
+	return s.clk.Now().Unix()
 }
 
 // migrations is the ordered list of schema migration functions.
@@ -107,15 +114,19 @@ type OpenOptions struct {
 	// Minimum 1, defaults to 3. Invalid values log a warning and use 3.
 	BackupRetentionCount int
 
+	// BackupTimeout is the maximum duration for the VACUUM INTO operation.
+	// Defaults to 5 minutes. Set via PEERLINE_BACKUP_TIMEOUT (in seconds).
+	BackupTimeout time.Duration
+
 	// Logger for warnings and info messages. Defaults to slog.Default().
 	Logger *slog.Logger
 
+	// Clock is an injectable time source for testing. If nil, uses clock.Real{}.
+	// Used for invite expiry checks, backup timestamps, and other time-based operations.
+	Clock clock.Clock
+
 	// vacuumInto is an injectable hook for testing. If nil, uses db.Exec("VACUUM INTO ?", path).
 	vacuumInto func(db *sql.DB, backupPath string) error
-
-	// now is an injectable clock for testing. If nil, uses time.Now().Unix().
-	// Used for backup timestamps and other time-based operations.
-	now func() int64
 
 	// migrationStepHook is an injectable hook for testing migration step failures.
 	// Called before each migration step with (targetVersion, currentVersion). If it returns
@@ -176,7 +187,7 @@ CREATE INDEX IF NOT EXISTS invites_expires_at ON invites(expires_at);
 `
 
 // Open opens the database at path, applies migrations, and returns a Store.
-// Use ":memory:" for tests. It is the only Store constructor; a zero-value Store{} has a nil now func and must not be used directly.
+// Use ":memory:" for tests. It is the only Store constructor; a zero-value Store{} has a nil clock and must not be used directly.
 func Open(path string) (*Store, error) {
 	keepEnv := os.Getenv("PEERLINE_BACKUP_KEEP")
 	var keep int
@@ -217,6 +228,11 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
+
+	// Tighten permissions on existing database files if needed (Unix only)
+	if absPath, err := filepath.Abs(path); err == nil && path != ":memory:" {
+		tightenDatabaseFilePermissions(absPath, opts.Logger)
+	}
 
 	// Guard: check version BEFORE executing schema
 	currentVersion, err := checkSchemaVersion(db)
@@ -269,11 +285,6 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		return nil, fmt.Errorf("schema: %w", err)
 	}
 
-	nowFunc := opts.now
-	if nowFunc == nil {
-		nowFunc = func() int64 { return time.Now().Unix() }
-	}
-
 	schemaInUse, err := runMigrations(db, currentVersion, opts)
 	if err != nil {
 		db.Close()
@@ -290,7 +301,7 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 
 	return &Store{
 		db:                 db,
-		now:                nowFunc,
+		clk:                clock.Or(opts.Clock),
 		schemaVersionInUse: schemaInUse,
 		lastBackupPath:     backupPath,
 		backupReused:       reused,
@@ -401,8 +412,10 @@ func pathless(err error) error {
 }
 
 // setupBackupDir ensures the backup directory exists with 0700 permissions and refuses symlinks,
-// directories owned by another user, and any group or world access.
-func setupBackupDir(dir string, logger *slog.Logger) error {
+// directories owned by another user, and any group or world write access.
+// For explicitly configured PEERLINE_BACKUP_DIR, enforces strict 0700 (no group/world access).
+// For the default DB directory, only refuses group/world writable (0022).
+func setupBackupDir(dir string, explicitlyConfigured bool, logger *slog.Logger) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("create backup directory: %w", pathless(err))
 	}
@@ -418,8 +431,20 @@ func setupBackupDir(dir string, logger *slog.Logger) error {
 	if !ownedByCurrentUser(info) {
 		return fmt.Errorf("backup directory %q is not owned by the user running peerline", dirBase)
 	}
-	if perm := info.Mode().Perm(); perm&0077 != 0 {
-		return fmt.Errorf("backup directory %q allows group or world access (mode %04o); fix permissions to 0700", dirBase, perm)
+
+	perm := info.Mode().Perm()
+	if explicitlyConfigured {
+		// Strict check for PEERLINE_BACKUP_DIR: no group/world access at all
+		if perm&0077 != 0 {
+			badBits := perm & 0077
+			return fmt.Errorf("backup directory %q allows group or world access (mode %04o, bad bits: %03o); fix permissions to 0700", dirBase, perm, badBits)
+		}
+	} else {
+		// Lenient check for default DB directory: only refuse writable
+		if perm&0022 != 0 {
+			badBits := perm & 0022
+			return fmt.Errorf("backup directory %q is group or world writable (mode %04o, bad bits: %03o); database directory must not be writable by others", dirBase, perm, badBits)
+		}
 	}
 
 	return nil
@@ -439,8 +464,10 @@ func runMigrations(db *sql.DB, currentVersion int, opts OpenOptions) (int, error
 	return checkSchemaVersion(db)
 }
 
-// backupSuffixRE matches the timestamp (and optional PID) suffix of backups we create.
-const backupSuffixRE = `\.\d{8}-\d{6}\.\d{6}(\.\d+)?$`
+// backupSuffixRE matches the timestamp suffix of backups we create.
+// Matches: .YYYYMMDD-HHMMSS.microseconds with optional .hexhexhexhexhexhexhexhex suffix (8 hex chars)
+// or legacy .decimal_pid suffix (for compatibility with pre-random-suffix backups).
+const backupSuffixRE = `\.\d{8}-\d{6}\.\d{6}(\.[0-9a-f]{8}|\.\d+)?$`
 
 // backupBeforeMigration creates a VACUUM INTO backup of the database before applying migrations.
 // For :memory: databases or brand-new databases, no backup is taken.
@@ -464,11 +491,12 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 
 	// Determine backup directory
 	backupDir := opts.BackupDir
+	explicitlyConfigured := backupDir != ""
 	if backupDir == "" {
 		backupDir = filepath.Dir(dbPath)
 	}
 
-	if err := setupBackupDir(backupDir, opts.Logger); err != nil {
+	if err := setupBackupDir(backupDir, explicitlyConfigured, opts.Logger); err != nil {
 		return "", false, err
 	}
 
@@ -519,68 +547,234 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 	}
 
 	// Create new backup
-	nowFunc := opts.now
-	if nowFunc == nil {
-		nowFunc = func() int64 { return time.Now().Unix() }
-	}
-	timestamp := time.Unix(nowFunc(), 0).UTC().Format("20060102-150405.000000")
-	backupName := fmt.Sprintf("%s.pre-v%d-from-v%d.%s", dbBase, targetVersion, currentVersion, timestamp)
-	backupPath := filepath.Join(backupDir, backupName)
-	if _, err := os.Lstat(backupPath); err == nil {
-		backupPath = fmt.Sprintf("%s.%d", backupPath, os.Getpid())
-	}
+	clk := clock.Or(opts.Clock)
+	timestamp := clk.Now().UTC().Format("20060102-150405.000000")
 
-	// Check available disk space
+	// Sweep stale .partial files from previous interrupted backups (older than 2 minutes)
+	sweepPartialBackups(backupDir, dbBase, opts.Logger)
+
+	backupName := fmt.Sprintf("%s.pre-v%d-from-v%d.%s", dbBase, targetVersion, currentVersion, timestamp)
+
+	// Check available disk space before creating the backup
 	if err := checkDiskSpace(db, backupDir, opts.Logger); err != nil {
 		return "", false, err
 	}
 
-	// Execute VACUUM INTO
-	vacuumFunc := opts.vacuumInto
-	if vacuumFunc == nil {
-		vacuumFunc = func(db *sql.DB, path string) error {
-			_, err := db.Exec(`VACUUM INTO ?`, path)
-			return err
+	// Retry loop: try up to 10 times with random suffixes on collision
+	var finalPath string
+	var backupSize int64
+	var backupDuration time.Duration
+	var linked bool
+
+	for attempts := 0; attempts < 10; attempts++ {
+		tryName := backupName
+		if attempts > 0 {
+			// Generate random suffix: 4 random bytes as hex
+			randomBytes := make([]byte, 4)
+			if _, err := rand.Read(randomBytes); err != nil {
+				return "", false, fmt.Errorf("generate random suffix: %w", err)
+			}
+			tryName = fmt.Sprintf("%s.%x", backupName, randomBytes)
 		}
+
+		finalPath = filepath.Join(backupDir, tryName)
+
+		// Check if final name already exists (collision)
+		if _, err := os.Lstat(finalPath); err == nil {
+			// Final name exists, try next random suffix
+			continue
+		} else if !os.IsNotExist(err) {
+			return "", false, fmt.Errorf("check backup file: %w", pathless(err))
+		}
+
+		partialPath := finalPath + ".partial"
+
+		// Create .partial file with O_EXCL|O_NOFOLLOW at 0600
+		f, err := openBackupFileExclusive(partialPath)
+		if err != nil {
+			if os.IsExist(err) {
+				// Partial file exists (stale or concurrent), try next suffix
+				continue
+			}
+			return "", false, fmt.Errorf("create partial backup file: %w", pathless(err))
+		}
+
+		// Verify owner and mode on the open fd
+		partialFinfo, err := f.Stat()
+		if err != nil {
+			f.Close()
+			os.Remove(partialPath)
+			return "", false, fmt.Errorf("stat created partial backup file: %w", pathless(err))
+		}
+
+		if !ownedByCurrentUser(partialFinfo) {
+			f.Close()
+			os.Remove(partialPath)
+			return "", false, fmt.Errorf("partial backup file %q is not owned by the user running peerline", filepath.Base(partialPath))
+		}
+
+		// Mode should be 0600 from OpenFile, but verify (unix-only check)
+		if err := verifyBackupFileMode(partialFinfo, partialPath); err != nil {
+			f.Close()
+			os.Remove(partialPath)
+			return "", false, err
+		}
+		f.Close()
+
+		// Execute VACUUM INTO with context timeout
+		opts.Logger.Info("starting pre-migration backup", "backup", filepath.Base(tryName), "size_bytes", "pending")
+		backupStart := time.Now()
+
+		timeout := opts.BackupTimeout
+		if timeout == 0 {
+			timeout = 5 * time.Minute // Default 5 minutes
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+
+		vacuumFunc := opts.vacuumInto
+		if vacuumFunc == nil {
+			vacuumFunc = func(db *sql.DB, path string) error {
+				_, err := db.ExecContext(ctx, `VACUUM INTO ?`, path)
+				return err
+			}
+		}
+
+		err = vacuumFunc(db, partialPath)
+		cancel()
+		if err != nil {
+			os.Remove(partialPath)
+			return "", false, fmt.Errorf("VACUUM INTO backup: %w", pathless(err))
+		}
+
+		backupDuration = time.Since(backupStart)
+
+		// Verify the partial file hasn't been replaced (check inode)
+		afterVacuum, err := os.Lstat(partialPath)
+		if err != nil {
+			os.Remove(partialPath)
+			return "", false, fmt.Errorf("stat partial after VACUUM: %w", pathless(err))
+		}
+		if !os.SameFile(partialFinfo, afterVacuum) {
+			os.Remove(partialPath)
+			return "", false, fmt.Errorf("partial backup file was replaced during VACUUM")
+		}
+		if err := verifyBackupFileMode(afterVacuum, partialPath); err != nil {
+			os.Remove(partialPath)
+			return "", false, fmt.Errorf("mode changed during VACUUM: %w", err)
+		}
+
+		// Fsync the backup file
+		if err := fsyncFile(partialPath, opts.Logger); err != nil {
+			opts.Logger.Warn("backup fsync failed", "backup", filepath.Base(partialPath), "error", pathless(err).Error())
+		}
+
+		// Verify backup before linking
+		// SQLite opens the .partial file by path and follows symlinks. This is acceptable
+		// because the setupBackupDir check ensures the directory owner matches the current user.
+		if err := verifyBackup(partialPath, currentVersion); err != nil {
+			os.Remove(partialPath)
+			return "", false, fmt.Errorf("backup verification failed: %w", err)
+		}
+
+		// Atomically link the partial file to the final name
+		// os.Link fails if finalPath already exists
+		if err := os.Link(partialPath, finalPath); err != nil {
+			os.Remove(partialPath)
+			if os.IsExist(err) {
+				// Final name now exists (race with another process or stale file), retry with new suffix
+				continue
+			}
+			return "", false, fmt.Errorf("link partial to final backup name: %w", pathless(err))
+		}
+
+		// Link succeeded, remove the .partial file (the final name now exists via hard link)
+		os.Remove(partialPath)
+		backupSize = afterVacuum.Size()
+		linked = true
+		break
 	}
 
-	if err := vacuumFunc(db, backupPath); err != nil {
-		// Clean up partial backup
-		os.Remove(backupPath)
-		return "", false, fmt.Errorf("VACUUM INTO backup: %w", pathless(err))
+	// If we exhausted all retries, fail
+	if !linked {
+		return "", false, fmt.Errorf("backup failed after 10 collision retries")
 	}
 
-	if err := os.Chmod(backupPath, 0600); err != nil {
-		os.Remove(backupPath)
-		return "", false, fmt.Errorf("chmod backup: %w", pathless(err))
+	// Fsync the backup directory to persist the final name
+	if err := fsyncDirectory(backupDir, opts.Logger); err != nil {
+		opts.Logger.Warn("backup directory fsync failed", "dir", backupDir, "error", pathless(err).Error())
 	}
 
-	// Fsync the backup file
-	if err := fsyncFile(backupPath, opts.Logger); err != nil {
-		opts.Logger.Warn("backup fsync failed", "backup", filepath.Base(backupPath), "error", pathless(err).Error())
-	}
-
-	// Verify backup
-	if err := verifyBackup(backupPath, currentVersion); err != nil {
-		os.Remove(backupPath)
-		return "", false, fmt.Errorf("backup verification failed: %w", err)
-	}
+	opts.Logger.Info("pre-migration backup complete", "backup", filepath.Base(finalPath), "size_bytes", backupSize, "duration_seconds", backupDuration.Seconds())
 
 	// Enforce retention policy
-	if err := enforceBackupRetention(backupDir, dbBase, backupPath, opts.BackupRetentionCount, opts.Logger); err != nil {
+	if err := enforceBackupRetention(backupDir, dbBase, finalPath, opts.BackupRetentionCount, opts.Logger); err != nil {
 		opts.Logger.Warn("backup retention cleanup failed", "error", pathless(err).Error())
 	}
 
-	return backupPath, false, nil
+	return finalPath, false, nil
 }
 
 // verifyBackup runs basic checks on a backup file.
 func verifyBackup(backupPath string, expectedVersion int) error {
-	db, err := sql.Open("sqlite", backupPath+"?mode=ro")
+	// Check that backup file exists and is not empty
+	info, err := os.Stat(backupPath)
+	if err != nil {
+		return fmt.Errorf("stat backup: %w", err)
+	}
+	if info.Size() == 0 {
+		return fmt.Errorf("backup file is empty")
+	}
+
+	// Get absolute path for comparison
+	absPath, err := filepath.Abs(backupPath)
+	if err != nil {
+		return fmt.Errorf("get absolute path: %w", err)
+	}
+
+	// Build proper file: URI with url.URL to handle special characters (?, #, %, etc.)
+	// On Windows, convert backslashes to forward slashes for the URI path
+	uriPath := absPath
+	if filepath.Separator == '\\' {
+		uriPath = "/" + filepath.ToSlash(absPath)
+	}
+
+	u := url.URL{
+		Scheme:   "file",
+		Path:     uriPath,
+		RawQuery: url.Values{"mode": {"ro"}, "_pragma": {"query_only(1)"}}.Encode(),
+	}
+	dsn := u.String()
+
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return fmt.Errorf("open backup: %w", err)
 	}
 	defer db.Close()
+
+	// Verify we opened the expected file by checking PRAGMA database_list
+	var seq int
+	var name, file string
+	if err := db.QueryRow(`SELECT seq, name, file FROM pragma_database_list() WHERE name='main'`).Scan(&seq, &name, &file); err != nil {
+		return fmt.Errorf("read database_list: %w", err)
+	}
+
+	// Compare opened file with expected path using os.SameFile
+	openedInfo, err := os.Stat(file)
+	if err != nil {
+		return fmt.Errorf("stat opened file %q: %w", file, err)
+	}
+	if !os.SameFile(info, openedInfo) {
+		return fmt.Errorf("backup verification opened wrong file: expected %q, got %q", absPath, file)
+	}
+
+	// Verify query_only mode is active
+	var queryOnly int
+	if err := db.QueryRow(`PRAGMA query_only`).Scan(&queryOnly); err != nil {
+		return fmt.Errorf("check query_only: %w", err)
+	}
+	if queryOnly != 1 {
+		return fmt.Errorf("backup was not opened read-only")
+	}
 
 	// Quick check
 	var ok string
@@ -597,10 +791,11 @@ func verifyBackup(backupPath string, expectedVersion int) error {
 		return fmt.Errorf("read user_version: %w", err)
 	}
 	if version != expectedVersion {
-		return fmt.Errorf("backup user_version %d != expected %d", version, expectedVersion)
+		return fmt.Errorf("backup user_version is %d, expected %d (hint: if another process migrated this database, retry)", version, expectedVersion)
 	}
 
-	// Check peers table is queryable (absent in databases predating the schema)
+	// Check peers table is queryable if it exists
+	// (Backups taken before schema initialization may not have it)
 	var hasPeers int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='peers'`).Scan(&hasPeers); err != nil {
 		return fmt.Errorf("check peers table: %w", err)
@@ -697,6 +892,51 @@ func fsyncFile(path string, logger *slog.Logger) error {
 	}
 	defer f.Close()
 	return f.Sync()
+}
+
+// fsyncDirectory fsyncs a directory to persist directory entries.
+func fsyncDirectory(path string, logger *slog.Logger) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
+// sweepPartialBackups removes stale .partial files older than 2 minutes
+// from interrupted backups. Only removes files matching our naming pattern.
+//
+// Uses real time.Now() to compare against real file mtimes from the filesystem.
+// An injected fake clock would incorrectly classify files as old or new.
+func sweepPartialBackups(backupDir, dbBase string, logger *slog.Logger) {
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		// Silently skip if directory is unreadable
+		return
+	}
+
+	cutoff := time.Now().Add(-2 * time.Minute)
+	// Match: <dbBase>.pre-vN-from-vM.<timestamp>[.<suffix>].partial
+	pattern := regexp.MustCompile(`^` + regexp.QuoteMeta(dbBase) + `\.pre-v\d+-from-v\d+\.` + `\d{8}-\d{6}\.\d{6}` + `(\.[0-9a-f]{8}|\.\d+)?\.partial$`)
+
+	for _, entry := range entries {
+		if !pattern.MatchString(entry.Name()) {
+			continue
+		}
+
+		path := filepath.Join(backupDir, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		if info.ModTime().Before(cutoff) {
+			if err := os.Remove(path); err == nil {
+				logger.Info("removed stale partial backup", "file", entry.Name())
+			}
+		}
+	}
 }
 
 // runMigrationStep runs a single migration step in its own transaction.
@@ -983,7 +1223,7 @@ type Peer struct {
 func (s *Store) CreatePeer(ctx context.Context, id, name, keyHash, notifyEmail, notifyToken string) error {
 	verified := 0
 	_, err := s.db.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email,notify_email_verified,notify_email_token) VALUES(?,?,?,?,?,?,?)`,
-		id, name, keyHash, s.now(), notifyEmail, verified, notifyToken)
+		id, name, keyHash, s.nowUnix(), notifyEmail, verified, notifyToken)
 	if err == nil {
 		// Add to key index after successful insert
 		s.keyIndex.add(keyHash, id)
@@ -1071,7 +1311,7 @@ func (s *Store) VerifyNotifyEmail(ctx context.Context, id, tokenHash string) err
 	storedHash := parts[1]
 
 	// Check expiry (24 hours: valid at exactly issued+86400, expired at issued+86401)
-	if s.now() > issuedUnix+86400 {
+	if s.nowUnix() > issuedUnix+86400 {
 		return ErrNotFound
 	}
 
@@ -1227,7 +1467,7 @@ func (s *Store) CreateInviteAtomic(ctx context.Context, codeHash, from string, s
 	defer tx.Rollback()
 
 	var count int
-	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=?2 AND `+outstandingInvite, s.now(), from).Scan(&count)
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=?2 AND `+outstandingInvite, s.nowUnix(), from).Scan(&count)
 	if err != nil {
 		return "", err
 	}
@@ -1273,7 +1513,7 @@ func (s *Store) createPairingInviteAtomic(ctx context.Context, codeHash, pairing
 	defer tx.Rollback()
 
 	var count int
-	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=?2 AND `+outstandingInvite, s.now(), from).Scan(&count)
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=?2 AND `+outstandingInvite, s.nowUnix(), from).Scan(&count)
 	if err != nil {
 		return "", err
 	}
@@ -1314,7 +1554,7 @@ func (s *Store) CountOutstandingInvites(ctx context.Context, peerID string) (int
 	var count int
 	err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM invites WHERE from_peer=?2 AND `+outstandingInvite,
-		s.now(), peerID).Scan(&count)
+		s.nowUnix(), peerID).Scan(&count)
 	return count, err
 }
 
@@ -1332,7 +1572,7 @@ func (s *Store) ListInvitesByPeer(ctx context.Context, peerID string, limit, off
 		   AND ((used_by IS NOT NULL AND expires_at>=?1) OR `+outstandingInvite+`)
 		 ORDER BY ROWID
 		 LIMIT ?3 OFFSET ?4`,
-		s.now(), peerID, limit, offset)
+		s.nowUnix(), peerID, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -1394,7 +1634,7 @@ func (s *Store) PurgeExpiredInvites(ctx context.Context, retentionSeconds int64)
 		retentionSeconds = 30 * 24 * 60 * 60 // 30 days default
 	}
 
-	ts := s.now()
+	ts := s.nowUnix()
 	// The grace does not guard an in-flight accept: acceptInviteInTx re-checks
 	// expires_at inside an IMMEDIATE transaction, so accept and purge are serialised
 	// and an expired row is rejected whether or not it was purged. It also does not
@@ -1471,7 +1711,7 @@ func (s *Store) GetInviteByPairingToken(ctx context.Context, pairingTokenHash st
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp < s.now() {
+	if used.Valid || exp < s.nowUnix() {
 		return nil, ErrNotFound
 	}
 	return &InviteInfo{
@@ -1496,7 +1736,7 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp < s.now() {
+	if used.Valid || exp < s.nowUnix() {
 		return nil, ErrNotFound
 	}
 
@@ -1506,7 +1746,7 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 	}
 	defer tx.Rollback()
 
-	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags, s.now())
+	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags, s.nowUnix())
 	if err != nil {
 		return nil, err
 	}
@@ -1520,7 +1760,7 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 // PairingTokenExists checks if a pairing token exists (is valid and not yet redeemed).
 func (s *Store) PairingTokenExists(ctx context.Context, pairingTokenHash string) (bool, error) {
 	var exists int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM invites WHERE pairing_token_hash=? AND used_by IS NULL AND expires_at >= ?`, pairingTokenHash, s.now()).Scan(&exists)
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM invites WHERE pairing_token_hash=? AND used_by IS NULL AND expires_at >= ?`, pairingTokenHash, s.nowUnix()).Scan(&exists)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -1544,7 +1784,7 @@ func (s *Store) AcceptInvite(ctx context.Context, codeHash, accepter string, bac
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp < s.now() {
+	if used.Valid || exp < s.nowUnix() {
 		return nil, ErrNotFound
 	}
 
@@ -1554,7 +1794,7 @@ func (s *Store) AcceptInvite(ctx context.Context, codeHash, accepter string, bac
 	}
 	defer tx.Rollback()
 
-	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags, s.now())
+	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags, s.nowUnix())
 	if err != nil {
 		return nil, err
 	}
@@ -1580,7 +1820,7 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 	if err != nil {
 		return nil, err
 	}
-	preCheckTime := s.now()
+	preCheckTime := s.nowUnix()
 	if used.Valid || exp < preCheckTime {
 		return nil, ErrNotFound
 	}
@@ -1593,7 +1833,7 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 	defer tx.Rollback()
 
 	// Take timestamp inside tx for expires_at guard and created_at
-	ts := s.now()
+	ts := s.nowUnix()
 
 	verified := 0
 	_, err = tx.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email,notify_email_verified,notify_email_token) VALUES(?,?,?,?,?,?,?)`,
@@ -1733,7 +1973,7 @@ type Message struct {
 }
 
 func (s *Store) InsertMessage(ctx context.Context, m *Message) error {
-	ts := s.now()
+	ts := s.nowUnix()
 	res, err := s.db.ExecContext(ctx, `INSERT INTO messages(sender,recipient,type,body,reply_to,created_at) VALUES(?,?,?,?,?,?)`,
 		m.From, m.To, m.Type, m.Body, m.ReplyTo, ts)
 	if err != nil {
@@ -1856,7 +2096,7 @@ func (s *Store) PutBag(ctx context.Context, owner, name string, content []byte, 
 	next := cur + 1
 	_, err = tx.ExecContext(ctx, `INSERT INTO bags(owner,name,content,version,updated_by,updated_at) VALUES(?,?,?,?,?,?)
 		ON CONFLICT(owner,name) DO UPDATE SET content=excluded.content, version=excluded.version,
-		updated_by=excluded.updated_by, updated_at=excluded.updated_at`, owner, name, content, next, by, s.now())
+		updated_by=excluded.updated_by, updated_at=excluded.updated_at`, owner, name, content, next, by, s.nowUnix())
 	if err != nil {
 		return 0, err
 	}
