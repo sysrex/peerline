@@ -383,10 +383,10 @@ func TestBuildTrustedProxySettings(t *testing.T) {
 			wantWarnCount:  0,
 		},
 		{
-			name:        "invalid opt-in value",
-			proxiesEnv:  "127.0.0.0/8",
+			name:          "invalid opt-in value",
+			proxiesEnv:    "127.0.0.0/8",
 			allowBroadEnv: "yes",
-			wantErr:     true,
+			wantErr:       true,
 		},
 		{
 			name:           "both unset no warn",
@@ -459,37 +459,37 @@ func TestBuildTrustedProxySettings(t *testing.T) {
 // main() passes to api.New, with no field assignments in between.
 func TestBuildAPIConfig(t *testing.T) {
 	tests := []struct {
-		name               string
-		envVars            map[string]string
-		trustedProxies     []string
-		allowBroadIPv6     bool
-		wantRegisterToken  string
-		wantCodePepper     string
-		wantEmailPerHour   int
-		wantNotifyPerHour  int
-		wantMaxOutstanding int
-		wantAuthFailMin    int
-		wantAuthFailBurst  int
-		wantWriteMin       int
-		wantWriteBurst     int
+		name                string
+		envVars             map[string]string
+		trustedProxies      []string
+		allowBroadIPv6      bool
+		wantRegisterToken   string
+		wantCodePepper      string
+		wantEmailPerHour    int
+		wantNotifyPerHour   int
+		wantMaxOutstanding  int
+		wantAuthFailMin     int
+		wantAuthFailBurst   int
+		wantWriteMin        int
+		wantWriteBurst      int
 		wantKeyIndexRebuild int
-		wantBuildErr       bool
-		wantNewErr         bool
-		wantNewErrContains string
+		wantBuildErr        bool
+		wantNewErr          bool
+		wantNewErrContains  string
 	}{
 		{
 			name: "all fields set",
 			envVars: map[string]string{
-				"PEERLINE_REGISTER_TOKEN":           "test_reg_token_abc123",
-				"PEERLINE_CODE_PEPPER":              "test_pepper_xyz789",
-				"PEERLINE_EMAIL_PER_HOUR":           "50",
-				"PEERLINE_NOTIFY_PER_HOUR":          "30",
-				"PEERLINE_MAX_OUTSTANDING_INVITES":  "15",
-				"PEERLINE_AUTH_FAIL_PER_MINUTE":     "20",
-				"PEERLINE_AUTH_FAIL_BURST":          "8",
-				"PEERLINE_WRITE_PER_MINUTE":         "15",
-				"PEERLINE_WRITE_BURST":              "5",
-				"PEERLINE_KEY_INDEX_REBUILD_HOURS":  "12",
+				"PEERLINE_REGISTER_TOKEN":          "test_reg_token_abc123",
+				"PEERLINE_CODE_PEPPER":             "test_pepper_xyz789",
+				"PEERLINE_EMAIL_PER_HOUR":          "50",
+				"PEERLINE_NOTIFY_PER_HOUR":         "30",
+				"PEERLINE_MAX_OUTSTANDING_INVITES": "15",
+				"PEERLINE_AUTH_FAIL_PER_MINUTE":    "20",
+				"PEERLINE_AUTH_FAIL_BURST":         "8",
+				"PEERLINE_WRITE_PER_MINUTE":        "15",
+				"PEERLINE_WRITE_BURST":             "5",
+				"PEERLINE_KEY_INDEX_REBUILD_HOURS": "12",
 			},
 			trustedProxies:      []string{"10.0.0.0/8"},
 			allowBroadIPv6:      true,
@@ -523,12 +523,12 @@ func TestBuildAPIConfig(t *testing.T) {
 			wantBuildErr:   true,
 		},
 		{
-			name:                "/29 without opt-in rejected by api.New",
-			envVars:             map[string]string{},
-			trustedProxies:      []string{"2a06:98c0::/29"},
-			allowBroadIPv6:      false,
-			wantNewErr:          true,
-			wantNewErrContains:  "must be at least /32",
+			name:               "/29 without opt-in rejected by api.New",
+			envVars:            map[string]string{},
+			trustedProxies:     []string{"2a06:98c0::/29"},
+			allowBroadIPv6:     false,
+			wantNewErr:         true,
+			wantNewErrContains: "must be at least /32",
 		},
 		{
 			name:           "/29 with opt-in accepted",
