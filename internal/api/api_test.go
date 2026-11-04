@@ -3584,7 +3584,6 @@ func FuzzSanitizeInviterName(f *testing.F) {
 	})
 }
 
-// TestAPIClock verifies that api.Server.clk is used in createInvite.
 // TestAPIClock verifies that the API and store share one clock, and that invite
 // expiry boundaries are exact: accepted at expires_at, rejected at expires_at+1.
 // Issue #110 item 5: clock agreement and exact-boundary semantics through the API.
