@@ -308,6 +308,13 @@ func (s *SMTP) Probe(ctx context.Context) error {
 	if s.ImplicitTLS {
 		tlsConn := tls.Client(conn, tlsCfg)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			// Check for not-yet-valid certificate (fatal: clock skew or misconfiguration)
+			var x509Invalid x509.CertificateInvalidError
+			if errors.As(err, &x509Invalid) && x509Invalid.Reason == x509.Expired && x509Invalid.Cert != nil {
+				if time.Now().Before(x509Invalid.Cert.NotBefore) {
+					return fmt.Errorf("smtp probe: TLS handshake failed on port 465: certificate not yet valid (NotBefore=%v); check the host clock: %w", x509Invalid.Cert.NotBefore.Format(time.RFC3339), err)
+				}
+			}
 			// Check for expiry-only error (transient: relay state, not Peerline config)
 			if s.isExpiryOnlyError(ctx, err, conn, tlsCfg) {
 				return fmt.Errorf("%w: relay certificate expired (sends will fail until renewed): %v", ErrRelayUnreachable, err)
@@ -345,6 +352,13 @@ func (s *SMTP) Probe(ctx context.Context) error {
 		if hasSTARTTLS {
 			// Actually perform the handshake to verify certs
 			if err := c.StartTLS(tlsCfg); err != nil {
+				// Check for not-yet-valid certificate (fatal: clock skew or misconfiguration)
+				var x509Invalid x509.CertificateInvalidError
+				if errors.As(err, &x509Invalid) && x509Invalid.Reason == x509.Expired && x509Invalid.Cert != nil {
+					if time.Now().Before(x509Invalid.Cert.NotBefore) {
+						return fmt.Errorf("smtp probe: STARTTLS handshake failed: certificate not yet valid (NotBefore=%v); check the host clock: %w", x509Invalid.Cert.NotBefore.Format(time.RFC3339), err)
+					}
+				}
 				// Check for expiry-only error (transient: relay state, not Peerline config)
 				if s.isExpiryOnlyError(ctx, err, conn, tlsCfg) {
 					return fmt.Errorf("%w: relay certificate expired (sends will fail until renewed): %v", ErrRelayUnreachable, err)
@@ -416,14 +430,9 @@ func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, 
 	fixedTime := x509Invalid.Cert.NotAfter.Add(-time.Second)
 	recheckCfg.Time = func() time.Time { return fixedTime }
 
-	// Re-handshake on a new connection to verify at the alternate time
-	timeout := 2 * time.Second
-	if deadline, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(deadline); remaining > 0 && remaining < timeout {
-			timeout = remaining
-		}
-	}
-	recheckCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	// Re-handshake on a new connection to verify at the alternate time.
+	// Use the caller's context so cancellation propagates; bound to 2s max.
+	recheckCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
 	d := &net.Dialer{}

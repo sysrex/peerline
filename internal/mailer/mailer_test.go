@@ -1006,6 +1006,12 @@ func TestSMTPProbe(t *testing.T) {
 		if errors.Is(err, ErrRelayUnreachable) {
 			t.Fatalf("not-yet-valid cert should be fatal, not ErrRelayUnreachable (clock skew): %v", err)
 		}
+		if !strings.Contains(err.Error(), "not yet valid") {
+			t.Fatalf("error should mention 'not yet valid', got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "check the host clock") {
+			t.Fatalf("error should mention 'check the host clock', got: %v", err)
+		}
 	})
 
 	t.Run("STARTTLS expired+self-signed = fatal", func(t *testing.T) {
@@ -1053,6 +1059,43 @@ func TestSMTPProbe(t *testing.T) {
 		}
 		if errors.Is(err, ErrRelayUnreachable) {
 			t.Fatalf("expired+wrong-host should be fatal, not ErrRelayUnreachable: %v", err)
+		}
+	})
+
+	t.Run("STARTTLS expired cert re-check respects caller context timeout", func(t *testing.T) {
+		cert := genExpiredTestCert(t, "localhost")
+		srv := newFakeServer(t, true, &cert)
+		defer srv.close()
+
+		certPool := x509.NewCertPool()
+		parsed, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			t.Fatalf("failed to parse test cert: %v", err)
+		}
+		certPool.AddCert(parsed)
+
+		// Use a very short timeout - if the re-check doesn't respect it and uses its own
+		// 2s timeout, this test would take longer
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		s := &SMTP{
+			Host:      "127.0.0.1",
+			Port:      srv.port(),
+			Timeout:   5 * time.Second,
+			TLSConfig: &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+		}
+		start := time.Now()
+		err = s.Probe(ctx)
+		elapsed := time.Since(start)
+
+		if err == nil {
+			t.Fatal("probe should fail on expired cert")
+		}
+		// The re-check should use the caller's short timeout, so it completes quickly
+		// (well under the 2s default re-check timeout)
+		if elapsed > 500*time.Millisecond {
+			t.Fatalf("probe took %v, should respect caller's short timeout", elapsed)
 		}
 	})
 
