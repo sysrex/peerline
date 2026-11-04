@@ -2869,6 +2869,55 @@ func TestSanitizerTrailingSpaceTrim(t *testing.T) {
 	}
 }
 
+// TestSanitizeInviterName verifies specific sanitization cases
+func TestSanitizeInviterName(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "basic ASCII",
+			input: "Alice",
+			want:  "Alice",
+		},
+		{
+			name:  "fuzz corpus case: virama after space from truncation",
+			input: "00000!000000000000000000000000000000000000000000000000000000क्ष् 00000" + strings.Repeat("ब", 70),
+			want:  "00000000000000000000000000000000000000000000000000000000000", // क्ष् dropped by back-off
+		},
+		{
+			name:  "virama behind several spaces after truncation",
+			input: strings.Repeat("a", 61) + "क् " + strings.Repeat("b", 10),
+			want:  strings.Repeat("a", 61), // truncates to ...क् space, drops क्, trims space
+		},
+		{
+			name:  "iterative cleanup: drop cluster exposes space, trim exposes virama",
+			input: strings.Repeat("a", 59) + "क् ष्" + strings.Repeat("b", 10),
+			want:  strings.Repeat("a", 59), // truncates to ...क् space ष्, drops ष्->space, drops क्
+		},
+		{
+			name:  "empty after cleanup falls back",
+			input: "!@#$%",
+			want:  "A Peerline peer",
+		},
+		{
+			name:  "only spaces falls back",
+			input: "     ",
+			want:  "A Peerline peer",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeInviterName(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeInviterName(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
 // FuzzSanitizeInviterName verifies invariants over random inputs
 func FuzzSanitizeInviterName(f *testing.F) {
 	// Seed corpus with edge cases

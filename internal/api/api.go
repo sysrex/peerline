@@ -1068,15 +1068,9 @@ func sanitizeInviterName(name string) string {
 			}
 		}
 
-		// Trim trailing spaces from the rune slice before virama back-off,
-		// so we don't miss viramas hidden behind spaces
-		for len(truncated) > 0 && truncated[len(truncated)-1] == ' ' {
-			truncated = truncated[:len(truncated)-1]
-		}
-
-		// Strip any trailing viramas (CCC 9) after truncation to handle stacked conjuncts
-		// (e.g., क्क्ष where multiple viramas chain, issue #206). Keep dropping entire
-		// clusters until no virama remains at the end.
+		// Strip trailing whitespace and trailing virama clusters to a fixed point.
+		// Dropping a cluster can expose spaces, and trimming spaces can expose viramas,
+		// so we iterate until neither operation applies.
 		dropCluster := func(t []rune) []rune {
 			for i := len(t) - 1; i >= 0; i-- {
 				r := t[i]
@@ -1092,16 +1086,29 @@ func sanitizeInviterName(name string) string {
 		}
 
 		for len(truncated) > 0 {
-			lastRune := truncated[len(truncated)-1]
-			props := norm.NFC.PropertiesString(string(lastRune))
-			if props.CCC() == 9 {
-				n := len(truncated)
-				truncated = dropCluster(truncated)
-				if len(truncated) == n {
-					// No progress made, stop to avoid infinite loop
-					break
+			startLen := len(truncated)
+
+			// Trim trailing spaces
+			for len(truncated) > 0 && truncated[len(truncated)-1] == ' ' {
+				truncated = truncated[:len(truncated)-1]
+			}
+
+			// Drop trailing virama clusters
+			if len(truncated) > 0 {
+				lastRune := truncated[len(truncated)-1]
+				props := norm.NFC.PropertiesString(string(lastRune))
+				if props.CCC() == 9 {
+					n := len(truncated)
+					truncated = dropCluster(truncated)
+					if len(truncated) == n {
+						// No progress made, stop to avoid infinite loop
+						break
+					}
 				}
-			} else {
+			}
+
+			// If neither operation changed anything, we're done
+			if len(truncated) == startLen {
 				break
 			}
 		}
@@ -1109,10 +1116,7 @@ func sanitizeInviterName(name string) string {
 		result = string(truncated)
 	}
 
-	// Trim trailing spaces that may have been left by the 64-rune truncation
-	result = strings.TrimRight(result, " ")
-
-	// Return fallback if result is now empty after trimming
+	// Apply empty-string fallback after cleanup
 	if result == "" {
 		return fallbackName
 	}
