@@ -1057,8 +1057,9 @@ func sanitizeInviterName(name string) string {
 		// maxViramaBackoff is the maximum number of trailing consonant+virama clusters
 		// to drop when the 64-rune cut lands inside a word. This prevents collapsing
 		// a name to the fallback when a long run of clusters (e.g. strings.Repeat("க்", 40))
-		// has no word boundary. Issue #332.
-		maxViramaBackoff = 1
+		// has no word boundary (issue #332), while still backing off through real stacked
+		// conjuncts (3–4 clusters, e.g. स्त्र्य). Set to 4 to cover typical conjunct stacks.
+		maxViramaBackoff = 4
 	)
 
 	result := sanitizeInviterNameUncapped(name)
