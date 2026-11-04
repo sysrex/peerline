@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func makeV2DB(t *testing.T, dir string) string {
@@ -168,8 +169,7 @@ func TestVacuumIntoFailureRemovesOnlyCreatedFile(t *testing.T) {
 func TestCollisionRetryWithRandomSuffix(t *testing.T) {
 	dir := secureTempDir(t)
 
-	// Create a v2 database and immediately make valid backups with fixed timestamps
-	// This simulates pre-existing backups from earlier failed attempts
+	// Create a v2 database
 	dbPath := filepath.Join(dir, "x.db")
 	tempDB, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -181,23 +181,21 @@ func TestCollisionRetryWithRandomSuffix(t *testing.T) {
 	}
 	tempDB.Close()
 
-	// Create valid backup files by copying the v2 database
-	base := "x.db.pre-v6-from-v2.20260101-120000.000000"
-	preExisting := []string{base, base + ".12345678", base + ".deadbeef"}
-	for _, name := range preExisting {
-		backupPath := filepath.Join(dir, name)
-		// Copy the v2 database as a backup
-		dbData, _ := os.ReadFile(dbPath)
-		if err := os.WriteFile(backupPath, dbData, 0600); err != nil {
-			t.Fatal(err)
-		}
+	// Pin clock to 2026-01-01 12:00:00 UTC
+	clockTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// Pre-plant invalid file at the base timestamp to force collision
+	// (invalid so reuse scan skips it and the create loop runs)
+	baseName := "x.db.pre-v6-from-v2.20260101-120000.000000"
+	basePath := filepath.Join(dir, baseName)
+	if err := os.WriteFile(basePath, []byte("invalid"), 0600); err != nil {
+		t.Fatal(err)
 	}
 
-	// Open should succeed with a random suffix
-	// Use BackupRetentionCount=10 to ensure pre-existing files aren't deleted by retention
+	// Open should succeed by adding a random hex suffix
 	opts := openOpts(dir)
 	opts.BackupRetentionCount = 10
-	opts.now = func() int64 { return 1704110400 } // Fixed timestamp matching the pre-created files
+	opts.now = func() int64 { return clockTime.Unix() }
 
 	s, err := OpenWithOptions(dbPath, opts)
 	if err != nil {
@@ -206,29 +204,46 @@ func TestCollisionRetryWithRandomSuffix(t *testing.T) {
 	defer s.Close()
 
 	// Verify a new backup was created
-	if s.LastBackupPath() == "" {
+	backupPath := s.LastBackupPath()
+	if backupPath == "" {
 		t.Fatal("no backup created")
 	}
 
-	// The new backup should have a different name (random suffix) or be reused from pre-existing
-	// Either way, verify all pre-existing files still exist
-	for _, name := range preExisting {
-		path := filepath.Join(dir, name)
-		if _, err := os.Stat(path); err != nil {
-			t.Errorf("pre-existing file %q was deleted: %v", name, err)
+	backupName := filepath.Base(backupPath)
+
+	// The new backup must NOT be the base name (must have hex suffix or .partial)
+	if backupName == baseName {
+		t.Errorf("backup used base name without hex suffix: %s", backupName)
+	}
+
+	// Verify the backup name has an 8-hex-digit suffix (or is .partial due to link collision)
+	hasHexSuffix := false
+	isPartial := strings.HasSuffix(backupName, ".partial")
+
+	if !isPartial && strings.HasPrefix(backupName, baseName+".") {
+		suffix := strings.TrimPrefix(backupName, baseName+".")
+		if len(suffix) == 8 {
+			// Check all chars are lowercase hex
+			allHex := true
+			for _, c := range suffix {
+				if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+					allHex = false
+					break
+				}
+			}
+			hasHexSuffix = allHex
 		}
 	}
 
-	// Verify total backups >= 3 (the pre-existing ones; may have reused one instead of creating new)
-	entries, _ := os.ReadDir(dir)
-	count := 0
-	for _, e := range entries {
-		if strings.Contains(e.Name(), ".pre-v6-from-v2.") {
-			count++
-		}
+	if !hasHexSuffix && !isPartial {
+		t.Errorf("backup name doesn't have 8-char hex suffix or .partial: %s", backupName)
 	}
-	if count < 3 {
-		t.Errorf("expected at least 3 backup files, got %d", count)
+
+	// Verify the pre-existing invalid base file still exists (not overwritten)
+	if data, err := os.ReadFile(basePath); err != nil {
+		t.Errorf("pre-existing file was deleted: %v", err)
+	} else if string(data) != "invalid" {
+		t.Errorf("pre-existing file was overwritten")
 	}
 }
 

@@ -122,7 +122,7 @@ Docker volumes typically create directories with mode **0755** (world-readable).
 
 **What happens on upgrade with a 0755 /data directory:**
 - ✅ Startup succeeds. The 0755 directory passes the default-directory check (only writable bits 0022 are refused), backups are written at 0600, and migration proceeds normally.
-- Note: With the umask fix in this release, new database files (peerline.db, -wal, -shm) are created at 0600, preventing other local users from reading them even in a 0755 directory.
+- Note: This release sets `umask(0077)` on Unix at startup (process-wide), so **all files** Peerline creates (database, WAL, SHM, backups, and any other files) are created at 0600 or 0700. This prevents other local users from reading the database even in a 0755 directory. On Windows, file permissions are handled via ACLs instead of umask.
 
 **If startup still fails** with a directory permission error:
 1. Check the actual directory mode: `ls -ld /data`

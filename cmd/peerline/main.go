@@ -88,9 +88,8 @@ func smtpProbeAction(err error) (fatal bool, level slog.Level, message string) {
 }
 
 func main() {
-	// Set umask to 0077 to ensure all files (database, WAL, SHM, backups) are created with 0600
-	// This prevents other local users from reading the database in a 0755 data directory
-	syscall.Umask(0o077)
+	// Set restrictive umask on Unix platforms (0600 for files, 0700 for directories)
+	setRestrictiveUmask()
 
 	showVersion := flag.Bool("version", false, "print version and exit")
 	addr := flag.String("addr", env("PEERLINE_ADDR", "127.0.0.1:8787"), "listen address")
