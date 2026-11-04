@@ -1240,6 +1240,9 @@ func (s *Server) acceptInvite(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "invite invalid, used, or expired")
 		return
 	case errors.Is(err, store.ErrConflict):
+		writeErr(w, http.StatusConflict, "already paired with different grants; revoke the grant or use a confirm-mode invite")
+		return
+	case errors.Is(err, store.ErrSelfPairing):
 		writeErr(w, http.StatusBadRequest, "cannot accept your own invite")
 		return
 	case err != nil:
@@ -1744,6 +1747,9 @@ func (s *Server) acceptPairing(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
 		return
 	case errors.Is(err, store.ErrConflict):
+		writeErr(w, http.StatusConflict, "already paired with different grants; revoke the grant or use a confirm-mode invite")
+		return
+	case errors.Is(err, store.ErrSelfPairing):
 		writeErr(w, http.StatusBadRequest, "cannot accept your own pairing link")
 		return
 	case err != nil:
@@ -1804,6 +1810,9 @@ func (s *Server) acceptPairingUnauthenticated(w http.ResponseWriter, r *http.Req
 		writeErr(w, http.StatusNotFound, "pairing link invalid, used, or expired")
 		return
 	case errors.Is(err, store.ErrConflict):
+		writeErr(w, http.StatusConflict, "already paired with different grants; revoke the grant or use a confirm-mode invite")
+		return
+	case errors.Is(err, store.ErrSelfPairing):
 		writeErr(w, http.StatusBadRequest, "cannot accept your own pairing link")
 		return
 	case err != nil:
