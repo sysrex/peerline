@@ -3190,7 +3190,8 @@ func TestInviteAcceptGETWithScopesReturns405(t *testing.T) {
 func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	var logs syncBuf
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
-	srv := newServer(t, Config{Logger: logger})
+	capture := &captureMailer{}
+	srv := newServer(t, Config{Logger: logger, Mailer: capture})
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
 	c := register(t, srv, "carol")
 
@@ -3214,6 +3215,12 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	want(t, resp, body, 201)
 	var inv4 struct{ Code string }
 	json.Unmarshal(body, &inv4)
+
+	// Create invite with to_email to check mailer log line
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "test@example.com"}, nil)
+	want(t, resp, body, 201)
+	var inv5 struct{ Code string }
+	json.Unmarshal(body, &inv5)
 
 	// Test all accept paths:
 	// 1. POST with body code (successful)
@@ -3271,8 +3278,10 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 		t.Error("logs should contain 'peer registered' (positive control)")
 	}
 
-	// Check logs don't contain any of the codes or their prefixes
-	for _, code := range []string{inv1.Code, inv2.Code, inv3.Code, inv4.Code, unknownCode} {
+	// Check logs don't contain any of the codes or their prefixes.
+	// This test captures only the injected slog logger, matching the current
+	// single-logger design (no access log, no http.Server.ErrorLog).
+	for _, code := range []string{inv1.Code, inv2.Code, inv3.Code, inv4.Code, inv5.Code, unknownCode} {
 		if strings.Contains(logStr, code) {
 			t.Errorf("invite code %s found in logs", code)
 		}
@@ -3467,6 +3476,33 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	resp2.Body.Close()
 	if resp2.StatusCode != 404 {
 		t.Errorf("HEAD trailing slash: want 404, got %d", resp2.StatusCode)
+	}
+
+	// Test 8a: Path-cleaning variants (issue #174)
+	// // and /./ trigger http.ServeMux path cleaning, which redirects to the canonical path
+	noRedirect := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	req, _ = http.NewRequest("POST", srv.URL+"/v1/invites//accept?code="+inv1.Code, nil)
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	resp2, err = noRedirect.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 307 {
+		t.Errorf("// variant POST: want 307, got %d", resp2.StatusCode)
+	}
+
+	req, _ = http.NewRequest("POST", srv.URL+"/v1/invites/./accept?code="+inv1.Code, nil)
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	resp2, err = noRedirect.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 307 {
+		t.Errorf("/./ variant POST: want 307, got %d", resp2.StatusCode)
 	}
 
 	// Test 9: Unauthenticated landing with bad code returns 400
