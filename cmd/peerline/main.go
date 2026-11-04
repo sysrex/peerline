@@ -81,6 +81,15 @@ func describeTLSMode(smtp *mailer.SMTP) string {
 	return "STARTTLS required"
 }
 
+// warnUnusedAllowBroad warns when PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled
+// but no trusted proxies are configured. This is a misconfiguration (the opt-in has no
+// entries to apply to), though not fatal.
+func warnUnusedAllowBroad(log *slog.Logger, allowBroad bool, trustedProxies string) {
+	if allowBroad && trustedProxies == "" {
+		log.Warn("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled but PEERLINE_TRUSTED_PROXIES is unset; the opt-in has no effect")
+	}
+}
+
 // describeSMTPMode returns the log level and message for SMTP startup logging.
 // Returns WARN for non-loopback non-implicit-TLS relays with plaintext allowed (invite codes unprotected in transit),
 // INFO otherwise.
@@ -239,6 +248,7 @@ func main() {
 		log.Error("invalid PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD value", "err", err)
 		os.Exit(1)
 	}
+	warnUnusedAllowBroad(log, allowBroadIPv6, tp)
 	var trustedProxies []string
 	if tp != "" {
 		trustedProxies = strings.Split(tp, ",")

@@ -310,6 +310,27 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 	return nets, relaxed, nil
 }
 
+// categorizeRelaxed examines the relaxed entries and returns whether they contain
+// public /29 prefixes or ULA prefixes. Used to word warnings precisely.
+func categorizeRelaxed(relaxed []string) (hasPublic bool, hasULA bool) {
+	for _, s := range relaxed {
+		prefix, err := netip.ParsePrefix(s)
+		if err != nil {
+			continue
+		}
+		addr := prefix.Addr()
+		if addr.Is6() {
+			// Check if this is a ULA prefix (starts with fc or fd)
+			if addr.As16()[0] == 0xfc || addr.As16()[0] == 0xfd {
+				hasULA = true
+			} else {
+				hasPublic = true
+			}
+		}
+	}
+	return
+}
+
 // LimiterManager manages multiple rate limiters with proper lifecycle and pruning.
 type LimiterManager struct {
 	msgLim        *msg.Limiter

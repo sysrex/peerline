@@ -200,7 +200,16 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 		if cfg.AllowBroadIPv6 {
 			if len(relaxed) > 0 {
 				cfg.Logger.Info("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD accepted entries that would have been rejected", "relaxed", strings.Join(relaxed, ", "))
-				cfg.Logger.Warn("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /29 lets anyone inside it spoof X-Forwarded-For; ULA (fc00::/7) ranges are also permitted and exempt from the /32 floor")
+				hasPublic, hasULA := categorizeRelaxed(relaxed)
+				var warnMsg string
+				if hasPublic && hasULA {
+					warnMsg = "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /29 lets anyone inside it spoof X-Forwarded-For; ULA (fc00::/7) ranges are also permitted and exempt from the /32 floor"
+				} else if hasPublic {
+					warnMsg = "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /29 lets anyone inside it spoof X-Forwarded-For"
+				} else if hasULA {
+					warnMsg = "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: ULA (fc00::/7) ranges are permitted and exempt from the /32 floor"
+				}
+				cfg.Logger.Warn(warnMsg)
 			} else {
 				cfg.Logger.Warn("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled but no entries needed it; consider disabling")
 			}
@@ -232,6 +241,11 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 // BagLimits returns the effective bag storage caps for this server.
 func (s *Server) BagLimits() (maxBags int, maxBytes int64) {
 	return s.cfg.MaxBagsPerPeer, s.cfg.MaxBagBytesPerPeer
+}
+
+// ConfigAllowBroadIPv6 returns whether the server was configured with AllowBroadIPv6.
+func (s *Server) ConfigAllowBroadIPv6() bool {
+	return s.cfg.AllowBroadIPv6
 }
 
 // Stop gracefully stops background tasks.

@@ -827,6 +827,15 @@ func TestFailedAuthKeyingUsesClientIP(t *testing.T) {
 	if status := makeAuthReq(xffD...); status != 429 {
 		t.Errorf("client D req 1 (same rightmost untrusted): got %d, want 429 (proves leftmost is ignored)", status)
 	}
+
+	// Forged-leftmost case that lands in client A's bucket (P3 #3)
+	// XFF [198.51.100.9, 203.0.113.60, 127.0.0.2]
+	// Walk right-to-left: 127.0.0.2 (trusted), 203.0.113.60 (untrusted → use this)
+	// Same rightmost untrusted as client A → same bucket → already exhausted
+	xffForged := []string{"198.51.100.9, 203.0.113.60, 127.0.0.2"}
+	if status := makeAuthReq(xffForged...); status != 429 {
+		t.Errorf("forged-leftmost landing in A's bucket: got %d, want 429 (proves A's bucket is exhausted)", status)
+	}
 }
 
 // TestPairingAcceptKeyingUsesClientIP verifies that unauthenticated pairing token checks
@@ -1291,47 +1300,68 @@ func TestIPv6FloorWithOptIn(t *testing.T) {
 }
 
 func TestAllowBroadIPv6Warning(t *testing.T) {
-	st, err := store.Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name           string
+		trustedProxies []string
+		wantPublic     bool
+		wantULA        bool
+	}{
+		{
+			name:           "both public and ULA",
+			trustedProxies: []string{"2a06:98c0::/29", "fd00::/8"},
+			wantPublic:     true,
+			wantULA:        true,
+		},
+		{
+			name:           "public only",
+			trustedProxies: []string{"2a06:98c0::/29", "2001:db8::/32"},
+			wantPublic:     true,
+			wantULA:        false,
+		},
+		{
+			name:           "ULA only",
+			trustedProxies: []string{"fd00::/8", "fc00::/7"},
+			wantPublic:     false,
+			wantULA:        true,
+		},
 	}
-	t.Cleanup(func() { st.Close() })
-	var logs bytes.Buffer
-	srv := mustNew(t, st, Config{
-		TrustedProxies: []string{"2a06:98c0::/29", "fd00::/8"},
-		AllowBroadIPv6: true,
-		Logger:         slog.New(slog.NewTextHandler(&logs, nil)),
-	})
-	t.Cleanup(srv.lim.Stop)
 
-	logOutput := logs.String()
-	if !strings.Contains(logOutput, "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled") {
-		t.Errorf("expected warning about ALLOW_BROAD, got logs: %q", logOutput)
-	}
-	if !strings.Contains(logOutput, "spoof X-Forwarded-For") {
-		t.Errorf("expected security warning about spoofing, got logs: %q", logOutput)
-	}
-	if !strings.Contains(logOutput, "ULA (fc00::/7)") {
-		t.Errorf("expected warning to mention ULA exemption, got logs: %q", logOutput)
-	}
-	// Check that the relaxed log line contains both entries (not just the "trusted proxy networks configured" line)
-	lines := strings.Split(logOutput, "\n")
-	var relaxedLine string
-	for _, line := range lines {
-		if strings.Contains(line, "relaxed=") {
-			relaxedLine = line
-			break
-		}
-	}
-	if relaxedLine == "" {
-		t.Errorf("expected log line with relaxed= attribute, got logs: %q", logOutput)
-	} else {
-		if !strings.Contains(relaxedLine, "2a06:98c0::/29") {
-			t.Errorf("expected relaxed log line to list 2a06:98c0::/29, got: %q", relaxedLine)
-		}
-		if !strings.Contains(relaxedLine, "fd00::/8") {
-			t.Errorf("expected relaxed log line to list fd00::/8, got: %q", relaxedLine)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st, err := store.Open(":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			var logs bytes.Buffer
+			srv := mustNew(t, st, Config{
+				TrustedProxies: tt.trustedProxies,
+				AllowBroadIPv6: true,
+				Logger:         slog.New(slog.NewTextHandler(&logs, nil)),
+			})
+			defer srv.lim.Stop()
+
+			logOutput := logs.String()
+			if !strings.Contains(logOutput, "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled") {
+				t.Errorf("expected warning about ALLOW_BROAD, got logs: %q", logOutput)
+			}
+
+			hasPublicMsg := strings.Contains(logOutput, "trusting a public /29 lets anyone inside it spoof X-Forwarded-For")
+			hasULAMsg := strings.Contains(logOutput, "ULA (fc00::/7)")
+
+			if tt.wantPublic && !hasPublicMsg {
+				t.Errorf("expected public /29 warning in logs: %q", logOutput)
+			}
+			if !tt.wantPublic && hasPublicMsg {
+				t.Errorf("unexpected public /29 warning (no public relaxed entries) in logs: %q", logOutput)
+			}
+			if tt.wantULA && !hasULAMsg {
+				t.Errorf("expected ULA warning in logs: %q", logOutput)
+			}
+			if !tt.wantULA && hasULAMsg {
+				t.Errorf("unexpected ULA warning (no ULA relaxed entries) in logs: %q", logOutput)
+			}
+		})
 	}
 }
 
