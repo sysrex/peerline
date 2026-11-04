@@ -146,6 +146,41 @@ func (s *Server) claimStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"public_id": c.PublicID, "state": c.State})
 }
 
+// buildInviterViewJSON builds the JSON representation of a claimed invite for the inviter,
+// including claimant details, offer_digest, the offered scopes/bags in both directions,
+// and (for claimed state only) any existing grants being replaced. Used by both GET
+// /v1/invites/{public_id} and the 409 stale-digest response.
+func (s *Server) buildInviterViewJSON(c *ClaimInvite) map[string]any {
+	out := map[string]any{
+		"public_id":    c.PublicID,
+		"state":        c.State,
+		"claimant":     map[string]any{"peer_id": c.Claimant, "untrusted": map[string]string{"name": sanitizeInviterName(c.ClaimantName)}},
+		"offer_digest": s.offerDigest(c),
+		"offer": map[string]any{
+			"inviter_to_claimant": map[string]any{"scopes": c.Scopes, "bags": c.Bags},
+			"claimant_to_inviter": map[string]any{"scopes": c.BackScopes, "bags": c.BackBags},
+		},
+	}
+	// Show replaces only for claimed invites (not active), since after activation it would show the just-written grants
+	if c.State == store.ClaimClaimed && c.Replaces != nil {
+		replaces := map[string]any{}
+		if c.Replaces.InviterToClaimant != nil {
+			replaces["inviter_to_claimant"] = map[string]any{
+				"scopes": c.Replaces.InviterToClaimant.Scopes,
+				"bags":   c.Replaces.InviterToClaimant.Bags,
+			}
+		}
+		if c.Replaces.ClaimantToInviter != nil {
+			replaces["claimant_to_inviter"] = map[string]any{
+				"scopes": c.Replaces.ClaimantToInviter.Scopes,
+				"bags":   c.Replaces.ClaimantToInviter.Bags,
+			}
+		}
+		out["replaces"] = replaces
+	}
+	return out
+}
+
 // inviteView never includes the code: the inviter must obtain it from the claimant's owner.
 func (s *Server) inviteView(w http.ResponseWriter, r *http.Request) {
 	c, err := s.claims.InviterView(r.Context(), r.PathValue("public_id"), auth.PeerID(r.Context()))
@@ -154,30 +189,7 @@ func (s *Server) inviteView(w http.ResponseWriter, r *http.Request) {
 	}
 	out := map[string]any{"public_id": c.PublicID, "state": c.State}
 	if c.Claimant != "" {
-		out["claimant"] = map[string]any{"peer_id": c.Claimant, "untrusted": map[string]string{"name": sanitizeInviterName(c.ClaimantName)}}
-		out["offer_digest"] = s.offerDigest(c)
-		// Show the offered scopes/bags in both directions so the inviter can review what confirm will write
-		out["offer"] = map[string]any{
-			"inviter_to_claimant": map[string]any{"scopes": c.Scopes, "bags": c.Bags},
-			"claimant_to_inviter": map[string]any{"scopes": c.BackScopes, "bags": c.BackBags},
-		}
-		// Show replaces only for claimed invites (not active), since after activation it would show the just-written grants
-		if c.State == store.ClaimClaimed && c.Replaces != nil {
-			replaces := map[string]any{}
-			if c.Replaces.InviterToClaimant != nil {
-				replaces["inviter_to_claimant"] = map[string]any{
-					"scopes": c.Replaces.InviterToClaimant.Scopes,
-					"bags":   c.Replaces.InviterToClaimant.Bags,
-				}
-			}
-			if c.Replaces.ClaimantToInviter != nil {
-				replaces["claimant_to_inviter"] = map[string]any{
-					"scopes": c.Replaces.ClaimantToInviter.Scopes,
-					"bags":   c.Replaces.ClaimantToInviter.Bags,
-				}
-			}
-			out["replaces"] = replaces
-		}
+		out = s.buildInviterViewJSON(c)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -245,36 +257,8 @@ func (s *Server) confirmClaim(w http.ResponseWriter, r *http.Request) {
 	// Handle stale digest (does not count toward failures)
 	if state == claimStateClaimed && freshClaim != nil {
 		s.log.Info("invite_confirm_stale_digest", "public_id", pub, "inviter", auth.PeerID(r.Context()))
-		resp := map[string]any{
-			"error":        "offer changed: GET /v1/invites/{public_id} for current offer_digest",
-			"state":        state,
-			"public_id":    freshClaim.PublicID,
-			"offer_digest": s.offerDigest(freshClaim),
-			"claimant": map[string]any{
-				"peer_id":   freshClaim.Claimant,
-				"untrusted": map[string]string{"name": sanitizeInviterName(freshClaim.ClaimantName)},
-			},
-			"offer": map[string]any{
-				"inviter_to_claimant": map[string]any{"scopes": freshClaim.Scopes, "bags": freshClaim.Bags},
-				"claimant_to_inviter": map[string]any{"scopes": freshClaim.BackScopes, "bags": freshClaim.BackBags},
-			},
-		}
-		if freshClaim.Replaces != nil {
-			replaces := map[string]any{}
-			if freshClaim.Replaces.InviterToClaimant != nil {
-				replaces["inviter_to_claimant"] = map[string]any{
-					"scopes": freshClaim.Replaces.InviterToClaimant.Scopes,
-					"bags":   freshClaim.Replaces.InviterToClaimant.Bags,
-				}
-			}
-			if freshClaim.Replaces.ClaimantToInviter != nil {
-				replaces["claimant_to_inviter"] = map[string]any{
-					"scopes": freshClaim.Replaces.ClaimantToInviter.Scopes,
-					"bags":   freshClaim.Replaces.ClaimantToInviter.Bags,
-				}
-			}
-			resp["replaces"] = replaces
-		}
+		resp := s.buildInviterViewJSON(freshClaim)
+		resp["error"] = "offer changed: GET /v1/invites/{public_id} for current offer_digest"
 		writeJSON(w, http.StatusConflict, resp)
 		return
 	}
