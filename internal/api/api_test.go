@@ -2933,7 +2933,7 @@ func TestRecipientLimitRefundDeleteFailure(t *testing.T) {
 	cfg.Clock = clocktest.New(frozenTime)
 
 	dbPath := t.TempDir() + "/t.db"
-	st, err := store.Open(dbPath)
+	st, err := store.OpenWithOptions(dbPath, store.OpenOptions{Clock: clocktest.New(frozenTime)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2980,17 +2980,26 @@ func TestRecipientLimitRefundDeleteFailure(t *testing.T) {
 
 	// Launch 2 concurrent requests to same@example.com
 	// Both pass Ready together, one Allow succeeds, the other hits rcptLim failure with refund
-	results := make(chan int, concurrent)
+	type result struct {
+		status     int
+		body       []byte
+		retryAfter string
+	}
+	results := make(chan result, concurrent)
 	var wg sync.WaitGroup
 	for i := 0; i < concurrent; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			resp, _ := alice.do("POST", "/v1/invites", map[string]any{
+			resp, body := alice.do("POST", "/v1/invites", map[string]any{
 				"to_email": "same@example.com",
 				"scopes":   []string{"messages"},
 			}, nil)
-			results <- resp.StatusCode
+			results <- result{
+				status:     resp.StatusCode,
+				body:       body,
+				retryAfter: resp.Header.Get("Retry-After"),
+			}
 		}()
 	}
 	wg.Wait()
@@ -3000,13 +3009,17 @@ func TestRecipientLimitRefundDeleteFailure(t *testing.T) {
 	armed.Store(false)
 
 	var created, failed int
-	for status := range results {
-		if status == http.StatusCreated {
+	var failureBody string
+	var failureRetryAfter string
+	for r := range results {
+		if r.status == http.StatusCreated {
 			created++
-		} else if status == http.StatusInternalServerError {
+		} else if r.status == http.StatusInternalServerError {
 			failed++
+			failureBody = string(r.body)
+			failureRetryAfter = r.retryAfter
 		} else {
-			t.Errorf("unexpected status: %d", status)
+			t.Errorf("unexpected status: %d", r.status)
 		}
 	}
 
@@ -3016,6 +3029,17 @@ func TestRecipientLimitRefundDeleteFailure(t *testing.T) {
 	}
 	if failed != 1 {
 		t.Errorf("delete failures: %d, want 1", failed)
+	}
+
+	// Verify 500 response has generic error body, no trigger text, no Retry-After
+	if !strings.Contains(failureBody, "internal error") {
+		t.Errorf("500 body should contain 'internal error', got: %s", failureBody)
+	}
+	if strings.Contains(failureBody, "trigger") || strings.Contains(failureBody, "ABORT") {
+		t.Errorf("500 body leaked internal details: %s", failureBody)
+	}
+	if failureRetryAfter != "" {
+		t.Errorf("500 should not have Retry-After header, got: %s", failureRetryAfter)
 	}
 
 	// Verify exactly one email sent to same@example.com
@@ -3058,9 +3082,15 @@ func TestRecipientLimitRefundDeleteFailure(t *testing.T) {
 	if err := json.Unmarshal(b, &listResp); err != nil {
 		t.Fatal(err)
 	}
+	if len(listResp.Invites) != 2 {
+		t.Errorf("list should show 2 invites before revoke, got %d", len(listResp.Invites))
+	}
 	for _, inv := range listResp.Invites {
 		if orphanID, ok := inv["public_id"].(string); ok {
-			alice.do("DELETE", "/v1/invites/"+orphanID, nil, nil)
+			resp, b := alice.do("DELETE", "/v1/invites/"+orphanID, nil, nil)
+			if resp.StatusCode != http.StatusNoContent {
+				t.Errorf("DELETE orphan: expected 204, got %d: %s", resp.StatusCode, b)
+			}
 		}
 	}
 
