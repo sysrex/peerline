@@ -2903,7 +2903,7 @@ func TestSanitizeInviterName(t *testing.T) {
 		},
 		{
 			name:  "Tamil pulli: many word-final viramas",
-			input: strings.Repeat("ம் ", 40), // 40 Tamil words ending in pulli
+			input: strings.Repeat("ம் ", 40),                                        // 40 Tamil words ending in pulli
 			want:  "ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம்", // 62 runes, keeps words
 		},
 		{
