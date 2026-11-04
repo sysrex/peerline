@@ -2505,41 +2505,26 @@ func TestConcurrentInviteCapRacePairing(t *testing.T) {
 
 // TestReadyAllowRaceSharedRecipient verifies the Ready→Allow race with concurrent requests to the same recipient.
 // Ready does not consume tokens, so multiple requests can pass Ready together, but only the first Allow succeeds.
-// The test uses a frozen clock to verify that losers of the rcptLim race get their mailLim tokens refunded.
-//
-// Limitation: The race window is narrow. Losers often fail at rcptLim.Ready (line 760) before calling mailLim.Allow,
-// so the Refund path (line 765) is rarely exercised. In testing with the Refund line commented out, the test passed
-// 100% of runs (0 failures in 350+ iterations), indicating the window is rarely hit in practice. The test still
-// provides value by verifying the budget accounting when the refund does execute, and documents the intended behavior.
+// The test uses a frozen clock and a test seam (testAfterEmailReadyHook) to deterministically verify that losers
+// of the rcptLim race get their mailLim tokens refunded.
 func TestReadyAllowRaceSharedRecipient(t *testing.T) {
 	frozenTime := time.Unix(1000000000, 0)
 	cfg := Config{}
 	cfg.MaxOutstandingInvites = 20
 	cfg.EmailPerHour = 10
-	cfg.EmailBurst = 10 // Higher burst to increase chance of hitting the window
+	cfg.EmailBurst = 10
 	cfg.EmailRcptPerHour = 1
 	cfg.Now = func() time.Time { return frozenTime }
 
-	st, err := store.Open(t.TempDir() + "/t.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-
-	prepareTestConfig(t, st, &cfg)
-	rawSrv, err := New(st, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(rawSrv.Handler())
-	defer srv.Close()
-
+	srv, rawSrv, _, db := newServerWithDB(t, cfg)
 	alice := register(t, srv, "Alice")
 
-	const concurrent = 10 // More goroutines to increase race window probability
+	const concurrent = 10
 	sharedRecipient := "shared@example.com"
 	barrier := newBarrier(t, concurrent, 5*time.Second)
-	rawSrv.testInviteCreatedHook = func(peerID string) {
+	
+	// Use testAfterEmailReadyHook to synchronize after Ready checks, before Allow calls
+	rawSrv.testAfterEmailReadyHook = func(peerID string) {
 		barrier()
 	}
 
@@ -2578,7 +2563,19 @@ func TestReadyAllowRaceSharedRecipient(t *testing.T) {
 		t.Errorf("concurrent rejects: %d, want %d", rejected, concurrent-1)
 	}
 
-	rawSrv.testInviteCreatedHook = nil
+	rawSrv.testAfterEmailReadyHook = nil
+
+	// Verify exactly 1 invite exists (the others were cleaned up during rejection)
+	var inviteCount int
+	err := db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL`,
+		alice.id).Scan(&inviteCount)
+	if err != nil {
+		t.Fatalf("count invites: %v", err)
+	}
+	if inviteCount != 1 {
+		t.Errorf("invite count: %d, want 1 (others should be cleaned up)", inviteCount)
+	}
 
 	// Verify sender budget was refunded: with EmailBurst=10 and 1 consumed, alice should send 9 more
 	// invites to distinct recipients (total 10 consumed), then the 11th should fail at 429.
