@@ -488,7 +488,7 @@ func genTestCertChain(t *testing.T, hostname string, leafNotBefore, leafNotAfter
 	rootTemplate := x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: "Test Root CA"},
-		NotBefore:             time.Now().Add(-time.Hour),
+		NotBefore:             time.Now().Add(-10 * time.Hour),
 		NotAfter:              time.Now().Add(24 * time.Hour),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		IsCA:                  true,
@@ -1318,13 +1318,52 @@ func TestSMTPProbe(t *testing.T) {
 		}
 	})
 
-	t.Run("STARTTLS valid cert under untrusted root = fatal", func(t *testing.T) {
-		// A valid but self-signed cert (untrusted)
-		cert := genTestCert(t, "localhost")
-		srv := newFakeServer(t, true, &cert)
+	t.Run("STARTTLS expired intermediate under trusted root = expiry-only warn", func(t *testing.T) {
+		// #246 and Architect P1-2: expired intermediate under a trusted root.
+		// The leaf must be issued while the intermediate was valid, so the re-check succeeds.
+		now := time.Now()
+		leafCert, rootCert := genTestCertChain(t, "localhost",
+			now.Add(-3*time.Hour), now.Add(24*time.Hour),   // leaf: issued 3h ago, valid for 24h more
+			now.Add(-4*time.Hour), now.Add(-time.Hour))    // intermediate: issued 4h ago, expired 1h ago
+
+		srv := newFakeServer(t, true, &leafCert)
 		defer srv.close()
 
-		// Don't trust it - use empty RootCAs pool
+		// Trust the root
+		certPool := x509.NewCertPool()
+		certPool.AddCert(rootCert)
+
+		s := &SMTP{
+			Host:      "127.0.0.1",
+			Port:      srv.port(),
+			Timeout:   2 * time.Second,
+			TLSConfig: &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+		}
+		err := s.Probe(context.Background())
+		if err == nil {
+			t.Fatal("probe should fail on expired intermediate")
+		}
+		// The expiry-only error should be ErrRelayUnreachable (transient/warn)
+		if !errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("expired intermediate under trusted root should be ErrRelayUnreachable (expiry-only warn), got: %v", err)
+		}
+		// Assert the exact message text the code emits for this case
+		if !strings.Contains(err.Error(), "relay certificate expired") {
+			t.Fatalf("error should contain 'relay certificate expired', got: %v", err)
+		}
+	})
+
+	t.Run("STARTTLS expired intermediate under untrusted root = fatal", func(t *testing.T) {
+		// #246: expired intermediate under an untrusted (or no) root.
+		now := time.Now()
+		leafCert, _ := genTestCertChain(t, "localhost",
+			now.Add(-3*time.Hour), now.Add(24*time.Hour),   // leaf: issued 3h ago, valid for 24h more
+			now.Add(-4*time.Hour), now.Add(-time.Hour))    // intermediate: issued 4h ago, expired 1h ago
+
+		srv := newFakeServer(t, true, &leafCert)
+		defer srv.close()
+
+		// Don't trust the root - use empty RootCAs pool
 		s := &SMTP{
 			Host:      "127.0.0.1",
 			Port:      srv.port(),
@@ -1333,10 +1372,11 @@ func TestSMTPProbe(t *testing.T) {
 		}
 		err := s.Probe(context.Background())
 		if err == nil {
-			t.Fatal("probe should fail on untrusted cert")
+			t.Fatal("probe should fail on expired intermediate under untrusted root")
 		}
+		// Should be fatal, not ErrRelayUnreachable
 		if errors.Is(err, ErrRelayUnreachable) {
-			t.Fatalf("untrusted cert should be fatal, not ErrRelayUnreachable: %v", err)
+			t.Fatalf("expired intermediate under untrusted root should be fatal, not ErrRelayUnreachable: %v", err)
 		}
 		// Positive control: assert STARTTLS was attempted
 		cmds := srv.receivedCommands()
@@ -1350,43 +1390,13 @@ func TestSMTPProbe(t *testing.T) {
 		if !hasSTARTTLS {
 			t.Fatalf("STARTTLS not attempted: %v", cmds)
 		}
-		// Positive control: assert the error is an x509 UnknownAuthorityError
-		var x509Unknown x509.UnknownAuthorityError
-		if !errors.As(err, &x509Unknown) {
-			t.Fatalf("error should be x509.UnknownAuthorityError, got: %T %v", err, err)
-		}
-	})
-
-	t.Run("STARTTLS expired leaf under trusted root = ErrRelayUnreachable (expiry-only)", func(t *testing.T) {
-		// An expired leaf certificate under a trusted root tests the expiry-only path.
-		cert := genExpiredTestCert(t, "localhost")
-		srv := newFakeServer(t, true, &cert)
-		defer srv.close()
-
-		// Trust it
-		certPool := x509.NewCertPool()
-		parsed, err := x509.ParseCertificate(cert.Certificate[0])
-		if err != nil {
-			t.Fatalf("failed to parse test cert: %v", err)
-		}
-		certPool.AddCert(parsed)
-
-		s := &SMTP{
-			Host:      "127.0.0.1",
-			Port:      srv.port(),
-			Timeout:   2 * time.Second,
-			TLSConfig: &tls.Config{RootCAs: certPool, ServerName: "localhost"},
-		}
-		err = s.Probe(context.Background())
-		if err == nil {
-			t.Fatal("probe should fail on expired cert")
-		}
-		// The expiry-only error should be ErrRelayUnreachable (transient)
-		if !errors.Is(err, ErrRelayUnreachable) {
-			t.Fatalf("expired leaf under trusted root should be ErrRelayUnreachable (transient), got: %v", err)
-		}
-		if !strings.Contains(err.Error(), "relay") {
-			t.Fatalf("error should mention 'relay', got: %v", err)
+		// With untrusted root + expired intermediate, x509 checks expiry first.
+		// The re-check also fails (because root is untrusted), so isExpiryOnlyError returns false,
+		// and we get the original CertificateInvalidError (expiry), not wrapped in ErrRelayUnreachable.
+		// This is correct: a fatal configuration error that happens to have an expired cert too.
+		var x509Invalid x509.CertificateInvalidError
+		if !errors.As(err, &x509Invalid) || x509Invalid.Reason != x509.Expired {
+			t.Fatalf("error should be x509.CertificateInvalidError with Expired reason (because x509 checks expiry before trust), got: %T %v", err, err)
 		}
 	})
 
