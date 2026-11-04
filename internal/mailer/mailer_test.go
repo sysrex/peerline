@@ -198,6 +198,8 @@ func TestFromEnvRejectsBracketedHosts(t *testing.T) {
 		{"[]", "[]", "use a valid hostname or IP"},
 		{"[127.0.0.1]:587", "[127.0.0.1]:587", "use 127.0.0.1 with PEERLINE_SMTP_PORT=587"},
 		{"[127.0.0.1]", "[127.0.0.1]", "use 127.0.0.1"},
+		{"[[::1]]", "[[::1]]", "use a valid hostname or IP"},
+		{"[::1]]", "[::1]]", "use a valid hostname or IP"},
 	}
 
 	for _, tt := range tests {

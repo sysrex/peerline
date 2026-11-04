@@ -142,8 +142,13 @@ func FromEnv(lg *slog.Logger) (Sender, error) {
 		if bareHost, port, err := net.SplitHostPort(host); err == nil {
 			suggested = fmt.Sprintf("use %s with PEERLINE_SMTP_PORT=%s", bareHost, port)
 		} else if len(host) > 2 && host[0] == '[' && host[len(host)-1] == ']' {
-			// Exactly [addr] format
-			suggested = fmt.Sprintf("use %s", host[1:len(host)-1])
+			// Exactly [addr] format - but check inner value doesn't contain brackets
+			inner := host[1 : len(host)-1]
+			if strings.Contains(inner, "[") || strings.Contains(inner, "]") {
+				suggested = "use a valid hostname or IP"
+			} else {
+				suggested = fmt.Sprintf("use %s", inner)
+			}
 		} else {
 			// Malformed brackets
 			suggested = "use a valid hostname or IP"
