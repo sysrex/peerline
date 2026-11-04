@@ -6,24 +6,26 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/sysrex/peerline/internal/clock/clocktest"
 )
 
 const claimNow = int64(2_000_000)
 
-func claimStore(t *testing.T) *Store {
+func claimStore(t *testing.T) (*Store, *clocktest.Fake) {
 	t.Helper()
-	s, err := Open(":memory:")
+	clk := clocktest.New(time.Unix(claimNow, 0))
+	s, err := OpenWithOptions(":memory:", OpenOptions{Clock: clk})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { s.Close() })
-	s.now = func() int64 { return claimNow }
 	for _, id := range []string{"alice", "bob", "carol"} {
 		if err := s.CreatePeer(context.Background(), id, id, "h"+id, "", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
-	return s
+	return s, clk
 }
 
 func (s *Store) mustExec(t *testing.T, q string, args ...any) {
@@ -44,7 +46,7 @@ func TestLegacyAcceptPathsGatedOnClaimState(t *testing.T) {
 	}
 	for name, set := range states {
 		t.Run(name, func(t *testing.T) {
-			s := claimStore(t)
+			s, _ := claimStore(t)
 			exp := time.Unix(claimNow+3600, 0)
 			if err := s.CreateInviteWithPairing(ctx, "code", "pair", "alice", []string{"messages"}, nil, exp); err != nil {
 				t.Fatal(err)
@@ -79,7 +81,7 @@ func TestLegacyAcceptPathsGatedOnClaimState(t *testing.T) {
 }
 
 func TestInviteChecksRejectBadStates(t *testing.T) {
-	s := claimStore(t)
+	s, _ := claimStore(t)
 	if err := s.CreateInvite(context.Background(), "x", "alice", nil, nil, time.Unix(claimNow+60, 0)); err != nil {
 		t.Fatal(err)
 	}
@@ -103,14 +105,14 @@ func TestInviteChecksRejectBadStates(t *testing.T) {
 // A claim made just before expires_at stays visible, counted and unpurged until confirm_by (#70).
 func TestClaimedInviteLivesUntilConfirmBy(t *testing.T) {
 	ctx := context.Background()
-	s := claimStore(t)
+	s, clk := claimStore(t)
 	if err := s.CreateInvite(ctx, "x", "alice", []string{"messages"}, nil, time.Unix(claimNow+60, 0)); err != nil {
 		t.Fatal(err)
 	}
 	confirmBy := claimNow + 60 + 86400
 	s.mustExec(t, `UPDATE invites SET claimed_by='carol', confirm_by=?`, confirmBy)
 
-	at := func(ts int64) { s.now = func() int64 { return ts } }
+	at := func(ts int64) { clk.Set(time.Unix(ts, 0)) }
 	state := func() (count, listed, purged int) {
 		count, _ = s.CountOutstandingInvites(ctx, "alice")
 		l, _ := s.ListInvitesByPeer(ctx, "alice", 50, 0)
@@ -138,12 +140,12 @@ func TestClaimedInviteLivesUntilConfirmBy(t *testing.T) {
 // The invite cap counts claimed-unexpired invites (#70).
 func TestInviteCapCountsClaimed(t *testing.T) {
 	ctx := context.Background()
-	s := claimStore(t)
+	s, clk := claimStore(t)
 	if _, err := s.CreateInviteAtomic(ctx, "x", "alice", nil, nil, time.Unix(claimNow+60, 0), 1); err != nil {
 		t.Fatal(err)
 	}
 	s.mustExec(t, `UPDATE invites SET claimed_by='carol', confirm_by=?`, claimNow+86400)
-	s.now = func() int64 { return claimNow + 120 }
+	clk.Set(time.Unix(claimNow + 120, 0))
 	if _, err := s.CreateInviteAtomic(ctx, "y", "alice", nil, nil, time.Unix(claimNow+9999, 0), 1); !errors.Is(err, ErrTooManyInvites) {
 		t.Fatalf("cap bypassed by claimed invite: %v", err)
 	}
@@ -152,7 +154,7 @@ func TestInviteCapCountsClaimed(t *testing.T) {
 // Peers created by an unconfirmed claim are purged only while they own nothing (#74).
 func TestPurgeOrphanClaimPeers(t *testing.T) {
 	ctx := context.Background()
-	s := claimStore(t)
+	s, _ := claimStore(t)
 	for _, id := range []string{"orphan", "granted", "messaged"} {
 		s.mustExec(t, `INSERT INTO peers(id,name,key_hash,created_at,created_via_invite) VALUES(?,?,?,?,1)`, id, id, "h"+id, claimNow-3600)
 	}

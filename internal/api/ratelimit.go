@@ -291,9 +291,9 @@ const (
 )
 
 // NewLimiterManager creates and starts a new limiter manager.
-func NewLimiterManager(cfg Config) *LimiterManager {
+func NewLimiterManager(cfg Config, nowFn func() time.Time) *LimiterManager {
 	ctx, cancel := context.WithCancel(context.Background())
-	clk := msg.WithClock(cfg.Now)
+	clk := msg.WithClock(nowFn)
 	lm := &LimiterManager{
 		msgLim:        msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst, clk),
 		regLim:        msg.NewLimiter(10, 5, clk),

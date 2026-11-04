@@ -24,6 +24,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/sysrex/peerline/internal/auth"
+	"github.com/sysrex/peerline/internal/clock/clocktest"
 	"github.com/sysrex/peerline/internal/store"
 	"golang.org/x/text/unicode/norm"
 )
@@ -1971,7 +1972,7 @@ func TestLimiterManagerStops(t *testing.T) {
 		NotifyPerHour:    10,
 		NotifyBurst:      5,
 	}
-	mgr := NewLimiterManager(cfg)
+	mgr := NewLimiterManager(cfg, time.Now)
 
 	// Let it run a bit
 	time.Sleep(100 * time.Millisecond)
@@ -2964,30 +2965,24 @@ func FuzzSanitizeInviterName(f *testing.F) {
 	})
 }
 
-// TestAPIClock verifies that api.Server.now is used in createInvite.
-// Note: the API clock (Server.now, time.Time) and the store clock (Store.now, int64)
-// are independent and can disagree; this test only fakes the API clock.
+// TestAPIClock verifies that api.Server.clk is used in createInvite.
 func TestAPIClock(t *testing.T) {
+	fixedTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	clk := clocktest.New(fixedTime)
+
 	st, err := store.Open(t.TempDir() + "/t.db")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
 
-	bareCfg := Config{}
+	bareCfg := Config{Clock: clk}
 	prepareTestConfig(t, st, &bareCfg)
 	srv, err := New(st, bareCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer srv.Stop()
-
-	// Stub the clock and verify non-nil default
-	if srv.now == nil {
-		t.Fatal("New() should set non-nil default clock")
-	}
-	fixedTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return fixedTime }
 
 	// Create test server and client
 	testSrv := httptest.NewServer(srv.Handler())
@@ -3027,7 +3022,7 @@ func TestAPIClock(t *testing.T) {
 	}
 
 	// Boundary test: advance clock by 100 seconds and create another invite
-	srv.now = func() time.Time { return fixedTime.Add(100 * time.Second) }
+	clk.Advance(100 * time.Second)
 	resp, body = c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	if err := json.Unmarshal(body, &inv); err != nil {
@@ -3294,25 +3289,16 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 // TestInviteAccept405Comprehensive covers all the edge cases from issue #146 and #174.
 func TestInviteAccept405Comprehensive(t *testing.T) {
 	// Use fake clock to control invite expiry deterministically
-	var mu sync.Mutex
-	now := time.Now()
-	fakeClock := func() time.Time {
-		mu.Lock()
-		defer mu.Unlock()
-		return now
-	}
-	fakeClockUnix := func() int64 {
-		return fakeClock().Unix()
-	}
+	clk := clocktest.New(time.Now())
 
 	// Open store with fake clock so expiry checks use it
-	st, err := store.OpenWithOptions(t.TempDir()+"/t.db", store.OpenOptions{Now: fakeClockUnix})
+	st, err := store.OpenWithOptions(t.TempDir()+"/t.db", store.OpenOptions{Clock: clk})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
 
-	cfg := Config{Now: fakeClock}
+	cfg := Config{Clock: clk}
 	prepareTestConfig(t, st, &cfg)
 	apiSrv, err := New(st, cfg)
 	if err != nil {
@@ -3338,12 +3324,12 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
 	want(t, resp, body, 201)
 	var inv3 struct{ Code string }
-	json.Unmarshal(body, &inv3)
+	if err := json.Unmarshal(body, &inv3); err != nil || inv3.Code == "" {
+		t.Fatalf("inv3: %v, code=%q", err, inv3.Code)
+	}
 	// Advance clock past inv3's expiry (1 second TTL). The store uses the same
 	// fake clock, so POST ?code= will see it as expired.
-	mu.Lock()
-	now = now.Add(2 * time.Second)
-	mu.Unlock()
+	clk.Advance(2 * time.Second)
 
 	// Use inv2
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
@@ -3519,25 +3505,75 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 		t.Errorf("bad code landing: %s", body)
 	}
 
-	// Test 10: POST ?code= for expired and missing codes return identical 404 (no oracle)
-	resp, body = b.do("POST", "/v1/invites/accept?code="+inv3.Code, nil, nil)
-	want(t, resp, body, 404)
-	expiredBody404 := body
-	expiredHdr404 := resp.Header
-
-	resp, body = b.do("POST", "/v1/invites/accept?code="+missingCode, nil, nil)
-	want(t, resp, body, 404)
-	missingBody404 := body
-	missingHdr404 := resp.Header
-
-	if !bytes.Equal(expiredBody404, missingBody404) {
-		t.Errorf("POST 404 body differs:\nexpired: %s\nmissing: %s", expiredBody404, missingBody404)
+	// Test 10: Expired vs missing code: no oracle (issue #305)
+	// Create two invites with 1s TTL for expiry testing
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
+	want(t, resp, body, 201)
+	var inv4 struct{ Code string }
+	if err := json.Unmarshal(body, &inv4); err != nil || inv4.Code == "" {
+		t.Fatalf("inv4: %v, code=%q", err, inv4.Code)
 	}
-	for _, h := range []string{"Content-Type", "Deprecation", "Link", "Cache-Control"} {
-		if expiredHdr404.Get(h) != missingHdr404.Get(h) {
-			t.Errorf("POST 404 header %s differs: expired=%q missing=%q",
-				h, expiredHdr404.Get(h), missingHdr404.Get(h))
-		}
+
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
+	want(t, resp, body, 201)
+	var inv5 struct{ Code string }
+	if err := json.Unmarshal(body, &inv5); err != nil || inv5.Code == "" {
+		t.Fatalf("inv5: %v, code=%q", err, inv5.Code)
+	}
+
+	// Positive control: inv4 is accepted before expiry
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv4.Code}, nil)
+	want(t, resp, body, 200)
+
+	// Advance clock well past TTL (TTL + 1h) to expire inv5
+	clk.Advance(1*time.Second + 1*time.Hour)
+
+	// Compare expired vs missing for both forms: ?code= and body-only
+	for _, tc := range []struct {
+		name string
+		do   func(code string) (*http.Response, []byte)
+	}{
+		{"POST ?code=", func(code string) (*http.Response, []byte) {
+			return b.do("POST", "/v1/invites/accept?code="+code, nil, nil)
+		}},
+		{"POST body", func(code string) (*http.Response, []byte) {
+			return b.do("POST", "/v1/invites/accept", map[string]any{"code": code}, nil)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Expired code
+			respExp, bodyExp := tc.do(inv5.Code)
+			want(t, respExp, bodyExp, 404)
+
+			// Missing code
+			respMiss, bodyMiss := tc.do(missingCode)
+			want(t, respMiss, bodyMiss, 404)
+
+			// Bodies must be identical
+			if !bytes.Equal(bodyExp, bodyMiss) {
+				t.Errorf("404 body differs:\nexpired: %s\nmissing: %s", bodyExp, bodyMiss)
+			}
+
+			// Compare all headers except Date (varies per request)
+			for k := range respExp.Header {
+				if k == "Date" {
+					continue // Date legitimately varies per request
+				}
+				if respExp.Header.Get(k) != respMiss.Header.Get(k) {
+					t.Errorf("header %s differs: expired=%q missing=%q",
+						k, respExp.Header.Get(k), respMiss.Header.Get(k))
+				}
+			}
+			for k := range respMiss.Header {
+				if k == "Date" {
+					continue
+				}
+				if respMiss.Header.Get(k) != respExp.Header.Get(k) {
+					t.Errorf("header %s differs: missing=%q expired=%q",
+						k, respMiss.Header.Get(k), respExp.Header.Get(k))
+				}
+			}
+		})
 	}
 
 	// Verify inv1 is still pending after all the above
@@ -3752,37 +3788,33 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 
 	// 14. 429 (rate limit) with ?code=: should have deprecation headers
 	// Use fake clock to control rate limiter refill deterministically
-	var mu429 sync.Mutex
-	now429 := time.Now()
-	fakeClock429 := func() time.Time {
-		mu429.Lock()
-		defer mu429.Unlock()
-		return now429
-	}
-	srvLimited := newServer(t, Config{WritePerMinute: 60, WriteBurst: 1, Now: fakeClock429})
+	clk429 := clocktest.New(time.Now())
+	srvLimited := newServer(t, Config{WritePerMinute: 60, WriteBurst: 1, Clock: clk429})
 	c := register(t, srvLimited, "charlie")
 	d := register(t, srvLimited, "dave")
 	respInv, bodyInv := c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, respInv, bodyInv, 201)
 	var inv4 struct{ Code string }
-	json.Unmarshal(bodyInv, &inv4)
+	if err := json.Unmarshal(bodyInv, &inv4); err != nil || inv4.Code == "" {
+		t.Fatalf("inv4: %v, code=%q", err, inv4.Code)
+	}
 	// Advance clock to allow rate limiter refill (60/min = 1 token per second)
-	mu429.Lock()
-	now429 = now429.Add(1100 * time.Millisecond)
-	mu429.Unlock()
+	clk429.Advance(1100 * time.Millisecond)
 	// Create another invite after bucket refill
 	respInv2, bodyInv2 := c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, respInv2, bodyInv2, 201)
 	var inv5 struct{ Code string }
-	json.Unmarshal(bodyInv2, &inv5)
+	if err := json.Unmarshal(bodyInv2, &inv5); err != nil || inv5.Code == "" {
+		t.Fatalf("inv5: %v, code=%q", err, inv5.Code)
+	}
 	// Create one more invite for body-only 429 test
-	mu429.Lock()
-	now429 = now429.Add(1100 * time.Millisecond)
-	mu429.Unlock()
+	clk429.Advance(1100 * time.Millisecond)
 	respInv3, bodyInv3 := c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, respInv3, bodyInv3, 201)
 	var inv6 struct{ Code string }
-	json.Unmarshal(bodyInv3, &inv6)
+	if err := json.Unmarshal(bodyInv3, &inv6); err != nil || inv6.Code == "" {
+		t.Fatalf("inv6: %v, code=%q", err, inv6.Code)
+	}
 	// Exhaust Dave's write rate limit by accepting first invite (uses burst token)
 	resp429, body429 := d.do("POST", "/v1/invites/accept?code="+inv4.Code, nil, nil)
 	want(t, resp429, body429, 200)
