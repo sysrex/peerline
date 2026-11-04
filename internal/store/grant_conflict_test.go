@@ -407,3 +407,197 @@ func TestSelfPairingStillReturnsError(t *testing.T) {
 		t.Fatalf("self-pairing: got %v, want ErrSelfPairing", err)
 	}
 }
+
+// TestExpiredInviteWithDifferentGrantReturns404 verifies that an expired invite
+// returns ErrNotFound (404), not ErrConflict (409), even when grants differ (#312).
+func TestExpiredInviteWithDifferentGrantReturns404(t *testing.T) {
+	ctx := context.Background()
+	clk := clocktest.New(time.Unix(1000000, 0))
+	s, err := OpenWithOptions(":memory:", OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create existing grant alice->bob with "messages"
+	code0 := "code0"
+	exp0 := clk.Now().Add(time.Hour)
+	if err := s.CreateInvite(ctx, code0, "alice", []string{"messages"}, nil, exp0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptInvite(ctx, code0, "bob", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Alice creates invite with different scope that expires in 1 hour
+	exp := clk.Now().Add(time.Hour)
+	code := "code1"
+	if err := s.CreateInvite(ctx, code, "alice", []string{"bags_read"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Advance clock past expiry
+	clk.Advance(2 * time.Hour)
+
+	// Bob tries to accept expired invite - should get ErrNotFound, not ErrConflict
+	_, err = s.AcceptInvite(ctx, code, "bob", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired invite with different grant: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestUsedInviteWithDifferentGrantReturns404 verifies that a used invite
+// returns ErrNotFound (404), not ErrConflict (409), even when grants differ (#312).
+func TestUsedInviteWithDifferentGrantReturns404(t *testing.T) {
+	ctx := context.Background()
+	clk := clocktest.New(time.Unix(1000000, 0))
+	s, err := OpenWithOptions(":memory:", OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "carol", "Carol", "hc", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Carol accepts first, getting grant with "messages"
+	code0 := "code0"
+	exp0 := clk.Now().Add(time.Hour)
+	if err := s.CreateInvite(ctx, code0, "alice", []string{"messages"}, nil, exp0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptInvite(ctx, code0, "carol", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Alice creates invite for Bob with "bags_read"
+	exp := clk.Now().Add(time.Hour)
+	code := "code1"
+	if err := s.CreateInvite(ctx, code, "alice", []string{"bags_read"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bob accepts it
+	if _, err := s.AcceptInvite(ctx, code, "bob", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Carol (who has different grant "messages") tries to accept the now-used invite
+	// Should get ErrNotFound, not ErrConflict
+	_, err = s.AcceptInvite(ctx, code, "carol", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("used invite with different grant: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestExpiredPairingTokenWithDifferentGrantReturns404 verifies that an expired
+// pairing token returns ErrNotFound (404), not ErrConflict (409), even when grants differ.
+func TestExpiredPairingTokenWithDifferentGrantReturns404(t *testing.T) {
+	ctx := context.Background()
+	clk := clocktest.New(time.Unix(1000000, 0))
+	s, err := OpenWithOptions(":memory:", OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create existing grant alice->bob with "messages"
+	code0 := "code0"
+	exp0 := clk.Now().Add(time.Hour)
+	if err := s.CreateInvite(ctx, code0, "alice", []string{"messages"}, nil, exp0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptInvite(ctx, code0, "bob", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Alice creates pairing invite with different scope that expires in 1 hour
+	exp := clk.Now().Add(time.Hour)
+	code := "code1"
+	pairingToken := "pair1"
+	if err := s.CreateInviteWithPairing(ctx, code, pairingToken, "alice", []string{"bags_read"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Advance clock past expiry
+	clk.Advance(2 * time.Hour)
+
+	// Bob tries to accept expired pairing token - should get ErrNotFound, not ErrConflict
+	_, err = s.AcceptInviteByPairingToken(ctx, pairingToken, "bob", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired pairing token with different grant: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestUsedPairingTokenWithDifferentGrantReturns404 verifies that a used pairing
+// token returns ErrNotFound (404), not ErrConflict (409), even when grants differ.
+func TestUsedPairingTokenWithDifferentGrantReturns404(t *testing.T) {
+	ctx := context.Background()
+	clk := clocktest.New(time.Unix(1000000, 0))
+	s, err := OpenWithOptions(":memory:", OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "carol", "Carol", "hc", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Carol accepts first, getting grant with "messages"
+	code0 := "code0"
+	exp0 := clk.Now().Add(time.Hour)
+	if err := s.CreateInvite(ctx, code0, "alice", []string{"messages"}, nil, exp0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptInvite(ctx, code0, "carol", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Alice creates pairing invite for Bob with "bags_read"
+	exp := clk.Now().Add(time.Hour)
+	code := "code1"
+	pairingToken := "pair1"
+	if err := s.CreateInviteWithPairing(ctx, code, pairingToken, "alice", []string{"bags_read"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bob accepts it
+	if _, err := s.AcceptInviteByPairingToken(ctx, pairingToken, "bob", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Carol (who has different grant "messages") tries to accept the now-used pairing token
+	// Should get ErrNotFound, not ErrConflict
+	_, err = s.AcceptInviteByPairingToken(ctx, pairingToken, "carol", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("used pairing token with different grant: got %v, want ErrNotFound", err)
+	}
+}

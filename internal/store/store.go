@@ -1897,7 +1897,8 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 func acceptInviteInTx(ctx context.Context, tx *sql.Tx, codeHash, accepter string, backScopes, backBags []string, now int64) (*Grant, error) {
 	var from, scopes, bags string
 	err := tx.QueryRowContext(ctx, `SELECT from_peer,scopes,bags FROM invites
-		WHERE code_hash=? AND require_confirm=0 AND claimed_by IS NULL AND declined_at IS NULL`, codeHash).
+		WHERE code_hash=? AND require_confirm=0 AND claimed_by IS NULL AND declined_at IS NULL
+		AND used_by IS NULL AND expires_at>=?`, codeHash, now).
 		Scan(&from, &scopes, &bags)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound

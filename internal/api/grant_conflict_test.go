@@ -365,3 +365,322 @@ func TestAcceptPairingUnauthenticatedGrantConflictAPI(t *testing.T) {
 		t.Error("api_key missing from response")
 	}
 }
+
+// TestExpiredInviteWithDifferentGrantReturns404API verifies that accepting an expired
+// invite returns 404, not 409, even when grants differ (status ordering fix, #312).
+func TestExpiredInviteWithDifferentGrantReturns404API(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	clk := clocktest.New(time.Unix(1000000, 0))
+	st, err := store.OpenWithOptions(":memory:", store.OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if _, _, err := st.LoadKeyIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := New(st, Config{
+		Logger:                slog.Default(),
+		Clock:                 clk,
+		MaxOutstandingInvites: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+
+	aliceKey := auth.NewKey()
+	bobKey := auth.NewKey()
+	if err := st.CreatePeer(ctx, "alice", "Alice", auth.Hash(aliceKey), "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreatePeer(ctx, "bob", "Bob", auth.Hash(bobKey), "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create existing grant alice->bob with "messages"
+	code0 := auth.NewSecret("inv_")
+	exp0 := clk.Now().Add(time.Hour)
+	if err := st.CreateInvite(ctx, auth.Hash(code0), "alice", []string{"messages"}, nil, exp0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AcceptInvite(ctx, auth.Hash(code0), "bob", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Alice creates invite with different scope that expires in 1 hour
+	exp := clk.Now().Add(time.Hour)
+	code := auth.NewSecret("inv_")
+	if err := st.CreateInvite(ctx, auth.Hash(code), "alice", []string{"bags_read"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Advance clock past expiry
+	clk.Advance(2 * time.Hour)
+
+	// Bob tries to accept expired invite - should get 404, not 409
+	body, err := json.Marshal(map[string]string{"code": code})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/v1/invites/accept", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+bobKey)
+
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expired invite: got %d, want %d (body: %s)", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
+// TestUsedInviteWithDifferentGrantReturns404API verifies that accepting a used
+// invite returns 404, not 409, even when grants differ (status ordering fix, #312).
+func TestUsedInviteWithDifferentGrantReturns404API(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	clk := clocktest.New(time.Unix(1000000, 0))
+	st, err := store.OpenWithOptions(":memory:", store.OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if _, _, err := st.LoadKeyIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := New(st, Config{
+		Logger:                slog.Default(),
+		Clock:                 clk,
+		MaxOutstandingInvites: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+
+	aliceKey := auth.NewKey()
+	bobKey := auth.NewKey()
+	carolKey := auth.NewKey()
+	if err := st.CreatePeer(ctx, "alice", "Alice", auth.Hash(aliceKey), "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreatePeer(ctx, "bob", "Bob", auth.Hash(bobKey), "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreatePeer(ctx, "carol", "Carol", auth.Hash(carolKey), "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Carol accepts first, getting grant with "messages"
+	code0 := auth.NewSecret("inv_")
+	exp0 := clk.Now().Add(time.Hour)
+	if err := st.CreateInvite(ctx, auth.Hash(code0), "alice", []string{"messages"}, nil, exp0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AcceptInvite(ctx, auth.Hash(code0), "carol", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Alice creates invite for Bob with "bags_read"
+	exp := clk.Now().Add(time.Hour)
+	code := auth.NewSecret("inv_")
+	if err := st.CreateInvite(ctx, auth.Hash(code), "alice", []string{"bags_read"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bob accepts it
+	body, err := json.Marshal(map[string]string{"code": code})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/v1/invites/accept", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+bobKey)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bob accept: got %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	// Carol (who has different grant "messages") tries to accept the now-used invite
+	// Should get 404, not 409
+	req2 := httptest.NewRequest("POST", "/v1/invites/accept", bytes.NewReader(body))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Authorization", "Bearer "+carolKey)
+	rec2 := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusNotFound {
+		t.Errorf("used invite: got %d, want %d (body: %s)", rec2.Code, http.StatusNotFound, rec2.Body.String())
+	}
+}
+
+// TestExpiredPairingTokenWithDifferentGrantReturns404API verifies that accepting an
+// expired pairing token returns 404, not 409, even when grants differ (#312).
+func TestExpiredPairingTokenWithDifferentGrantReturns404API(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	clk := clocktest.New(time.Unix(1000000, 0))
+	st, err := store.OpenWithOptions(":memory:", store.OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if _, _, err := st.LoadKeyIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := New(st, Config{
+		Logger:                slog.Default(),
+		Clock:                 clk,
+		MaxOutstandingInvites: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+
+	aliceKey := auth.NewKey()
+	bobKey := auth.NewKey()
+	if err := st.CreatePeer(ctx, "alice", "Alice", auth.Hash(aliceKey), "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreatePeer(ctx, "bob", "Bob", auth.Hash(bobKey), "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create existing grant alice->bob with "messages"
+	code0 := auth.NewSecret("inv_")
+	exp0 := clk.Now().Add(time.Hour)
+	if err := st.CreateInvite(ctx, auth.Hash(code0), "alice", []string{"messages"}, nil, exp0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AcceptInvite(ctx, auth.Hash(code0), "bob", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Alice creates pairing invite with different scope that expires in 1 hour
+	exp := clk.Now().Add(time.Hour)
+	code := auth.NewSecret("inv_")
+	pairingToken := auth.NewPairingToken()
+	if err := st.CreateInviteWithPairing(ctx, auth.Hash(code), auth.Hash(pairingToken), "alice", []string{"bags_read"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Advance clock past expiry
+	clk.Advance(2 * time.Hour)
+
+	// Bob tries to accept expired pairing token - should get 404, not 409
+	body, err := json.Marshal(map[string]interface{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/v1/pairing/"+pairingToken, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+bobKey)
+	req.SetPathValue("token", pairingToken)
+
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expired pairing token: got %d, want %d (body: %s)", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
+// TestUsedPairingTokenWithDifferentGrantReturns404API verifies that accepting a used
+// pairing token returns 404, not 409, even when grants differ (#312).
+func TestUsedPairingTokenWithDifferentGrantReturns404API(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	clk := clocktest.New(time.Unix(1000000, 0))
+	st, err := store.OpenWithOptions(":memory:", store.OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if _, _, err := st.LoadKeyIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := New(st, Config{
+		Logger:                slog.Default(),
+		Clock:                 clk,
+		MaxOutstandingInvites: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+
+	aliceKey := auth.NewKey()
+	bobKey := auth.NewKey()
+	carolKey := auth.NewKey()
+	if err := st.CreatePeer(ctx, "alice", "Alice", auth.Hash(aliceKey), "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreatePeer(ctx, "bob", "Bob", auth.Hash(bobKey), "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreatePeer(ctx, "carol", "Carol", auth.Hash(carolKey), "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Carol accepts first, getting grant with "messages"
+	code0 := auth.NewSecret("inv_")
+	exp0 := clk.Now().Add(time.Hour)
+	if err := st.CreateInvite(ctx, auth.Hash(code0), "alice", []string{"messages"}, nil, exp0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AcceptInvite(ctx, auth.Hash(code0), "carol", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Alice creates pairing invite for Bob with "bags_read"
+	exp := clk.Now().Add(time.Hour)
+	code := auth.NewSecret("inv_")
+	pairingToken := auth.NewPairingToken()
+	if err := st.CreateInviteWithPairing(ctx, auth.Hash(code), auth.Hash(pairingToken), "alice", []string{"bags_read"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bob accepts it
+	body, err := json.Marshal(map[string]interface{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/v1/pairing/"+pairingToken, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+bobKey)
+	req.SetPathValue("token", pairingToken)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bob accept: got %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	// Carol (who has different grant "messages") tries to accept the now-used pairing token
+	// Should get 404, not 409
+	req2 := httptest.NewRequest("POST", "/v1/pairing/"+pairingToken, bytes.NewReader(body))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Authorization", "Bearer "+carolKey)
+	req2.SetPathValue("token", pairingToken)
+	rec2 := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusNotFound {
+		t.Errorf("used pairing token: got %d, want %d (body: %s)", rec2.Code, http.StatusNotFound, rec2.Body.String())
+	}
+}
