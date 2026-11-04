@@ -607,19 +607,19 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 			return "", false, fmt.Errorf("stat created partial backup file: %w", pathless(err))
 		}
 
-	if !ownedByCurrentUser(partialFinfo) {
-		f.Close()
-		os.Remove(partialPath)
-		return "", false, fmt.Errorf("partial backup file %q is not owned by the user running peerline", filepath.Base(partialPath))
-	}
+		if !ownedByCurrentUser(partialFinfo) {
+			f.Close()
+			os.Remove(partialPath)
+			return "", false, fmt.Errorf("partial backup file %q is not owned by the user running peerline", filepath.Base(partialPath))
+		}
 
-	// Mode should be 0600 from OpenFile, but verify (unix-only check)
-	if err := verifyBackupFileMode(partialFinfo, partialPath); err != nil {
+		// Mode should be 0600 from OpenFile, but verify (unix-only check)
+		if err := verifyBackupFileMode(partialFinfo, partialPath); err != nil {
+			f.Close()
+			os.Remove(partialPath)
+			return "", false, err
+		}
 		f.Close()
-		os.Remove(partialPath)
-		return "", false, err
-	}
-	f.Close()
 
 		// Execute VACUUM INTO with context timeout
 		opts.Logger.Info("starting pre-migration backup", "backup", filepath.Base(tryName), "size_bytes", "pending")
@@ -654,14 +654,14 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 			os.Remove(partialPath)
 			return "", false, fmt.Errorf("stat partial after VACUUM: %w", pathless(err))
 		}
-	if !os.SameFile(partialFinfo, afterVacuum) {
-		os.Remove(partialPath)
-		return "", false, fmt.Errorf("partial backup file was replaced during VACUUM")
-	}
-	if err := verifyBackupFileMode(afterVacuum, partialPath); err != nil {
-		os.Remove(partialPath)
-		return "", false, fmt.Errorf("mode changed during VACUUM: %w", err)
-	}
+		if !os.SameFile(partialFinfo, afterVacuum) {
+			os.Remove(partialPath)
+			return "", false, fmt.Errorf("partial backup file was replaced during VACUUM")
+		}
+		if err := verifyBackupFileMode(afterVacuum, partialPath); err != nil {
+			os.Remove(partialPath)
+			return "", false, fmt.Errorf("mode changed during VACUUM: %w", err)
+		}
 
 		// Fsync the backup file
 		if err := fsyncFile(partialPath, opts.Logger); err != nil {
