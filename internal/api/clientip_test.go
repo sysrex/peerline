@@ -17,6 +17,28 @@ import (
 	"github.com/sysrex/peerline/internal/store"
 )
 
+// captureHandler captures log records for inspection in tests.
+type captureHandler struct {
+	records []slog.Record
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool {
+	return true
+}
+
+func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.records = append(h.records, r)
+	return nil
+}
+
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler {
+	return h
+}
+
+func (h *captureHandler) WithGroup(string) slog.Handler {
+	return h
+}
+
 func TestClientIPEdgeCases(t *testing.T) {
 	trustedNets, _ := ParseTrustedProxies([]string{"10.0.0.0/8", "192.168.1.0/24"})
 
@@ -1223,18 +1245,28 @@ func TestNewWarnsWhenTrustedProxiesParseToNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	var logs bytes.Buffer
-	srv := mustNew(t, st, Config{TrustedProxies: []string{" ", ""}, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	
+	h := &captureHandler{}
+	srv := mustNew(t, st, Config{TrustedProxies: []string{" ", ""}, Logger: slog.New(h)})
 	t.Cleanup(srv.lim.Stop)
-	logOutput := logs.String()
-	if !strings.Contains(logOutput, "no trusted proxies configured") {
-		t.Fatalf("api.New must warn when the parsed list is empty, got logs: %q", logOutput)
+	
+	// Verify api.New emits exactly one warning for the empty proxy list
+	warnCount := 0
+	foundExpectedMsg := false
+	for _, r := range h.records {
+		if r.Level == slog.LevelWarn {
+			warnCount++
+			if strings.Contains(r.Message, "no trusted proxies configured") {
+				foundExpectedMsg = true
+			}
+		}
 	}
-	// Verify api.New emits exactly one warning (this test only calls api.New,
-	// so it cannot detect a duplicate warning added elsewhere, e.g. in main.go).
-	count := strings.Count(logOutput, "no trusted proxies configured")
-	if count != 1 {
-		t.Fatalf("api.New emitted %d warnings, want 1, in logs: %q", count, logOutput)
+	
+	if !foundExpectedMsg {
+		t.Fatalf("api.New must warn when the parsed list is empty")
+	}
+	if warnCount != 1 {
+		t.Fatalf("api.New emitted %d warnings, want exactly 1 (this test only calls api.New, so it cannot detect a duplicate warning added elsewhere, e.g. in main.go)", warnCount)
 	}
 }
 

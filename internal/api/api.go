@@ -206,9 +206,11 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 					warnMsg = "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /29 lets anyone inside it spoof X-Forwarded-For; ULA (fc00::/7) ranges are also permitted and exempt from the /32 floor"
 				} else if hasPublic {
 					warnMsg = "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /29 lets anyone inside it spoof X-Forwarded-For"
-				} else {
-					// ULA only, or categorization failed - default to ULA-only message
+				} else if hasULA {
 					warnMsg = "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: ULA (fc00::/7) ranges are permitted and exempt from the /32 floor"
+				} else {
+					// Fallback when categorization cannot classify the relaxed entries (e.g., unparsable)
+					warnMsg = "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: broader ranges are permitted"
 				}
 				cfg.Logger.Warn(warnMsg)
 			} else {

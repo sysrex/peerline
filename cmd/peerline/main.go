@@ -81,14 +81,15 @@ func describeTLSMode(smtp *mailer.SMTP) string {
 	return "STARTTLS required"
 }
 
-// buildTrustedProxyConfig extracts and validates trusted proxy configuration from environment.
-// It parses PEERLINE_TRUSTED_PROXIES and PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD, emits any
-// startup warnings, and returns the values to pass to api.Config. Called once from main.
-func buildTrustedProxyConfig(getenv func(string) string, log *slog.Logger) (proxies []string, allowBroad bool, err error) {
+// applyTrustedProxyConfig extracts and validates trusted proxy configuration from environment
+// and writes it directly into cfg.TrustedProxies and cfg.AllowBroadIPv6. It parses
+// PEERLINE_TRUSTED_PROXIES and PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD, and emits any startup warnings.
+// Called once from main before passing cfg to api.New.
+func applyTrustedProxyConfig(cfg *api.Config, getenv func(string) string, log *slog.Logger) error {
 	tp := getenv("PEERLINE_TRUSTED_PROXIES")
-	allowBroad, err = parseBoolStrict(getenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD"))
+	allowBroad, err := parseBoolStrict(getenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD"))
 	if err != nil {
-		return nil, false, fmt.Errorf("invalid PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD value: %w", err)
+		return fmt.Errorf("invalid PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD value: %w", err)
 	}
 
 	// Warn if opt-in is enabled but no proxies configured (P3 #1)
@@ -96,10 +97,14 @@ func buildTrustedProxyConfig(getenv func(string) string, log *slog.Logger) (prox
 		log.Warn("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled but PEERLINE_TRUSTED_PROXIES is unset; the opt-in has no effect")
 	}
 
+	var proxies []string
 	if tp != "" {
 		proxies = strings.Split(tp, ",")
 	}
-	return proxies, allowBroad, nil
+
+	cfg.TrustedProxies = proxies
+	cfg.AllowBroadIPv6 = allowBroad
+	return nil
 }
 
 // describeSMTPMode returns the log level and message for SMTP startup logging.
@@ -253,13 +258,6 @@ func main() {
 		log.Warn("PEERLINE_REGISTER_TOKEN unset: registration is open to anyone who can reach this server")
 	}
 
-	// Parse trusted proxy CIDRs and opt-in for broader IPv6
-	trustedProxies, allowBroadIPv6, err := buildTrustedProxyConfig(os.Getenv, log)
-	if err != nil {
-		log.Error("trusted proxy config", "err", err)
-		os.Exit(1)
-	}
-
 	maxOutstandingInvites, _ := strconv.Atoi(os.Getenv("PEERLINE_MAX_OUTSTANDING_INVITES"))
 
 	ml, err := mailer.FromEnv(log)
@@ -351,7 +349,8 @@ func main() {
 		"write_per_minute", writePerMinute,
 		"write_burst", writeBurst)
 
-	apiServer, err := api.New(st, api.Config{
+	// Build api.Config and apply trusted proxy settings
+	cfg := api.Config{
 		RegisterToken:         regTok,
 		CodePepper:            []byte(os.Getenv("PEERLINE_CODE_PEPPER")),
 		Logger:                log,
@@ -359,8 +358,6 @@ func main() {
 		PublicURL:             publicURL,
 		EmailPerHour:          emailPerHour,
 		NotifyPerHour:         notifyPerHour,
-		TrustedProxies:        trustedProxies,
-		AllowBroadIPv6:        allowBroadIPv6,
 		Clock:                 clk,
 		MaxOutstandingInvites: maxOutstandingInvites,
 		RetentionSeconds:      retentionSeconds,
@@ -372,7 +369,13 @@ func main() {
 		VersionDetail:         versionDetail,
 		MaxBagsPerPeer:        maxBagsPerPeer,
 		MaxBagBytesPerPeer:    maxBagBytesPerPeer,
-	})
+	}
+	if err := applyTrustedProxyConfig(&cfg, os.Getenv, log); err != nil {
+		log.Error("trusted proxy config", "err", err)
+		os.Exit(1)
+	}
+
+	apiServer, err := api.New(st, cfg)
 	if err != nil {
 		log.Error("failed to create API server", "err", err)
 		os.Exit(1)
