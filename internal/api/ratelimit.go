@@ -178,9 +178,9 @@ func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 }
 
 // ParseTrustedProxiesWithOpts parses trusted proxies with optional broader IPv6 floor.
-// When allowBroadIPv6 is true, the IPv6 floor is /29 (allowing Cloudflare 2a06:98c0::/29)
-// and ULA ranges fc00::/7 and fd00::/8 are permitted. Even with the opt-in,
-// ::/0, 2000::/3, and 2002::/16 are still rejected.
+// When allowBroadIPv6 is true, the IPv6 floor is /29 (allowing Cloudflare 2a06:98c0::/29,
+// and rejecting 2000::/3 and 2002::/16 as too broad), and ULA ranges contained in fc00::/7
+// (bits >= 7) are permitted. ::/0 is always rejected.
 func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IPNet, error) {
 	var nets []*net.IPNet
 	for _, cidr := range cidrs {

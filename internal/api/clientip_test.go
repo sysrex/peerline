@@ -1241,6 +1241,8 @@ func TestIPv6FloorWithOptIn(t *testing.T) {
 		{name: "ULA fc00::/7 allowed (opt-in)", input: []string{"fc00::/7"}, allowBroad: true, wantNet: "fc00::/7"},
 		{name: "ULA fc00::/6 rejected (opt-in, too broad)", input: []string{"fc00::/6"}, allowBroad: true, wantError: "must be at least "},
 		{name: "ULA fd00::/8 allowed (opt-in)", input: []string{"fd00::/8"}, allowBroad: true, wantNet: "fd00::/8"},
+		{name: "2000::/3 rejected (opt-in)", input: []string{"2000::/3"}, allowBroad: true, wantError: "must be at least /29"},
+		{name: "2002::/16 rejected (opt-in)", input: []string{"2002::/16"}, allowBroad: true, wantError: "must be at least /29"},
 
 		// Still rejected even with opt-in
 		{name: "::/0 rejected (opt-in)", input: []string{"::/0"}, allowBroad: true, wantError: "too broad"},
