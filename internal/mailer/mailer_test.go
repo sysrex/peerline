@@ -134,6 +134,8 @@ func TestFromEnv(t *testing.T) {
 		{"invalid require TLS", "localhost", "", "", "", "test@example.com", "ture", "", false, false, true, false, ""},
 		{"user without pass", "localhost", "", "u", "", "test@example.com", "", "", false, false, true, false, ""},
 		{"credentials with REQUIRE_TLS=false on non-loopback", "192.168.1.1", "", "u", "p", "test@example.com", "false", "smtp", true, false, false, false, ""},
+		{"::1 IPv6 loopback = plaintext ok", "::1", "", "", "", "test@example.com", "", "smtp", true, false, false, false, ""},
+		{"2001:db8::1 IPv6 non-loopback = TLS required", "2001:db8::1", "", "", "", "test@example.com", "", "smtp", false, false, false, false, ""},
 	}
 
 	for _, tt := range tests {
@@ -207,11 +209,27 @@ func TestFromEnvRejectsBracketedHosts(t *testing.T) {
 }
 
 func TestFromEnvRejectsHostWithPort(t *testing.T) {
-	t.Setenv("PEERLINE_SMTP_HOST", "mail.example.com:587")
-	t.Setenv("PEERLINE_SMTP_FROM", "test@example.com")
-	_, err := FromEnv(nil)
-	if err == nil || !strings.Contains(err.Error(), "PEERLINE_SMTP_PORT") {
-		t.Fatalf("expected port error, got %v", err)
+	tests := []struct {
+		name            string
+		host            string
+		wantErrContains string
+	}{
+		{"host:port", "mail.example.com:587", "PEERLINE_SMTP_PORT"},
+		{"[::1]:25", "[::1]:25", "bracketed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PEERLINE_SMTP_HOST", tt.host)
+			t.Setenv("PEERLINE_SMTP_FROM", "test@example.com")
+			_, err := FromEnv(nil)
+			if err == nil {
+				t.Fatalf("expected error for host %q, got nil", tt.host)
+			}
+			if !strings.Contains(err.Error(), tt.wantErrContains) {
+				t.Fatalf("error %q should contain %q", err.Error(), tt.wantErrContains)
+			}
+		})
 	}
 }
 
@@ -506,6 +524,54 @@ func TestSMTPAllowPlaintext(t *testing.T) {
 	}
 	if !hasDATA {
 		t.Fatal("DATA not sent in plaintext mode")
+	}
+}
+
+func TestSMTPSendRefusesExpiredCert(t *testing.T) {
+	cert := genExpiredTestCert(t, "localhost")
+	srv := newFakeServer(t, true, &cert)
+	defer srv.close()
+
+	certPool := x509.NewCertPool()
+	parsed, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("failed to parse test cert: %v", err)
+	}
+	certPool.AddCert(parsed)
+
+	tests := []struct {
+		name           string
+		allowPlaintext bool
+	}{
+		{"AllowPlaintext=false", false},
+		{"AllowPlaintext=true", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &SMTP{
+				Host:           "127.0.0.1",
+				Port:           srv.port(),
+				From:           "test@example.com",
+				User:           "testuser",
+				Pass:           "testpass",
+				Timeout:        2 * time.Second,
+				AllowPlaintext: tt.allowPlaintext,
+				TLSConfig:      &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+			}
+			err := s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
+			if err == nil {
+				t.Fatal("Send should refuse expired cert")
+			}
+			// Verify no AUTH, MAIL, RCPT or DATA were sent
+			cmds := srv.receivedCommands()
+			for _, cmd := range cmds {
+				if strings.HasPrefix(cmd, "AUTH") || strings.HasPrefix(cmd, "MAIL") ||
+					strings.HasPrefix(cmd, "RCPT") || cmd == "DATA" {
+					t.Fatalf("command %q reached server despite expired cert: %v", cmd, cmds)
+				}
+			}
+		})
 	}
 }
 
@@ -910,12 +976,12 @@ func TestSMTPProbe(t *testing.T) {
 		if !errors.Is(err, ErrRelayUnreachable) {
 			t.Fatalf("expired cert should be ErrRelayUnreachable, got: %v", err)
 		}
-		if !strings.Contains(err.Error(), "expired or not yet valid") {
-			t.Fatalf("expected distinct expired cert message, got: %v", err)
+		if !strings.Contains(err.Error(), "expired") {
+			t.Fatalf("expected expired cert message, got: %v", err)
 		}
 	})
 
-	t.Run("STARTTLS with not-yet-valid cert = ErrRelayUnreachable", func(t *testing.T) {
+	t.Run("STARTTLS with not-yet-valid cert = fatal (clock skew)", func(t *testing.T) {
 		cert := genTestCertWithValidity(t, "localhost", time.Now().Add(time.Hour), time.Now().Add(2*time.Hour))
 		srv := newFakeServer(t, true, &cert)
 		defer srv.close()
@@ -937,11 +1003,8 @@ func TestSMTPProbe(t *testing.T) {
 		if err == nil {
 			t.Fatal("probe should fail on not-yet-valid cert")
 		}
-		if !errors.Is(err, ErrRelayUnreachable) {
-			t.Fatalf("not-yet-valid cert should be ErrRelayUnreachable, got: %v", err)
-		}
-		if !strings.Contains(err.Error(), "expired or not yet valid") {
-			t.Fatalf("expected distinct expired cert message, got: %v", err)
+		if errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("not-yet-valid cert should be fatal, not ErrRelayUnreachable (clock skew): %v", err)
 		}
 	})
 
@@ -1275,8 +1338,8 @@ func TestSMTPImplicitTLS(t *testing.T) {
 		if !errors.Is(err, ErrRelayUnreachable) {
 			t.Fatalf("expired cert should be ErrRelayUnreachable, got: %v", err)
 		}
-		if !strings.Contains(err.Error(), "expired or not yet valid") {
-			t.Fatalf("expected distinct expired cert message, got: %v", err)
+		if !strings.Contains(err.Error(), "expired") {
+			t.Fatalf("expected expired cert message, got: %v", err)
 		}
 	})
 

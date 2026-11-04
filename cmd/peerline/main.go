@@ -77,14 +77,14 @@ func describeSMTPMode(smtp *mailer.SMTP) (slog.Level, string) {
 
 // smtpProbeAction decides whether a probe error should be fatal (exit 1) or a warning.
 // Returns (fatal=true, level, message) for config errors; (fatal=false, level, message) for transient errors.
-func smtpProbeAction(err error, smtp *mailer.SMTP) (fatal bool, level slog.Level, message string) {
+func smtpProbeAction(err error) (fatal bool, level slog.Level, message string) {
 	if err == nil {
 		return false, slog.LevelInfo, ""
 	}
 	if errors.Is(err, mailer.ErrRelayUnreachable) {
 		return false, slog.LevelWarn, "smtp relay unreachable at startup (will retry on send)"
 	}
-	return true, slog.LevelError, "smtp probe failed: TLS misconfiguration"
+	return true, slog.LevelError, "smtp probe failed: configuration error"
 }
 
 func main() {
@@ -239,7 +239,7 @@ func main() {
 		// Probe SMTP server at startup to fail fast if TLS is misconfigured.
 		// Network errors (connection refused, timeout) only warn; Send retries at runtime.
 		probeErr := smtp.Probe(context.Background())
-		fatal, probeLevel, probeMsg := smtpProbeAction(probeErr, smtp)
+		fatal, probeLevel, probeMsg := smtpProbeAction(probeErr)
 		if probeErr != nil {
 			log.Log(context.Background(), probeLevel, probeMsg, "host", smtp.Host, "port", smtp.Port, "err", probeErr)
 			if fatal {

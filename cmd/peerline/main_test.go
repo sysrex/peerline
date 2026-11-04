@@ -229,21 +229,20 @@ func TestSMTPProbeAction(t *testing.T) {
 			err:       errors.New("x509: certificate signed by unknown authority"),
 			wantFatal: true,
 			wantLevel: slog.LevelError,
-			wantMsg:   "smtp probe failed: TLS misconfiguration",
+			wantMsg:   "smtp probe failed: configuration error",
 		},
 		{
 			name:      "other error = fatal",
 			err:       errors.New("something else"),
 			wantFatal: true,
 			wantLevel: slog.LevelError,
-			wantMsg:   "smtp probe failed: TLS misconfiguration",
+			wantMsg:   "smtp probe failed: configuration error",
 		},
 	}
 
-	smtp := &mailer.SMTP{Host: "mail.example.com", Port: 587}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotFatal, gotLevel, gotMsg := smtpProbeAction(tt.err, smtp)
+			gotFatal, gotLevel, gotMsg := smtpProbeAction(tt.err)
 			if gotFatal != tt.wantFatal {
 				t.Errorf("fatal = %v, want %v", gotFatal, tt.wantFatal)
 			}

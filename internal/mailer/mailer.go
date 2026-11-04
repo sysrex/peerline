@@ -137,8 +137,8 @@ func FromEnv(lg *slog.Logger) (Sender, error) {
 		}
 		return nil, fmt.Errorf("PEERLINE_SMTP_HOST: bracketed address %q not allowed (use %s)", host, suggested)
 	}
-	// Reject host:port syntax (port must be in PEERLINE_SMTP_PORT)
-	if strings.Contains(host, ":") {
+	// Reject host:port syntax (port must be in PEERLINE_SMTP_PORT), but allow IPv6 addresses
+	if strings.Contains(host, ":") && net.ParseIP(host) == nil {
 		return nil, fmt.Errorf("PEERLINE_SMTP_HOST: host %q contains ':' (use PEERLINE_SMTP_PORT for the port)", host)
 	}
 	port := 587
@@ -235,7 +235,7 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 	if !s.ImplicitTLS {
 		hasSTARTTLS, _ := c.Extension("STARTTLS")
 		if err := s.checkSTARTTLS(hasSTARTTLS); err != nil {
-			return err
+			return fmt.Errorf("smtp: %w", err)
 		}
 		if hasSTARTTLS {
 			if err := c.StartTLS(tlsCfg); err != nil {
@@ -310,7 +310,7 @@ func (s *SMTP) Probe(ctx context.Context) error {
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			// Check for expiry-only error (transient: relay state, not Peerline config)
 			if s.isExpiryOnlyError(ctx, err, conn, tlsCfg) {
-				return fmt.Errorf("%w: relay certificate expired or not yet valid (sends will fail until renewed): %v", ErrRelayUnreachable, err)
+				return fmt.Errorf("%w: relay certificate expired (sends will fail until renewed): %v", ErrRelayUnreachable, err)
 			}
 			// Check if it's a certificate/TLS error (fatal) or a timeout/reset (transient)
 			if isTLSError(err) {
@@ -347,7 +347,7 @@ func (s *SMTP) Probe(ctx context.Context) error {
 			if err := c.StartTLS(tlsCfg); err != nil {
 				// Check for expiry-only error (transient: relay state, not Peerline config)
 				if s.isExpiryOnlyError(ctx, err, conn, tlsCfg) {
-					return fmt.Errorf("%w: relay certificate expired or not yet valid (sends will fail until renewed): %v", ErrRelayUnreachable, err)
+					return fmt.Errorf("%w: relay certificate expired (sends will fail until renewed): %v", ErrRelayUnreachable, err)
 				}
 				if isTLSError(err) {
 					return fmt.Errorf("smtp probe: STARTTLS handshake failed: %w", err)
@@ -384,21 +384,34 @@ func isTLSError(err error) bool {
 	return false
 }
 
-// isExpiryOnlyError returns true if err is a certificate expiry/not-yet-valid error and that is
+// isExpiryOnlyError returns true if err is a certificate expiry error (past NotAfter) and that is
 // the ONLY problem (hostname and trust are valid). Go's x509 checks validity dates before
 // hostname and trust, so Reason == Expired can mask config errors (wrong host, untrusted CA).
 // We re-verify at a time when the cert would be valid to distinguish expiry-only (transient)
 // from multi-problem certs (fatal config error).
+// Not-yet-valid certificates (NotBefore in the future) are treated as fatal: they indicate
+// clock skew or misconfiguration, not relay state.
+//
+// The re-verification makes a second connection to the same host:port with a modified TLS config
+// (Time set to NotAfter - 1s). If that connection fails for any reason (network error, rate limit,
+// timeout), the expired certificate is treated as fatal (safe side). A load-balanced relay could
+// answer from a different backend with a different certificate; that is acceptable since Send
+// verifies independently.
 func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, tlsCfg *tls.Config) bool {
 	var x509Invalid x509.CertificateInvalidError
 	if !errors.As(err, &x509Invalid) || x509Invalid.Reason != x509.Expired {
 		return false
 	}
-	// Cert is expired or not-yet-valid. Check if it would be valid at NotAfter - 1s.
-	// If that succeeds, expiry was the only problem (transient).
 	if x509Invalid.Cert == nil {
 		return false
 	}
+	// Not-yet-valid (NotBefore in the future) is fatal: indicates clock skew or misconfiguration
+	if time.Now().Before(x509Invalid.Cert.NotBefore) {
+		return false
+	}
+	// Cert is expired (past NotAfter). Check if it would be valid at NotAfter - 1s.
+	// If that succeeds, expiry was the only problem (transient).
+
 	recheckCfg := tlsCfg.Clone()
 	fixedTime := x509Invalid.Cert.NotAfter.Add(-time.Second)
 	recheckCfg.Time = func() time.Time { return fixedTime }
