@@ -61,7 +61,9 @@ func TestClaimEndToEndRealStore(t *testing.T) {
 	if strings.Contains(string(b), cl.Code) {
 		t.Fatal("inviter view leaks code")
 	}
-	var view struct{ OfferDigest string `json:"offer_digest"` }
+	var view struct {
+		OfferDigest string `json:"offer_digest"`
+	}
 	json.Unmarshal(b, &view)
 	if view.OfferDigest == "" {
 		t.Fatal("offer_digest missing from inviter view")
@@ -93,7 +95,9 @@ func TestClaimWrongCodeThriceDeclines(t *testing.T) {
 	// Get offer digest
 	resp, b = inviter.do("GET", "/v1/invites/"+pub, nil, nil)
 	want(t, resp, b, 200)
-	var view struct{ OfferDigest string `json:"offer_digest"` }
+	var view struct {
+		OfferDigest string `json:"offer_digest"`
+	}
 	json.Unmarshal(b, &view)
 
 	for i := 0; i < maxCodeFails; i++ {

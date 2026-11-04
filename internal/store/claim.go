@@ -167,7 +167,7 @@ func (s *Store) ConfirmClaim(ctx context.Context, publicID, inviter string, maxF
 
 	// First, try to load as outstanding (claimed but not confirmed/declined)
 	c, err := s.loadClaim(ctx, tx, `i.public_id=?2 AND i.from_peer=?3 AND i.claimed_by IS NOT NULL AND `+outstandingInvite, publicID, inviter)
-	
+
 	// If not found as outstanding, check if it's already active (idempotent confirm)
 	if errors.Is(err, ErrNotFound) {
 		cActive, errActive := s.loadClaim(ctx, tx, `i.public_id=?2 AND i.from_peer=?3 AND i.used_by IS NOT NULL`, publicID, inviter)
@@ -184,7 +184,7 @@ func (s *Store) ConfirmClaim(ctx context.Context, publicID, inviter string, maxF
 	if err != nil {
 		return "", err
 	}
-	
+
 	now := s.now()
 	if check(c) {
 		if _, err := tx.ExecContext(ctx, `UPDATE invites SET used_by=claimed_by WHERE code_hash=?`, c.codeHash); err != nil {

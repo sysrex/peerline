@@ -172,7 +172,7 @@ func TestClaimThiefCodeRejectedAndInviterViewHidesCode(t *testing.T) {
 	if !ok || digest == "" {
 		t.Fatal("offer_digest missing")
 	}
-	
+
 	for _, in := range []map[string]string{{"peer_id": e.real.id, "code": thiefCode, "offer_digest": digest}, {"peer_id": e.thief.id, "offer_digest": digest}} {
 		resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm", in, nil)
 		want(t, resp, b, 400)
@@ -197,14 +197,14 @@ func TestClaimConfirmHappyPathIdempotentAndLogsClean(t *testing.T) {
 		t.Fatalf("claim not idempotent: %d %q %q", st, c1, c2)
 	}
 	typed := strings.ToLower(strings.ReplaceAll(c1, "-", " "))
-	
+
 	// Get offer digest
 	resp, b := e.inviter.do("GET", "/v1/invites/"+e.pub, nil, nil)
 	want(t, resp, b, 200)
 	var view map[string]any
 	json.Unmarshal(b, &view)
 	digest := view["offer_digest"].(string)
-	
+
 	resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm", map[string]string{"peer_id": e.real.id, "code": typed, "offer_digest": digest}, nil)
 	want(t, resp, b, 200)
 	resp, b = e.real.do("POST", "/v1/pairing/status", map[string]string{"token": e.token}, nil)
@@ -304,38 +304,38 @@ func TestConfirmRequiresOfferDigest(t *testing.T) {
 	if st != 200 || code == "" {
 		t.Fatalf("claim failed: %d", st)
 	}
-	
+
 	// Get the inviter view to see the offer_digest
 	resp, b := e.inviter.do("GET", "/v1/invites/"+e.pub, nil, nil)
 	want(t, resp, b, 200)
-	
+
 	var view map[string]any
 	if err := json.Unmarshal(b, &view); err != nil {
 		t.Fatal(err)
 	}
-	
+
 	digest, ok := view["offer_digest"].(string)
 	if !ok || digest == "" {
 		t.Fatalf("offer_digest missing from view: %v", view)
 	}
-	
+
 	// Try to confirm with wrong digest
 	resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm",
 		map[string]string{"peer_id": e.real.id, "code": code, "offer_digest": "wrong"}, nil)
 	if resp.StatusCode != 400 {
 		t.Errorf("wrong digest: got %d, want 400", resp.StatusCode)
 	}
-	
+
 	// Verify no grants were written
 	if len(e.fake.grant) != 0 {
 		t.Error("grant written with wrong digest")
 	}
-	
+
 	// Confirm with correct digest
 	resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm",
 		map[string]string{"peer_id": e.real.id, "code": code, "offer_digest": digest}, nil)
 	want(t, resp, b, 200)
-	
+
 	if len(e.fake.grant) != 1 {
 		t.Errorf("grants: %d, want 1", len(e.fake.grant))
 	}
@@ -345,7 +345,7 @@ func TestConfirmRequiresOfferDigest(t *testing.T) {
 // includes replaces information (#80, requirement 2).
 func TestInviterViewShowsReplaces(t *testing.T) {
 	e := setupClaim(t)
-	
+
 	// Simulate existing grants (in the fake store, we track this separately)
 	// In real usage, this would come from the store layer
 	existingGrant := &ClaimInvite{
@@ -361,25 +361,25 @@ func TestInviterViewShowsReplaces(t *testing.T) {
 		},
 	}
 	e.fake.byTok[auth.Hash(e.token)] = existingGrant
-	
+
 	e.claim(t, e.real)
-	
+
 	resp, b := e.inviter.do("GET", "/v1/invites/"+e.pub, nil, nil)
 	want(t, resp, b, 200)
-	
+
 	var view map[string]any
 	json.Unmarshal(b, &view)
-	
+
 	replaces, ok := view["replaces"].(map[string]any)
 	if !ok {
 		t.Fatalf("replaces missing when grant exists: %v", view)
 	}
-	
+
 	inv, ok := replaces["inviter_to_claimant"].(map[string]any)
 	if !ok {
 		t.Fatalf("inviter_to_claimant missing: %v", replaces)
 	}
-	
+
 	scopes := inv["scopes"].([]any)
 	if len(scopes) == 0 || scopes[0].(string) != "bags:read" {
 		t.Errorf("wrong existing scopes: %v", inv)
@@ -393,23 +393,23 @@ func TestConfirmIdempotency(t *testing.T) {
 	if st != 200 {
 		t.Fatal("claim failed")
 	}
-	
+
 	// Get digest
 	resp, b := e.inviter.do("GET", "/v1/invites/"+e.pub, nil, nil)
 	var view map[string]any
 	json.Unmarshal(b, &view)
 	digest := view["offer_digest"].(string)
-	
+
 	// First confirm
 	resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm",
 		map[string]string{"peer_id": e.real.id, "code": code, "offer_digest": digest}, nil)
 	want(t, resp, b, 200)
-	
+
 	// Second confirm (idempotent)
 	resp, b = e.inviter.do("POST", "/v1/invites/"+e.pub+"/confirm",
 		map[string]string{"peer_id": e.real.id, "code": code, "offer_digest": digest}, nil)
 	want(t, resp, b, 200)
-	
+
 	// Verify result is the same
 	var result map[string]any
 	json.Unmarshal(b, &result)
