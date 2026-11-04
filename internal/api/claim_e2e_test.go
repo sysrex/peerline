@@ -746,9 +746,30 @@ func TestDeclineIdempotentAndActiveReturns404(t *testing.T) {
 }
 
 // TestDeleteClaimedInvite verifies that DELETE /v1/invites/{public_id} works on
-// claimed (pending-confirm) invites and returns 204, but returns 404 on active
-// (confirmed) invites (#80 docs).
+// offered, claimed, declined, and expired-not-yet-purged invites (all return 204),
+// but returns 404 on active (confirmed) invites (#80 docs).
 func TestDeleteClaimedInvite(t *testing.T) {
+	t.Run("delete offered returns 204", func(t *testing.T) {
+		srv, _, _ := claimServer(t)
+		inviter := register(t, srv, "inviter_delete_offered")
+		pub, _ := confirmInvite(t, inviter)
+
+		// DELETE should work on offered invites
+		resp, b := inviter.do("DELETE", "/v1/invites/"+pub, nil, nil)
+		if resp.StatusCode != 204 {
+			t.Fatalf("DELETE offered invite: got %d, want 204; body: %s", resp.StatusCode, b)
+		}
+		if len(b) != 0 {
+			t.Errorf("DELETE offered invite: expected empty body, got: %s", b)
+		}
+
+		// Verify the invite is gone
+		resp, b = inviter.do("GET", "/v1/invites/"+pub, nil, nil)
+		if resp.StatusCode != 404 {
+			t.Fatalf("GET after DELETE: got %d, want 404; body: %s", resp.StatusCode, b)
+		}
+	})
+
 	t.Run("delete claimed returns 204", func(t *testing.T) {
 		srv, _, _ := claimServer(t)
 		inviter := register(t, srv, "inviter_delete_claimed")
@@ -796,6 +817,30 @@ func TestDeleteClaimedInvite(t *testing.T) {
 		}
 		if len(b) != 0 {
 			t.Errorf("DELETE declined invite: expected empty body, got: %s", b)
+		}
+
+		// Verify the invite is gone
+		resp, b = inviter.do("GET", "/v1/invites/"+pub, nil, nil)
+		if resp.StatusCode != 404 {
+			t.Fatalf("GET after DELETE: got %d, want 404; body: %s", resp.StatusCode, b)
+		}
+	})
+
+	t.Run("delete expired not yet purged returns 204", func(t *testing.T) {
+		srv, _, clk := claimServer(t)
+		inviter := register(t, srv, "inviter_delete_expired")
+		pub, _ := confirmInvite(t, inviter)
+
+		// Advance clock past expires_at (default 1 hour)
+		clk.Advance(2 * time.Hour)
+
+		// DELETE should work on expired invites that haven't been purged
+		resp, b := inviter.do("DELETE", "/v1/invites/"+pub, nil, nil)
+		if resp.StatusCode != 204 {
+			t.Fatalf("DELETE expired invite: got %d, want 204; body: %s", resp.StatusCode, b)
+		}
+		if len(b) != 0 {
+			t.Errorf("DELETE expired invite: expected empty body, got: %s", b)
 		}
 
 		// Verify the invite is gone
