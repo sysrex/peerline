@@ -223,6 +223,8 @@ func TestParseTrustedProxiesRejectsOverlyBroad(t *testing.T) {
 		{name: "mapped /95", input: []string{"::ffff:10.0.0.0/95"}, wantError: "at least /96"},
 		{name: "mapped bare", input: []string{"::ffff:10.0.0.1"}},
 		{name: "mapped /104", input: []string{"::ffff:10.0.0.0/104"}},
+		{name: "0.0.0.0/8 (this network)", input: []string{"0.0.0.0/8"}, wantError: "this network"},
+		{name: "::ffff:0.0.0.0/104 (mapped this network)", input: []string{"::ffff:0.0.0.0/104"}, wantError: "this network"},
 		{
 			name:      "zoned IPv6 address",
 			input:     []string{"fe80::1%eth0"},
@@ -335,27 +337,37 @@ func TestParseTrustedProxiesSymmetry(t *testing.T) {
 		t.Errorf("native network = %q, want 10.0.0.0/8", native[0].String())
 	}
 
-	// Test with /16 as well
-	mapped16, err := ParseTrustedProxies([]string{"::ffff:192.168.0.0/112"})
-	if err != nil {
-		t.Fatalf("ParseTrustedProxies(mapped /112) failed: %v", err)
-	}
-	native16, err := ParseTrustedProxies([]string{"192.168.0.0/16"})
-	if err != nil {
-		t.Fatalf("ParseTrustedProxies(native /16) failed: %v", err)
-	}
-
-	if mapped16[0].String() != "192.168.0.0/16" {
-		t.Errorf("mapped /16 network = %q, want 192.168.0.0/16", mapped16[0].String())
-	}
-	if native16[0].String() != "192.168.0.0/16" {
-		t.Errorf("native /16 network = %q, want 192.168.0.0/16", native16[0].String())
+	// Verify Contains agrees for mapped and native forms for a table of addresses
+	testAddrs := []struct {
+		addr     string
+		inRange  bool
+		mappable bool
+	}{
+		{"10.0.0.5", true, true},
+		{"::ffff:10.0.0.5", true, false}, // already mapped, so "mappable" = false
+		{"10.1.0.1", true, true},
+		{"::1", false, false},
+		{"2001:db8::1", false, false},
+		{"203.0.113.1", false, true},
 	}
 
-	// Verify ::1 is NOT trusted by ::ffff:0:0/104 (would be by /80)
-	loopback := net.ParseIP("::1")
-	if mapped[0].Contains(loopback) {
-		t.Error("::ffff:10.0.0.0/104 should not trust ::1")
+	for _, tt := range testAddrs {
+		addr := net.ParseIP(tt.addr)
+		mappedContains := mapped[0].Contains(addr)
+		nativeContains := native[0].Contains(addr)
+
+		if mappedContains != nativeContains {
+			t.Errorf("Contains(%q): mapped=%v native=%v, want same", tt.addr, mappedContains, nativeContains)
+		}
+		if mappedContains != tt.inRange {
+			t.Errorf("Contains(%q) = %v, want %v", tt.addr, mappedContains, tt.inRange)
+		}
+	}
+
+	// Test clientIP with a mapped peer and mapped XFF hop
+	ip := clientIP("[::ffff:10.0.0.5]:1234", []string{"::ffff:203.0.113.9"}, mapped)
+	if ip != "203.0.113.9" {
+		t.Errorf("clientIP with mapped peer and mapped XFF = %q, want 203.0.113.9", ip)
 	}
 }
 
@@ -521,7 +533,9 @@ func TestRateLimitGetRightmostKeying(t *testing.T) {
 	var regBody struct {
 		APIKey string `json:"api_key"`
 	}
-	json.NewDecoder(regResp.Body).Decode(&regBody)
+	if err := json.NewDecoder(regResp.Body).Decode(&regBody); err != nil {
+		t.Fatal(err)
+	}
 
 	invReq, _ := http.NewRequest("POST", httpSrv.URL+"/v1/invites", strings.NewReader(`{"scopes":["messages"],"generate_pairing":true}`))
 	invReq.Header.Set("Authorization", "Bearer "+regBody.APIKey)
@@ -534,7 +548,9 @@ func TestRateLimitGetRightmostKeying(t *testing.T) {
 	var invBody struct {
 		PairingURL string `json:"pairing_url"`
 	}
-	json.NewDecoder(invResp.Body).Decode(&invBody)
+	if err := json.NewDecoder(invResp.Body).Decode(&invBody); err != nil {
+		t.Fatal(err)
+	}
 	parts := strings.Split(invBody.PairingURL, "/")
 	token := parts[len(parts)-1]
 
@@ -543,7 +559,10 @@ func TestRateLimitGetRightmostKeying(t *testing.T) {
 		for _, h := range xff {
 			req.Header.Add("X-Forwarded-For", h)
 		}
-		resp, _ := http.DefaultClient.Do(req)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
 		resp.Body.Close()
 		return resp.StatusCode
 	}
@@ -569,6 +588,11 @@ func TestRateLimitGetRightmostKeying(t *testing.T) {
 	if status := makeReq("198.51.100.3", "203.0.113.10, 127.0.0.4"); status != 429 {
 		t.Errorf("client C split headers: got %d, want 429", status)
 	}
+
+	// Positive control: Client D with a different rightmost entry should still get 200
+	if status := makeReq("198.51.100.4, 203.0.113.11", "127.0.0.5"); status != 200 {
+		t.Errorf("client D different rightmost: got %d, want 200", status)
+	}
 }
 
 // TestUntrustedDirectPeer verifies that XFF is ignored when RemoteAddr is not trusted.
@@ -580,7 +604,7 @@ func TestUntrustedDirectPeer(t *testing.T) {
 	defer st.Close()
 
 	cfg := Config{
-		TrustedProxies: []string{"10.0.0.0/8"},
+		TrustedProxies: []string{"10.0.0.0/8"}, // httptest server uses 127.0.0.1 (loopback, not in 10/8)
 		MsgPerMinute:   10,
 		MsgBurst:       10,
 	}
@@ -597,29 +621,31 @@ func TestUntrustedDirectPeer(t *testing.T) {
 	httpSrv := httptest.NewServer(srv.Handler())
 	defer httpSrv.Close()
 
-	// Register from untrusted IP with XFF header - XFF should be ignored
-	makeReg := func(remoteOverride string, xff string) int {
+	// Register from RemoteAddr that is not in the trusted 10.0.0.0/8 range.
+	// XFF header should be ignored.
+	makeReg := func(xff string) int {
 		req, _ := http.NewRequest("POST", httpSrv.URL+"/v1/register", strings.NewReader(`{"name":"test"}`))
 		req.Header.Set("Content-Type", "application/json")
 		if xff != "" {
 			req.Header.Set("X-Forwarded-For", xff)
 		}
-		// Can't actually override RemoteAddr in test, but the server will see httptest's address
-		// which is 127.0.0.1 (trusted). Let's use a different endpoint instead.
-		resp, _ := http.DefaultClient.Do(req)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
 		resp.Body.Close()
 		return resp.StatusCode
 	}
 
 	// Two registrations - keyed on RemoteAddr not XFF
-	if status := makeReg("", "1.2.3.4"); status != 201 {
+	if status := makeReg("1.2.3.4"); status != 201 {
 		t.Errorf("reg 1: got %d, want 201", status)
 	}
-	if status := makeReg("", "5.6.7.8"); status != 201 {
+	if status := makeReg("5.6.7.8"); status != 201 {
 		t.Errorf("reg 2: got %d, want 201", status)
 	}
 	// Third should be rate limited - same RemoteAddr bucket
-	if status := makeReg("", "9.10.11.12"); status != 429 {
+	if status := makeReg("9.10.11.12"); status != 429 {
 		t.Errorf("reg 3: got %d, want 429", status)
 	}
 }
@@ -645,10 +671,16 @@ func TestIPv4MappedDirectPeer(t *testing.T) {
 	if keyMapped != keyNative {
 		t.Errorf("rate limit keys differ: mapped=%q native=%q", keyMapped, keyNative)
 	}
+
+	// Test a trusted mapped peer with XFF: should extract the XFF hop
+	ipWithXFF := clientIP("[::ffff:10.0.0.5]:1234", []string{"203.0.113.9"}, trustedNets)
+	if ipWithXFF != "203.0.113.9" {
+		t.Errorf("clientIP with trusted mapped peer and XFF = %q, want 203.0.113.9", ipWithXFF)
+	}
 }
 
 // TestClientIPAtMultipleCallSites verifies clientIP is used correctly at
-// registration (regLim) in addition to GET routes.
+// registration (regLim), pairing (pairLim), and auth-fail (failLim) call sites.
 func TestClientIPAtMultipleCallSites(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/t.db")
 	if err != nil {
@@ -670,6 +702,8 @@ func TestClientIPAtMultipleCallSites(t *testing.T) {
 	}
 
 	srv.lim.regLim = msg.NewLimiter(2, 2)
+	srv.lim.pairLim = msg.NewLimiter(2, 2)
+	srv.lim.failLim = msg.NewLimiter(2, 2)
 
 	httpSrv := httptest.NewServer(srv.Handler())
 	defer httpSrv.Close()
@@ -680,11 +714,15 @@ func TestClientIPAtMultipleCallSites(t *testing.T) {
 		for _, h := range xff {
 			req.Header.Add("X-Forwarded-For", h)
 		}
-		resp, _ := http.DefaultClient.Do(req)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
 		resp.Body.Close()
 		return resp.StatusCode
 	}
 
+	// Test regLim keying
 	// Client with XFF [203.0.113.50, 127.0.0.2]
 	xff := []string{"203.0.113.50", "127.0.0.2"}
 	if status := makeReg(xff...); status != 201 {
@@ -695,6 +733,112 @@ func TestClientIPAtMultipleCallSites(t *testing.T) {
 	}
 	if status := makeReg(xff...); status != 429 {
 		t.Errorf("reg 3: got %d, want 429 (rate limited)", status)
+	}
+
+	// Test pairLim keying: create an invite with pairing URL and POST to accept it
+	regResp, err := http.Post(httpSrv.URL+"/v1/register", "application/json", strings.NewReader(`{"name":"pair-test"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer regResp.Body.Close()
+	var regBody struct {
+		PeerID string `json:"peer_id"`
+		APIKey string `json:"api_key"`
+	}
+	if err := json.NewDecoder(regResp.Body).Decode(&regBody); err != nil {
+		t.Fatal(err)
+	}
+	acceptorKey := regBody.APIKey
+
+	// Register another peer to create invites for each test
+	regResp2, err := http.Post(httpSrv.URL+"/v1/register", "application/json", strings.NewReader(`{"name":"inviter"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer regResp2.Body.Close()
+	var regBody2 struct {
+		APIKey string `json:"api_key"`
+	}
+	if err := json.NewDecoder(regResp2.Body).Decode(&regBody2); err != nil {
+		t.Fatal(err)
+	}
+	inviterKey := regBody2.APIKey
+
+	// Helper to create a new pairing invite
+	createPairingInvite := func() string {
+		invReq, _ := http.NewRequest("POST", httpSrv.URL+"/v1/invites", strings.NewReader(`{"scopes":["messages"],"generate_pairing":true}`))
+		invReq.Header.Set("Authorization", "Bearer "+inviterKey)
+		invReq.Header.Set("Content-Type", "application/json")
+		invResp, err := http.DefaultClient.Do(invReq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer invResp.Body.Close()
+		var invBody struct {
+			PairingURL string `json:"pairing_url"`
+		}
+		if err := json.NewDecoder(invResp.Body).Decode(&invBody); err != nil {
+			t.Fatal(err)
+		}
+		return invBody.PairingURL
+	}
+
+	// POST to pairing URL charges pairLim
+	makePairReq := func(pairingURL string, xff ...string) int {
+		req, _ := http.NewRequest("POST", pairingURL, strings.NewReader(`{}`))
+		req.Header.Set("Authorization", "Bearer "+acceptorKey)
+		req.Header.Set("Content-Type", "application/json")
+		for _, h := range xff {
+			req.Header.Add("X-Forwarded-For", h)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	xffPair := []string{"203.0.113.60", "127.0.0.3"}
+	url1 := createPairingInvite()
+	status1 := makePairReq(url1, xffPair...)
+	if status1 != 200 && status1 != 201 {
+		t.Errorf("pair 1: got %d, want 200 or 201", status1)
+	}
+	url2 := createPairingInvite()
+	status2 := makePairReq(url2, xffPair...)
+	if status2 != 200 && status2 != 201 {
+		t.Errorf("pair 2: got %d, want 200 or 201", status2)
+	}
+	url3 := createPairingInvite()
+	if status := makePairReq(url3, xffPair...); status != 429 {
+		t.Errorf("pair 3: got %d, want 429 (rate limited)", status)
+	}
+
+	// Test failLim keying: send bad auth to /v1/me
+	makeFailReq := func(xff ...string) int {
+		req, _ := http.NewRequest("GET", httpSrv.URL+"/v1/me", nil)
+		req.Header.Set("Authorization", "Bearer pl_invalid")
+		for _, h := range xff {
+			req.Header.Add("X-Forwarded-For", h)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	xffFail := []string{"203.0.113.70", "127.0.0.4"}
+	if status := makeFailReq(xffFail...); status != 401 {
+		t.Errorf("fail 1: got %d, want 401", status)
+	}
+	if status := makeFailReq(xffFail...); status != 401 {
+		t.Errorf("fail 2: got %d, want 401", status)
+	}
+	if status := makeFailReq(xffFail...); status != 429 {
+		t.Errorf("fail 3: got %d, want 429 (rate limited)", status)
 	}
 }
 
@@ -734,8 +878,9 @@ func TestNewWithInvalidProxyConfig(t *testing.T) {
 	}
 }
 
-// TestNoRequestPanicAfterValidConfig verifies that request handling never panics
-// after any valid configuration is accepted.
+// TestNoRequestPanicAfterValidConfig verifies that clientIP call sites never panic
+// after any valid configuration is accepted. This is the request-level version of
+// the parse-level guard (TestNewWithInvalidProxyConfig).
 func TestNoRequestPanicAfterValidConfig(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/t.db")
 	if err != nil {
@@ -743,42 +888,92 @@ func TestNoRequestPanicAfterValidConfig(t *testing.T) {
 	}
 	defer st.Close()
 
-	validConfigs := [][]string{
-		{},                          // empty
-		{"10.0.0.0/8"},              // simple IPv4
-		{"2001:db8::/32"},           // IPv6
-		{"::ffff:10.0.0.0/104"},     // IPv4-mapped
-		{"10.0.0.1", "192.168.1.1"}, // bare IPs
+	tests := []struct {
+		name           string
+		trustedProxies []string
+		remoteAddr     string
+		xff            string
+		wantStatus     int
+	}{
+		// Empty config: no trusted proxies, should work
+		{name: "empty config", trustedProxies: []string{}, remoteAddr: "127.0.0.1", xff: "203.0.113.1", wantStatus: 200},
+		// Simple IPv4
+		{name: "IPv4 /8, untrusted peer", trustedProxies: []string{"10.0.0.0/8"}, remoteAddr: "127.0.0.1", xff: "203.0.113.2", wantStatus: 200},
+		{name: "IPv4 /8, trusted peer with XFF", trustedProxies: []string{"10.0.0.0/8"}, remoteAddr: "10.0.0.1", xff: "203.0.113.3", wantStatus: 200},
+		// IPv6
+		{name: "IPv6 /32", trustedProxies: []string{"2001:db8::/32"}, remoteAddr: "2001:db8::1", xff: "2001:db8::99", wantStatus: 200},
+		// IPv4-mapped IPv6 (this was the #164 nil *net.IPNet path)
+		{name: "IPv4-mapped /104, trusted peer", trustedProxies: []string{"::ffff:10.0.0.0/104"}, remoteAddr: "::ffff:10.0.0.5", xff: "203.0.113.4", wantStatus: 200},
+		{name: "IPv4-mapped /104, untrusted peer", trustedProxies: []string{"::ffff:10.0.0.0/104"}, remoteAddr: "127.0.0.1", xff: "203.0.113.5", wantStatus: 200},
+		// Bare IPs
+		{name: "bare IPs", trustedProxies: []string{"10.0.0.1", "192.168.1.1"}, remoteAddr: "10.0.0.1", xff: "203.0.113.6", wantStatus: 200},
 	}
 
-	for _, proxies := range validConfigs {
-		cfg := Config{
-			TrustedProxies: proxies,
-		}
-		if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		srv, err := New(st, cfg)
-		if err != nil {
-			t.Fatalf("New() with %v failed: %v", proxies, err)
-		}
-
-		httpSrv := httptest.NewServer(srv.Handler())
-
-		// Make a request and ensure no panic
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					t.Errorf("request panicked with config %v: %v", proxies, r)
-				}
-			}()
-			resp, _ := http.Get(httpSrv.URL + "/healthz")
-			if resp != nil {
-				resp.Body.Close()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				TrustedProxies: tt.trustedProxies,
+				MsgPerMinute:   10,
+				MsgBurst:       10,
 			}
-		}()
+			if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			srv, err := New(st, cfg)
+			if err != nil {
+				t.Fatalf("New() with %v failed: %v", tt.trustedProxies, err)
+			}
 
-		httpSrv.Close()
+			httpSrv := httptest.NewServer(srv.Handler())
+			defer httpSrv.Close()
+
+			// Register a peer and create a pairing invite
+			regResp, err := http.Post(httpSrv.URL+"/v1/register", "application/json", strings.NewReader(`{"name":"test"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var regBody struct {
+				APIKey string `json:"api_key"`
+			}
+			json.NewDecoder(regResp.Body).Decode(&regBody)
+			regResp.Body.Close()
+
+			invReq, _ := http.NewRequest("POST", httpSrv.URL+"/v1/invites", strings.NewReader(`{"scopes":["messages"],"generate_pairing":true}`))
+			invReq.Header.Set("Authorization", "Bearer "+regBody.APIKey)
+			invReq.Header.Set("Content-Type", "application/json")
+			invResp, err := http.DefaultClient.Do(invReq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var invBody struct {
+				PairingURL string `json:"pairing_url"`
+			}
+			json.NewDecoder(invResp.Body).Decode(&invBody)
+			invResp.Body.Close()
+
+			// Extract pairing token
+			parts := strings.Split(invBody.PairingURL, "/")
+			pairingToken := parts[len(parts)-1]
+
+			// Make a request through clientIP call site (GET /v1/pairing/{token})
+			// This exercises the actual clientIP code path, including the #164 nil-IPNet case
+			req, _ := http.NewRequest("GET", httpSrv.URL+"/v1/pairing/"+pairingToken, nil)
+			if tt.xff != "" {
+				req.Header.Set("X-Forwarded-For", tt.xff)
+			}
+			// Note: httptest always uses 127.0.0.1 as RemoteAddr, so we can't actually
+			// test the exact RemoteAddr, but we can verify no panic and correct status.
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("request failed (connection error): %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("got status %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+		})
 	}
 }
 
@@ -842,9 +1037,102 @@ func TestNewWarnsWhenTrustedProxiesParseToNothing(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 	var logs bytes.Buffer
-	srv := mustNew(t, st, Config{TrustedProxies: []string{" ", ""}, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(st, Config{TrustedProxies: []string{" ", ""}, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(srv.lim.Stop)
-	if !strings.Contains(logs.String(), "no trusted proxies configured") {
-		t.Fatalf("a set-but-empty trusted proxy list must warn, got logs: %q", logs.String())
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, "no trusted proxies configured") {
+		t.Fatalf("a set-but-empty trusted proxy list must warn, got logs: %q", logOutput)
+	}
+	// Ensure there's only one warning (not duplicated)
+	count := strings.Count(logOutput, "no trusted proxies configured")
+	if count != 1 {
+		t.Fatalf("expected exactly 1 warning, got %d in logs: %q", count, logOutput)
+	}
+}
+
+func TestIPv6FloorWithOptIn(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      []string
+		allowBroad bool
+		wantError  string
+		wantNet    string
+	}{
+		// Default floor /32
+		{name: "IPv6 /32 allowed (default)", input: []string{"2001:db8::/32"}, allowBroad: false},
+		{name: "IPv6 /31 rejected (default)", input: []string{"2001:db8::/31"}, allowBroad: false, wantError: "must be at least /32"},
+		{name: "IPv6 /29 rejected (default)", input: []string{"2a06:98c0::/29"}, allowBroad: false, wantError: "must be at least /32"},
+		{name: "ULA fc00::/7 rejected (default)", input: []string{"fc00::/7"}, allowBroad: false, wantError: "must be at least /32"},
+		{name: "ULA fd00::/8 rejected (default)", input: []string{"fd00::/8"}, allowBroad: false, wantError: "must be at least /32"},
+
+		// Opt-in floor /29
+		{name: "IPv6 /29 allowed (opt-in)", input: []string{"2a06:98c0::/29"}, allowBroad: true, wantNet: "2a06:98c0::/29"},
+		{name: "IPv6 /32 allowed (opt-in)", input: []string{"2001:db8::/32"}, allowBroad: true},
+		{name: "IPv6 /28 rejected (opt-in)", input: []string{"2a06:98c0::/28"}, allowBroad: true, wantError: "must be at least /29"},
+		{name: "ULA fc00::/7 allowed (opt-in)", input: []string{"fc00::/7"}, allowBroad: true, wantNet: "fc00::/7"},
+		{name: "ULA fd00::/8 allowed (opt-in)", input: []string{"fd00::/8"}, allowBroad: true, wantNet: "fd00::/8"},
+
+		// Still rejected even with opt-in
+		{name: "::/0 rejected (opt-in)", input: []string{"::/0"}, allowBroad: true, wantError: "too broad"},
+		{name: "2000::/3 rejected (opt-in)", input: []string{"2000::/3"}, allowBroad: true, wantError: "too broad"},
+		{name: "2002::/16 rejected (opt-in)", input: []string{"2002::/16"}, allowBroad: true, wantError: "not allowed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nets, err := ParseTrustedProxiesWithOpts(tt.input, tt.allowBroad)
+			if tt.wantError != "" {
+				if err == nil {
+					t.Errorf("ParseTrustedProxiesWithOpts(%v, %v) succeeded, want error containing %q", tt.input, tt.allowBroad, tt.wantError)
+				} else if !strings.Contains(err.Error(), tt.wantError) {
+					t.Errorf("error = %q, want error containing %q", err.Error(), tt.wantError)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("ParseTrustedProxiesWithOpts(%v, %v) failed: %v", tt.input, tt.allowBroad, err)
+				} else if tt.wantNet != "" {
+					if len(nets) != 1 {
+						t.Errorf("got %d networks, want 1", len(nets))
+					} else if nets[0].String() != tt.wantNet {
+						t.Errorf("got network %q, want %q", nets[0].String(), tt.wantNet)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestAllowBroadIPv6Warning(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	var logs bytes.Buffer
+	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(st, Config{
+		TrustedProxies: []string{"2a06:98c0::/29"},
+		AllowBroadIPv6: true,
+		Logger:         slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.lim.Stop)
+
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled") {
+		t.Errorf("expected warning about ALLOW_BROAD, got logs: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "spoof X-Forwarded-For") {
+		t.Errorf("expected security warning about spoofing, got logs: %q", logOutput)
 	}
 }

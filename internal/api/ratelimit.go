@@ -167,11 +167,20 @@ func rateLimitKey(ip string) string {
 
 // ParseTrustedProxies parses a list of CIDR strings (or bare IPs) into IPNets.
 // Rejects overly broad prefixes (0.0.0.0/0, ::/0, and prefixes shorter than
-// /8 for IPv4 or /32 for IPv6) to prevent misconfiguration (#62).
+// /8 for IPv4 or /32 for IPv6, or /29 for IPv6 with AllowBroadIPv6) to prevent misconfiguration (#62).
 // IPv4-mapped IPv6 prefixes (e.g., ::ffff:10.0.0.0/104) are unmapped and
 // converted to IPv4 (10.0.0.0/8), with the IPv4 /8 floor applied.
 // Rejects zone identifiers (e.g., fe80::1%eth0).
+// Rejects 0.0.0.0/8 ("this network") and its IPv4-mapped form.
 func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
+	return ParseTrustedProxiesWithOpts(cidrs, false)
+}
+
+// ParseTrustedProxiesWithOpts parses trusted proxies with optional broader IPv6 floor.
+// When allowBroadIPv6 is true, the IPv6 floor is /29 (allowing Cloudflare 2a06:98c0::/29)
+// and ULA ranges fc00::/7 and fd00::/8 are permitted. Even with the opt-in,
+// ::/0, 2000::/3, and 2002::/16 are still rejected.
+func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IPNet, error) {
 	var nets []*net.IPNet
 	for _, cidr := range cidrs {
 		cidr = strings.TrimSpace(cidr)
@@ -243,9 +252,47 @@ func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 			if bits < 8 {
 				return nil, fmt.Errorf("parsing %q: IPv4 prefix must be at least /8", cidr)
 			}
+			// Reject 0.0.0.0/8 ("this network")
+			if prefix.String() == "0.0.0.0/8" {
+				return nil, fmt.Errorf("parsing %q: 0.0.0.0/8 (this network) is not allowed", cidr)
+			}
 		} else {
-			if bits < 32 {
-				return nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /32", cidr)
+			// IPv6: apply floor and additional checks
+			addr := prefix.Addr()
+			
+			// Always reject ::/0
+			// Already handled by bits == 0 check above
+
+			// Reject 2000::/3 (global unicast, too broad) even with opt-in
+			if bits <= 3 && addr.As16()[0]&0xE0 == 0x20 {
+				return nil, fmt.Errorf("parsing %q: 2000::/3 is too broad", cidr)
+			}
+			// Reject 2002::/16 (6to4) even with opt-in
+			if bits <= 16 && addr.As16()[0] == 0x20 && addr.As16()[1] == 0x02 {
+				return nil, fmt.Errorf("parsing %q: 2002::/16 (6to4) is not allowed", cidr)
+			}
+
+			// Apply floor: /32 by default, /29 with allowBroadIPv6
+			// ULA ranges (fc00::/7, fd00::/8) are only allowed with opt-in
+			minBits := 32
+			isULA := (addr.As16()[0] == 0xfc || addr.As16()[0] == 0xfd)
+			
+			if isULA && !allowBroadIPv6 {
+				// Reject ULA ranges without opt-in (they're broader than /32)
+				return nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /%d", cidr, minBits)
+			}
+			
+			if allowBroadIPv6 {
+				if isULA {
+					// ULA ranges are allowed with opt-in even though they're broader than /29
+					// fc00::/7 and fd00::/8 are private ranges
+				} else {
+					minBits = 29
+				}
+			}
+			
+			if !isULA && bits < minBits {
+				return nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /%d", cidr, minBits)
 			}
 		}
 

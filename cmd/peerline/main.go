@@ -165,23 +165,12 @@ func main() {
 		log.Warn("PEERLINE_REGISTER_TOKEN unset: registration is open to anyone who can reach this server")
 	}
 
-	// Parse trusted proxy CIDRs
+	// Parse trusted proxy CIDRs and opt-in for broader IPv6
 	tp := os.Getenv("PEERLINE_TRUSTED_PROXIES")
-	warnTrustedProxies(log, tp)
+	allowBroadIPv6 := os.Getenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD") == "1"
 	var trustedProxies []string
 	if tp != "" {
 		trustedProxies = strings.Split(tp, ",")
-		// Validate at startup
-		nets, err := api.ParseTrustedProxies(trustedProxies)
-		if err != nil {
-			log.Error("invalid PEERLINE_TRUSTED_PROXIES CIDR", "err", err)
-			os.Exit(1)
-		}
-		if len(nets) == 0 {
-			log.Warn("PEERLINE_TRUSTED_PROXIES set but contains no entries: X-Forwarded-For headers are ignored")
-		} else {
-			log.Info("trusted proxies", "count", len(nets), "cidrs", nets)
-		}
 	}
 
 	maxOutstandingInvites, _ := strconv.Atoi(os.Getenv("PEERLINE_MAX_OUTSTANDING_INVITES"))
@@ -295,6 +284,7 @@ func main() {
 		EmailPerHour:          emailPerHour,
 		NotifyPerHour:         notifyPerHour,
 		TrustedProxies:        trustedProxies,
+		AllowBroadIPv6:        allowBroadIPv6,
 		MaxOutstandingInvites: maxOutstandingInvites,
 		RetentionSeconds:      retentionSeconds,
 		AuthFailPerMinute:     authFailPerMinute,

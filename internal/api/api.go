@@ -66,6 +66,9 @@ type Config struct {
 	// TrustedProxies is a list of CIDR ranges (e.g. "10.0.0.0/8") from which
 	// X-Forwarded-For headers are honored. If empty, X-Forwarded-For is ignored.
 	TrustedProxies []string
+	// AllowBroadIPv6 lowers the IPv6 floor from /32 to /29 and permits ULA ranges.
+	// Only use when trusting a known public /29 (e.g. Cloudflare 2a06:98c0::/29).
+	AllowBroadIPv6 bool
 	// Now is the clock for invite expiry and rate limiters; defaults to time.Now.
 	Now func() time.Time
 	// MaxOutstandingInvites is the per-peer limit on active (non-expired, unused) invites.
@@ -181,7 +184,7 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 		cfg.Now = time.Now
 	}
 
-	trustedNets, err := ParseTrustedProxies(cfg.TrustedProxies)
+	trustedNets, err := ParseTrustedProxiesWithOpts(cfg.TrustedProxies, cfg.AllowBroadIPv6)
 	if err != nil {
 		return nil, fmt.Errorf("invalid trusted proxy configuration: %w", err)
 	}
@@ -193,6 +196,9 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 			prefixes = append(prefixes, n.String())
 		}
 		cfg.Logger.Info("trusted proxy networks configured", "prefixes", strings.Join(prefixes, ", "))
+		if cfg.AllowBroadIPv6 {
+			cfg.Logger.Warn("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /32 or /29 lets anyone inside it spoof X-Forwarded-For")
+		}
 	} else {
 		cfg.Logger.Warn("no trusted proxies configured: X-Forwarded-For will be ignored", "entries", len(cfg.TrustedProxies))
 	}
