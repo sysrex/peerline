@@ -187,37 +187,150 @@ CREATE TABLE IF NOT EXISTS bags (
 CREATE INDEX IF NOT EXISTS invites_expires_at ON invites(expires_at);
 `
 
+// dbFilePath extracts the actual file path from a database DSN (data source name).
+// It matches the DSN parsing done by modernc.org/sqlite v1.61.0 driver's newConn function
+// (conn.go lines 103-119).
+//
+// Returns:
+//   - path: the file system path SQLite will actually open, empty for memory databases
+//   - isMemory: true for ":memory:", "file::memory:", or "?mode=memory" databases
+//   - err: parsing errors (currently always nil)
+//
+// The driver behavior:
+//   - Query string (after '?') is extracted
+//   - If DSN starts with "file:", the full DSN (including query) is passed to sqlite3_open_v2
+//     with SQLITE_OPEN_URI flag, and SQLite decodes the URI
+//   - Otherwise, the query is stripped before passing to sqlite3_open_v2
+//
+// Memory databases:
+//   - ":memory:" (plain)
+//   - "file::memory:" or "file::memory:?params" (URI)
+//   - Any DSN with "mode=memory" query parameter (case-insensitive, last value wins)
+func dbFilePath(dsn string) (path string, isMemory bool, err error) {
+	// Plain :memory:
+	if dsn == ":memory:" {
+		return "", true, nil
+	}
+
+	// Extract query string
+	queryStart := strings.IndexRune(dsn, '?')
+	var query string
+	if queryStart >= 0 {
+		query = dsn[queryStart+1:]
+	}
+
+	// Check for mode=memory in query (case-insensitive, last value wins)
+	if query != "" {
+		// Parse query parameters
+		for _, param := range strings.Split(query, "&") {
+			if kv := strings.SplitN(param, "=", 2); len(kv) == 2 {
+				if strings.ToLower(kv[0]) == "mode" && strings.ToLower(kv[1]) == "memory" {
+					return "", true, nil
+				}
+			}
+		}
+	}
+
+	// Handle file: URIs
+	if strings.HasPrefix(dsn, "file:") {
+		// Strip "file:" prefix
+		uriPath := dsn[5:]
+
+		// Check for file::memory: (with or without query)
+		if strings.HasPrefix(uriPath, ":memory:") {
+			return "", true, nil
+		}
+
+		// Strip query if present (sqlite3_open_v2 with SQLITE_OPEN_URI handles it)
+		if queryStart >= 0 {
+			uriPath = uriPath[:queryStart-5] // -5 for "file:" prefix
+		}
+
+		// Decode URI: handle file:/// (3 slashes), file:// (2 slashes), file:/ (1 slash), file:rel
+		// SQLite URI decoding: file:///path is /path, file://host/path is UNC, file:/path is /path
+		// We implement basic percent-decoding for local paths
+		if strings.HasPrefix(uriPath, "///") {
+			// file:///absolute/path -> /absolute/path
+			uriPath = uriPath[2:] // Keep one slash
+		} else if strings.HasPrefix(uriPath, "//") {
+			// file://host/path or file://C:/path - keep as-is for now (UNC or Windows)
+			// For simplicity, we don't handle UNC paths differently
+		} else if strings.HasPrefix(uriPath, "/") {
+			// file:/absolute/path -> /absolute/path (already correct)
+		}
+		// else: file:relative/path -> relative/path (already correct)
+
+		// Percent-decode the path
+		decoded, decodeErr := url.PathUnescape(uriPath)
+		if decodeErr != nil {
+			// If decoding fails, use the original path
+			decoded = uriPath
+		}
+
+		return decoded, false, nil
+	}
+
+	// Plain file path: strip query if present
+	if queryStart >= 0 {
+		return dsn[:queryStart], false, nil
+	}
+
+	return dsn, false, nil
+}
+
 // checkDatabasePath refuses non-regular database files (FIFO, socket, device, directory).
 // Symlinks are allowed if their target is a regular file or doesn't exist (dangling).
 // Symlinks to non-regular files (FIFO, socket, device, directory) are refused.
 // ":memory:" and SQLite URI paths are skipped.
 // A missing path is acceptable (will be created).
-func checkDatabasePath(path string) error {
-	// Skip special paths
-	if path == ":memory:" || strings.HasPrefix(path, "file:") || strings.Contains(path, "?mode=memory") {
+func checkDatabasePath(dsn string) error {
+	// Parse the DSN to get the actual file path
+	path, isMemory, err := dbFilePath(dsn)
+	if err != nil {
+		return err
+	}
+
+	// Memory databases are always OK
+	if isMemory {
 		return nil
 	}
 
+	// Empty path from URI parsing is an error
+	if path == "" {
+		return fmt.Errorf("database path is empty after parsing DSN")
+	}
+
 	// Lstat to detect symlinks
-	info, err := os.Lstat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
+	info, lstatErr := os.Lstat(path)
+	if lstatErr != nil {
+		if os.IsNotExist(lstatErr) {
 			// Missing path is OK, it will be created
 			return nil
 		}
-		return pathless(err)
+		return pathless(lstatErr)
 	}
 
 	// If it's a symlink, check the target
 	if info.Mode()&os.ModeSymlink != 0 {
 		// Stat the target (follows the symlink)
-		targetInfo, err := os.Stat(path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				// Dangling symlink is OK (same as missing path)
+		targetInfo, statErr := os.Stat(path)
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				// Dangling symlink: check parent directory permissions
+				// Refuse only if parent is group- or world-writable
+				parentDir := filepath.Dir(path)
+				parentInfo, parentErr := os.Stat(parentDir)
+				if parentErr != nil {
+					// Can't check parent, err on the safe side and refuse
+					return pathless(statErr)
+				}
+				if parentInfo.Mode().Perm()&0o022 != 0 {
+					return fmt.Errorf("database symlink %s is dangling and parent directory is group- or world-writable", filepath.Base(path))
+				}
+				// Dangling symlink with safe parent is OK
 				return nil
 			}
-			return pathless(err)
+			return pathless(statErr)
 		}
 		// Check if target is a regular file
 		info = targetInfo
@@ -229,14 +342,14 @@ func checkDatabasePath(path string) error {
 		switch {
 		case info.IsDir():
 			fileType = "directory"
+		case info.Mode()&os.ModeCharDevice != 0:
+			fileType = "character device"
+		case info.Mode()&os.ModeDevice != 0:
+			fileType = "device"
 		case info.Mode()&os.ModeNamedPipe != 0:
 			fileType = "named pipe (FIFO)"
 		case info.Mode()&os.ModeSocket != 0:
 			fileType = "socket"
-		case info.Mode()&os.ModeDevice != 0:
-			fileType = "device"
-		case info.Mode()&os.ModeCharDevice != 0:
-			fileType = "character device"
 		}
 		return fmt.Errorf("database file %s is a %s; must be a regular file", filepath.Base(path), fileType)
 	}
@@ -291,11 +404,6 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
-
-	// Tighten permissions on existing database files if needed (Unix only)
-	if absPath, err := filepath.Abs(path); err == nil && path != ":memory:" {
-		tightenDatabaseFilePermissions(absPath, opts.Logger)
-	}
 
 	// Guard: check version BEFORE executing schema
 	currentVersion, err := checkSchemaVersion(db)
@@ -361,6 +469,10 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("backfill invite public_id: %w", err)
 	}
+
+	// Tighten permissions on database files (main, WAL, SHM) if needed (Unix only)
+	// Called after schema setup so all files exist
+	tightenDatabaseFilePermissions(path, opts.Logger)
 
 	return &Store{
 		db:                 db,

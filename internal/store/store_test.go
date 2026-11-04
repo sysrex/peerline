@@ -3686,14 +3686,14 @@ func TestNoAbsolutePathsInErrors(t *testing.T) {
 		db.Close()
 
 		// This should fail when trying to read the directory for retention
-		// But the migration itself may succeed before retention is enforced
-		// So we accept either success or failure, but if there's an error, check path redaction
 		_, err = OpenWithOptions(path, opts)
-		if err != nil {
-			// Error should not contain the temp directory path
-			if strings.Contains(err.Error(), tempDir) {
-				t.Errorf("error contains temp directory path %q: %v", tempDir, err)
-			}
+		if err == nil {
+			t.Fatal("expected error when retention directory is unreadable, got nil")
+		}
+
+		// Error should not contain the temp directory path
+		if strings.Contains(err.Error(), tempDir) {
+			t.Errorf("error contains temp directory path %q: %v", tempDir, err)
 		}
 	})
 }
