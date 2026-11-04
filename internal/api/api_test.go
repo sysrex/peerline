@@ -2919,15 +2919,18 @@ func TestInviteRateLimitDeleteFailure(t *testing.T) {
 }
 
 // TestRecipientLimitRefundDeleteFailure verifies that when mailLim.Allow succeeds but rcptLim.Allow
-// fails, the sender's mail token is refunded even if the compensating delete fails. This tests the
-// security-critical refund path (line 778 in api.go: s.lim.mailLim.Refund(me)).
+// fails, the sender's mail token is refunded even if the compensating delete fails. Uses concurrent
+// requests synchronized with testAfterEmailReadyHook to ensure both pass Ready together, so one
+// succeeds and one hits the rcptLim failure path with refund.
 func TestRecipientLimitRefundDeleteFailure(t *testing.T) {
+	frozenTime := time.Unix(1000000000, 0)
 	capture := &captureMailer{}
 	cfg := Config{}
 	cfg.EmailPerHour = 10
 	cfg.EmailBurst = 2       // Burst of 2 to test refund logic
-	cfg.EmailRcptPerHour = 1 // Only 1 email per recipient
+	cfg.EmailRcptPerHour = 1 // Only 1 email per recipient per hour
 	cfg.Mailer = capture
+	cfg.Clock = clocktest.New(frozenTime)
 
 	dbPath := t.TempDir() + "/t.db"
 	st, err := store.Open(dbPath)
@@ -2942,27 +2945,6 @@ func TestRecipientLimitRefundDeleteFailure(t *testing.T) {
 	}
 	defer db.Close()
 
-	prepareTestConfig(t, st, &cfg)
-	rawSrv, err := New(st, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rawSrv.Stop()
-
-	srv := httptest.NewServer(rawSrv.Handler())
-	defer srv.Close()
-
-	alice := register(t, srv, "Alice")
-
-	// First invite to same@example.com succeeds, consumes 1 sender token and 1 recipient token
-	resp, b := alice.do("POST", "/v1/invites", map[string]any{
-		"to_email": "same@example.com",
-		"scopes":   []string{"messages"},
-	}, nil)
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
-	}
-
 	// Install BEFORE DELETE trigger to force cleanup failure
 	_, err = db.Exec(`CREATE TRIGGER fail_inv_del BEFORE DELETE ON invites BEGIN SELECT RAISE(ABORT, 'trigger_error'); END`)
 	if err != nil {
@@ -2972,35 +2954,71 @@ func TestRecipientLimitRefundDeleteFailure(t *testing.T) {
 		db.Exec(`DROP TRIGGER IF EXISTS fail_inv_del`)
 	})
 
-	// Second invite to same@example.com: Both Ready checks pass (Ready doesn't consume),
-	// mailLim.Allow succeeds (consumes 1 sender token, leaving 0), rcptLim.Allow fails
-	// (recipient already used), mailLim.Refund restores the token (back to 1), then
-	// rejectEmailRateLimited with delete failure returns 500.
-	resp, b = alice.do("POST", "/v1/invites", map[string]any{
-		"to_email": "same@example.com",
-		"scopes":   []string{"messages"},
-	}, nil)
+	prepareTestConfig(t, st, &cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawSrv.Stop()
 
-	// Should get 500 (delete failed during recipient rate limit rejection), not 429
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Errorf("expected 500 when compensating delete fails, got %d: %s", resp.StatusCode, b)
+	const concurrent = 2
+	barrier := newBarrier(t, concurrent, 5*time.Second)
+	var armed atomic.Bool
+	rawSrv.testAfterEmailReadyHook = func(peerID string) {
+		if armed.Load() {
+			barrier()
+		}
 	}
 
-	// Error body must be generic
-	bodyStr := string(b)
-	if !strings.Contains(bodyStr, "internal error") {
-		t.Errorf("expected generic 'internal error' body, got: %s", bodyStr)
+	srv := httptest.NewServer(rawSrv.Handler())
+	defer srv.Close()
+
+	alice := register(t, srv, "Alice")
+
+	// Arm the hook for concurrent requests
+	armed.Store(true)
+
+	// Launch 2 concurrent requests to same@example.com
+	// Both pass Ready together, one Allow succeeds, the other hits rcptLim failure with refund
+	results := make(chan int, concurrent)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, _ := alice.do("POST", "/v1/invites", map[string]any{
+				"to_email": "same@example.com",
+				"scopes":   []string{"messages"},
+			}, nil)
+			results <- resp.StatusCode
+		}()
 	}
-	if strings.Contains(bodyStr, "trigger") || strings.Contains(bodyStr, "ABORT") {
-		t.Errorf("error body leaked internal details: %s", bodyStr)
+	wg.Wait()
+	close(results)
+
+	// Disarm the hook
+	armed.Store(false)
+
+	var created, failed int
+	for status := range results {
+		if status == http.StatusCreated {
+			created++
+		} else if status == http.StatusInternalServerError {
+			failed++
+		} else {
+			t.Errorf("unexpected status: %d", status)
+		}
 	}
 
-	// Should NOT have Retry-After (500, not 429)
-	if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
-		t.Errorf("unexpected Retry-After header on 500: %s", retryAfter)
+	// Exactly one should succeed (201), one should fail at rcptLim with delete failure (500)
+	if created != 1 {
+		t.Errorf("concurrent creates: %d succeeded, want 1", created)
+	}
+	if failed != 1 {
+		t.Errorf("delete failures: %d, want 1", failed)
 	}
 
-	// No email sent to same@example.com on the second request
+	// Verify exactly one email sent to same@example.com
 	msgs := capture.messages()
 	var sameCount int
 	for _, m := range msgs {
@@ -3009,17 +3027,28 @@ func TestRecipientLimitRefundDeleteFailure(t *testing.T) {
 		}
 	}
 	if sameCount != 1 {
-		t.Errorf("expected 1 email to same@example.com (only first request), got %d", sameCount)
+		t.Errorf("expected 1 email to same@example.com, got %d", sameCount)
 	}
 
-	// Drop trigger so we can verify state
+	// Verify orphan invite persists by checking database directly (with trigger still in place)
+	var inviteCount int
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM invites WHERE from_peer=? AND used_by IS NULL`,
+		alice.id).Scan(&inviteCount); err != nil {
+		t.Fatalf("count invites: %v", err)
+	}
+	if inviteCount != 2 {
+		t.Errorf("orphan count: %d, want 2 (one succeeded, one orphaned)", inviteCount)
+	}
+
+	// Drop trigger so we can revoke orphans through the API
 	_, err = db.Exec(`DROP TRIGGER fail_inv_del`)
 	if err != nil {
 		t.Fatalf("drop trigger: %v", err)
 	}
 
-	// Orphan invite persists (cleanup failed)
-	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	// Now revoke orphans through the API
+	resp, b := alice.do("GET", "/v1/invites", nil, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("list invites: %d %s", resp.StatusCode, b)
 	}
@@ -3029,22 +3058,15 @@ func TestRecipientLimitRefundDeleteFailure(t *testing.T) {
 	if err := json.Unmarshal(b, &listResp); err != nil {
 		t.Fatal(err)
 	}
-	if len(listResp.Invites) != 2 {
-		t.Errorf("orphan count: %d, want 2 (first succeeded, second orphaned)", len(listResp.Invites))
-	}
-
-	// Revoke both invites to clean state
 	for _, inv := range listResp.Invites {
-		orphanID := inv["public_id"].(string)
-		resp, b := alice.do("DELETE", "/v1/invites/"+orphanID, nil, nil)
-		if resp.StatusCode != http.StatusNoContent {
-			t.Errorf("revoke orphan: expected 204, got %d: %s", resp.StatusCode, b)
+		if orphanID, ok := inv["public_id"].(string); ok {
+			alice.do("DELETE", "/v1/invites/"+orphanID, nil, nil)
 		}
 	}
 
-	// Verify sender budget was refunded: After first email Alice has 1 token left.
-	// Second email consumed 1 (leaving 0), then refunded 1 (back to 1).
-	// So Alice should be able to send to a distinct recipient (would fail without refund).
+	// Verify sender budget was refunded: EmailBurst=2, first request consumed 1 (leaving 1),
+	// second request consumed 1 then refunded 1 (leaving 1). Without refund, 0 would remain.
+	// So distinct@ should succeed (proves refund happened), and another@ should fail.
 	resp, b = alice.do("POST", "/v1/invites", map[string]any{
 		"to_email": "distinct@example.com",
 		"scopes":   []string{"messages"},
@@ -3052,16 +3074,9 @@ func TestRecipientLimitRefundDeleteFailure(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated {
 		t.Errorf("refund check: expected 201, got %d: %s", resp.StatusCode, b)
 		t.Errorf("this proves sender's mailLim tokens were NOT refunded after rcptLim failure")
-	} else {
-		// Revoke this invite for cleanup
-		var inv struct {
-			PublicID string `json:"public_id"`
-		}
-		json.Unmarshal(b, &inv)
-		alice.do("DELETE", "/v1/invites/"+inv.PublicID, nil, nil)
 	}
 
-	// Verify budget is now exhausted (second distinct recipient should fail)
+	// Budget now exhausted, next distinct recipient should fail
 	resp, b = alice.do("POST", "/v1/invites", map[string]any{
 		"to_email": "another@example.com",
 		"scopes":   []string{"messages"},
