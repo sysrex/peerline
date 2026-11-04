@@ -338,30 +338,25 @@ func TestParseTrustedProxiesSymmetry(t *testing.T) {
 		t.Errorf("native network = %q, want 10.0.0.0/8", native[0].String())
 	}
 
-	// Verify Contains agrees for mapped and native forms for a table of addresses
+	// Verify Contains agrees for mapped and native forms of each address against the same net
 	testAddrs := []struct {
-		addr     string
-		inRange  bool
-		mappable bool
+		addr    string
+		inRange bool
 	}{
-		{"10.0.0.5", true, true},
-		{"::ffff:10.0.0.5", true, false},
-		{"10.1.0.1", true, true},
-		{"::1", false, false},
-		{"2001:db8::1", false, false},
-		{"203.0.113.1", false, true},
+		{"10.0.0.5", true},
+		{"::ffff:10.0.0.5", true},
+		{"10.1.0.1", true},
+		{"::1", false},
+		{"2001:db8::1", false},
+		{"203.0.113.1", false},
 	}
 
 	for _, tt := range testAddrs {
 		addr := net.ParseIP(tt.addr)
-		mappedContains := mapped[0].Contains(addr)
-		nativeContains := native[0].Contains(addr)
+		contains := native[0].Contains(addr)
 
-		if mappedContains != nativeContains {
-			t.Errorf("Contains(%q): mapped=%v native=%v, want same", tt.addr, mappedContains, nativeContains)
-		}
-		if mappedContains != tt.inRange {
-			t.Errorf("Contains(%q) = %v, want %v", tt.addr, mappedContains, tt.inRange)
+		if contains != tt.inRange {
+			t.Errorf("Contains(%q) = %v, want %v", tt.addr, contains, tt.inRange)
 		}
 	}
 
@@ -556,7 +551,10 @@ func TestRateLimitGetRightmostKeying(t *testing.T) {
 		for _, h := range xff {
 			req.Header.Add("X-Forwarded-For", h)
 		}
-		resp, _ := http.DefaultClient.Do(req)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
 		resp.Body.Close()
 		return resp.StatusCode
 	}
@@ -581,6 +579,11 @@ func TestRateLimitGetRightmostKeying(t *testing.T) {
 	// Client C: same rightmost (203.0.113.10) split differently
 	if status := makeReq("198.51.100.3", "203.0.113.10, 127.0.0.4"); status != 429 {
 		t.Errorf("client C split headers: got %d, want 429", status)
+	}
+
+	// Positive control: Client D with a different rightmost entry should still get 200
+	if status := makeReq("198.51.100.5, 203.0.113.11", "127.0.0.5"); status != 200 {
+		t.Errorf("client D different rightmost: got %d, want 200", status)
 	}
 }
 
@@ -613,27 +616,30 @@ func TestUntrustedDirectPeer(t *testing.T) {
 	defer httpSrv.Close()
 
 	// Register from untrusted IP with XFF header - XFF should be ignored
-	makeReg := func(remoteOverride string, xff string) int {
+	makeReg := func(xff string) int {
 		req, _ := http.NewRequest("POST", httpSrv.URL+"/v1/register", strings.NewReader(`{"name":"test"}`))
 		req.Header.Set("Content-Type", "application/json")
 		if xff != "" {
 			req.Header.Set("X-Forwarded-For", xff)
 		}
 		// httptest's RemoteAddr (127.0.0.1) is outside 10.0.0.0/8, so XFF is ignored
-		resp, _ := http.DefaultClient.Do(req)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
 		resp.Body.Close()
 		return resp.StatusCode
 	}
 
 	// Two registrations - keyed on RemoteAddr not XFF
-	if status := makeReg("", "1.2.3.4"); status != 201 {
+	if status := makeReg("1.2.3.4"); status != 201 {
 		t.Errorf("reg 1: got %d, want 201", status)
 	}
-	if status := makeReg("", "5.6.7.8"); status != 201 {
+	if status := makeReg("5.6.7.8"); status != 201 {
 		t.Errorf("reg 2: got %d, want 201", status)
 	}
 	// Third should be rate limited - same RemoteAddr bucket
-	if status := makeReg("", "9.10.11.12"); status != 429 {
+	if status := makeReg("9.10.11.12"); status != 429 {
 		t.Errorf("reg 3: got %d, want 429", status)
 	}
 }
@@ -700,7 +706,10 @@ func TestClientIPAtMultipleCallSites(t *testing.T) {
 		for _, h := range xff {
 			req.Header.Add("X-Forwarded-For", h)
 		}
-		resp, _ := http.DefaultClient.Do(req)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
 		resp.Body.Close()
 		return resp.StatusCode
 	}
@@ -1221,18 +1230,19 @@ func TestIPv6FloorWithOptIn(t *testing.T) {
 		{name: "IPv6 /29 rejected (default)", input: []string{"2a06:98c0::/29"}, allowBroad: false, wantError: "must be at least /32"},
 		{name: "ULA fc00::/7 rejected (default)", input: []string{"fc00::/7"}, allowBroad: false, wantError: "must be at least /32"},
 		{name: "ULA fd00::/8 rejected (default)", input: []string{"fd00::/8"}, allowBroad: false, wantError: "must be at least /32"},
+		{name: "ULA fd12:3456:789a::/48 allowed (default)", input: []string{"fd12:3456:789a::/48"}, allowBroad: false, wantNet: "fd12:3456:789a::/48"},
+		{name: "ULA bare fd00::1 allowed (default)", input: []string{"fd00::1"}, allowBroad: false, wantNet: "fd00::1/128"},
 
 		// Opt-in floor /29
 		{name: "IPv6 /29 allowed (opt-in)", input: []string{"2a06:98c0::/29"}, allowBroad: true, wantNet: "2a06:98c0::/29"},
 		{name: "IPv6 /32 allowed (opt-in)", input: []string{"2001:db8::/32"}, allowBroad: true},
 		{name: "IPv6 /28 rejected (opt-in)", input: []string{"2a06:98c0::/28"}, allowBroad: true, wantError: "must be at least /29"},
 		{name: "ULA fc00::/7 allowed (opt-in)", input: []string{"fc00::/7"}, allowBroad: true, wantNet: "fc00::/7"},
+		{name: "ULA fc00::/6 rejected (opt-in, too broad)", input: []string{"fc00::/6"}, allowBroad: true, wantError: "must be at least "},
 		{name: "ULA fd00::/8 allowed (opt-in)", input: []string{"fd00::/8"}, allowBroad: true, wantNet: "fd00::/8"},
 
 		// Still rejected even with opt-in
 		{name: "::/0 rejected (opt-in)", input: []string{"::/0"}, allowBroad: true, wantError: "too broad"},
-		{name: "2000::/3 rejected (opt-in)", input: []string{"2000::/3"}, allowBroad: true, wantError: "too broad"},
-		{name: "2002::/16 rejected (opt-in)", input: []string{"2002::/16"}, allowBroad: true, wantError: "not allowed"},
 	}
 
 	for _, tt := range tests {

@@ -55,6 +55,21 @@ func parseVersionDetail(raw string) (string, error) {
 	}
 }
 
+// parseBoolStrict validates boolean environment variables strictly.
+// Accepts: "", "0", "false" (false) or "1", "true" (true), case-insensitive, whitespace-trimmed.
+// Returns an error for any other value to fail-closed on typos.
+func parseBoolStrict(raw string) (bool, error) {
+	normalized := strings.ToLower(strings.TrimSpace(raw))
+	switch normalized {
+	case "", "0", "false":
+		return false, nil
+	case "1", "true":
+		return true, nil
+	default:
+		return false, fmt.Errorf("must be '0', '1', 'false', or 'true', got: %q", raw)
+	}
+}
+
 func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	addr := flag.String("addr", env("PEERLINE_ADDR", "127.0.0.1:8787"), "listen address")
@@ -167,7 +182,11 @@ func main() {
 
 	// Parse trusted proxy CIDRs and opt-in for broader IPv6
 	tp := os.Getenv("PEERLINE_TRUSTED_PROXIES")
-	allowBroadIPv6 := os.Getenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD") == "1"
+	allowBroadIPv6, err := parseBoolStrict(os.Getenv("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD"))
+	if err != nil {
+		log.Error("invalid PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD value", "err", err)
+		os.Exit(1)
+	}
 	var trustedProxies []string
 	if tp != "" {
 		trustedProxies = strings.Split(tp, ",")

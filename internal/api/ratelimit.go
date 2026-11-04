@@ -260,38 +260,23 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 			// IPv6: apply floor and additional checks
 			addr := prefix.Addr()
 
-			// Always reject ::/0
-			// Already handled by bits == 0 check above
-
-			// Reject 2000::/3 (global unicast, too broad) even with opt-in
-			if bits <= 3 && addr.As16()[0]&0xE0 == 0x20 {
-				return nil, fmt.Errorf("parsing %q: 2000::/3 is too broad", cidr)
-			}
-			// Reject 2002::/16 (6to4) even with opt-in
-			if bits <= 16 && addr.As16()[0] == 0x20 && addr.As16()[1] == 0x02 {
-				return nil, fmt.Errorf("parsing %q: 2002::/16 (6to4) is not allowed", cidr)
-			}
+			// Check if prefix is ULA (fc00::/7) and contained within fc00::/7
+			// (bits >= 7 ensures it's not broader than fc00::/7 itself)
+			isContainedULA := (addr.As16()[0] == 0xfc || addr.As16()[0] == 0xfd) && bits >= 7
 
 			// Apply floor: /32 by default, /29 with allowBroadIPv6
-			// ULA ranges (fc00::/7, fd00::/8) are only allowed with opt-in
+			// Exception: with opt-in, ULA contained in fc00::/7 is exempt from floor
 			minBits := 32
-			isULA := (addr.As16()[0] == 0xfc || addr.As16()[0] == 0xfd)
-
-			if isULA && !allowBroadIPv6 {
-				// Reject ULA ranges without opt-in (they're broader than /32)
-				return nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /%d", cidr, minBits)
-			}
-
 			if allowBroadIPv6 {
-				if isULA {
-					// ULA ranges are allowed with opt-in even though they're broader than /29
-					// fc00::/7 and fd00::/8 are private ranges
+				if isContainedULA {
+					// ULA ranges contained in fc00::/7 are exempt from floor with opt-in
+					minBits = 0 // no floor for contained ULA
 				} else {
 					minBits = 29
 				}
 			}
 
-			if !isULA && bits < minBits {
+			if bits < minBits {
 				return nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /%d", cidr, minBits)
 			}
 		}
