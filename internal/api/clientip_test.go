@@ -1219,12 +1219,13 @@ func TestNewWarnsWhenTrustedProxiesParseToNothing(t *testing.T) {
 	t.Cleanup(srv.lim.Stop)
 	logOutput := logs.String()
 	if !strings.Contains(logOutput, "no trusted proxies configured") {
-		t.Fatalf("a set-but-empty trusted proxy list must warn, got logs: %q", logOutput)
+		t.Fatalf("api.New must warn when the parsed list is empty, got logs: %q", logOutput)
 	}
-	// Ensure there's only one warning (not duplicated)
+	// Verify api.New emits exactly one warning (this test only calls api.New,
+	// so it cannot detect a duplicate warning added elsewhere, e.g. in main.go).
 	count := strings.Count(logOutput, "no trusted proxies configured")
 	if count != 1 {
-		t.Fatalf("expected exactly 1 warning, got %d in logs: %q", count, logOutput)
+		t.Fatalf("api.New emitted %d warnings, want 1, in logs: %q", count, logOutput)
 	}
 }
 
@@ -1313,14 +1314,24 @@ func TestAllowBroadIPv6Warning(t *testing.T) {
 	if !strings.Contains(logOutput, "ULA (fc00::/7)") {
 		t.Errorf("expected warning to mention ULA exemption, got logs: %q", logOutput)
 	}
-	if !strings.Contains(logOutput, "relaxed") {
-		t.Errorf("expected log about relaxed entries, got logs: %q", logOutput)
+	// Check that the relaxed log line contains both entries (not just the "trusted proxy networks configured" line)
+	lines := strings.Split(logOutput, "\n")
+	var relaxedLine string
+	for _, line := range lines {
+		if strings.Contains(line, "relaxed=") {
+			relaxedLine = line
+			break
+		}
 	}
-	if !strings.Contains(logOutput, "2a06:98c0::/29") {
-		t.Errorf("expected relaxed log to list 2a06:98c0::/29, got logs: %q", logOutput)
-	}
-	if !strings.Contains(logOutput, "fd00::/8") {
-		t.Errorf("expected relaxed log to list fd00::/8, got logs: %q", logOutput)
+	if relaxedLine == "" {
+		t.Errorf("expected log line with relaxed= attribute, got logs: %q", logOutput)
+	} else {
+		if !strings.Contains(relaxedLine, "2a06:98c0::/29") {
+			t.Errorf("expected relaxed log line to list 2a06:98c0::/29, got: %q", relaxedLine)
+		}
+		if !strings.Contains(relaxedLine, "fd00::/8") {
+			t.Errorf("expected relaxed log line to list fd00::/8, got: %q", relaxedLine)
+		}
 	}
 }
 
@@ -1347,21 +1358,35 @@ func TestAllowBroadIPv6NoEntriesNeeded(t *testing.T) {
 	}
 }
 
-func TestAllowBroadIPv6ConfigValue(t *testing.T) {
-	st, err := store.Open(":memory:")
+func TestParseTrustedProxiesWithOptsRelaxedList(t *testing.T) {
+	// Mix of entries: public /29, broad ULA, narrow /32, specific ULA
+	input := []string{"2a06:98c0::/29", "fd00::/8", "2001:db8::/32", "fd12:3456:789a::/48"}
+	nets, relaxed, err := ParseTrustedProxiesWithOpts(input, true)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("ParseTrustedProxiesWithOpts failed: %v", err)
 	}
-	t.Cleanup(func() { st.Close() })
-
-	srv := mustNew(t, st, Config{
-		TrustedProxies: []string{"2a06:98c0::/29"},
-		AllowBroadIPv6: true,
-		Logger:         slog.Default(),
-	})
-	t.Cleanup(srv.lim.Stop)
-
-	if !srv.cfg.AllowBroadIPv6 {
-		t.Errorf("srv.cfg.AllowBroadIPv6 = false, want true")
+	if len(nets) != 4 {
+		t.Errorf("got %d networks, want 4", len(nets))
 	}
+	// relaxed should contain exactly the entries that needed the opt-in:
+	// 2a06:98c0::/29 (public /29, would be rejected at /32 floor)
+	// fd00::/8 (broad ULA, would be rejected at /32 floor)
+	// NOT 2001:db8::/32 (meets /32 floor without opt-in)
+	// NOT fd12:3456:789a::/48 (ULA but meets /32 floor without opt-in)
+	want := []string{"2a06:98c0::/29", "fd00::/8"}
+	if len(relaxed) != len(want) {
+		t.Errorf("relaxed list has %d entries, want %d: got %v, want %v", len(relaxed), len(want), relaxed, want)
+	}
+	for i, w := range want {
+		if i >= len(relaxed) || relaxed[i] != w {
+			t.Errorf("relaxed[%d] = %q, want %q (full list: %v)", i, safeIndex(relaxed, i), w, relaxed)
+		}
+	}
+}
+
+func safeIndex(s []string, i int) string {
+	if i >= 0 && i < len(s) {
+		return s[i]
+	}
+	return "<out of range>"
 }
