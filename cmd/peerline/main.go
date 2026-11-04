@@ -55,6 +55,26 @@ func parseVersionDetail(raw string) (string, error) {
 	}
 }
 
+// describeTLSMode returns a human-readable description of the SMTP TLS mode.
+func describeTLSMode(smtp *mailer.SMTP) string {
+	if smtp.ImplicitTLS {
+		return "implicit TLS (port 465)"
+	} else if smtp.AllowPlaintext {
+		return "STARTTLS optional (plaintext allowed)"
+	}
+	return "STARTTLS required"
+}
+
+// describeSMTPMode returns the log level and message for SMTP startup logging.
+// Returns WARN for non-loopback plaintext-allowed relays (invite codes unprotected in transit),
+// INFO otherwise.
+func describeSMTPMode(smtp *mailer.SMTP) (slog.Level, string) {
+	if smtp.AllowPlaintext && !mailer.IsLoopback(smtp.Host) {
+		return slog.LevelWarn, "SMTP configured with plaintext allowed to non-loopback relay; invite codes and message previews are not protected in transit"
+	}
+	return slog.LevelInfo, "SMTP configured"
+}
+
 func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	addr := flag.String("addr", env("PEERLINE_ADDR", "127.0.0.1:8787"), "listen address")
@@ -206,7 +226,7 @@ func main() {
 	} else if smtp, ok := ml.(*mailer.SMTP); ok {
 		// Probe SMTP server at startup to fail fast if TLS is misconfigured.
 		// Network errors (connection refused, timeout) only warn; Send retries at runtime.
-		if err := smtp.Probe(context.Background(), log); err != nil {
+		if err := smtp.Probe(context.Background()); err != nil {
 			if errors.Is(err, mailer.ErrRelayUnreachable) {
 				log.Warn("smtp relay unreachable at startup (will retry on send)", "host", smtp.Host, "port", smtp.Port, "err", err)
 			} else {
@@ -214,19 +234,8 @@ func main() {
 				os.Exit(1)
 			}
 		}
-		// Log TLS mode at startup
-		var tlsMode string
-		if smtp.ImplicitTLS {
-			tlsMode = "implicit TLS (port 465)"
-		} else if smtp.AllowPlaintext {
-			tlsMode = "STARTTLS optional (plaintext allowed)"
-			if !mailer.IsLoopback(smtp.Host) {
-				log.Warn("SMTP configured with plaintext allowed to non-loopback relay; invite codes and message previews are not protected in transit", "host", smtp.Host, "port", smtp.Port)
-			}
-		} else {
-			tlsMode = "STARTTLS required"
-		}
-		log.Info("SMTP configured", "host", smtp.Host, "port", smtp.Port, "tls", tlsMode, "authenticated", smtp.User != "")
+		level, msg := describeSMTPMode(smtp)
+		log.Log(context.Background(), level, msg, "host", smtp.Host, "port", smtp.Port, "tls", describeTLSMode(smtp), "authenticated", smtp.User != "")
 	}
 	if publicURL == "" {
 		log.Warn("PEERLINE_PUBLIC_URL unset: pairing links and base_url fall back to the request Host header; set it so clients never send keys to a forged origin")

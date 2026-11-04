@@ -133,6 +133,8 @@ func TestFromEnv(t *testing.T) {
 		{"host set without FROM is error", "mail.example.com", "", "", "", "", "", "", false, false, true, false, ""},
 		{"invalid require TLS", "localhost", "", "", "", "test@example.com", "ture", "", false, false, true, false, ""},
 		{"user without pass", "localhost", "", "u", "", "test@example.com", "", "", false, false, true, false, ""},
+		{"credentials with REQUIRE_TLS=false on non-loopback", "192.168.1.1", "", "u", "p", "test@example.com", "false", "smtp", true, false, false, false, ""},
+		{"bracketed IPv6 host is rejected", "[::1]", "", "", "", "test@example.com", "", "", false, false, true, false, ""},
 	}
 
 	for _, tt := range tests {
@@ -542,12 +544,24 @@ func TestSMTPSend(t *testing.T) {
 }
 
 func TestFromEnvRejectsLegacyAllowPlaintext(t *testing.T) {
-	t.Setenv("PEERLINE_SMTP_HOST", "localhost")
-	t.Setenv("PEERLINE_SMTP_FROM", "test@example.com")
-	t.Setenv("PEERLINE_SMTP_ALLOW_PLAINTEXT", "1")
-	if _, err := FromEnv(nil); err == nil || !strings.Contains(err.Error(), "PEERLINE_SMTP_REQUIRE_TLS") {
-		t.Fatalf("want rename error, got %v", err)
-	}
+	t.Run("ALLOW_PLAINTEXT alone", func(t *testing.T) {
+		t.Setenv("PEERLINE_SMTP_HOST", "localhost")
+		t.Setenv("PEERLINE_SMTP_FROM", "test@example.com")
+		t.Setenv("PEERLINE_SMTP_ALLOW_PLAINTEXT", "1")
+		if _, err := FromEnv(nil); err == nil || !strings.Contains(err.Error(), "PEERLINE_SMTP_REQUIRE_TLS") {
+			t.Fatalf("want rename error, got %v", err)
+		}
+	})
+
+	t.Run("both ALLOW_PLAINTEXT and REQUIRE_TLS set", func(t *testing.T) {
+		t.Setenv("PEERLINE_SMTP_HOST", "localhost")
+		t.Setenv("PEERLINE_SMTP_FROM", "test@example.com")
+		t.Setenv("PEERLINE_SMTP_ALLOW_PLAINTEXT", "1")
+		t.Setenv("PEERLINE_SMTP_REQUIRE_TLS", "false")
+		if _, err := FromEnv(nil); err == nil || !strings.Contains(err.Error(), "PEERLINE_SMTP_REQUIRE_TLS") {
+			t.Fatalf("want rename error, got %v", err)
+		}
+	})
 }
 
 func TestSMTPProbeCredentialsWithoutSTARTTLS(t *testing.T) {
@@ -560,7 +574,7 @@ func TestSMTPProbeCredentialsWithoutSTARTTLS(t *testing.T) {
 	defer srv.close()
 
 	s := &SMTP{Host: "127.1.2.3", Port: srv.port(), User: "u", Pass: "p", Timeout: 2 * time.Second, AllowPlaintext: true}
-	err = s.Probe(context.Background(), nil)
+	err = s.Probe(context.Background())
 	if err == nil || errors.Is(err, ErrRelayUnreachable) || !strings.Contains(err.Error(), "PLAIN auth") {
 		t.Fatalf("want fatal credentials error, got %v", err)
 	}
@@ -583,7 +597,7 @@ func TestSMTPProbe(t *testing.T) {
 			AllowPlaintext: false,
 			TLSConfig:      &tls.Config{RootCAs: certPool, ServerName: "localhost"},
 		}
-		err := s.Probe(context.Background(), nil)
+		err := s.Probe(context.Background())
 		if err != nil {
 			t.Fatalf("probe should succeed: %v", err)
 		}
@@ -599,7 +613,7 @@ func TestSMTPProbe(t *testing.T) {
 			Timeout:        2 * time.Second,
 			AllowPlaintext: false,
 		}
-		err := s.Probe(context.Background(), nil)
+		err := s.Probe(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "PEERLINE_SMTP_REQUIRE_TLS") {
 			t.Fatalf("probe should fail and mention env var, got: %v", err)
 		}
@@ -620,7 +634,7 @@ func TestSMTPProbe(t *testing.T) {
 			Timeout:        100 * time.Millisecond,
 			AllowPlaintext: false,
 		}
-		err = s.Probe(context.Background(), nil)
+		err = s.Probe(context.Background())
 		if err == nil {
 			t.Fatal("probe should return error for unreachable")
 		}
@@ -641,7 +655,7 @@ func TestSMTPProbe(t *testing.T) {
 			AllowPlaintext: false,
 			// No custom TLSConfig - will use system roots and fail
 		}
-		err := s.Probe(context.Background(), nil)
+		err := s.Probe(context.Background())
 		if err == nil {
 			t.Fatal("probe should fail on untrusted cert")
 		}
@@ -669,7 +683,7 @@ func TestSMTPProbe(t *testing.T) {
 			AllowPlaintext: false,
 			TLSConfig:      &tls.Config{RootCAs: certPool, ServerName: "localhost"},
 		}
-		err := s.Probe(context.Background(), nil)
+		err := s.Probe(context.Background())
 		if err != nil {
 			t.Fatalf("probe should succeed with trusted cert: %v", err)
 		}
@@ -710,7 +724,7 @@ func TestSMTPProbe(t *testing.T) {
 			Timeout:        500 * time.Millisecond,
 			AllowPlaintext: false,
 		}
-		err = s.Probe(context.Background(), nil)
+		err = s.Probe(context.Background())
 		if err == nil {
 			t.Fatal("probe should return error for timeout")
 		}
@@ -743,12 +757,71 @@ func TestSMTPProbe(t *testing.T) {
 			Timeout:        500 * time.Millisecond,
 			AllowPlaintext: false,
 		}
-		err = s.Probe(context.Background(), nil)
+		err = s.Probe(context.Background())
 		if err == nil {
 			t.Fatal("probe should return error for 4xx greeting")
 		}
 		if !errors.Is(err, ErrRelayUnreachable) {
 			t.Fatalf("4xx greeting should be ErrRelayUnreachable, got: %v", err)
+		}
+	})
+
+	t.Run("AllowPlaintext true: STARTTLS offered = handshake runs", func(t *testing.T) {
+		cert := genTestCert(t, "localhost")
+		srv := newFakeServer(t, true, &cert)
+		defer srv.close()
+
+		certPool := x509.NewCertPool()
+		parsed, _ := x509.ParseCertificate(cert.Certificate[0])
+		certPool.AddCert(parsed)
+
+		s := &SMTP{
+			Host:           "127.0.0.1",
+			Port:           srv.port(),
+			Timeout:        2 * time.Second,
+			AllowPlaintext: true,
+			TLSConfig:      &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+		}
+		err := s.Probe(context.Background())
+		if err != nil {
+			t.Fatalf("probe should succeed with AllowPlaintext and good cert: %v", err)
+		}
+	})
+
+	t.Run("AllowPlaintext true: STARTTLS absent = passes", func(t *testing.T) {
+		srv := newFakeServer(t, false, nil)
+		defer srv.close()
+
+		s := &SMTP{
+			Host:           "127.0.0.1",
+			Port:           srv.port(),
+			Timeout:        2 * time.Second,
+			AllowPlaintext: true,
+		}
+		err := s.Probe(context.Background())
+		if err != nil {
+			t.Fatalf("probe should succeed with AllowPlaintext and no STARTTLS: %v", err)
+		}
+	})
+
+	t.Run("AllowPlaintext true: STARTTLS offered with bad cert = fatal", func(t *testing.T) {
+		cert := genTestCert(t, "localhost")
+		srv := newFakeServer(t, true, &cert)
+		defer srv.close()
+
+		s := &SMTP{
+			Host:           "127.0.0.1",
+			Port:           srv.port(),
+			Timeout:        2 * time.Second,
+			AllowPlaintext: true,
+			// No custom TLSConfig - will use system roots and fail
+		}
+		err := s.Probe(context.Background())
+		if err == nil {
+			t.Fatal("probe should fail on bad cert even with AllowPlaintext")
+		}
+		if errors.Is(err, ErrRelayUnreachable) {
+			t.Fatalf("cert error should be fatal, not ErrRelayUnreachable: %v", err)
 		}
 	})
 
@@ -781,7 +854,7 @@ func TestSMTPProbe(t *testing.T) {
 			Timeout:        500 * time.Millisecond,
 			AllowPlaintext: false,
 		}
-		err = s.Probe(context.Background(), nil)
+		err = s.Probe(context.Background())
 		if err == nil {
 			t.Fatal("probe should return error for EHLO failure")
 		}
@@ -902,7 +975,7 @@ func TestSMTPImplicitTLS(t *testing.T) {
 			ImplicitTLS: true,
 			// No custom TLSConfig - will use system roots and fail cert validation
 		}
-		err = s.Probe(context.Background(), nil)
+		err = s.Probe(context.Background())
 		if err == nil {
 			t.Fatal("probe should fail on port 465 TLS error, got nil")
 		}
@@ -940,7 +1013,7 @@ func TestSMTPImplicitTLS(t *testing.T) {
 			Timeout:     500 * time.Millisecond,
 			ImplicitTLS: true,
 		}
-		err = s.Probe(context.Background(), nil)
+		err = s.Probe(context.Background())
 		if err == nil {
 			t.Fatal("probe should return error for timeout")
 		}
@@ -964,7 +1037,7 @@ func TestSMTPImplicitTLS(t *testing.T) {
 			Timeout:     100 * time.Millisecond,
 			ImplicitTLS: true,
 		}
-		err = s.Probe(context.Background(), nil)
+		err = s.Probe(context.Background())
 		if err == nil {
 			t.Fatal("probe should return error for closed port")
 		}

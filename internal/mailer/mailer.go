@@ -101,6 +101,14 @@ type SMTP struct {
 
 func (s *SMTP) Mode() string { return "smtp" }
 
+// checkSTARTTLS validates STARTTLS policy: returns an error if STARTTLS is required but not offered.
+func (s *SMTP) checkSTARTTLS(offered bool) error {
+	if !offered && !s.AllowPlaintext {
+		return errors.New("smtp: STARTTLS required but not offered by server (set PEERLINE_SMTP_REQUIRE_TLS=false to allow cleartext)")
+	}
+	return nil
+}
+
 // IsLoopback returns true if host is a loopback address.
 // Matches net/smtp PlainAuth: "localhost", "127.0.0.1", and "::1".
 // Hostnames are not resolved; only these three literals are recognized as loopback.
@@ -121,6 +129,9 @@ func FromEnv(lg *slog.Logger) (Sender, error) {
 	if host == "" {
 		logBody := os.Getenv("PEERLINE_DEV_LOG_EMAIL_BODY") == "1"
 		return Log{Logger: lg, LogFullBody: logBody}, nil
+	}
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		return nil, fmt.Errorf("PEERLINE_SMTP_HOST: bracketed host %q not allowed (use %s without brackets)", host, host[1:len(host)-1])
 	}
 	port := 587
 	if p := os.Getenv("PEERLINE_SMTP_PORT"); p != "" {
@@ -214,12 +225,14 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 	}
 	defer c.Close()
 	if !s.ImplicitTLS {
-		if ok, _ := c.Extension("STARTTLS"); ok {
+		hasSTARTTLS, _ := c.Extension("STARTTLS")
+		if err := s.checkSTARTTLS(hasSTARTTLS); err != nil {
+			return err
+		}
+		if hasSTARTTLS {
 			if err := c.StartTLS(tlsCfg); err != nil {
 				return fmt.Errorf("smtp starttls: %w", err)
 			}
-		} else if !s.AllowPlaintext {
-			return errors.New("smtp: STARTTLS required but not offered by server (set PEERLINE_SMTP_REQUIRE_TLS=false to allow cleartext)")
 		}
 	}
 	if s.User != "" {
@@ -252,10 +265,7 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 // Network errors (timeouts, connection refused, resets), SMTP greeting/EHLO errors, and
 // all other transient failures return an error wrapping ErrRelayUnreachable; the caller
 // should log a warning and continue (Send will retry at runtime).
-func (s *SMTP) Probe(ctx context.Context, lg *slog.Logger) error {
-	if lg == nil {
-		lg = slog.Default()
-	}
+func (s *SMTP) Probe(ctx context.Context) error {
 	timeout := s.Timeout
 	if timeout <= 0 {
 		timeout = 10 * time.Second
@@ -314,9 +324,8 @@ func (s *SMTP) Probe(ctx context.Context, lg *slog.Logger) error {
 
 	if !s.ImplicitTLS {
 		hasSTARTTLS, _ := c.Extension("STARTTLS")
-		if !hasSTARTTLS && !s.AllowPlaintext {
-			// Missing STARTTLS when required is a config error
-			return fmt.Errorf("smtp probe: STARTTLS not offered by %s:%d but TLS is required (set PEERLINE_SMTP_REQUIRE_TLS=false to allow cleartext)", s.Host, s.Port)
+		if err := s.checkSTARTTLS(hasSTARTTLS); err != nil {
+			return fmt.Errorf("smtp probe: %s:%d: %w", s.Host, s.Port, err)
 		}
 		if !hasSTARTTLS && s.User != "" && !IsLoopback(s.Host) {
 			return fmt.Errorf("smtp probe: credentials are set but %s:%d offers no STARTTLS and is not loopback; PLAIN auth would be refused", s.Host, s.Port)
@@ -336,6 +345,7 @@ func (s *SMTP) Probe(ctx context.Context, lg *slog.Logger) error {
 
 // isTLSError returns true if err is a certificate validation error or TLS protocol error.
 // These are fatal configuration errors, not transient network errors.
+// Exception: expired certificates are treated as transient (relay state, not Peerline config).
 func isTLSError(err error) bool {
 	if err == nil {
 		return false
@@ -344,7 +354,14 @@ func isTLSError(err error) bool {
 	var x509Unknown x509.UnknownAuthorityError
 	var x509Hostname x509.HostnameError
 	var x509Invalid x509.CertificateInvalidError
-	if errors.As(err, &x509Unknown) || errors.As(err, &x509Hostname) || errors.As(err, &x509Invalid) {
+	if errors.As(err, &x509Unknown) || errors.As(err, &x509Hostname) {
+		return true
+	}
+	if errors.As(err, &x509Invalid) {
+		// Expired certificates are relay state, not Peerline config: treat as transient
+		if x509Invalid.Reason == x509.Expired {
+			return false
+		}
 		return true
 	}
 	// Check for TLS errors
