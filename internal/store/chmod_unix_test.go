@@ -4,6 +4,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -178,6 +179,20 @@ func TestTightenSkipsFIFO(t *testing.T) {
 	if err := syscall.Mkfifo(walPath, 0644); err != nil {
 		t.Fatalf("mkfifo: %v", err)
 	}
+
+	// Cleanup: unblock any goroutine that might be blocked on the FIFO
+	t.Cleanup(func() {
+		// Open for writing non-blocking to unblock any reader
+		// ENXIO means no reader is blocked, which is fine
+		f, err := os.OpenFile(walPath, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err != nil && !errors.Is(err, syscall.ENXIO) {
+			// Log but don't fail the cleanup
+			t.Logf("cleanup: failed to unblock FIFO: %v", err)
+		}
+		if f != nil {
+			f.Close()
+		}
+	})
 
 	// Verify it's a FIFO
 	info, err := os.Lstat(walPath)

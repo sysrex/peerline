@@ -187,6 +187,52 @@ CREATE TABLE IF NOT EXISTS bags (
 CREATE INDEX IF NOT EXISTS invites_expires_at ON invites(expires_at);
 `
 
+// checkDatabasePath refuses non-regular database files (FIFO, socket, device, directory).
+// Symlinks are refused following the same pattern as tightenDatabaseFilePermissions (#245/#323).
+// ":memory:" and SQLite URI paths are skipped.
+// A missing path is acceptable (will be created).
+func checkDatabasePath(path string) error {
+	// Skip special paths
+	if path == ":memory:" || strings.HasPrefix(path, "file:") || strings.Contains(path, "?mode=memory") {
+		return nil
+	}
+
+	// Lstat to not follow symlinks
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Missing path is OK, it will be created
+			return nil
+		}
+		return pathless(err)
+	}
+
+	// Refuse symlinks (following #245/#323 pattern)
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("database file %s must not be a symlink", filepath.Base(path))
+	}
+
+	// Refuse non-regular files (FIFO, socket, device, directory)
+	if !info.Mode().IsRegular() {
+		fileType := "non-regular file"
+		switch {
+		case info.IsDir():
+			fileType = "directory"
+		case info.Mode()&os.ModeNamedPipe != 0:
+			fileType = "named pipe (FIFO)"
+		case info.Mode()&os.ModeSocket != 0:
+			fileType = "socket"
+		case info.Mode()&os.ModeDevice != 0:
+			fileType = "device"
+		case info.Mode()&os.ModeCharDevice != 0:
+			fileType = "character device"
+		}
+		return fmt.Errorf("database file %s is a %s; must be a regular file", filepath.Base(path), fileType)
+	}
+
+	return nil
+}
+
 // Open opens the database at path, applies migrations, and returns a Store.
 // Use ":memory:" for tests. It is the only Store constructor; a zero-value Store{} has a nil clock and must not be used directly.
 func Open(path string) (*Store, error) {
@@ -219,6 +265,11 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	if opts.BackupRetentionCount < 1 {
 		opts.Logger.Warn("BackupRetentionCount < 1, using 3", "value", opts.BackupRetentionCount)
 		opts.BackupRetentionCount = 3
+	}
+
+	// Refuse non-regular DB files before opening
+	if err := checkDatabasePath(path); err != nil {
+		return nil, err
 	}
 
 	dsn := buildDSN(path)
