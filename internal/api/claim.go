@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/sysrex/peerline/internal/auth"
 	"github.com/sysrex/peerline/internal/pair"
@@ -36,7 +37,8 @@ type ClaimStore interface {
 	// ConfirmClaim runs check on a claimed invite in one transaction. CheckOK writes
 	// the grants and activates it; CheckCodeFail/CheckPeerIDFail count toward maxFails;
 	// CheckDigestStale does not count. Returns the resulting state and optionally a fresh claim.
-	ConfirmClaim(ctx context.Context, publicID, inviter string, maxFails int, check func(*ClaimInvite) (store.CheckResult, *ClaimInvite)) (string, *ClaimInvite, error)
+	// claimantPeerID is used for constant-time comparison on active replay.
+	ConfirmClaim(ctx context.Context, publicID, inviter string, claimantPeerID string, maxFails int, check func(*ClaimInvite) (store.CheckResult, *ClaimInvite)) (string, *ClaimInvite, error)
 	DeclineClaim(ctx context.Context, publicID, inviter string) error
 }
 
@@ -213,16 +215,17 @@ func (s *Server) confirmClaim(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pub := r.PathValue("public_id")
-	state, freshClaim, err := s.claims.ConfirmClaim(r.Context(), pub, auth.PeerID(r.Context()), maxCodeFails, func(c *ClaimInvite) (store.CheckResult, *ClaimInvite) {
+	// Normalize offer_digest to lowercase for comparison
+	normalizedDigest := strings.ToLower(in.OfferDigest)
+	
+	state, freshClaim, err := s.claims.ConfirmClaim(r.Context(), pub, auth.PeerID(r.Context()), in.PeerID, maxCodeFails, func(c *ClaimInvite) (store.CheckResult, *ClaimInvite) {
 		// Check digest FIRST, before evaluating code (prevents code oracle)
-		digestOK := pair.OfferDigestMatches(s.offerDigest(c), in.OfferDigest)
+		// Use normalized (lowercase) digest for comparison
+		digestOK := pair.OfferDigestMatches(s.offerDigest(c), normalizedDigest)
 		if !digestOK {
-			// Reload fresh claim for 409 response
-			fresh, viewErr := s.claims.InviterView(r.Context(), pub, auth.PeerID(r.Context()))
-			if viewErr != nil {
-				fresh = c // fallback to what we have
-			}
-			return store.CheckDigestStale, fresh
+			// Return c (already loaded in this transaction) for 409 response
+			// DO NOT call InviterView here - it would open a second transaction and deadlock with SetMaxOpenConns(1)
+			return store.CheckDigestStale, c
 		}
 
 		// Only check code and peer_id if digest matches

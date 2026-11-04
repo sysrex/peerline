@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"log/slog"
 	"net/http/httptest"
@@ -67,19 +68,19 @@ func (f *fakeClaims) InviterView(_ context.Context, pub, who string) (*ClaimInvi
 	return nil, store.ErrNotFound
 }
 
-func (f *fakeClaims) ConfirmClaim(_ context.Context, pub, who string, max int, check func(*ClaimInvite) (store.CheckResult, *ClaimInvite)) (string, *ClaimInvite, error) {
+func (f *fakeClaims) ConfirmClaim(_ context.Context, pub, who string, claimantPeerID string, max int, check func(*ClaimInvite) (store.CheckResult, *ClaimInvite)) (string, *ClaimInvite, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	c := f.byPub(pub)
 	if c == nil || c.Inviter != who {
 		return "", nil, store.ErrNotFound
 	}
-	// Idempotent: already active
+	// Idempotent: already active - check peer_id only (constant time)
 	if c.State == claimStateActive {
-		result, _ := check(cp(c))
-		if result == store.CheckOK || result == store.CheckDigestStale {
+		if subtle.ConstantTimeCompare([]byte(claimantPeerID), []byte(c.Claimant)) == 1 {
 			return claimStateActive, nil, nil
 		}
+		// Different claimant
 		return "", nil, store.ErrNotFound
 	}
 	if c.State != claimStateClaimed {

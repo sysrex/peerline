@@ -119,3 +119,35 @@ func TestOfferDigestOrder(t *testing.T) {
 		t.Error("same scopes in different order should produce same digest (canonical)")
 	}
 }
+
+func TestOfferDigestAbsentVsEmpty(t *testing.T) {
+	// Absent grant (nil) should produce a different digest than empty grant ([]string{})
+	dAbsent := OfferDigest("pub", "alice", "bob",
+		[]string{"messages"}, nil,
+		nil, nil,
+		nil, nil, nil, nil) // existingInviterScopes = nil
+
+	dEmpty := OfferDigest("pub", "alice", "bob",
+		[]string{"messages"}, nil,
+		nil, nil,
+		[]string{}, nil, nil, nil) // existingInviterScopes = []string{}
+
+	if dAbsent == dEmpty {
+		t.Error("absent grant (nil) and empty grant ([]string{}) should produce different digests")
+	}
+
+	// Test for all grant positions
+	dAbsentBags := OfferDigest("pub", "alice", "bob",
+		[]string{"messages"}, nil,
+		nil, nil,
+		nil, nil, nil, nil) // existingInviterBags = nil
+
+	dEmptyBags := OfferDigest("pub", "alice", "bob",
+		[]string{"messages"}, nil,
+		nil, nil,
+		nil, []string{}, nil, nil) // existingInviterBags = []string{}
+
+	if dAbsentBags == dEmptyBags {
+		t.Error("absent bags (nil) and empty bags ([]string{}) should produce different digests")
+	}
+}

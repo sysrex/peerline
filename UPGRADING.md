@@ -68,9 +68,11 @@ curl -X POST -H "Authorization: Bearer $KEY" \
 - The claimant's peer_id
 - Any existing grants being replaced
 
-This prevents time-of-check-time-of-use vulnerabilities and silent grant overwrites.
+This prevents time-of-check-time-of-use vulnerabilities and silent grant overwrites in confirm-mode invites (`require_confirm: true`).
 
-**Note:** A stale `offer_digest` (if the offer changed between GET and confirm) returns HTTP 409 with the fresh digest, and does not count toward the 3-strike auto-decline limit. Only code mismatches count toward auto-decline.
+**Note:** A stale `offer_digest` (if the offer changed between GET and confirm) returns HTTP 409 with the fresh digest, and does not count toward the 3-strike auto-decline limit. Only code or peer_id mismatches count toward auto-decline.
+
+**Important:** This overwrite prevention applies only to confirm-mode invites. Legacy pairing paths (`POST /v1/pairing/{token}` with invite codes or pairing links) still silently overwrite existing grants between the two peers. See [issue #312](https://github.com/sysrex/peerline/issues/312) for details. For controlled re-pairing with review, use confirm-mode invites.
 
 ## Schema Migrations and Backups
 

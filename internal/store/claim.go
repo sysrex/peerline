@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"errors"
 	"time"
@@ -190,7 +191,8 @@ const (
 // grants and activates it; on CheckCodeFail or CheckPeerIDFail it counts a failure and declines at maxFails.
 // CheckDigestStale does not count toward failures.
 // Idempotent: repeated confirm by the same inviter with matching peer_id returns the same state.
-func (s *Store) ConfirmClaim(ctx context.Context, publicID, inviter string, maxFails int, check func(*Claim) (CheckResult, *Claim)) (string, *Claim, error) {
+// The claimantPeerID is used for constant-time comparison on active replay.
+func (s *Store) ConfirmClaim(ctx context.Context, publicID, inviter string, claimantPeerID string, maxFails int, check func(*Claim) (CheckResult, *Claim)) (string, *Claim, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", nil, err
@@ -204,13 +206,14 @@ func (s *Store) ConfirmClaim(ctx context.Context, publicID, inviter string, maxF
 	if errors.Is(err, ErrNotFound) {
 		cActive, errActive := s.loadClaim(ctx, tx, `i.public_id=?2 AND i.from_peer=?3 AND i.used_by IS NOT NULL`, publicID, inviter)
 		if errActive == nil && cActive.State == ClaimActive {
-			// Already confirmed - on replay, only check peer_id (not digest, since replaces would be the just-written grants)
-			result, _ := check(cActive)
-			if result == CheckOK || result == CheckDigestStale {
-				return ClaimActive, nil, nil
+			// Already confirmed - check peer_id only (constant time), no digest or code
+			// On replay, replaces would now contain the just-written grants, so the digest would always differ
+			if subtle.ConstantTimeCompare([]byte(claimantPeerID), []byte(cActive.Claimant)) != 1 {
+				// Different claimant - return same 404 as unknown invite
+				return "", nil, ErrNotFound
 			}
-			// Different claimant - return 404
-			return "", nil, ErrNotFound
+			// Same claimant - idempotent success
+			return ClaimActive, nil, nil
 		}
 		return "", nil, err
 	}

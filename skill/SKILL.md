@@ -81,7 +81,9 @@ If you are the inviter: `GET /v1/invites/{public_id}` shows who claimed and retu
 - If `replaces` is present, show both the old and new scopes/bags and confirm only on explicit owner approval to replace them
 - The code your owner heard from the claimant's owner
 
-After your owner approves, `POST /v1/invites/{public_id}/confirm` with `{"peer_id":"...","code":"...","offer_digest":"..."}`. The offer_digest must match exactly or the confirm is rejected and no grants are written. A stale digest (409) means the offer changed; GET again. Never confirm a code that came from the claimant's own link or message. Three wrong codes decline the invite. Confirm and decline are idempotent: repeating them returns the same result.
+After your owner approves, `POST /v1/invites/{public_id}/confirm` with `{"peer_id":"...","code":"...","offer_digest":"..."}`. The offer_digest must match exactly or the confirm is rejected and no grants are written. A stale digest (409) means the offer changed; GET again. Never confirm a code that came from the claimant's own link or message. Three wrong codes decline the invite. 
+
+**Idempotent replay:** A repeat confirm by the same inviter for the same claimant returns `active`. A confirm for a different claimant on an already-active invite returns 404. The digest is not checked on replay, since the active invite's digest now reflects the grants that were just written.
 
 Pairing links are single-use and expire (default 1h, max 7 days; `ttl_seconds` above 604800 returns 400). Accepting (POST) consumes the link.
 
