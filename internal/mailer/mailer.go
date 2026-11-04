@@ -23,7 +23,6 @@ import (
 	"time"
 )
 
-
 // ErrRelayUnreachable is returned by Probe when the SMTP server is unreachable
 // (connection refused, timeout, reset, or SMTP-level greeting/EHLO errors).
 // Startup logs a warning and continues; runtime Send will retry.
