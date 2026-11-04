@@ -55,6 +55,38 @@ func parseVersionDetail(raw string) (string, error) {
 	}
 }
 
+// describeTLSMode returns a human-readable description of the SMTP TLS mode.
+func describeTLSMode(smtp *mailer.SMTP) string {
+	if smtp.ImplicitTLS {
+		return "implicit TLS (port 465)"
+	} else if smtp.AllowPlaintext {
+		return "STARTTLS optional (plaintext allowed)"
+	}
+	return "STARTTLS required"
+}
+
+// describeSMTPMode returns the log level and message for SMTP startup logging.
+// Returns WARN for non-loopback non-implicit-TLS relays with plaintext allowed (invite codes unprotected in transit),
+// INFO otherwise.
+func describeSMTPMode(smtp *mailer.SMTP) (slog.Level, string) {
+	if !smtp.ImplicitTLS && smtp.AllowPlaintext && !mailer.IsLoopback(smtp.Host) {
+		return slog.LevelWarn, "SMTP configured with plaintext allowed to non-loopback relay; invite codes and message previews are not protected in transit"
+	}
+	return slog.LevelInfo, "SMTP configured"
+}
+
+// smtpProbeAction decides whether a probe error should be fatal (exit 1) or a warning.
+// Returns (fatal=true, level, message) for config errors; (fatal=false, level, message) for transient errors.
+func smtpProbeAction(err error) (fatal bool, level slog.Level, message string) {
+	if err == nil {
+		return false, slog.LevelInfo, ""
+	}
+	if errors.Is(err, mailer.ErrRelayUnreachable) {
+		return false, slog.LevelWarn, "smtp relay unreachable at startup (will retry on send)"
+	}
+	return true, slog.LevelError, "smtp probe failed: configuration error"
+}
+
 func main() {
 	// Set umask to 0077 to ensure all files (database, WAL, SHM, backups) are created with 0600
 	// This prevents other local users from reading the database in a 0755 data directory
@@ -224,27 +256,16 @@ func main() {
 	} else if smtp, ok := ml.(*mailer.SMTP); ok {
 		// Probe SMTP server at startup to fail fast if TLS is misconfigured.
 		// Network errors (connection refused, timeout) only warn; Send retries at runtime.
-		if err := smtp.Probe(context.Background(), log); err != nil {
-			if errors.Is(err, mailer.ErrRelayUnreachable) {
-				log.Warn("smtp relay unreachable at startup (will retry on send)", "host", smtp.Host, "port", smtp.Port, "err", err)
-			} else {
-				log.Error("smtp probe failed: TLS misconfiguration", "err", err)
+		probeErr := smtp.Probe(context.Background())
+		fatal, probeLevel, probeMsg := smtpProbeAction(probeErr)
+		if probeErr != nil {
+			log.Log(context.Background(), probeLevel, probeMsg, "host", smtp.Host, "port", smtp.Port, "err", probeErr)
+			if fatal {
 				os.Exit(1)
 			}
 		}
-		// Log TLS mode at startup
-		var tlsMode string
-		if smtp.ImplicitTLS {
-			tlsMode = "implicit TLS (port 465)"
-		} else if smtp.AllowPlaintext {
-			tlsMode = "STARTTLS optional (plaintext allowed)"
-			if !mailer.IsLoopback(smtp.Host) {
-				log.Warn("SMTP configured with plaintext allowed to non-loopback relay; invite codes and message previews are not protected in transit", "host", smtp.Host, "port", smtp.Port)
-			}
-		} else {
-			tlsMode = "STARTTLS required"
-		}
-		log.Info("SMTP configured", "host", smtp.Host, "port", smtp.Port, "tls", tlsMode, "authenticated", smtp.User != "")
+		level, msg := describeSMTPMode(smtp)
+		log.Log(context.Background(), level, msg, "host", smtp.Host, "port", smtp.Port, "tls", describeTLSMode(smtp), "authenticated", smtp.User != "")
 	}
 	if publicURL == "" {
 		log.Warn("PEERLINE_PUBLIC_URL unset: pairing links and base_url fall back to the request Host header; set it so clients never send keys to a forged origin")

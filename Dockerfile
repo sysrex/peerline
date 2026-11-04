@@ -48,5 +48,6 @@ FROM gcr.io/distroless/static:nonroot
 COPY --from=build /peerline /peerline
 VOLUME /data
 ENV PEERLINE_ADDR=0.0.0.0:8787 PEERLINE_DB=/data/peerline.db
+LABEL org.opencontainers.image.licenses="MIT"
 EXPOSE 8787
 ENTRYPOINT ["/peerline"]
