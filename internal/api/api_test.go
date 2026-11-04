@@ -2993,13 +2993,13 @@ func FuzzSanitizeInviterName(f *testing.F) {
 	// Seed corpus with edge cases
 	f.Add("Alice")
 	f.Add(strings.Repeat("a", 70))
-	f.Add("e\u0300\u0316")                                   // non-composing marks
-	f.Add("\uFDFA")                                          // NFKC expands
-	f.Add("\xf0\u00b2")                                      // invalid byte + NFKC char
-	f.Add(strings.Repeat("a", 1022) + "日")                   // 3-byte rune at 1024
-	f.Add("क्ष")                                             // Indic conjunct (virama)
-	f.Add(strings.Repeat("a", 60) + "क्ष्म" + "bbb")         // Chained virama (force CCC 9 strip)
-	f.Add(strings.Repeat("ब", 70))                           // Force 64-rune cap path
+	f.Add("e\u0300\u0316")                                 // non-composing marks
+	f.Add("\uFDFA")                                        // NFKC expands
+	f.Add("\xf0\u00b2")                                    // invalid byte + NFKC char
+	f.Add(strings.Repeat("a", 1022) + "日")                 // 3-byte rune at 1024
+	f.Add("क्ष")                                           // Indic conjunct (virama)
+	f.Add(strings.Repeat("a", 60) + "क्ष्म" + "bbb")       // Chained virama (force CCC 9 strip)
+	f.Add(strings.Repeat("ब", 70))                         // Force 64-rune cap path
 	f.Add(strings.Repeat("a", 59) + "क् ष्" + "bbbbbbbbb") // Iterative cleanup: drop ष्, expose space, drop क्
 
 	f.Fuzz(func(t *testing.T, input string) {
