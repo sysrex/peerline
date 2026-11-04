@@ -4323,29 +4323,30 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 		t.Errorf("invalid to_email: inv_ pattern found in logs: %v", invCodeRegex.FindString(invalidEmailLogStr))
 	}
 
-	// 11. Send-failure path with messageEmbeddingFailMailer
-	t.Run("send-failure", func(t *testing.T) {
-		var failLogs syncBuf
-		failLogger := slog.New(slog.NewJSONHandler(&failLogs, nil))
-		failSrv := newServer(t, Config{Logger: failLogger, Mailer: messageEmbeddingFailMailer{}})
-		a3 := register(t, failSrv, "alice3")
-		resp, body := a3.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "fail@example.com"}, nil)
-		want(t, resp, body, 201)
-		var inv6 struct {
-			Code  string
-			Email map[string]string
-		}
-		if err := json.Unmarshal(body, &inv6); err != nil || inv6.Code == "" {
-			t.Fatalf("inv6: %v %s", err, body)
-		}
-		if inv6.Email["status"] != "failed" {
-			t.Errorf("send-failure: email.status = %q, want failed", inv6.Email["status"])
-		}
-		failLogStr := failLogs.String()
-		if leaked, found := detectLeak(failLogStr, inv6.Code); found {
-			t.Skip("REAL LEAK: send-failure path logs code in error message; api.go:~828 logs raw err that wraps message body. Skipping to allow separate fix. Leaked: " + leaked)
-		}
-	})
+	// 11. Send-failure path with failMailer
+	var failLogs syncBuf
+	failLogger := slog.New(slog.NewJSONHandler(&failLogs, nil))
+	failSrv := newServer(t, Config{Logger: failLogger, Mailer: failMailer{}})
+	a3 := register(t, failSrv, "alice3")
+	resp, body = a3.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "fail@example.com"}, nil)
+	want(t, resp, body, 201)
+	var inv6 struct {
+		Code  string
+		Email map[string]string
+	}
+	if err := json.Unmarshal(body, &inv6); err != nil || inv6.Code == "" {
+		t.Fatalf("inv6: %v %s", err, body)
+	}
+	if inv6.Email["status"] != "failed" {
+		t.Errorf("send-failure: email.status = %q, want failed", inv6.Email["status"])
+	}
+	failLogStr := failLogs.String()
+	if !strings.Contains(failLogStr, "invite email failed") {
+		t.Error("send-failure logs should contain 'invite email failed'")
+	}
+	if leaked, found := detectLeak(failLogStr, inv6.Code); found {
+		t.Errorf("send-failure: code leaked in logs: %s", leaked)
+	}
 
 	// 12. Mail rate-limit (429) path
 	var rateLimitLogs syncBuf
@@ -4361,7 +4362,8 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	// First invite succeeds
 	resp, body = a4.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "first@example.com"}, nil)
 	want(t, resp, body, 201)
-	// Second invite hits rate limit (code is created but then deleted)
+	// Second invite hits rate limit: Ready() returns false, triggering rejectEmailRateLimited
+	// (code is created but then deleted before the response is sent)
 	resp, body = a4.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "second@example.com"}, nil)
 	want(t, resp, body, 429)
 	rateLimitLogStr := rateLimitLogs.String()

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -201,14 +200,6 @@ type failMailer struct{}
 
 func (failMailer) Mode() string                               { return "smtp" }
 func (failMailer) Send(context.Context, mailer.Message) error { return errors.New("boom") }
-
-// messageEmbeddingFailMailer wraps the message in the error to test that the log-check detects it.
-type messageEmbeddingFailMailer struct{}
-
-func (messageEmbeddingFailMailer) Mode() string { return "smtp" }
-func (messageEmbeddingFailMailer) Send(_ context.Context, m mailer.Message) error {
-	return fmt.Errorf("SMTP error: failed to send to %s: message body: %s", m.To, m.Body)
-}
 
 func TestEmailSendFailureStillCreatesInvite(t *testing.T) {
 	srv := newServer(t, Config{Mailer: failMailer{}})
