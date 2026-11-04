@@ -1260,7 +1260,28 @@ func TestIPv6FloorWithOptIn(t *testing.T) {
 		{name: "fe00::/7 (near ULA) rejected (opt-in)", input: []string{"fe00::/7"}, allowBroad: true, wantError: "must be at least /29"},
 		{name: "fe80::/10 (link-local) rejected (opt-in)", input: []string{"fe80::/10"}, allowBroad: true, wantError: "must be at least /29"},
 		{name: "2000::/3 rejected (opt-in)", input: []string{"2000::/3"}, allowBroad: true, wantError: "must be at least /29"},
-		{name: "2002::/16 rejected (opt-in)", input: []string{"2002::/16"}, allowBroad: true, wantError: "must be at least /29"},
+
+		// Transition/translation prefixes rejected regardless of opt-in (#320)
+		{name: "Teredo 2001::/32 rejected (default)", input: []string{"2001::/32"}, allowBroad: false, wantError: "overlaps Teredo prefix 2001::/32"},
+		{name: "Teredo 2001::/32 rejected (opt-in)", input: []string{"2001::/32"}, allowBroad: true, wantError: "overlaps Teredo prefix 2001::/32"},
+		{name: "Teredo /48 2001:0:4136::/48 rejected (default)", input: []string{"2001:0:4136::/48"}, allowBroad: false, wantError: "overlaps Teredo prefix 2001::/32"},
+		{name: "Teredo /48 2001:0:4136::/48 rejected (opt-in)", input: []string{"2001:0:4136::/48"}, allowBroad: true, wantError: "overlaps Teredo prefix 2001::/32"},
+		{name: "NAT64 64:ff9b::/96 rejected (default)", input: []string{"64:ff9b::/96"}, allowBroad: false, wantError: "overlaps NAT64 well-known prefix 64:ff9b::/96"},
+		{name: "NAT64 64:ff9b::/96 rejected (opt-in)", input: []string{"64:ff9b::/96"}, allowBroad: true, wantError: "overlaps NAT64 well-known prefix 64:ff9b::/96"},
+		{name: "NAT64 host 64:ff9b::c000:201 rejected (default)", input: []string{"64:ff9b::c000:201"}, allowBroad: false, wantError: "overlaps NAT64 well-known prefix 64:ff9b::/96"},
+		{name: "NAT64 host 64:ff9b::c000:201 rejected (opt-in)", input: []string{"64:ff9b::c000:201"}, allowBroad: true, wantError: "overlaps NAT64 well-known prefix 64:ff9b::/96"},
+		{name: "NAT64 local 64:ff9b:1::/48 rejected (default)", input: []string{"64:ff9b:1::/48"}, allowBroad: false, wantError: "overlaps NAT64 local prefix 64:ff9b:1::/48"},
+		{name: "NAT64 local 64:ff9b:1::/48 rejected (opt-in)", input: []string{"64:ff9b:1::/48"}, allowBroad: true, wantError: "overlaps NAT64 local prefix 64:ff9b:1::/48"},
+		{name: "6to4 2002::/16 rejected (default)", input: []string{"2002::/16"}, allowBroad: false, wantError: "must be at least /32"},
+		{name: "6to4 2002::/16 rejected (opt-in)", input: []string{"2002::/16"}, allowBroad: true, wantError: "must be at least /29"},
+		{name: "6to4 /32 2002:c000::/32 rejected (default)", input: []string{"2002:c000::/32"}, allowBroad: false, wantError: "overlaps 6to4 prefix 2002::/16"},
+		{name: "6to4 /32 2002:c000::/32 rejected (opt-in)", input: []string{"2002:c000::/32"}, allowBroad: true, wantError: "overlaps 6to4 prefix 2002::/16"},
+
+		// Positive controls: normal prefixes near transition ranges still allowed
+		{name: "2001:db8::/32 allowed (default)", input: []string{"2001:db8::/32"}, allowBroad: false, wantNet: "2001:db8::/32"},
+		{name: "2001:db8::/32 allowed (opt-in)", input: []string{"2001:db8::/32"}, allowBroad: true, wantNet: "2001:db8::/32"},
+		{name: "Google 2001:4860::/32 allowed (default)", input: []string{"2001:4860::/32"}, allowBroad: false, wantNet: "2001:4860::/32"},
+		{name: "Google 2001:4860::/32 allowed (opt-in)", input: []string{"2001:4860::/32"}, allowBroad: true, wantNet: "2001:4860::/32"},
 
 		// Still rejected even with opt-in
 		{name: "::/0 rejected (opt-in)", input: []string{"::/0"}, allowBroad: true, wantError: "too broad"},

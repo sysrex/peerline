@@ -168,11 +168,13 @@ func rateLimitKey(ip string) string {
 
 // ParseTrustedProxies parses a list of CIDR strings (or bare IPs) into IPNets.
 // Rejects overly broad prefixes (0.0.0.0/0, ::/0, and prefixes shorter than
-// /8 for IPv4 or /32 for IPv6, or /29 for IPv6 with AllowBroadIPv6) to prevent misconfiguration (#62).
+// /8 for IPv4 or /32 for IPv6) to prevent misconfiguration (#62).
 // IPv4-mapped IPv6 prefixes (e.g., ::ffff:10.0.0.0/104) are unmapped and
 // converted to IPv4 (10.0.0.0/8), with the IPv4 /8 floor applied.
 // Rejects zone identifiers (e.g., fe80::1%eth0).
 // Rejects 0.0.0.0/8 ("this network") and its IPv4-mapped form.
+// Rejects IPv6 transition/translation prefixes: Teredo 2001::/32,
+// NAT64 64:ff9b::/96 and 64:ff9b:1::/48, and 6to4 2002::/16.
 func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 	nets, _, err := ParseTrustedProxiesWithOpts(cidrs, false)
 	return nets, err
@@ -180,8 +182,10 @@ func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 
 // ParseTrustedProxiesWithOpts parses trusted proxies with optional broader IPv6 floor.
 // When allowBroadIPv6 is true, the IPv6 floor is /29 (allowing Cloudflare 2a06:98c0::/29,
-// and rejecting 2000::/3 and 2002::/16 as too broad), and ULA ranges contained in fc00::/7
+// and rejecting 2000::/3 as too broad), and ULA ranges contained in fc00::/7
 // (bits >= 7) are permitted. ::/0 is always rejected.
+// IPv6 transition/translation prefixes are always rejected: Teredo 2001::/32,
+// NAT64 64:ff9b::/96 and 64:ff9b:1::/48, and 6to4 2002::/16.
 // Returns the parsed networks and a list of entries that were accepted only because allowBroadIPv6 was true.
 func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IPNet, []string, error) {
 	var nets []*net.IPNet
@@ -291,6 +295,30 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 
 			if bits < minBits {
 				return nil, nil, fmt.Errorf("parsing %q: IPv6 prefix must be at least /%d", cidr, minBits)
+			}
+
+			// Reject transition/translation prefixes that cover arbitrary clients
+			// (after floor check, so overly broad prefixes get the floor error)
+			// Teredo: every Teredo client worldwide sits inside 2001::/32
+			teredoPrefix := netip.MustParsePrefix("2001::/32")
+			if teredoPrefix.Overlaps(prefix) {
+				return nil, nil, fmt.Errorf("parsing %q: overlaps Teredo prefix 2001::/32", cidr)
+			}
+
+			// NAT64: embeds the whole IPv4 internet in 64:ff9b::/96 and 64:ff9b:1::/48
+			nat64WKPrefix := netip.MustParsePrefix("64:ff9b::/96")
+			if nat64WKPrefix.Overlaps(prefix) {
+				return nil, nil, fmt.Errorf("parsing %q: overlaps NAT64 well-known prefix 64:ff9b::/96", cidr)
+			}
+			nat64LocalPrefix := netip.MustParsePrefix("64:ff9b:1::/48")
+			if nat64LocalPrefix.Overlaps(prefix) {
+				return nil, nil, fmt.Errorf("parsing %q: overlaps NAT64 local prefix 64:ff9b:1::/48", cidr)
+			}
+
+			// 6to4: 2002::/16 contains all 6to4 relays
+			sixToFourPrefix := netip.MustParsePrefix("2002::/16")
+			if sixToFourPrefix.Overlaps(prefix) {
+				return nil, nil, fmt.Errorf("parsing %q: overlaps 6to4 prefix 2002::/16", cidr)
 			}
 
 			if neededOptIn {
