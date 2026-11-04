@@ -13,15 +13,19 @@ import (
 type fakeClock struct{ t time.Time }
 
 func (c *fakeClock) now() time.Time { return c.t }
+func (c *fakeClock) unix() int64    { return c.t.Unix() }
 
 func newLimitedServer(t *testing.T, trusted []string, clk *fakeClock) http.Handler {
 	t.Helper()
-	st, err := store.Open(":memory:")
+	st, err := store.OpenWithOptions(":memory:", store.OpenOptions{
+		SkipMigrationBackup: true,
+		Now:                 clk.unix,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	srv := mustNew(t, st, Config{TrustedProxies: trusted, Now: clk.now})
+	srv := mustNew(t, st, Config{TrustedProxies: trusted})
 	t.Cleanup(srv.lim.Stop)
 	return srv.Handler()
 }

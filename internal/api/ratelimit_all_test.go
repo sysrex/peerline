@@ -15,8 +15,14 @@ import (
 )
 
 func TestLimiterManagerAllCoversEveryLimiter(t *testing.T) {
-	lm := NewLimiterManager(Config{Now: time.Now, MsgPerMinute: 1, MsgBurst: 1, AuthFailPerMinute: 1, AuthFailBurst: 1,
-		WritePerMinute: 1, WriteBurst: 1, EmailPerHour: 1, EmailBurst: 1, EmailRcptPerHour: 1, NotifyPerHour: 1, NotifyBurst: 1})
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	
+	lm := NewLimiterManager(Config{MsgPerMinute: 1, MsgBurst: 1, AuthFailPerMinute: 1, AuthFailBurst: 1,
+		WritePerMinute: 1, WriteBurst: 1, EmailPerHour: 1, EmailBurst: 1, EmailRcptPerHour: 1, NotifyPerHour: 1, NotifyBurst: 1}, st)
 	defer lm.Stop()
 	listed := map[unsafe.Pointer]bool{}
 	for _, l := range lm.all() {
@@ -33,8 +39,17 @@ func TestLimiterManagerAllCoversEveryLimiter(t *testing.T) {
 
 func TestVersionLimiterPruned(t *testing.T) {
 	now := time.Unix(1e9, 0)
-	lm := NewLimiterManager(Config{Now: func() time.Time { return now }, MsgPerMinute: 1, MsgBurst: 1, AuthFailPerMinute: 1, AuthFailBurst: 1,
-		WritePerMinute: 1, WriteBurst: 1, EmailPerHour: 1, EmailBurst: 1, EmailRcptPerHour: 1, NotifyPerHour: 1, NotifyBurst: 1})
+	st, err := store.OpenWithOptions(":memory:", store.OpenOptions{
+		SkipMigrationBackup: true,
+		Now:                 func() int64 { return now.Unix() },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	
+	lm := NewLimiterManager(Config{MsgPerMinute: 1, MsgBurst: 1, AuthFailPerMinute: 1, AuthFailBurst: 1,
+		WritePerMinute: 1, WriteBurst: 1, EmailPerHour: 1, EmailBurst: 1, EmailRcptPerHour: 1, NotifyPerHour: 1, NotifyBurst: 1}, st)
 	defer lm.Stop()
 	lm.versionLim.Allow("1.2.3.4")
 	now = now.Add(time.Hour)

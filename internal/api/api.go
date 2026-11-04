@@ -66,8 +66,6 @@ type Config struct {
 	// TrustedProxies is a list of CIDR ranges (e.g. "10.0.0.0/8") from which
 	// X-Forwarded-For headers are honored. If empty, X-Forwarded-For is ignored.
 	TrustedProxies []string
-	// Now is the clock for invite expiry and rate limiters; defaults to time.Now.
-	Now func() time.Time
 	// MaxOutstandingInvites is the per-peer limit on active (non-expired, unused) invites.
 	MaxOutstandingInvites int
 	// RetentionSeconds is how long (in seconds) to keep used invites before purging.
@@ -104,8 +102,7 @@ type Server struct {
 	maint       *MaintenanceManager
 	log         *slog.Logger
 	trustedNets []*net.IPNet
-	now         func() time.Time // clock for invite expiry; defaults to time.Now
-	claims      ClaimStore       // claim/confirm backend; nil = claim routes are not served
+	claims      ClaimStore // claim/confirm backend; nil = claim routes are not served
 
 	// For pruning verifyLim
 	pruneDone chan struct{}
@@ -177,10 +174,6 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 	}
 	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
 
-	if cfg.Now == nil {
-		cfg.Now = time.Now
-	}
-
 	trustedNets, err := ParseTrustedProxies(cfg.TrustedProxies)
 	if err != nil {
 		return nil, fmt.Errorf("invalid trusted proxy configuration: %w", err)
@@ -201,10 +194,9 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 		st:          st,
 		cfg:         cfg,
 		log:         cfg.Logger,
-		lim:         NewLimiterManager(cfg),
+		lim:         NewLimiterManager(cfg, st),
 		verifyLim:   msg.NewLimiterPerHour(3, 3), // 3 verification emails per peer/address per hour
 		trustedNets: trustedNets,
-		now:         cfg.Now,
 		pruneDone:   make(chan struct{}),
 	}
 
@@ -426,16 +418,16 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	var tokenWithExpiry string
 	var rawToken string
 	if notify != "" {
-		// Rate limit verification emails per-address
-		normalizedAddr := strings.ToLower(notify)
-		if !s.verifyLim.Allow(normalizedAddr) {
-			// Per-address budget exhausted: register anyway but skip email
-			tokenWithExpiry = "" // Leave unverified
-		} else {
-			rawToken = auth.NewSecret(auth.EmailVerifyPrefix)
-			issuedAt := s.now().Unix()
-			tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
-		}
+	// Rate limit verification emails per-address
+	normalizedAddr := strings.ToLower(notify)
+	if !s.verifyLim.Allow(normalizedAddr) {
+		// Per-address budget exhausted: register anyway but skip email
+		tokenWithExpiry = "" // Leave unverified
+	} else {
+		rawToken = auth.NewSecret(auth.EmailVerifyPrefix)
+		issuedAt := s.st.Now().Unix()
+		tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
+	}
 	}
 
 	id, key := auth.NewID(), auth.NewKey()
@@ -556,7 +548,7 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 			return
 		} else {
 			rawToken = auth.NewSecret(auth.EmailVerifyPrefix)
-			issuedAt := s.now().Unix()
+			issuedAt := s.st.Now().Unix()
 			tokenWithExpiry = fmt.Sprintf("%d:%s", issuedAt, auth.Hash(rawToken))
 		}
 	}
@@ -713,7 +705,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	code := auth.NewSecret("inv_")
-	exp := s.now().Add(ttl).UTC()
+	exp := s.st.Now().Add(ttl).UTC()
 	var pairingToken string
 	var publicID string
 

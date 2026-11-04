@@ -3,14 +3,13 @@ package api
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/sysrex/peerline/internal/store"
 )
 
-// newTestServer creates a Server whose rate limiters use a custom clock (testing only).
-func newTestServer(st *store.Store, cfg Config, clock func() time.Time) *Server {
-	cfg.Now = clock
+// newTestServer creates a Server whose rate limiters use the store's clock (testing only).
+// The store should be created with OpenWithOptions and a custom Now func for clock control.
+func newTestServer(st *store.Store, cfg Config) *Server {
 	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
 		panic(err)
 	}

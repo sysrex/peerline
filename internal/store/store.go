@@ -59,6 +59,12 @@ type Store struct {
 	keyIndexLoaded     bool
 }
 
+// Now returns the current time according to this store's clock.
+// This is the single source of time for both API and store layers.
+func (s *Store) Now() time.Time {
+	return time.Unix(s.now(), 0).UTC()
+}
+
 // migrations is the ordered list of schema migration functions.
 // SchemaVersion() returns len(migrations).
 var migrations = []func(*sql.Tx) error{
@@ -113,9 +119,9 @@ type OpenOptions struct {
 	// vacuumInto is an injectable hook for testing. If nil, uses db.Exec("VACUUM INTO ?", path).
 	vacuumInto func(db *sql.DB, backupPath string) error
 
-	// now is an injectable clock for testing. If nil, uses time.Now().Unix().
+	// Now is an injectable clock for testing. If nil, uses time.Now().Unix().
 	// Used for backup timestamps and other time-based operations.
-	now func() int64
+	Now func() int64
 
 	// migrationStepHook is an injectable hook for testing migration step failures.
 	// Called before each migration step with (targetVersion, currentVersion). If it returns
@@ -269,7 +275,7 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		return nil, fmt.Errorf("schema: %w", err)
 	}
 
-	nowFunc := opts.now
+	nowFunc := opts.Now
 	if nowFunc == nil {
 		nowFunc = func() int64 { return time.Now().Unix() }
 	}
@@ -519,7 +525,7 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 	}
 
 	// Create new backup
-	nowFunc := opts.now
+	nowFunc := opts.Now
 	if nowFunc == nil {
 		nowFunc = func() int64 { return time.Now().Unix() }
 	}

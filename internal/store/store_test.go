@@ -778,6 +778,59 @@ func TestExpiredInviteRejection(t *testing.T) {
 	}
 }
 
+// TestAcceptInviteExactBoundary verifies AcceptInvite (by code) at exact expiry boundary.
+// Issue #110 item 3: exact-boundary row for AcceptInvite (now == expires_at accepted; expires_at+1 rejected).
+func TestAcceptInviteExactBoundary(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inject fake clock
+	origNow := s.now
+	defer func() { s.now = origNow }()
+
+	currentTime := int64(1000000)
+	s.now = func() int64 { return currentTime }
+
+	// Create an invite that expires at currentTime + 100
+	expiresAt := time.Unix(currentTime+100, 0)
+	if err := s.CreateInvite(ctx, "code_boundary", "alice", []string{"messages"}, nil, expiresAt); err != nil {
+		t.Fatal(err)
+	}
+
+	// At exactly expires_at (now == expires_at), invite should be accepted
+	s.now = func() int64 { return currentTime + 100 }
+	grant, err := s.AcceptInvite(ctx, "code_boundary", "bob", nil, nil)
+	if err != nil {
+		t.Fatalf("AcceptInvite at exact boundary (now == expires_at) should succeed, got %v", err)
+	}
+	if grant == nil || grant.Owner != "alice" || grant.Grantee != "bob" {
+		t.Errorf("AcceptInvite at boundary returned wrong grant: %+v", grant)
+	}
+
+	// Create another invite to test expires_at+1
+	if err := s.CreateInvite(ctx, "code_boundary2", "alice", []string{"messages"}, nil, expiresAt); err != nil {
+		t.Fatal(err)
+	}
+
+	// At expires_at+1, invite should be rejected
+	s.now = func() int64 { return currentTime + 101 }
+	_, err = s.AcceptInvite(ctx, "code_boundary2", "bob", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("AcceptInvite at expires_at+1 should return ErrNotFound, got %v", err)
+	}
+}
+
 // TestPairingTokenExpiryWithClock verifies pairing token expiry behavior with precise clock control.
 // From #88/#102: tests exact expiry boundaries and ensures no orphan peers on mid-transaction expiry.
 func TestPairingTokenExpiryWithClock(t *testing.T) {
@@ -849,6 +902,30 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 	}
 	if exists {
 		t.Error("token should not exist 1 second after expiry")
+	}
+
+	// 3a. GetInviteByPairingToken: exact boundary test at +100
+	codeHashBoundary := "code_boundary"
+	pairingHashBoundary := "pair_boundary"
+	expiresAtBoundary := time.Unix(currentTime+100, 0)
+	s.now = func() int64 { return currentTime }
+	if err := s.CreateInviteWithPairing(ctx, codeHashBoundary, pairingHashBoundary, "alice", []string{"messages"}, nil, expiresAtBoundary); err != nil {
+		t.Fatal(err)
+	}
+	// At exactly expires_at, invite should be retrievable
+	s.now = func() int64 { return currentTime + 100 }
+	info, err := s.GetInviteByPairingToken(ctx, pairingHashBoundary)
+	if err != nil {
+		t.Errorf("GetInviteByPairingToken at exact boundary (now == expires_at) should succeed, got %v", err)
+	}
+	if info == nil || info.FromPeer != "alice" {
+		t.Errorf("GetInviteByPairingToken at boundary returned wrong info: %+v", info)
+	}
+	// One second after expires_at, should fail
+	s.now = func() int64 { return currentTime + 101 }
+	_, err = s.GetInviteByPairingToken(ctx, pairingHashBoundary)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetInviteByPairingToken at expires_at+1 should return ErrNotFound, got %v", err)
 	}
 
 	// 4. GetInviteByPairingToken rejects expired token
@@ -3339,7 +3416,7 @@ func TestBackupCollisionRetry(t *testing.T) {
 	opts := OpenOptions{
 		Logger:               slog.Default(),
 		BackupRetentionCount: 3,
-		now: func() int64 {
+		Now: func() int64 {
 			return fixedTime.Unix()
 		},
 	}

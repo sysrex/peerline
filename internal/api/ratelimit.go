@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sysrex/peerline/internal/msg"
+	"github.com/sysrex/peerline/internal/store"
 )
 
 // clientIP returns the client IP, honoring X-Forwarded-For only from trusted proxies.
@@ -291,9 +292,10 @@ const (
 )
 
 // NewLimiterManager creates and starts a new limiter manager.
-func NewLimiterManager(cfg Config) *LimiterManager {
+// The store's clock (st.Now) is used for all rate limiters.
+func NewLimiterManager(cfg Config, st *store.Store) *LimiterManager {
 	ctx, cancel := context.WithCancel(context.Background())
-	clk := msg.WithClock(cfg.Now)
+	clk := msg.WithClock(st.Now)
 	lm := &LimiterManager{
 		msgLim:        msg.NewLimiter(cfg.MsgPerMinute, cfg.MsgBurst, clk),
 		regLim:        msg.NewLimiter(10, 5, clk),
