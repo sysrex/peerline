@@ -8,7 +8,7 @@ This document describes how to safely upgrade Peerline across versions, with a f
 - [Breaking Changes](#breaking-changes)
 - [Schema Migrations and Backups](#schema-migrations-and-backups)
 - [Backup Files](#backup-files)
-- [Rolling Deployments](#rolling-deployments)
+- [Deployment and Schema Upgrades](#deployment-and-schema-upgrades)
 - [Rollback Procedure](#rollback-procedure)
 - [Environment Variables](#environment-variables)
 - [Troubleshooting](#troubleshooting)
@@ -18,9 +18,10 @@ This document describes how to safely upgrade Peerline across versions, with a f
 1. **Stop the Peerline service** (recommended for single-instance deployments)
 2. **Back up your database file** manually as a precaution (in addition to automatic pre-migration backups)
 3. **Replace the binary** with the new version
-4. **Start the service** – schema migrations run automatically on the first Open()
+4. **Fix directory permissions if needed** (see [Docker /data directories](#docker-data-directories) below)
+5. **Start the service** – schema migrations run automatically on the first Open()
 
-For zero-downtime deployments, see [Rolling Deployments](#rolling-deployments).
+For zero-downtime deployments, see [Deployment and Schema Upgrades](#deployment-and-schema-upgrades).
 
 ## Breaking Changes
 
@@ -72,6 +73,8 @@ This prevents time-of-check-time-of-use vulnerabilities and silent grant overwri
 
 **Note:** A stale `offer_digest` (if the offer changed between GET and confirm) returns HTTP 409 with the fresh digest, and does not count toward the 3-strike auto-decline limit. Only code or peer_id mismatches count toward auto-decline.
 
+**Repeat decline now succeeds (idempotent):** As of PR #241, calling `POST /v1/invites/{public_id}/decline` on an already-declined invite returns HTTP 200 success instead of HTTP 404. This makes decline idempotent, consistent with the behavior of repeated confirm operations on active invites. Clients that relied on 404 for already-declined invites should update their logic.
+
 **Important:** This overwrite prevention applies only to confirm-mode invites. Legacy pairing paths (`POST /v1/pairing/{token}` with invite codes or pairing links) still silently overwrite existing grants between the two peers. See [issue #312](https://github.com/sysrex/peerline/issues/312) for details. For controlled re-pairing with review, use confirm-mode invites.
 
 ## Schema Migrations and Backups
@@ -93,7 +96,7 @@ Each backup is a complete, consistent snapshot of your database taken via `VACUU
 - **All tables**: `peers`, `invites`, `grants`, `messages`, `bags`
 - **All indexes** and constraints
 - **Schema version** (`PRAGMA user_version`) matching the pre-migration state
-- **WAL journal mode** (same as the source database)
+- **Journal mode**: `delete` (backups are not in WAL mode, regardless of source database mode)
 
 Backups are **verified** after creation:
 - SQLite `PRAGMA quick_check` to detect corruption
@@ -102,10 +105,17 @@ Backups are **verified** after creation:
 
 ### Backup Security
 
-- Created with **0600 permissions** (owner-only access) to prevent world-readable windows
-- **Contain sensitive data**: Backups contain API key hashes (unsalted SHA-256), invite/pairing-token hashes, notify email addresses, full message bodies, and bag contents. No passwords are stored anywhere in Peerline.
+- Created with **0600 permissions** (owner-only access) via `O_CREATE|O_EXCL|O_NOFOLLOW` before SQLite writes to them
+- **Contain sensitive data**: Backups contain API key hashes (unsalted SHA-256), invite/pairing-token hashes, notify email addresses, **full message bodies, and bag contents**. No passwords are stored anywhere in Peerline.
+- **Backups retain deleted data**: Backups preserve data that retention purging or peer deletion has since removed from the live database. This data persists until the backup rotates out (up to `PEERLINE_BACKUP_KEEP` files, no age limit). Operators should:
+  - Delete old backups after confirming successful upgrades
+  - Include backup files in your backup and encryption policy
+  - Securely wipe (`shred` or equivalent) backups before disposal
 - Should be stored on encrypted volumes in production
-- Backup directory (including the default, the database directory) must be a real directory (not a symlink), owned by the user running Peerline, with no group or world access (mode 0700); checked on startup
+- Backup directory requirements:
+  - Must be a real directory (not a symlink), owned by the user running Peerline
+  - For `PEERLINE_BACKUP_DIR`: must have mode 0700 (no group or world access)
+  - For default database directory: must not be group or world writable (mode 0022 bits clear)
 - Excluded from Git via `.gitignore` (`*.db.pre-v*`)
 
 ## Backup Files
@@ -115,14 +125,15 @@ Backups are **verified** after creation:
 Backup filenames encode the migration context:
 
 ```
-<database>.pre-v<to>-from-v<from>.<timestamp>
+<database>.pre-v<to>-from-v<from>.<timestamp>[.<suffix>]
 ```
 
-Example: `peerline.db.pre-v3-from-v2.20260130-120000.123456`
+Example: `peerline.db.pre-v6-from-v5.20260130-120000.123456` or `peerline.db.pre-v6-from-v5.20260130-120000.000000.a1b2c3d4` (with random suffix on collision)
 
-- `pre-v3`: Backup taken before migrating **to** version 3
-- `from-v2`: Database was at version 2 when backup was created
-- Timestamp: UTC in `YYYYMMDD-HHMMSS.microseconds` format
+- `pre-v6`: Backup taken before migrating **to** version 6
+- `from-v5`: Database was at version 5 when backup was created
+- Timestamp: UTC in `YYYYMMDD-HHMMSS.microseconds` format (microseconds are real only with system clock; injected test clocks show `.000000`)
+- Optional suffix: 8 hex digits (lowercase) added automatically on filename collision, or legacy decimal PID for compatibility with older backups. Collisions are rare in production (microsecond-resolution timestamps) but can occur in rapid restart loops or when files are pre-planted in the backup directory.
 
 ### Backup Reuse (Restart-Loop Guard)
 
@@ -141,7 +152,7 @@ To adjust retention:
 - Set `PEERLINE_BACKUP_KEEP=5` to keep at most 5 backup files in total
 - Minimum value is 1; invalid values log a warning and use the default (3)
 - The just-created or reused backup counts toward this limit but is never deleted
-- Only regular files named exactly like Peerline backups (`<db>.pre-vN-from-vM.<timestamp>[.<pid>]`) are managed and deleted; to keep a backup, copy it elsewhere or rename it so it no longer matches
+- Only regular files matching the exact pattern (`<db>.pre-vN-from-vM.<timestamp>` with optional `.<hexhexhexhexhexhexhexhex>` or `.<decimal_pid>` suffix) are managed by retention; to keep a backup permanently, copy it elsewhere or rename it (e.g., add `.KEEP` or use uppercase hex)
 
 ### Storage Location
 
@@ -156,9 +167,41 @@ Peerline will **refuse to start** if the backup directory is a symlink, is owned
 
 ### Disk Space Requirements
 
-Peerline checks for sufficient disk space before creating a backup and will abort the migration if space is insufficient (requires ~110% of database size to account for VACUUM expansion).
+Peerline checks for sufficient disk space before creating a backup and will abort the migration if space is insufficient. The preflight check requires at least 100% of the database's logical size (page_count × page_size). A margin of ~10% is recommended to account for VACUUM expansion, but the check enforces only the 100% minimum.
 
 On Unix systems, this check uses `statfs(2)`. On unsupported platforms, the check is skipped and VACUUM INTO will fail if space runs out.
+
+## Docker /data Directories
+
+Docker volumes typically create directories with mode **0755** (world-readable). This is compatible with Peerline's backup system when using the default backup location (the database directory itself), because the backup directory permission check only refuses **writable** bits (0022), not readable bits.
+
+**What happens on upgrade with a 0755 /data directory:**
+- ✅ Startup succeeds. The 0755 directory passes the default-directory check (only writable bits 0022 are refused), backups are written at 0600, and migration proceeds normally.
+- **Automatic permission tightening**: On Unix, Peerline now tightens permissions on existing database files (database, -wal, -shm) at open if they are wider than 0600, removing group and other access. A warning is logged for each file that is tightened.
+- **New file creation**: This release sets `umask(0077)` on Unix at startup (process-wide), so new files Peerline creates (database, WAL, SHM, backups) are created at 0600 or 0700. This prevents other local users from reading the database even in a 0755 directory. On Windows, file permissions are handled via ACLs instead of umask.
+- **One-time manual step for backups**: After upgrading, run `chmod 600 peerline.db.pre-v*` to tighten permissions on existing backup files from earlier releases (the automatic tightening only applies to the main database files, not backups).
+
+**If startup still fails** with a directory permission error:
+1. Check the actual directory mode: `ls -ld /data`
+2. If it's group-writable (0775) or world-writable (0777), fix it: `chmod 755 /data`
+3. If even 0755 is refused (you're using an explicit `PEERLINE_BACKUP_DIR` pointing to a 0755 directory), either:
+   - Fix the backup directory: `chmod 700 "$PEERLINE_BACKUP_DIR"`
+   - Or leave the database directory at 0755 and unset `PEERLINE_BACKUP_DIR` to use the default location
+
+**Recommended for production Docker deployments:**
+```dockerfile
+# In your Dockerfile or docker-compose volume setup:
+# The container runs as uid 65532 (nonroot user), so the directory must be owned by that user
+RUN mkdir -p /data && chown 65532:65532 /data && chmod 700 /data
+```
+
+Or in an entrypoint script:
+```bash
+chown 65532:65532 /data
+chmod 700 /data
+```
+
+This ensures the backup directory has strict permissions and correct ownership. The `chown` is required because the image's nonroot user (uid 65532) cannot write to a root-owned directory even if it's 0700.
 
 ## Deployment and Schema Upgrades
 
@@ -166,9 +209,7 @@ On Unix systems, this check uses `statfs(2)`. On unsupported platforms, the chec
 
 **Peerline requires a single-instance SQLite database.** Do not run multiple Peerline instances writing to the same database file, even in WAL mode. SQLite's locking is designed for single-host access; network filesystem locks are unreliable and can cause corruption.
 
-For high availability, use:
-- Active/standby with filesystem replication, or
-- Load-balanced read replicas with a single writer
+**Single-instance deployment only.** Peerline does not support active/standby with filesystem replication or read replicas; SQLite requires a single writer instance.
 
 ### Standard Deployment Procedure
 
@@ -183,15 +224,17 @@ Peerline will create a pre-migration backup before applying any schema changes, 
 
 ### First Deployment with Schema Guard (This Release)
 
-**Special case for the first deployment that adds the fail-closed schema version guard:**
+**Important: This release includes both the fail-closed schema version guard AND schema v4 (email verification).**
 
 Binaries from before this release (before the schema guard was introduced) will **silently open** databases with any schema version, including future versions they don't understand. This means:
 
-1. **Deploy this release's binary first** (adds version guard, no schema changes yet)
-2. **Restart the service** with this binary
-3. **Only after this binary is running, deploy future schema versions** that introduce schema changes
+1. **Deploy this release's binary first** (adds version guard and migrates to v6)
+2. **Verify the startup log line** confirms the migration: `database opened ... schema_version=6 max_supported=6 backup=<filename or none>`
+3. **Only after confirming this binary is deployed and running everywhere**, deploy future releases with schema changes
 
 This ensures no old binary without the guard can open a migrated database. **Binaries from this release onward refuse to open newer schemas** and will exit with code 2 and error message: `database schema version X is newer than this binary supports (max Y); upgrade the peerline binary or restore from backup`
+
+**Pre-guard binaries run on v4+ databases silently**: The only rollback path after deploying this release is restore-from-backup, never "run the old binary".
 
 ## Rollback Procedure
 
@@ -212,7 +255,10 @@ If a migration fails or the new version has issues, you can roll back to a previ
    mv peerline.db-shm peerline.db-shm.failed 2>/dev/null || true
    
    # Restore the pre-migration backup
-   cp peerline.db.pre-v3-from-v2.20260130-120000.123456 peerline.db
+   cp peerline.db.pre-v6-from-v5.20260130-120000.123456 peerline.db
+   
+   # Ensure correct permissions (newer Peerline versions create backups at 0600)
+   chmod 600 peerline.db*
    ```
 4. **Downgrade the Peerline binary** to the version that supports the backup's schema version
 5. **Start Peerline** with the older binary – it will open the restored database without attempting migration
@@ -268,7 +314,7 @@ After rollback:
 **Cause**: Not enough free space to create the pre-migration backup.
 
 **Solution**:
-- Free up disk space (need ~110% of database size)
+- Free up disk space (need at least 100% of database size, 110% recommended)
 - Move the database to a volume with more space
 - Set `PEERLINE_BACKUP_DIR` to a volume with sufficient space
 
@@ -285,7 +331,7 @@ After rollback:
 
 **Cause**: Peerline crashed during a previous migration attempt and is retrying, but the timestamp-based backup filename collides.
 
-**Behavior**: Peerline automatically adds a PID suffix and retries once. If that also fails, the migration is aborted.
+**Behavior**: Peerline automatically adds a random 8-character hex suffix and retries up to 10 times. If all attempts fail, the migration is aborted.
 
 **Solution**:
 - Inspect the existing backup to determine if the previous migration partially completed
