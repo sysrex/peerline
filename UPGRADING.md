@@ -25,6 +25,19 @@ For zero-downtime deployments, see [Deployment and Schema Upgrades](#deployment-
 
 ## Breaking Changes
 
+### IPv6 transition/translation prefixes rejected in PEERLINE_TRUSTED_PROXIES (#320)
+
+**Affected versions:** All versions upgrading to include the #320 fix
+
+**Impact:** If `PEERLINE_TRUSTED_PROXIES` contains or overlaps `2001::/32`, `2002::/16`, `64:ff9b::/96` or `64:ff9b:1::/48`, startup now fails with `overlaps <range name>`. Remove the entry; these are never reverse-proxy ranges.
+
+**What changed:**
+- Teredo (`2001::/32`), NAT64 (`64:ff9b::/96` and `64:ff9b:1::/48`), and 6to4 (`2002::/16`) prefixes are now explicitly rejected at startup.
+- There is no override; any entry that overlaps these ranges will prevent the server from starting.
+
+**How to fix:**
+Remove the overlapping entry from `PEERLINE_TRUSTED_PROXIES`. These ranges cover arbitrary internet clients and are not legitimate reverse-proxy networks.
+
 ### Confirm API requires offer_digest (Security Fix for #80)
 
 **Affected versions:** All versions upgrading to include the #80 fix

@@ -13,6 +13,18 @@ import (
 	"github.com/sysrex/peerline/internal/msg"
 )
 
+// rejectedIPv6Prefixes lists IPv6 transition/translation ranges that are rejected
+// from trusted proxy lists because they cover arbitrary clients.
+var rejectedIPv6Prefixes = []struct {
+	prefix netip.Prefix
+	errMsg string
+}{
+	{netip.MustParsePrefix("2001::/32"), "overlaps Teredo prefix 2001::/32"},
+	{netip.MustParsePrefix("64:ff9b::/96"), "overlaps NAT64 well-known prefix 64:ff9b::/96"},
+	{netip.MustParsePrefix("64:ff9b:1::/48"), "overlaps NAT64 local prefix 64:ff9b:1::/48"},
+	{netip.MustParsePrefix("2002::/16"), "overlaps 6to4 prefix 2002::/16"},
+}
+
 // clientIP returns the client IP, honoring X-Forwarded-For only from trusted proxies.
 // It walks X-Forwarded-For right-to-left, skipping entries in trustedNets, and returns
 // the first untrusted IP. Only consults XFF when RemoteAddr itself is trusted.
@@ -299,26 +311,10 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 
 			// Reject transition/translation prefixes that cover arbitrary clients
 			// (after floor check, so overly broad prefixes get the floor error)
-			// Teredo: every Teredo client worldwide sits inside 2001::/32
-			teredoPrefix := netip.MustParsePrefix("2001::/32")
-			if teredoPrefix.Overlaps(prefix) {
-				return nil, nil, fmt.Errorf("parsing %q: overlaps Teredo prefix 2001::/32", cidr)
-			}
-
-			// NAT64: embeds the whole IPv4 internet in 64:ff9b::/96 and 64:ff9b:1::/48
-			nat64WKPrefix := netip.MustParsePrefix("64:ff9b::/96")
-			if nat64WKPrefix.Overlaps(prefix) {
-				return nil, nil, fmt.Errorf("parsing %q: overlaps NAT64 well-known prefix 64:ff9b::/96", cidr)
-			}
-			nat64LocalPrefix := netip.MustParsePrefix("64:ff9b:1::/48")
-			if nat64LocalPrefix.Overlaps(prefix) {
-				return nil, nil, fmt.Errorf("parsing %q: overlaps NAT64 local prefix 64:ff9b:1::/48", cidr)
-			}
-
-			// 6to4: 2002::/16 contains all 6to4 relays
-			sixToFourPrefix := netip.MustParsePrefix("2002::/16")
-			if sixToFourPrefix.Overlaps(prefix) {
-				return nil, nil, fmt.Errorf("parsing %q: overlaps 6to4 prefix 2002::/16", cidr)
+			for _, rejected := range rejectedIPv6Prefixes {
+				if rejected.prefix.Overlaps(prefix) {
+					return nil, nil, fmt.Errorf("parsing %q: %s", cidr, rejected.errMsg)
+				}
 			}
 
 			if neededOptIn {
