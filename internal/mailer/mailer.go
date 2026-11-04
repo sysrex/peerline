@@ -380,7 +380,8 @@ func (s *SMTP) Probe(ctx context.Context) error {
 
 	// For implicit TLS (port 465), perform TLS handshake now
 	if s.ImplicitTLS {
-		tlsConn := tls.Client(conn, tlsCfg)
+		implicitCfg := s.tlsConfigForImplicitTLS(tlsCfg)
+		tlsConn := tls.Client(conn, implicitCfg)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			// Check for not-yet-valid certificate (fatal: clock skew or misconfiguration)
 			if isNotYetValid, wrappedErr := isNotYetValidError(err, tlsCfg, "TLS handshake failed on port 465"); isNotYetValid {
