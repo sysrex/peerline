@@ -1068,6 +1068,12 @@ func sanitizeInviterName(name string) string {
 			}
 		}
 
+		// Trim trailing spaces from the rune slice before virama back-off,
+		// so we don't miss viramas hidden behind spaces
+		for len(truncated) > 0 && truncated[len(truncated)-1] == ' ' {
+			truncated = truncated[:len(truncated)-1]
+		}
+
 		// Strip any trailing viramas (CCC 9) after truncation to handle stacked conjuncts
 		// (e.g., क्क्ष where multiple viramas chain, issue #206). Keep dropping entire
 		// clusters until no virama remains at the end.
@@ -1086,9 +1092,6 @@ func sanitizeInviterName(name string) string {
 		}
 
 		for len(truncated) > 0 {
-			if len(truncated) == 0 {
-				break
-			}
 			lastRune := truncated[len(truncated)-1]
 			props := norm.NFC.PropertiesString(string(lastRune))
 			if props.CCC() == 9 {
