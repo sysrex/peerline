@@ -16,12 +16,13 @@ import (
 
 func claimServer(t *testing.T) (*httptest.Server, *store.Store) {
 	t.Helper()
-	st, err := store.Open(t.TempDir() + "/t.db")
+	cfg := Config{CodePepper: []byte("pepper")}
+	st, err := store.OpenWithOptions(t.TempDir()+"/t.db", store.OpenOptions{Clock: cfg.Clock})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	s := mustNew(t, st, Config{CodePepper: []byte("pepper")})
+	s := mustNew(t, st, cfg)
 	s.lim.pairLim = msg.NewLimiter(1000, 1000)
 	s.SetClaimStore(st)
 	srv := httptest.NewServer(s.Handler())

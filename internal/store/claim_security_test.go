@@ -86,12 +86,12 @@ func TestConfirmWithStaleDigestWritesNothing(t *testing.T) {
 	}
 }
 
-// TestConfirmStaleDigestNeverCallsStoreMethod verifies that ConfirmClaim with a stale
-// digest completes without needing a second Store query, proving it doesn't leak a connection
-// (#310). This test uses a synthetic closure to verify the contract at the store layer: the
-// real regression guard is TestConfirmWithStaleDigestDoesNotDeadlock in the API tests, which
-// exercises the actual stale-digest closure under a client deadline.
-func TestConfirmStaleDigestNeverCallsStoreMethod(t *testing.T) {
+// TestConfirmStaleDigestReturnsInTxClaimAndKeepsCodeFails verifies that ConfirmClaim with
+// CheckDigestStale returns the in-tx claim and does not increment code_fails. The check closure
+// runs inside ConfirmClaim's write tx; with SetMaxOpenConns(1) any Store call from it would
+// deadlock. The #310 regression guard is the API-level TestConfirmWithStaleDigestDoesNotDeadlock,
+// which runs the real handler closure under a 2s client timeout.
+func TestConfirmStaleDigestReturnsInTxClaimAndKeepsCodeFails(t *testing.T) {
 	s, _ := claimStore(t)
 	ctx := context.Background()
 	exp := time.Unix(claimNow+3600, 0)
@@ -108,22 +108,16 @@ func TestConfirmStaleDigestNeverCallsStoreMethod(t *testing.T) {
 		t.Fatalf("claim: %v, %v", err, c)
 	}
 
-	// Confirm with stale digest under a 2 second timeout
-	timeoutCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-
-	start := time.Now()
+	// Confirm with stale digest
 	staleCheck := func(claim *Claim) (CheckResult, *Claim) {
 		// Return stale digest - the claim is already loaded in this transaction,
 		// so no second query is needed
 		return CheckDigestStale, claim
 	}
-	state, freshClaim, err := s.ConfirmClaim(timeoutCtx, c.PublicID, "alice", "bob", 3, staleCheck)
-	elapsed := time.Since(start)
+	state, freshClaim, err := s.ConfirmClaim(ctx, c.PublicID, "alice", "bob", 3, staleCheck)
 
-	// Should succeed without deadline exceeded error
 	if err != nil {
-		t.Fatalf("ConfirmClaim failed: %v (elapsed %v)", err, elapsed)
+		t.Fatalf("ConfirmClaim failed: %v", err)
 	}
 	if state != ClaimClaimed {
 		t.Fatalf("state: %s, want claimed", state)
@@ -132,9 +126,12 @@ func TestConfirmStaleDigestNeverCallsStoreMethod(t *testing.T) {
 		t.Fatal("freshClaim is nil, want fresh claim")
 	}
 
-	// Should finish well under the deadline (under 500ms is generous for a single tx)
-	if elapsed > 500*time.Millisecond {
-		t.Errorf("ConfirmClaim took %v, want < 500ms (possible connection starvation)", elapsed)
+	// Verify freshClaim is the same invite (same PublicID and Claimant)
+	if freshClaim.PublicID != c.PublicID {
+		t.Errorf("freshClaim.PublicID=%q, want %q", freshClaim.PublicID, c.PublicID)
+	}
+	if freshClaim.Claimant != c.Claimant {
+		t.Errorf("freshClaim.Claimant=%q, want %q", freshClaim.Claimant, c.Claimant)
 	}
 
 	// Verify code_fails is still 0
