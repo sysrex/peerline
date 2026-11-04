@@ -369,10 +369,10 @@ func TestBuildAPIConfig(t *testing.T) {
 			wantWarnCount:  0,
 		},
 		{
-			name:         "invalid opt-in value",
-			proxiesEnv:   "127.0.0.0/8",
+			name:          "invalid opt-in value",
+			proxiesEnv:    "127.0.0.0/8",
 			allowBroadEnv: "yes",
-			wantBuildErr: true,
+			wantBuildErr:  true,
 		},
 		{
 			name:           "both unset no warn",
