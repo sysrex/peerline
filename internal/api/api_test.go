@@ -3377,9 +3377,9 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"ﷺ×5 NFKC expands", strings.Repeat("\uFDFA", 5), "صلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى الله ع"}, // 5*18=90 -> 64
 
 		// Issue #182/#206: Virama cut (CCC 9) - should not leave dangling virama
-		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62)},                                       // क + virama + ष cut before the conjunct
-		{"chained virama at 64", strings.Repeat("a", 60) + "क्ष्म" + "bbb", strings.Repeat("a", 60) + "क्"},                        // 65 runes → 64 (60 a + क्ष्) → backoff drops ष् (bound) → 62 (60 a + क्, ends in virama)
-		{"many chained viramas", strings.Repeat("क्", 32) + "का", strings.Repeat("क्", 31)},                                        // 65 runes → 64 (32 pairs) → backoff drops 1 cluster (bound hit) → 62 runes (31 pairs, ends in virama); was fallback on main
+		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62)},              // क + virama + ष cut before the conjunct
+		{"chained virama at 64", strings.Repeat("a", 60) + "क्ष्म" + "bbb", strings.Repeat("a", 60) + "क्"}, // 65 runes → 64 (60 a + क्ष्) → backoff drops ष् (bound) → 62 (60 a + क्, ends in virama)
+		{"many chained viramas", strings.Repeat("क्", 32) + "का", strings.Repeat("क्", 31)},                 // 65 runes → 64 (32 pairs) → backoff drops 1 cluster (bound hit) → 62 runes (31 pairs, ends in virama); was fallback on main
 
 		// Issue #206: Stacked conjunct (C V C V | C) - bounded back-off
 		{"stacked conjunct at 64", strings.Repeat("a", 60) + "क्क्ष" + "bbb", strings.Repeat("a", 60) + "क्"}, // 66 runes → 64 (60 a + क्क्) → backoff drops क् (bound) → 62 (60 a + क्, ends in virama)
