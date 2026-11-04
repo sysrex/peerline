@@ -26,6 +26,7 @@ import (
 
 	"github.com/sysrex/peerline/internal/auth"
 	"github.com/sysrex/peerline/internal/clock/clocktest"
+	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/store"
 	"golang.org/x/text/unicode/norm"
 )
@@ -4061,8 +4062,9 @@ func TestInviteAcceptGETWithScopesReturns405(t *testing.T) {
 // This test captures only the slog logger; there is no http.Server.ErrorLog or access-log middleware today.
 func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	var logs syncBuf
+	// Share one logger with both API and mailer for a single unified log stream
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
-	srv := newServer(t, Config{Logger: logger})
+	srv := newServer(t, Config{Logger: logger, Mailer: mailer.Log{Logger: logger}})
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
 	c := register(t, srv, "carol")
 
@@ -4070,22 +4072,37 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv1 struct{ Code string }
-	json.Unmarshal(body, &inv1)
+	if err := json.Unmarshal(body, &inv1); err != nil || inv1.Code == "" {
+		t.Fatalf("inv1: %v %s", err, body)
+	}
 
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv2 struct{ Code string }
-	json.Unmarshal(body, &inv2)
+	if err := json.Unmarshal(body, &inv2); err != nil || inv2.Code == "" {
+		t.Fatalf("inv2: %v %s", err, body)
+	}
 
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv3 struct{ Code string }
-	json.Unmarshal(body, &inv3)
+	if err := json.Unmarshal(body, &inv3); err != nil || inv3.Code == "" {
+		t.Fatalf("inv3: %v %s", err, body)
+	}
 
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv4 struct{ Code string }
-	json.Unmarshal(body, &inv4)
+	if err := json.Unmarshal(body, &inv4); err != nil || inv4.Code == "" {
+		t.Fatalf("inv4: %v %s", err, body)
+	}
+
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "test@example.com"}, nil)
+	want(t, resp, body, 201)
+	var inv5 struct{ Code string }
+	if err := json.Unmarshal(body, &inv5); err != nil || inv5.Code == "" {
+		t.Fatalf("inv5: %v %s", err, body)
+	}
 
 	// Test all accept paths:
 	// 1. POST with body code (successful)
@@ -4142,9 +4159,12 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	if !strings.Contains(logStr, "peer registered") {
 		t.Error("logs should contain 'peer registered' (positive control)")
 	}
+	if !strings.Contains(logStr, "body_len") {
+		t.Error("logs should contain mailer 'body_len' (positive control for to_email path)")
+	}
 
 	// Check logs don't contain any of the codes or their prefixes
-	for _, code := range []string{inv1.Code, inv2.Code, inv3.Code, inv4.Code, unknownCode} {
+	for _, code := range []string{inv1.Code, inv2.Code, inv3.Code, inv4.Code, inv5.Code, unknownCode} {
 		if strings.Contains(logStr, code) {
 			t.Errorf("invite code %s found in logs", code)
 		}
@@ -4219,8 +4239,10 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	if resp2.StatusCode != 405 {
 		t.Errorf("HEAD with auth: want 405, got %d", resp2.StatusCode)
 	}
-	if got := resp2.Header.Get("Allow"); got != "POST" {
-		t.Errorf("HEAD Allow: got %q, want POST", got)
+	// Allow header includes DELETE because DELETE /v1/invites/{public_id} also matches
+	// the literal path "accept", and ServeMux lists all methods registered on that pattern.
+	if got := resp2.Header.Get("Allow"); got != "DELETE, POST" {
+		t.Errorf("HEAD Allow: got %q, want DELETE, POST", got)
 	}
 	if got := resp2.Header.Get("Deprecation"); got != wantDeprecation {
 		t.Errorf("HEAD Deprecation: got %q, want %q", got, wantDeprecation)
@@ -4287,6 +4309,40 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 			}
 		}
 	}
+
+	// Test 4.5: Path cleaning variants (// and /./) redirect 307 to canonical path
+	noRedirect := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	req, _ = http.NewRequest("POST", srv.URL+"/v1/invites//accept?code="+inv1.Code, nil)
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	resp2, err = noRedirect.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 307 {
+		t.Errorf("// variant POST: want 307, got %d", resp2.StatusCode)
+	}
+	if got := resp2.Header.Get("Location"); got != "/v1/invites/accept?code="+inv1.Code {
+		t.Errorf("// variant Location: got %q, want /v1/invites/accept?code=...", got)
+	}
+	assertSecurityHeaders(t, resp2.Header, "// variant POST")
+
+	req, _ = http.NewRequest("POST", srv.URL+"/v1/invites/./accept?code="+inv1.Code, nil)
+	req.Header.Set("Authorization", "Bearer "+b.key)
+	resp2, err = noRedirect.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 307 {
+		t.Errorf("/./ variant POST: want 307, got %d", resp2.StatusCode)
+	}
+	if got := resp2.Header.Get("Location"); got != "/v1/invites/accept?code="+inv1.Code {
+		t.Errorf("/./ variant Location: got %q, want /v1/invites/accept?code=...", got)
+	}
+	assertSecurityHeaders(t, resp2.Header, "/./ variant POST")
 
 	// Test 5: Body and query code mismatch returns 400
 	resp, body = b.do("POST", "/v1/invites/accept?code="+inv1.Code, map[string]any{"code": "inv_other"}, nil)
