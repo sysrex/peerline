@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sysrex/peerline/internal/clock"
 	_ "modernc.org/sqlite"
 )
 
@@ -51,12 +52,17 @@ var memDBCounter uint64
 
 type Store struct {
 	db                 *sql.DB
-	now                func() int64
+	clk                clock.Clock
 	schemaVersionInUse int
 	lastBackupPath     string
 	backupReused       bool
 	keyIndex           *keyIndex
 	keyIndexLoaded     bool
+}
+
+// nowUnix returns the current Unix timestamp from the store's clock.
+func (s *Store) nowUnix() int64 {
+	return s.clk.Now().Unix()
 }
 
 // migrations is the ordered list of schema migration functions.
@@ -110,12 +116,12 @@ type OpenOptions struct {
 	// Logger for warnings and info messages. Defaults to slog.Default().
 	Logger *slog.Logger
 
+	// Clock is an injectable time source for testing. If nil, uses clock.Real{}.
+	// Used for invite expiry checks, backup timestamps, and other time-based operations.
+	Clock clock.Clock
+
 	// vacuumInto is an injectable hook for testing. If nil, uses db.Exec("VACUUM INTO ?", path).
 	vacuumInto func(db *sql.DB, backupPath string) error
-
-	// now is an injectable clock for testing. If nil, uses time.Now().Unix().
-	// Used for backup timestamps and other time-based operations.
-	now func() int64
 
 	// migrationStepHook is an injectable hook for testing migration step failures.
 	// Called before each migration step with (targetVersion, currentVersion). If it returns
@@ -269,11 +275,6 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		return nil, fmt.Errorf("schema: %w", err)
 	}
 
-	nowFunc := opts.now
-	if nowFunc == nil {
-		nowFunc = func() int64 { return time.Now().Unix() }
-	}
-
 	schemaInUse, err := runMigrations(db, currentVersion, opts)
 	if err != nil {
 		db.Close()
@@ -290,7 +291,7 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 
 	return &Store{
 		db:                 db,
-		now:                nowFunc,
+		clk:                clock.Or(opts.Clock),
 		schemaVersionInUse: schemaInUse,
 		lastBackupPath:     backupPath,
 		backupReused:       reused,
@@ -519,11 +520,8 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 	}
 
 	// Create new backup
-	nowFunc := opts.now
-	if nowFunc == nil {
-		nowFunc = func() int64 { return time.Now().Unix() }
-	}
-	timestamp := time.Unix(nowFunc(), 0).UTC().Format("20060102-150405.000000")
+	clk := clock.Or(opts.Clock)
+	timestamp := clk.Now().UTC().Format("20060102-150405.000000")
 	backupName := fmt.Sprintf("%s.pre-v%d-from-v%d.%s", dbBase, targetVersion, currentVersion, timestamp)
 	backupPath := filepath.Join(backupDir, backupName)
 	if _, err := os.Lstat(backupPath); err == nil {
@@ -983,7 +981,7 @@ type Peer struct {
 func (s *Store) CreatePeer(ctx context.Context, id, name, keyHash, notifyEmail, notifyToken string) error {
 	verified := 0
 	_, err := s.db.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email,notify_email_verified,notify_email_token) VALUES(?,?,?,?,?,?,?)`,
-		id, name, keyHash, s.now(), notifyEmail, verified, notifyToken)
+		id, name, keyHash, s.nowUnix(), notifyEmail, verified, notifyToken)
 	if err == nil {
 		// Add to key index after successful insert
 		s.keyIndex.add(keyHash, id)
@@ -1071,7 +1069,7 @@ func (s *Store) VerifyNotifyEmail(ctx context.Context, id, tokenHash string) err
 	storedHash := parts[1]
 
 	// Check expiry (24 hours: valid at exactly issued+86400, expired at issued+86401)
-	if s.now() > issuedUnix+86400 {
+	if s.nowUnix() > issuedUnix+86400 {
 		return ErrNotFound
 	}
 
@@ -1227,7 +1225,7 @@ func (s *Store) CreateInviteAtomic(ctx context.Context, codeHash, from string, s
 	defer tx.Rollback()
 
 	var count int
-	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=?2 AND `+outstandingInvite, s.now(), from).Scan(&count)
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=?2 AND `+outstandingInvite, s.nowUnix(), from).Scan(&count)
 	if err != nil {
 		return "", err
 	}
@@ -1273,7 +1271,7 @@ func (s *Store) createPairingInviteAtomic(ctx context.Context, codeHash, pairing
 	defer tx.Rollback()
 
 	var count int
-	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=?2 AND `+outstandingInvite, s.now(), from).Scan(&count)
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites WHERE from_peer=?2 AND `+outstandingInvite, s.nowUnix(), from).Scan(&count)
 	if err != nil {
 		return "", err
 	}
@@ -1314,7 +1312,7 @@ func (s *Store) CountOutstandingInvites(ctx context.Context, peerID string) (int
 	var count int
 	err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM invites WHERE from_peer=?2 AND `+outstandingInvite,
-		s.now(), peerID).Scan(&count)
+		s.nowUnix(), peerID).Scan(&count)
 	return count, err
 }
 
@@ -1332,7 +1330,7 @@ func (s *Store) ListInvitesByPeer(ctx context.Context, peerID string, limit, off
 		   AND ((used_by IS NOT NULL AND expires_at>=?1) OR `+outstandingInvite+`)
 		 ORDER BY ROWID
 		 LIMIT ?3 OFFSET ?4`,
-		s.now(), peerID, limit, offset)
+		s.nowUnix(), peerID, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -1394,7 +1392,7 @@ func (s *Store) PurgeExpiredInvites(ctx context.Context, retentionSeconds int64)
 		retentionSeconds = 30 * 24 * 60 * 60 // 30 days default
 	}
 
-	ts := s.now()
+	ts := s.nowUnix()
 	// The grace does not guard an in-flight accept: acceptInviteInTx re-checks
 	// expires_at inside an IMMEDIATE transaction, so accept and purge are serialised
 	// and an expired row is rejected whether or not it was purged. It also does not
@@ -1471,7 +1469,7 @@ func (s *Store) GetInviteByPairingToken(ctx context.Context, pairingTokenHash st
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp < s.now() {
+	if used.Valid || exp < s.nowUnix() {
 		return nil, ErrNotFound
 	}
 	return &InviteInfo{
@@ -1496,7 +1494,7 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp < s.now() {
+	if used.Valid || exp < s.nowUnix() {
 		return nil, ErrNotFound
 	}
 
@@ -1506,7 +1504,7 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 	}
 	defer tx.Rollback()
 
-	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags, s.now())
+	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags, s.nowUnix())
 	if err != nil {
 		return nil, err
 	}
@@ -1520,7 +1518,7 @@ func (s *Store) AcceptInviteByPairingToken(ctx context.Context, pairingTokenHash
 // PairingTokenExists checks if a pairing token exists (is valid and not yet redeemed).
 func (s *Store) PairingTokenExists(ctx context.Context, pairingTokenHash string) (bool, error) {
 	var exists int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM invites WHERE pairing_token_hash=? AND used_by IS NULL AND expires_at >= ?`, pairingTokenHash, s.now()).Scan(&exists)
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM invites WHERE pairing_token_hash=? AND used_by IS NULL AND expires_at >= ?`, pairingTokenHash, s.nowUnix()).Scan(&exists)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -1544,7 +1542,7 @@ func (s *Store) AcceptInvite(ctx context.Context, codeHash, accepter string, bac
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp < s.now() {
+	if used.Valid || exp < s.nowUnix() {
 		return nil, ErrNotFound
 	}
 
@@ -1554,7 +1552,7 @@ func (s *Store) AcceptInvite(ctx context.Context, codeHash, accepter string, bac
 	}
 	defer tx.Rollback()
 
-	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags, s.now())
+	grant, err := acceptInviteInTx(ctx, tx, codeHash, accepter, backScopes, backBags, s.nowUnix())
 	if err != nil {
 		return nil, err
 	}
@@ -1580,7 +1578,7 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 	if err != nil {
 		return nil, err
 	}
-	preCheckTime := s.now()
+	preCheckTime := s.nowUnix()
 	if used.Valid || exp < preCheckTime {
 		return nil, ErrNotFound
 	}
@@ -1593,7 +1591,7 @@ func (s *Store) RegisterAndAcceptByPairing(ctx context.Context, pairingTokenHash
 	defer tx.Rollback()
 
 	// Take timestamp inside tx for expires_at guard and created_at
-	ts := s.now()
+	ts := s.nowUnix()
 
 	verified := 0
 	_, err = tx.ExecContext(ctx, `INSERT INTO peers(id,name,key_hash,created_at,notify_email,notify_email_verified,notify_email_token) VALUES(?,?,?,?,?,?,?)`,
@@ -1733,7 +1731,7 @@ type Message struct {
 }
 
 func (s *Store) InsertMessage(ctx context.Context, m *Message) error {
-	ts := s.now()
+	ts := s.nowUnix()
 	res, err := s.db.ExecContext(ctx, `INSERT INTO messages(sender,recipient,type,body,reply_to,created_at) VALUES(?,?,?,?,?,?)`,
 		m.From, m.To, m.Type, m.Body, m.ReplyTo, ts)
 	if err != nil {
@@ -1856,7 +1854,7 @@ func (s *Store) PutBag(ctx context.Context, owner, name string, content []byte, 
 	next := cur + 1
 	_, err = tx.ExecContext(ctx, `INSERT INTO bags(owner,name,content,version,updated_by,updated_at) VALUES(?,?,?,?,?,?)
 		ON CONFLICT(owner,name) DO UPDATE SET content=excluded.content, version=excluded.version,
-		updated_by=excluded.updated_by, updated_at=excluded.updated_at`, owner, name, content, next, by, s.now())
+		updated_by=excluded.updated_by, updated_at=excluded.updated_at`, owner, name, content, next, by, s.nowUnix())
 	if err != nil {
 		return 0, err
 	}

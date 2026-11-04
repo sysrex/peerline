@@ -131,7 +131,7 @@ func TestEmailInviteDevMode(t *testing.T) {
 		t.Fatal("landing echoed bad code")
 	}
 
-	// Bob's bot follows the magic link with its key (POST, reciprocal scopes in body).
+	// Bob's bot accepts via the accept_url landing page with its key (POST, reciprocal scopes in body).
 	resp, body = b.do("POST", path, map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 200)
 	if !strings.Contains(string(body), `"granted_by_you"`) {

@@ -25,6 +25,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/sysrex/peerline/internal/auth"
+	"github.com/sysrex/peerline/internal/clock/clocktest"
 	"github.com/sysrex/peerline/internal/store"
 	"golang.org/x/text/unicode/norm"
 )
@@ -71,7 +72,7 @@ func newBarrier(t testing.TB, n int, timeout time.Duration) func() {
 
 func newServer(t *testing.T, cfg Config) *httptest.Server {
 	t.Helper()
-	st, err := store.Open(t.TempDir() + "/t.db")
+	st, err := store.OpenWithOptions(t.TempDir()+"/t.db", store.OpenOptions{Clock: cfg.Clock})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +92,7 @@ func newServer(t *testing.T, cfg Config) *httptest.Server {
 func newServerWithAccess(t *testing.T, cfg Config) (*httptest.Server, *Server, *store.Store) {
 	t.Helper()
 	dbPath := t.TempDir() + "/t.db"
-	st, err := store.Open(dbPath)
+	st, err := store.OpenWithOptions(dbPath, store.OpenOptions{Clock: cfg.Clock})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +112,7 @@ func newServerWithAccess(t *testing.T, cfg Config) (*httptest.Server, *Server, *
 func newServerWithDB(t *testing.T, cfg Config) (*httptest.Server, *Server, *store.Store, *sql.DB) {
 	t.Helper()
 	dbPath := t.TempDir() + "/t.db"
-	st, err := store.Open(dbPath)
+	st, err := store.OpenWithOptions(dbPath, store.OpenOptions{Clock: cfg.Clock})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,6 +204,15 @@ func assertSecurityHeaders(t *testing.T, hdr http.Header, context string) {
 	}
 	if got := hdr.Get("Referrer-Policy"); got != "no-referrer" {
 		t.Errorf("%s: Referrer-Policy = %q, want no-referrer", context, got)
+	}
+	if got := hdr.Get("X-Frame-Options"); got != "DENY" {
+		t.Errorf("%s: X-Frame-Options = %q, want DENY", context, got)
+	}
+	csp := hdr.Get("Content-Security-Policy")
+	if csp == "" {
+		t.Errorf("%s: missing Content-Security-Policy header", context)
+	} else if !strings.Contains(csp, "default-src 'none'") {
+		t.Errorf("%s: CSP missing default-src 'none': %s", context, csp)
 	}
 }
 
@@ -2017,7 +2027,7 @@ func TestMaintenanceManagerStops(t *testing.T) {
 
 	ctx := context.Background()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	mgr := NewMaintenanceManager(ctx, st, logger, 30*24*60*60, 6)
+	mgr := NewMaintenanceManager(ctx, st, logger, nil, 30*24*60*60, 6)
 
 	// Let it run a bit
 	time.Sleep(100 * time.Millisecond)
@@ -2636,7 +2646,7 @@ func TestReadyAllowRaceSharedRecipient(t *testing.T) {
 	cfg.EmailPerHour = 10
 	cfg.EmailBurst = 10
 	cfg.EmailRcptPerHour = 1
-	cfg.Now = func() time.Time { return frozenTime }
+	cfg.Clock = clocktest.New(frozenTime)
 
 	dbPath := t.TempDir() + "/t.db"
 	st, err := store.Open(dbPath)
@@ -3572,116 +3582,220 @@ func TestSanitizerTrailingSpaceTrim(t *testing.T) {
 	}
 }
 
+// TestSanitizeInviterName verifies specific sanitization cases
+func TestSanitizeInviterName(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "basic ASCII",
+			input: "Alice",
+			want:  "Alice",
+		},
+		{
+			name:  "word-final virama kept: Devanagari halant before space",
+			input: "00000!000000000000000000000000000000000000000000000000000000क्ष् 00000" + strings.Repeat("ब", 70),
+			want:  "00000000000000000000000000000000000000000000000000000000000क्ष्", // word-final क्ष् kept (63 runes)
+		},
+		{
+			name:  "word-final virama kept: single syllable before space",
+			input: strings.Repeat("a", 61) + "क् " + strings.Repeat("b", 10),
+			want:  strings.Repeat("a", 61) + "क्", // word-final क् kept (63 runes)
+		},
+		{
+			name:  "word-final viramas kept: two words ending in virama",
+			input: strings.Repeat("a", 59) + "क् ष्" + strings.Repeat("b", 10),
+			want:  strings.Repeat("a", 59) + "क्", // truncates after क्, word-final so kept (61 runes)
+		},
+		{
+			name:  "mid-word virama dropped: cut inside a conjunct",
+			input: strings.Repeat("a", 60) + "क्ष्म" + "bbb",
+			want:  strings.Repeat("a", 60), // क्ष्म cut mid-word, virama clusters dropped (60 runes)
+		},
+		{
+			name:  "Tamil pulli: many word-final viramas",
+			input: strings.Repeat("ம் ", 40),                                        // 40 Tamil words ending in pulli
+			want:  "ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம்", // 62 runes, keeps words
+		},
+		{
+			name:  "Tamil pulli at exactly position 64",
+			input: "xx" + strings.Repeat("ம் ", 40),                                   // Rune 63 is ் (virama), rune 64 is space
+			want:  "xxம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம் ம்", // 64 runes, word-final virama kept
+		},
+		{
+			name:  "Devanagari halant at exactly position 64",
+			input: strings.Repeat("a", 62) + "क् " + strings.Repeat("b", 10),
+			want:  strings.Repeat("a", 62) + "क्", // 64 runes, word-final virama kept
+		},
+		{
+			name:  "Tamil word kept whole: மரம் not cut",
+			input: strings.Repeat("a", 58) + " மரம் zz" + strings.Repeat("b", 10),
+			want:  strings.Repeat("a", 58) + " மரம்", // 63 runes, மரம் kept whole
+		},
+		{
+			name:  "empty after cleanup falls back",
+			input: "!@#$%",
+			want:  "A Peerline peer",
+		},
+		{
+			name:  "only spaces falls back",
+			input: "     ",
+			want:  "A Peerline peer",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeInviterName(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeInviterName(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// checkSanitizeInvariants verifies all sanitizeInviterName invariants on an output.
+// checkVirama should be true only when checking a forced-truncation path.
+func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama bool) {
+	t.Helper()
+
+	// Invariant 1: Output is valid UTF-8
+	if !utf8.ValidString(got) {
+		t.Errorf("sanitizeInviterName(%q) [%s] returned invalid UTF-8: %q", input, label, got)
+	}
+
+	// Invariant 2: Output is NFC normalized
+	if !norm.NFC.IsNormalString(got) {
+		t.Errorf("sanitizeInviterName(%q) [%s] returned non-NFC string: %q", input, label, got)
+	}
+
+	// Invariant 3: At most 64 runes
+	runeCount := utf8.RuneCountInString(got)
+	if runeCount > 64 {
+		t.Errorf("sanitizeInviterName(%q) [%s] returned %d runes (> 64): %q", input, label, runeCount, got)
+	}
+
+	// Invariant 4: Non-empty (fallback applied if needed)
+	if got == "" {
+		t.Errorf("sanitizeInviterName(%q) [%s] returned empty string", input, label)
+	}
+
+	// Invariant 5: No leading/trailing space
+	if strings.TrimSpace(got) != got {
+		t.Errorf("sanitizeInviterName(%q) [%s] has leading/trailing space: %q", input, label, got)
+	}
+
+	// Invariant 6: No leading combining mark
+	runes := []rune(got)
+	if len(runes) > 0 {
+		firstRune := runes[0]
+		if unicode.Is(unicode.Mn, firstRune) || unicode.Is(unicode.Mc, firstRune) {
+			t.Errorf("sanitizeInviterName(%q) [%s] starts with combining mark: %q", input, label, got)
+		}
+	}
+
+	// Invariant 7: Idempotent
+	got2 := sanitizeInviterName(got)
+	if got != got2 {
+		t.Errorf("sanitizeInviterName [%s] not idempotent for input %q: first=%q, second=%q", label, input, got, got2)
+	}
+
+	// Invariant 8: Every output rune is in the allowlist (L*, N*, Mn, Mc, space, . , - _ ')
+	// and no U+FFFD
+	for _, r := range got {
+		if r == '\uFFFD' {
+			t.Errorf("sanitizeInviterName(%q) [%s] contains U+FFFD: %q", input, label, got)
+		}
+		isAllowed := unicode.IsLetter(r) || unicode.IsNumber(r) ||
+			unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) ||
+			r == ' ' || r == '.' || r == ',' || r == '-' || r == '_' || r == '\''
+		if !isAllowed {
+			t.Errorf("sanitizeInviterName(%q) [%s] contains disallowed rune %U (%c): %q", input, label, r, r, got)
+		}
+	}
+
+	// Invariant 9: Truncated output may end in CCC 9 (virama) only if word-final.
+	// For truncated paths, compare against the uncapped result.
+	if checkVirama {
+		// Get the uncapped result
+		full := []rune(sanitizeInviterNameUncapped(input))
+		out := []rune(got)
+
+		// (a) If the output ends in CCC 9 and is shorter than full,
+		// the next rune in full must be a space (word-final virama).
+		if len(out) > 0 && len(out) < len(full) {
+			lastRune := out[len(out)-1]
+			props := norm.NFC.PropertiesString(string(lastRune))
+			if props.CCC() == 9 {
+				nextRune := full[len(out)]
+				if nextRune != ' ' {
+					t.Errorf("sanitizeInviterName(%q) [%s] ends in mid-word CCC 9 (virama) rune U+%04X, next rune is U+%04X (not space): output=%q full=%q", input, label, lastRune, nextRune, got, string(full))
+				}
+			}
+		}
+
+		// (b) If full is >64 runes, full[63] has CCC 9, and full[64] is a space,
+		// the output must equal string(full[:64]) (word-final virama kept).
+		if len(full) > 64 {
+			props := norm.NFC.PropertiesString(string(full[63]))
+			if props.CCC() == 9 && full[64] == ' ' {
+				expected := string(full[:64])
+				if got != expected {
+					t.Errorf("sanitizeInviterName(%q) [%s] should keep word-final virama at position 63: got=%q, expected=%q", input, label, got, expected)
+				}
+			}
+		}
+	}
+}
+
 // FuzzSanitizeInviterName verifies invariants over random inputs
 func FuzzSanitizeInviterName(f *testing.F) {
 	// Seed corpus with edge cases
 	f.Add("Alice")
 	f.Add(strings.Repeat("a", 70))
-	f.Add("e\u0300\u0316")                           // non-composing marks
-	f.Add("\uFDFA")                                  // NFKC expands
-	f.Add("\xf0\u00b2")                              // invalid byte + NFKC char
-	f.Add(strings.Repeat("a", 1022) + "日")           // 3-byte rune at 1024
-	f.Add("क्ष")                                     // Indic conjunct (virama)
-	f.Add(strings.Repeat("a", 60) + "क्ष्म" + "bbb") // Chained virama (force CCC 9 strip)
-	f.Add(strings.Repeat("ब", 70))                   // Force 64-rune cap path
+	f.Add("e\u0300\u0316")                                 // non-composing marks
+	f.Add("\uFDFA")                                        // NFKC expands
+	f.Add("\xf0\u00b2")                                    // invalid byte + NFKC char
+	f.Add(strings.Repeat("a", 1022) + "日")                 // 3-byte rune at 1024
+	f.Add("क्ष")                                           // Indic conjunct (virama)
+	f.Add(strings.Repeat("a", 60) + "क्ष्म" + "bbb")       // Mid-word virama: cut inside conjunct
+	f.Add(strings.Repeat("ब", 70))                         // Force 64-rune cap path
+	f.Add(strings.Repeat("a", 59) + "क् ष्" + "bbbbbbbbb") // Word-final virama: keep complete words
 
 	f.Fuzz(func(t *testing.T, input string) {
 		got := sanitizeInviterName(input)
 
-		// Invariant 1: Output is valid UTF-8
-		if !utf8.ValidString(got) {
-			t.Errorf("sanitizeInviterName(%q) returned invalid UTF-8: %q", input, got)
-		}
+		// Check all invariants on the direct output (Invariant 9 not checked here)
+		checkSanitizeInvariants(t, input, got, "direct", false)
 
-		// Invariant 2: Output is NFC normalized
-		if !norm.NFC.IsNormalString(got) {
-			t.Errorf("sanitizeInviterName(%q) returned non-NFC string: %q", input, got)
-		}
-
-		// Invariant 3: At most 64 runes
-		runeCount := utf8.RuneCountInString(got)
-		if runeCount > 64 {
-			t.Errorf("sanitizeInviterName(%q) returned %d runes (> 64): %q", input, runeCount, got)
-		}
-
-		// Invariant 4: Non-empty (fallback applied if needed)
-		if got == "" {
-			t.Errorf("sanitizeInviterName(%q) returned empty string", input)
-		}
-
-		// Invariant 5: No leading/trailing space
-		if strings.TrimSpace(got) != got {
-			t.Errorf("sanitizeInviterName(%q) has leading/trailing space: %q", input, got)
-		}
-
-		// Invariant 6: No leading combining mark
-		runes := []rune(got)
-		if len(runes) > 0 {
-			firstRune := runes[0]
-			if unicode.Is(unicode.Mn, firstRune) || unicode.Is(unicode.Mc, firstRune) {
-				t.Errorf("sanitizeInviterName(%q) starts with combining mark: %q", input, got)
-			}
-		}
-
-		// Invariant 7: Idempotent
-		got2 := sanitizeInviterName(got)
-		if got != got2 {
-			t.Errorf("sanitizeInviterName not idempotent for input %q: first=%q, second=%q", input, got, got2)
-		}
-
-		// Invariant 8: Every output rune is in the allowlist (L*, N*, Mn, Mc, space, . , - _ ')
-		// and no U+FFFD
-		for _, r := range got {
-			if r == '\uFFFD' {
-				t.Errorf("sanitizeInviterName(%q) contains U+FFFD: %q", input, got)
-			}
-			isAllowed := unicode.IsLetter(r) || unicode.IsNumber(r) ||
-				unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) ||
-				r == ' ' || r == '.' || r == ',' || r == '-' || r == '_' || r == '\''
-			if !isAllowed {
-				t.Errorf("sanitizeInviterName(%q) contains disallowed rune %U (%c): %q", input, r, r, got)
-			}
-		}
-
-		// Invariant 9: Truncated output never ends in CCC 9 (virama) unless it's the only rune
-		// This only applies when the 64-rune cap was hit (force truncation by appending text)
+		// Force truncation by appending ब×70 and check all invariants on that path too.
+		// This is the only path that exercises the tail cleanup loop.
 		truncationTest := input + strings.Repeat("ब", 70)
 		gotTruncated := sanitizeInviterName(truncationTest)
-		runesTruncated := []rune(gotTruncated)
-		if len(runesTruncated) > 1 && utf8.RuneCountInString(gotTruncated) == 64 {
-			lastRune := runesTruncated[len(runesTruncated)-1]
-			props := norm.NFC.PropertiesString(string(lastRune))
-			if props.CCC() == 9 {
-				t.Errorf("sanitizeInviterName(%q+...70×ब) truncated output ends in CCC 9 (virama) rune %U: %q", input, lastRune, gotTruncated)
-			}
-		}
+		checkSanitizeInvariants(t, truncationTest, gotTruncated, "truncated", true)
 	})
 }
 
-// TestAPIClock verifies that api.Server.now is used in createInvite.
-// Note: the API clock (Server.now, time.Time) and the store clock (Store.now, int64)
-// are independent and can disagree; this test only fakes the API clock.
+// TestAPIClock verifies that api.Server.clk is used in createInvite.
 func TestAPIClock(t *testing.T) {
+	fixedTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	clk := clocktest.New(fixedTime)
+
 	st, err := store.Open(t.TempDir() + "/t.db")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
 
-	bareCfg := Config{}
+	bareCfg := Config{Clock: clk}
 	prepareTestConfig(t, st, &bareCfg)
 	srv, err := New(st, bareCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer srv.Stop()
-
-	// Stub the clock and verify non-nil default
-	if srv.now == nil {
-		t.Fatal("New() should set non-nil default clock")
-	}
-	fixedTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return fixedTime }
 
 	// Create test server and client
 	testSrv := httptest.NewServer(srv.Handler())
@@ -3721,7 +3835,7 @@ func TestAPIClock(t *testing.T) {
 	}
 
 	// Boundary test: advance clock by 100 seconds and create another invite
-	srv.now = func() time.Time { return fixedTime.Add(100 * time.Second) }
+	clk.Advance(100 * time.Second)
 	resp, body = c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	if err := json.Unmarshal(body, &inv); err != nil {
@@ -3988,14 +4102,25 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 // TestInviteAccept405Comprehensive covers all the edge cases from issue #146 and #174.
 func TestInviteAccept405Comprehensive(t *testing.T) {
 	// Use fake clock to control invite expiry deterministically
-	var mu sync.Mutex
-	now := time.Now()
-	fakeClock := func() time.Time {
-		mu.Lock()
-		defer mu.Unlock()
-		return now
+	clk := clocktest.New(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+
+	// Open store with fake clock so expiry checks use it
+	st, err := store.OpenWithOptions(t.TempDir()+"/t.db", store.OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
 	}
-	srv := newServer(t, Config{Now: fakeClock})
+	t.Cleanup(func() { st.Close() })
+
+	cfg := Config{Clock: clk}
+	prepareTestConfig(t, st, &cfg)
+	apiSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(apiSrv.Stop)
+	srv := httptest.NewServer(apiSrv.Handler())
+	t.Cleanup(srv.Close)
+
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
 
 	// Create invites with different states: valid, used, expired, missing
@@ -4012,11 +4137,12 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
 	want(t, resp, body, 201)
 	var inv3 struct{ Code string }
-	json.Unmarshal(body, &inv3)
-	// Advance clock past inv3's expiry (1 second TTL)
-	mu.Lock()
-	now = now.Add(2 * time.Second)
-	mu.Unlock()
+	if err := json.Unmarshal(body, &inv3); err != nil || inv3.Code == "" {
+		t.Fatalf("inv3: %v, code=%q", err, inv3.Code)
+	}
+	// Advance clock past inv3's expiry (1 second TTL). The store uses the same
+	// fake clock, so POST ?code= will see it as expired.
+	clk.Advance(2 * time.Second)
 
 	// Use inv2
 	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
@@ -4131,6 +4257,12 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 		if rsp.Header.Get("Allow") == "" {
 			t.Errorf("%s: missing Allow header", method)
 		}
+		if got := rsp.Header.Get("Deprecation"); got != wantDeprecation {
+			t.Errorf("%s with ?code=: Deprecation = %q, want %q", method, got, wantDeprecation)
+		}
+		if got := rsp.Header.Get("Link"); got != wantLink {
+			t.Errorf("%s with ?code=: Link = %q, want %q", method, got, wantLink)
+		}
 	}
 	// DELETE: no handler in authed mux, should get 404
 	r, _ := http.NewRequest("DELETE", srv.URL+"/v1/invites/accept?code="+inv1.Code, nil)
@@ -4142,6 +4274,12 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	rsp.Body.Close()
 	if rsp.StatusCode != 404 {
 		t.Errorf("DELETE: want 404, got %d", rsp.StatusCode)
+	}
+	if got := rsp.Header.Get("Deprecation"); got != wantDeprecation {
+		t.Errorf("DELETE with ?code=: Deprecation = %q, want %q", got, wantDeprecation)
+	}
+	if got := rsp.Header.Get("Link"); got != wantLink {
+		t.Errorf("DELETE with ?code=: Link = %q, want %q", got, wantLink)
 	}
 
 	// Test 7: Trailing slash returns 404 (strict, issue #174)
@@ -4178,6 +4316,77 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	want(t, resp, body, 400)
 	if !strings.Contains(string(body), "malformed") {
 		t.Errorf("bad code landing: %s", body)
+	}
+
+	// Test 10: Expired vs missing code: no oracle (issue #305)
+	// Create two invites with 1s TTL for expiry testing
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
+	want(t, resp, body, 201)
+	var inv4 struct{ Code string }
+	if err := json.Unmarshal(body, &inv4); err != nil || inv4.Code == "" {
+		t.Fatalf("inv4: %v, code=%q", err, inv4.Code)
+	}
+
+	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 1}, nil)
+	want(t, resp, body, 201)
+	var inv5 struct{ Code string }
+	if err := json.Unmarshal(body, &inv5); err != nil || inv5.Code == "" {
+		t.Fatalf("inv5: %v, code=%q", err, inv5.Code)
+	}
+
+	// Positive control: inv4 is accepted before expiry
+	resp, body = b.do("POST", "/v1/invites/accept", map[string]any{"code": inv4.Code}, nil)
+	want(t, resp, body, 200)
+
+	// Advance clock past inv5's 1s TTL to expire it
+	clk.Advance(2 * time.Second)
+
+	// Compare expired vs missing for both forms: ?code= and body-only
+	for _, tc := range []struct {
+		name string
+		do   func(code string) (*http.Response, []byte)
+	}{
+		{"POST ?code=", func(code string) (*http.Response, []byte) {
+			return b.do("POST", "/v1/invites/accept?code="+code, nil, nil)
+		}},
+		{"POST body", func(code string) (*http.Response, []byte) {
+			return b.do("POST", "/v1/invites/accept", map[string]any{"code": code}, nil)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Expired code
+			respExp, bodyExp := tc.do(inv5.Code)
+			want(t, respExp, bodyExp, 404)
+
+			// Missing code
+			respMiss, bodyMiss := tc.do(missingCode)
+			want(t, respMiss, bodyMiss, 404)
+
+			// Bodies must be identical
+			if !bytes.Equal(bodyExp, bodyMiss) {
+				t.Errorf("404 body differs:\nexpired: %s\nmissing: %s", bodyExp, bodyMiss)
+			}
+
+			// Compare all headers except Date (varies per request)
+			for k := range respExp.Header {
+				if k == "Date" {
+					continue // Date legitimately varies per request
+				}
+				if respExp.Header.Get(k) != respMiss.Header.Get(k) {
+					t.Errorf("header %s differs: expired=%q missing=%q",
+						k, respExp.Header.Get(k), respMiss.Header.Get(k))
+				}
+			}
+			for k := range respMiss.Header {
+				if k == "Date" {
+					continue
+				}
+				if respMiss.Header.Get(k) != respExp.Header.Get(k) {
+					t.Errorf("header %s differs: missing=%q expired=%q",
+						k, respMiss.Header.Get(k), respExp.Header.Get(k))
+				}
+			}
+		})
 	}
 
 	// Verify inv1 is still pending after all the above
@@ -4392,29 +4601,33 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 
 	// 14. 429 (rate limit) with ?code=: should have deprecation headers
 	// Use fake clock to control rate limiter refill deterministically
-	var mu429 sync.Mutex
-	now429 := time.Now()
-	fakeClock429 := func() time.Time {
-		mu429.Lock()
-		defer mu429.Unlock()
-		return now429
-	}
-	srvLimited := newServer(t, Config{WritePerMinute: 60, WriteBurst: 1, Now: fakeClock429})
+	clk429 := clocktest.New(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	srvLimited := newServer(t, Config{WritePerMinute: 60, WriteBurst: 1, Clock: clk429})
 	c := register(t, srvLimited, "charlie")
 	d := register(t, srvLimited, "dave")
 	respInv, bodyInv := c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, respInv, bodyInv, 201)
 	var inv4 struct{ Code string }
-	json.Unmarshal(bodyInv, &inv4)
+	if err := json.Unmarshal(bodyInv, &inv4); err != nil || inv4.Code == "" {
+		t.Fatalf("inv4: %v, code=%q", err, inv4.Code)
+	}
 	// Advance clock to allow rate limiter refill (60/min = 1 token per second)
-	mu429.Lock()
-	now429 = now429.Add(1100 * time.Millisecond)
-	mu429.Unlock()
+	clk429.Advance(1100 * time.Millisecond)
 	// Create another invite after bucket refill
 	respInv2, bodyInv2 := c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, respInv2, bodyInv2, 201)
 	var inv5 struct{ Code string }
-	json.Unmarshal(bodyInv2, &inv5)
+	if err := json.Unmarshal(bodyInv2, &inv5); err != nil || inv5.Code == "" {
+		t.Fatalf("inv5: %v, code=%q", err, inv5.Code)
+	}
+	// Create one more invite for body-only 429 test
+	clk429.Advance(1100 * time.Millisecond)
+	respInv3, bodyInv3 := c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	want(t, respInv3, bodyInv3, 201)
+	var inv6 struct{ Code string }
+	if err := json.Unmarshal(bodyInv3, &inv6); err != nil || inv6.Code == "" {
+		t.Fatalf("inv6: %v, code=%q", err, inv6.Code)
+	}
 	// Exhaust Dave's write rate limit by accepting first invite (uses burst token)
 	resp429, body429 := d.do("POST", "/v1/invites/accept?code="+inv4.Code, nil, nil)
 	want(t, resp429, body429, 200)
@@ -4427,10 +4640,24 @@ func TestInviteAcceptDeprecationHeaders(t *testing.T) {
 	if got := resp429.Header.Get("Link"); got != wantLink {
 		t.Errorf("POST 429 rate limit: Link = %q, want %q", got, wantLink)
 	}
-	if got := resp429.Header.Get("Retry-After"); got == "" {
-		t.Error("POST 429 rate limit: missing Retry-After header")
+	if got := resp429.Header.Get("Retry-After"); got != "2" {
+		t.Errorf("POST 429 rate limit: Retry-After = %q, want \"2\"", got)
 	}
 	assertSecurityHeaders(t, resp429.Header, "POST 429 rate limit")
+
+	// 15. Body-only 429 should NOT have deprecation headers (negative control)
+	resp429, body429 = d.do("POST", "/v1/invites/accept", map[string]any{"code": inv6.Code}, nil)
+	want(t, resp429, body429, 429)
+	if got := resp429.Header.Get("Deprecation"); got != "" {
+		t.Errorf("body-only POST 429: unexpected Deprecation = %q", got)
+	}
+	if got := resp429.Header.Get("Link"); got != "" {
+		t.Errorf("body-only POST 429: unexpected Link = %q", got)
+	}
+	if got := resp429.Header.Get("Retry-After"); got != "2" {
+		t.Errorf("body-only POST 429: Retry-After = %q, want \"2\"", got)
+	}
+	assertSecurityHeaders(t, resp429.Header, "body-only POST 429")
 }
 
 func TestPairingLookupsBoundedPerIP(t *testing.T) {
