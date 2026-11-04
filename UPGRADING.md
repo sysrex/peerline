@@ -90,6 +90,57 @@ This prevents time-of-check-time-of-use vulnerabilities and silent grant overwri
 
 **Important:** This overwrite prevention applies only to confirm-mode invites. Legacy pairing paths (`POST /v1/pairing/{token}` with invite codes or pairing links) still silently overwrite existing grants between the two peers. See [issue #312](https://github.com/sysrex/peerline/issues/312) for details. For controlled re-pairing with review, use confirm-mode invites.
 
+### Legacy Pairing Refuses Re-pair with Different Grants (Security Fix for #312)
+
+**Affected versions:** All versions upgrading to include the #312 fix
+
+**Impact:** Legacy accept paths (`POST /v1/invites/accept` with invite codes and `POST /v1/pairing/{token}` with or without Bearer auth) now refuse to overwrite existing grants when scopes or bags differ. A re-pair attempt with different grants returns HTTP 409 and leaves both the grants and the invite unchanged.
+
+**What changed:**
+- Before: Accepting an invite when already paired silently replaced existing grants with no review
+- After: Accept fails with 409 if grants would change; succeeds (idempotent 200) if grants are identical
+
+**Error response:**
+```json
+{
+  "error": "already paired with different grants; revoke the grant or use a confirm-mode invite"
+}
+```
+
+**How to update your workflow:**
+
+If you need to change grant scopes between two already-paired peers:
+
+**Option 1: Revoke first, then accept (immediate)**
+```bash
+# Revoke the existing grant
+curl -X DELETE -H "Authorization: Bearer $KEY" \
+  https://peerline.example.com/v1/grants/$PEER_ID
+
+# Now accept the new invite
+curl -X POST -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  https://peerline.example.com/v1/invites/accept \
+  -d "{\"code\":\"$CODE\"}"
+```
+
+**Option 2: Use confirm-mode invites (with review step)**
+```bash
+# Create invite with require_confirm: true
+curl -X POST -H "Authorization: Bearer $INVITER_KEY" \
+  -H "Content-Type: application/json" \
+  https://peerline.example.com/v1/invites \
+  -d '{"scopes":["new_scope"],"generate_pairing":true,"require_confirm":true}'
+
+# The accepter claims it, you review the offer_digest, then confirm
+```
+
+Confirm-mode invites show you what grants are being replaced and require explicit confirmation (see the Confirm API section above).
+
+**Why this change:** The silent overwrite allowed a stale invite to restore previously-revoked access without the inviter's knowledge. A narrower old invite could also silently downgrade a grant. This fix ensures both peers must explicitly revoke or confirm before changing grant scopes.
+
+**Note:** This affects only re-pairing between two already-paired peers. First-time pairing is unchanged.
+
 ## Schema Migrations and Backups
 
 Peerline automatically migrates your database schema to the latest version when the service starts. Before applying any migration, Peerline creates a **pre-migration backup** using SQLite's `VACUUM INTO` command.
