@@ -117,7 +117,7 @@ type OpenOptions struct {
 	// vacuumInto is an injectable hook for testing. If nil, uses db.Exec("VACUUM INTO ?", path).
 	vacuumInto func(db *sql.DB, backupPath string) error
 
-	// now is an internal alias for Now, used for backup timestamps.
+	// now is an internal test hook for backup timestamps. Overridden by Now when set.
 	now func() int64
 
 	// migrationStepHook is an injectable hook for testing migration step failures.
@@ -272,11 +272,11 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		return nil, fmt.Errorf("schema: %w", err)
 	}
 
-	// Use Now if set, otherwise fall back to internal now for backward compat
-	nowFunc := opts.Now
-	if nowFunc == nil {
-		nowFunc = opts.now
+	// Propagate Now into internal now for time-based operations
+	if opts.Now != nil {
+		opts.now = opts.Now
 	}
+	nowFunc := opts.now
 	if nowFunc == nil {
 		nowFunc = func() int64 { return time.Now().Unix() }
 	}
@@ -526,10 +526,7 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 	}
 
 	// Create new backup
-	nowFunc := opts.Now
-	if nowFunc == nil {
-		nowFunc = opts.now
-	}
+	nowFunc := opts.now
 	if nowFunc == nil {
 		nowFunc = func() int64 { return time.Now().Unix() }
 	}
