@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -1218,6 +1219,32 @@ func TestConcurrentAcceptSameInvite(t *testing.T) {
 	}
 }
 
+// grantRow returns the scopes for the specified grant, or returns empty string and logs
+// fatal on any error other than sql.ErrNoRows.
+func grantRow(t *testing.T, db *sql.DB, owner, grantee string) string {
+	t.Helper()
+	var scopes string
+	err := db.QueryRow(`SELECT scopes FROM grants WHERE owner=? AND grantee=?`, owner, grantee).Scan(&scopes)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ""
+	}
+	if err != nil {
+		t.Fatalf("grantRow(%s→%s) error: %v", owner, grantee, err)
+	}
+	return scopes
+}
+
+// inviteUsed returns true if the invite is marked used, false if not, and logs fatal on error.
+func inviteUsed(t *testing.T, db *sql.DB, code string) bool {
+	t.Helper()
+	var used interface{}
+	err := db.QueryRow(`SELECT used_by FROM invites WHERE code_hash=?`, code).Scan(&used)
+	if err != nil {
+		t.Fatalf("inviteUsed(%s) error: %v", code, err)
+	}
+	return used != nil
+}
+
 // TestConcurrentAcceptVsRevoke races a legacy accept against RevokeGrant to ensure
 // no mixed state occurs: the invite is either consumed with the grant written, or
 // left unused when the grant is missing (#337 item 4).
@@ -1232,117 +1259,94 @@ func TestConcurrentAcceptVsRevoke(t *testing.T) {
 	clk := clocktest.New(time.Unix(1000000, 0))
 
 	for iter := 0; iter < 50; iter++ {
-		dbPath := t.TempDir() + "/test.db"
-		s1, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if err := s1.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-		if err := s1.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-
-		// Create initial grant
-		code0 := "code0"
-		exp0 := clk.Now().Add(time.Hour)
-		if err := s1.CreateInvite(ctx, code0, "alice", []string{"messages"}, nil, exp0); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-		if _, err := s1.AcceptInvite(ctx, code0, "bob", nil, nil); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-
-		// Create second invite with identical grant
-		exp := clk.Now().Add(time.Hour)
-		code := "code_race"
-		if err := s1.CreateInvite(ctx, code, "alice", []string{"messages"}, nil, exp); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-
-		s2, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
-		if err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-
-		var wg sync.WaitGroup
-		barrier := make(chan struct{})
-		acceptErr := make(chan error, 1)
-		revokeErr := make(chan error, 1)
-
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			<-barrier
-			_, err := s1.AcceptInvite(ctx, code, "bob", nil, nil)
-			acceptErr <- err
-		}()
-		go func() {
-			defer wg.Done()
-			<-barrier
-			err := s2.RevokeGrant(ctx, "alice", "bob")
-			revokeErr <- err
-		}()
-
-		close(barrier)
-		wg.Wait()
-
-		aErr := <-acceptErr
-		rErr := <-revokeErr
-
-		var grantExists bool
-		gErr := s1.db.QueryRow(`SELECT 1 FROM grants WHERE owner=? AND grantee=?`, "alice", "bob").Scan(new(int))
-		if gErr == nil {
-			grantExists = true
-		} else if !errors.Is(gErr, sql.ErrNoRows) {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: grant check error: %v", iter, gErr)
-		}
-
-		var used interface{}
-		if err := s1.db.QueryRow(`SELECT used_by FROM invites WHERE code_hash=?`, code).Scan(&used); err != nil {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: invite check error: %v", iter, err)
-		}
-
-		inviteUsed := (used != nil)
-
-		// Accept both valid serial outcomes: (1) accept-then-revoke → no grant, or
-		// (2) revoke-then-accept → grant exists. Both invites carry the same grant,
-		// so accept never returns ErrConflict (it takes the skip path).
-		if aErr == nil && rErr == nil {
-			// Both succeeded. Valid outcomes: grant exists (revoke-then-accept) or not (accept-then-revoke).
-			// In both cases, invite must be consumed.
-			if !inviteUsed {
-				t.Errorf("iter %d: accept succeeded but invite not consumed (grantExists=%v)", iter, grantExists)
+		t.Run(fmt.Sprintf("iter%d", iter), func(t *testing.T) {
+			dbPath := t.TempDir() + "/test.db"
+			s1, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
+			if err != nil {
+				t.Fatal(err)
 			}
-		} else if aErr != nil && !errors.Is(aErr, ErrConflict) {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: unexpected accept error: %v", iter, aErr)
-		} else if rErr != nil && !errors.Is(rErr, ErrNotFound) {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: unexpected revoke error: %v", iter, rErr)
-		}
+			t.Cleanup(func() { s1.Close() })
 
-		s1.Close()
-		s2.Close()
+			if err := s1.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+				t.Fatal(err)
+			}
+			if err := s1.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+				t.Fatal(err)
+			}
+
+			// Create initial grant
+			code0 := "code0"
+			exp0 := clk.Now().Add(time.Hour)
+			if err := s1.CreateInvite(ctx, code0, "alice", []string{"messages"}, nil, exp0); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s1.AcceptInvite(ctx, code0, "bob", nil, nil); err != nil {
+				t.Fatal(err)
+			}
+
+			// Create second invite with identical grant
+			exp := clk.Now().Add(time.Hour)
+			code := "code_race"
+			if err := s1.CreateInvite(ctx, code, "alice", []string{"messages"}, nil, exp); err != nil {
+				t.Fatal(err)
+			}
+
+			s2, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { s2.Close() })
+
+			var wg sync.WaitGroup
+			barrier := make(chan struct{})
+			acceptErr := make(chan error, 1)
+			revokeErr := make(chan error, 1)
+
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				<-barrier
+				_, err := s1.AcceptInvite(ctx, code, "bob", nil, nil)
+				acceptErr <- err
+			}()
+			go func() {
+				defer wg.Done()
+				<-barrier
+				err := s2.RevokeGrant(ctx, "alice", "bob")
+				revokeErr <- err
+			}()
+
+			close(barrier)
+			wg.Wait()
+
+			aErr := <-acceptErr
+			rErr := <-revokeErr
+
+			grantScopes := grantRow(t, s1.db, "alice", "bob")
+			grantExists := grantScopes != ""
+			used := inviteUsed(t, s1.db, code)
+
+			// Both invites carry the same grant, so accept never returns ErrConflict (takes skip path).
+			// Two valid serial outcomes:
+			// (1) accept-then-revoke: accept nil, revoke nil, grant absent, invite used
+			// (2) revoke-then-accept: revoke nil, accept nil, grant exists, invite used
+			if aErr == nil && rErr == nil {
+				// Both succeeded. Invite must be consumed.
+				if !used {
+					t.Errorf("accept succeeded but invite not consumed (grantExists=%v)", grantExists)
+				}
+			} else if aErr != nil {
+				t.Fatalf("unexpected accept error: %v", aErr)
+			} else if rErr != nil {
+				t.Fatalf("unexpected revoke error: %v", rErr)
+			}
+		})
 	}
 }
 
 // TestConcurrentAcceptVsRevokeDifferentGrant races accept (with a different grant)
-// against RevokeGrant. The accept should return ErrConflict and leave the invite unused.
+// against RevokeGrant. Two valid orderings: accept-then-revoke (conflict), or
+// revoke-then-accept (new grant written).
 func TestConcurrentAcceptVsRevokeDifferentGrant(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping concurrency test in short mode")
@@ -1354,135 +1358,107 @@ func TestConcurrentAcceptVsRevokeDifferentGrant(t *testing.T) {
 	clk := clocktest.New(time.Unix(1000000, 0))
 
 	for iter := 0; iter < 50; iter++ {
-		dbPath := t.TempDir() + "/test.db"
-		s1, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if err := s1.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-		if err := s1.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-
-		// Create initial grant with "messages"
-		code0 := "code0"
-		exp0 := clk.Now().Add(time.Hour)
-		if err := s1.CreateInvite(ctx, code0, "alice", []string{"messages"}, nil, exp0); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-		if _, err := s1.AcceptInvite(ctx, code0, "bob", nil, nil); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-
-		// Create second invite with DIFFERENT grant ("bags_read")
-		exp := clk.Now().Add(time.Hour)
-		code := "code_race"
-		if err := s1.CreateInvite(ctx, code, "alice", []string{"bags_read"}, nil, exp); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-
-		s2, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
-		if err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-
-		var wg sync.WaitGroup
-		barrier := make(chan struct{})
-		acceptErr := make(chan error, 1)
-		revokeErr := make(chan error, 1)
-
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			<-barrier
-			_, err := s1.AcceptInvite(ctx, code, "bob", nil, nil)
-			acceptErr <- err
-		}()
-		go func() {
-			defer wg.Done()
-			<-barrier
-			err := s2.RevokeGrant(ctx, "alice", "bob")
-			revokeErr <- err
-		}()
-
-		close(barrier)
-		wg.Wait()
-
-		aErr := <-acceptErr
-		rErr := <-revokeErr
-
-		var grantExists bool
-		var grantScopes string
-		gErr := s1.db.QueryRow(`SELECT scopes FROM grants WHERE owner=? AND grantee=?`, "alice", "bob").Scan(&grantScopes)
-		if gErr == nil {
-			grantExists = true
-		} else if !errors.Is(gErr, sql.ErrNoRows) {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: grant check error: %v", iter, gErr)
-		}
-
-		var used interface{}
-		if err := s1.db.QueryRow(`SELECT used_by FROM invites WHERE code_hash=?`, code).Scan(&used); err != nil {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: invite check error: %v", iter, err)
-		}
-
-		inviteUsed := (used != nil)
-
-		// Two valid orderings with different grants:
-		// (1) accept-then-revoke: accept returns ErrConflict, invite unused, grant may or may not exist
-		// (2) revoke-then-accept: revoke succeeds, accept succeeds with new grant, invite used
-		if aErr == nil {
-			// Accept succeeded: revoke must have gone first. New grant must exist and invite used.
-			if !grantExists {
-				s1.Close()
-				s2.Close()
-				t.Errorf("iter %d: accept succeeded but grant missing", iter)
+		t.Run(fmt.Sprintf("iter%d", iter), func(t *testing.T) {
+			dbPath := t.TempDir() + "/test.db"
+			s1, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
+			if err != nil {
+				t.Fatal(err)
 			}
-			if grantScopes != "bags_read" {
-				s1.Close()
-				s2.Close()
-				t.Errorf("iter %d: accept succeeded but grant is %q, want bags_read", iter, grantScopes)
-			}
-			if !inviteUsed {
-				s1.Close()
-				s2.Close()
-				t.Errorf("iter %d: accept succeeded but invite not consumed", iter)
-			}
-			if rErr != nil && !errors.Is(rErr, ErrNotFound) {
-				s1.Close()
-				s2.Close()
-				t.Errorf("iter %d: unexpected revoke error: %v", iter, rErr)
-			}
-		} else if errors.Is(aErr, ErrConflict) {
-			// Accept conflicted: old grant was still there. Invite must be unused.
-			if inviteUsed {
-				s1.Close()
-				s2.Close()
-				t.Errorf("iter %d: accept returned ErrConflict but invite was consumed", iter)
-			}
-		} else {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: unexpected accept error: %v", iter, aErr)
-		}
+			t.Cleanup(func() { s1.Close() })
 
-		s1.Close()
-		s2.Close()
+			if err := s1.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+				t.Fatal(err)
+			}
+			if err := s1.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+				t.Fatal(err)
+			}
+
+			// Create initial grant with "messages"
+			code0 := "code0"
+			exp0 := clk.Now().Add(time.Hour)
+			if err := s1.CreateInvite(ctx, code0, "alice", []string{"messages"}, nil, exp0); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s1.AcceptInvite(ctx, code0, "bob", nil, nil); err != nil {
+				t.Fatal(err)
+			}
+
+			// Create second invite with DIFFERENT grant ("bags_read")
+			exp := clk.Now().Add(time.Hour)
+			code := "code_race"
+			if err := s1.CreateInvite(ctx, code, "alice", []string{"bags_read"}, nil, exp); err != nil {
+				t.Fatal(err)
+			}
+
+			s2, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { s2.Close() })
+
+			var wg sync.WaitGroup
+			barrier := make(chan struct{})
+			acceptErr := make(chan error, 1)
+			revokeErr := make(chan error, 1)
+
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				<-barrier
+				_, err := s1.AcceptInvite(ctx, code, "bob", nil, nil)
+				acceptErr <- err
+			}()
+			go func() {
+				defer wg.Done()
+				<-barrier
+				err := s2.RevokeGrant(ctx, "alice", "bob")
+				revokeErr <- err
+			}()
+
+			close(barrier)
+			wg.Wait()
+
+			aErr := <-acceptErr
+			rErr := <-revokeErr
+
+			grantScopes := grantRow(t, s1.db, "alice", "bob")
+			used := inviteUsed(t, s1.db, code)
+
+			// Two valid orderings with different grants:
+			// (1) accept-then-revoke: accept sees "messages" grant and returns ErrConflict,
+			//     invite unused, then revoke deletes "messages" → grant absent, rErr nil
+			// (2) revoke-then-accept: revoke deletes "messages" (rErr nil), then accept writes
+			//     "bags_read", invite used → grant exists with "bags_read"
+			if errors.Is(aErr, ErrConflict) {
+				// Ordering (1): accept conflicted, revoke should have succeeded afterwards
+				if rErr != nil {
+					t.Fatalf("accept returned ErrConflict but revoke failed: %v", rErr)
+				}
+				if used {
+					t.Errorf("accept returned ErrConflict but invite was consumed")
+				}
+				if grantScopes != "" {
+					t.Errorf("accept conflicted, revoke succeeded, but grant still exists: %q", grantScopes)
+				}
+			} else if aErr == nil {
+				// Ordering (2): revoke went first, accept succeeded
+				if rErr != nil {
+					t.Fatalf("accept succeeded but revoke failed: %v", rErr)
+				}
+				if grantScopes != "bags_read" {
+					t.Errorf("accept succeeded but grant is %q, want bags_read", grantScopes)
+				}
+				if !used {
+					t.Errorf("accept succeeded but invite not consumed")
+				}
+			} else {
+				t.Fatalf("unexpected accept error: %v", aErr)
+			}
+		})
 	}
 }
 
+// TestConcurrentAcceptDifferentInvites races two accepts of different invites between
 // TestConcurrentAcceptDifferentInvites races two accepts of different invites between
 // the same pair with identical grants. Both should succeed (second takes skip path),
 // both invites consumed, exactly one grant row with unchanged created_at (#340).
@@ -1497,143 +1473,122 @@ func TestConcurrentAcceptDifferentInvites(t *testing.T) {
 	clk := clocktest.New(time.Unix(1000000, 0))
 
 	for iter := 0; iter < 50; iter++ {
-		dbPath := t.TempDir() + "/test.db"
-		s1, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if err := s1.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-		if err := s1.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-
-		// Capture the time before creating invites
-		createdAtBefore := clk.Now().Unix()
-
-		// Create two invites with identical grants
-		exp := clk.Now().Add(time.Hour)
-		code1 := "code1"
-		code2 := "code2"
-		if err := s1.CreateInvite(ctx, code1, "alice", []string{"messages"}, nil, exp); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-		if err := s1.CreateInvite(ctx, code2, "alice", []string{"messages"}, nil, exp); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-
-		s2, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
-		if err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-
-		var wg sync.WaitGroup
-		barrier := make(chan struct{})
-		results := make(chan error, 2)
-
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			<-barrier
-			_, err := s1.AcceptInvite(ctx, code1, "bob", nil, nil)
-			results <- err
-		}()
-		go func() {
-			defer wg.Done()
-			<-barrier
-			_, err := s2.AcceptInvite(ctx, code2, "bob", nil, nil)
-			results <- err
-		}()
-
-		close(barrier)
-		wg.Wait()
-		close(results)
-
-		var errs []error
-		for e := range results {
-			errs = append(errs, e)
-		}
-
-		// Assert exactly 2 successes (both invites carry identical grants)
-		successes := 0
-		for _, e := range errs {
-			if e == nil {
-				successes++
-			} else if !errors.Is(e, ErrConflict) && !errors.Is(e, ErrNotFound) {
-				s1.Close()
-				s2.Close()
-				t.Fatalf("iter %d: unexpected error: %v", iter, e)
+		t.Run(fmt.Sprintf("iter%d", iter), func(t *testing.T) {
+			dbPath := t.TempDir() + "/test.db"
+			s1, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
+			t.Cleanup(func() { s1.Close() })
 
-		if successes != 2 {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: expected exactly 2 successes with identical grants, got %d (errs: %v)", iter, successes, errs)
-		}
+			if err := s1.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+				t.Fatal(err)
+			}
+			if err := s1.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+				t.Fatal(err)
+			}
 
-		// Verify exactly one alice→bob grant row
-		var grantCount int
-		if err := s1.db.QueryRow(`SELECT COUNT(*) FROM grants WHERE owner=? AND grantee=?`, "alice", "bob").Scan(&grantCount); err != nil {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: grant count error: %v", iter, err)
-		}
-		if grantCount != 1 {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: expected exactly 1 grant row, got %d", iter, grantCount)
-		}
+			// Create alice→bob grant at T0
+			code0 := "code0"
+			exp0 := clk.Now().Add(time.Hour)
+			if err := s1.CreateInvite(ctx, code0, "alice", []string{"messages"}, nil, exp0); err != nil {
+				t.Fatal(err)
+			}
+			t0 := clk.Now().Unix()
+			if _, err := s1.AcceptInvite(ctx, code0, "bob", nil, nil); err != nil {
+				t.Fatal(err)
+			}
 
-		// Verify grant created_at is unchanged (skip path preserves it)
-		var grantCreatedAt int64
-		if err := s1.db.QueryRow(`SELECT created_at FROM grants WHERE owner=? AND grantee=?`, "alice", "bob").Scan(&grantCreatedAt); err != nil {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: grant created_at query error: %v", iter, err)
-		}
-		if grantCreatedAt != createdAtBefore {
-			s1.Close()
-			s2.Close()
-			t.Errorf("iter %d: grant created_at changed from %d to %d", iter, createdAtBefore, grantCreatedAt)
-		}
+			// Advance clock so re-accepts would have different timestamps if they rewrote
+			clk.Advance(10 * time.Minute)
 
-		// Verify both invites are used
-		var used1, used2 interface{}
-		if err := s1.db.QueryRow(`SELECT used_by FROM invites WHERE code_hash=?`, code1).Scan(&used1); err != nil {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: invite1 check error: %v", iter, err)
-		}
-		if err := s1.db.QueryRow(`SELECT used_by FROM invites WHERE code_hash=?`, code2).Scan(&used2); err != nil {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: invite2 check error: %v", iter, err)
-		}
+			// Create two invites with identical grants
+			exp := clk.Now().Add(time.Hour)
+			code1 := "code1"
+			code2 := "code2"
+			if err := s1.CreateInvite(ctx, code1, "alice", []string{"messages"}, nil, exp); err != nil {
+				t.Fatal(err)
+			}
+			if err := s1.CreateInvite(ctx, code2, "alice", []string{"messages"}, nil, exp); err != nil {
+				t.Fatal(err)
+			}
 
-		if used1 == nil {
-			s1.Close()
-			s2.Close()
-			t.Errorf("iter %d: invite1 not consumed", iter)
-		}
-		if used2 == nil {
-			s1.Close()
-			s2.Close()
-			t.Errorf("iter %d: invite2 not consumed", iter)
-		}
+			s2, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { s2.Close() })
 
-		s1.Close()
-		s2.Close()
+			var wg sync.WaitGroup
+			barrier := make(chan struct{})
+			results := make(chan error, 2)
+
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				<-barrier
+				_, err := s1.AcceptInvite(ctx, code1, "bob", nil, nil)
+				results <- err
+			}()
+			go func() {
+				defer wg.Done()
+				<-barrier
+				_, err := s2.AcceptInvite(ctx, code2, "bob", nil, nil)
+				results <- err
+			}()
+
+			close(barrier)
+			wg.Wait()
+			close(results)
+
+			var errs []error
+			for e := range results {
+				errs = append(errs, e)
+			}
+
+			// Assert exactly 2 successes (both invites carry identical grants)
+			successes := 0
+			for _, e := range errs {
+				if e == nil {
+					successes++
+				} else if !errors.Is(e, ErrConflict) && !errors.Is(e, ErrNotFound) {
+					t.Fatalf("unexpected error: %v", e)
+				}
+			}
+
+			if successes != 2 {
+				t.Fatalf("expected exactly 2 successes with identical grants, got %d (errs: %v)", successes, errs)
+			}
+
+			// Verify exactly one alice→bob grant row
+			var grantCount int
+			if err := s1.db.QueryRow(`SELECT COUNT(*) FROM grants WHERE owner=? AND grantee=?`, "alice", "bob").Scan(&grantCount); err != nil {
+				t.Fatalf("grant count error: %v", err)
+			}
+			if grantCount != 1 {
+				t.Fatalf("expected exactly 1 grant row, got %d", grantCount)
+			}
+
+			// Verify grant created_at is unchanged (skip path preserves it)
+			var grantCreatedAt int64
+			if err := s1.db.QueryRow(`SELECT created_at FROM grants WHERE owner=? AND grantee=?`, "alice", "bob").Scan(&grantCreatedAt); err != nil {
+				t.Fatalf("grant created_at query error: %v", err)
+			}
+			if grantCreatedAt != t0 {
+				t.Errorf("grant created_at changed from %d to %d (should be preserved on skip path)", t0, grantCreatedAt)
+			}
+
+			// Verify both invites are used
+			if !inviteUsed(t, s1.db, code1) {
+				t.Errorf("invite1 not consumed")
+			}
+			if !inviteUsed(t, s1.db, code2) {
+				t.Errorf("invite2 not consumed")
+			}
+		})
 	}
 }
-
+// TestConcurrentAcceptDifferentInvitesDifferentGrants races two accepts of different
 // TestConcurrentAcceptDifferentInvitesDifferentGrants races two accepts of different
 // invites with DIFFERENT grants. Exactly one should succeed, the other gets ErrConflict,
 // and the loser's invite is left unused (#340).
@@ -1648,138 +1603,110 @@ func TestConcurrentAcceptDifferentInvitesDifferentGrants(t *testing.T) {
 	clk := clocktest.New(time.Unix(1000000, 0))
 
 	for iter := 0; iter < 50; iter++ {
-		dbPath := t.TempDir() + "/test.db"
-		s1, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if err := s1.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-		if err := s1.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-
-		// Create two invites with DIFFERENT grants
-		exp := clk.Now().Add(time.Hour)
-		code1 := "code1"
-		code2 := "code2"
-		if err := s1.CreateInvite(ctx, code1, "alice", []string{"messages"}, nil, exp); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-		if err := s1.CreateInvite(ctx, code2, "alice", []string{"bags_read"}, nil, exp); err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-
-		s2, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
-		if err != nil {
-			s1.Close()
-			t.Fatal(err)
-		}
-
-		var wg sync.WaitGroup
-		barrier := make(chan struct{})
-		results := make(chan error, 2)
-
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			<-barrier
-			_, err := s1.AcceptInvite(ctx, code1, "bob", nil, nil)
-			results <- err
-		}()
-		go func() {
-			defer wg.Done()
-			<-barrier
-			_, err := s2.AcceptInvite(ctx, code2, "bob", nil, nil)
-			results <- err
-		}()
-
-		close(barrier)
-		wg.Wait()
-		close(results)
-
-		var errs []error
-		for e := range results {
-			errs = append(errs, e)
-		}
-
-		// Assert exactly 1 success and 1 ErrConflict
-		successes := 0
-		conflicts := 0
-		for _, e := range errs {
-			if e == nil {
-				successes++
-			} else if errors.Is(e, ErrConflict) {
-				conflicts++
-			} else {
-				s1.Close()
-				s2.Close()
-				t.Fatalf("iter %d: unexpected error: %v", iter, e)
+		t.Run(fmt.Sprintf("iter%d", iter), func(t *testing.T) {
+			dbPath := t.TempDir() + "/test.db"
+			s1, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
+			t.Cleanup(func() { s1.Close() })
 
-		if successes != 1 || conflicts != 1 {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: expected 1 success and 1 conflict with different grants, got %d successes, %d conflicts (errs: %v)", iter, successes, conflicts, errs)
-		}
+			if err := s1.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+				t.Fatal(err)
+			}
+			if err := s1.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+				t.Fatal(err)
+			}
 
-		// Verify exactly one alice→bob grant row
-		var grantCount int
-		if err := s1.db.QueryRow(`SELECT COUNT(*) FROM grants WHERE owner=? AND grantee=?`, "alice", "bob").Scan(&grantCount); err != nil {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: grant count error: %v", iter, err)
-		}
-		if grantCount != 1 {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: expected exactly 1 grant row, got %d", iter, grantCount)
-		}
+			// Create two invites with DIFFERENT grants
+			exp := clk.Now().Add(time.Hour)
+			code1 := "code1"
+			code2 := "code2"
+			if err := s1.CreateInvite(ctx, code1, "alice", []string{"messages"}, nil, exp); err != nil {
+				t.Fatal(err)
+			}
+			if err := s1.CreateInvite(ctx, code2, "alice", []string{"bags_read"}, nil, exp); err != nil {
+				t.Fatal(err)
+			}
 
-		// Verify exactly one invite is used (the winner's), one unused (the loser's)
-		var used1, used2 interface{}
-		if err := s1.db.QueryRow(`SELECT used_by FROM invites WHERE code_hash=?`, code1).Scan(&used1); err != nil {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: invite1 check error: %v", iter, err)
-		}
-		if err := s1.db.QueryRow(`SELECT used_by FROM invites WHERE code_hash=?`, code2).Scan(&used2); err != nil {
-			s1.Close()
-			s2.Close()
-			t.Fatalf("iter %d: invite2 check error: %v", iter, err)
-		}
+			s2, err := OpenWithOptions(dbPath, OpenOptions{Clock: clk})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { s2.Close() })
 
-		usedCount := 0
-		if used1 != nil {
-			usedCount++
-		}
-		if used2 != nil {
-			usedCount++
-		}
+			var wg sync.WaitGroup
+			barrier := make(chan struct{})
+			results := make(chan error, 2)
 
-		if usedCount != 1 {
-			s1.Close()
-			s2.Close()
-			t.Errorf("iter %d: expected exactly 1 invite consumed, got %d (used1=%v, used2=%v)", iter, usedCount, used1, used2)
-		}
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				<-barrier
+				_, err := s1.AcceptInvite(ctx, code1, "bob", nil, nil)
+				results <- err
+			}()
+			go func() {
+				defer wg.Done()
+				<-barrier
+				_, err := s2.AcceptInvite(ctx, code2, "bob", nil, nil)
+				results <- err
+			}()
 
-		s1.Close()
-		s2.Close()
+			close(barrier)
+			wg.Wait()
+			close(results)
+
+			var errs []error
+			for e := range results {
+				errs = append(errs, e)
+			}
+
+			// Assert exactly 1 success and 1 ErrConflict
+			successes := 0
+			conflicts := 0
+			for _, e := range errs {
+				if e == nil {
+					successes++
+				} else if errors.Is(e, ErrConflict) {
+					conflicts++
+				} else {
+					t.Fatalf("unexpected error: %v", e)
+				}
+			}
+
+			if successes != 1 || conflicts != 1 {
+				t.Fatalf("expected 1 success and 1 conflict with different grants, got %d successes, %d conflicts (errs: %v)", successes, conflicts, errs)
+			}
+
+			// Verify exactly one alice→bob grant row
+			var grantCount int
+			if err := s1.db.QueryRow(`SELECT COUNT(*) FROM grants WHERE owner=? AND grantee=?`, "alice", "bob").Scan(&grantCount); err != nil {
+				t.Fatalf("grant count error: %v", err)
+			}
+			if grantCount != 1 {
+				t.Fatalf("expected exactly 1 grant row, got %d", grantCount)
+			}
+
+			// Verify exactly one invite is used (the winner's), one unused (the loser's)
+			used1 := inviteUsed(t, s1.db, code1)
+			used2 := inviteUsed(t, s1.db, code2)
+
+			usedCount := 0
+			if used1 {
+				usedCount++
+			}
+			if used2 {
+				usedCount++
+			}
+
+			if usedCount != 1 {
+				t.Errorf("expected exactly 1 invite consumed, got %d (used1=%v, used2=%v)", usedCount, used1, used2)
+			}
+		})
 	}
 }
 
-// TestForwardGrantBumpedWhenReverseChanges verifies that when an invite carries
-// a forward grant equal to the existing one, but a NEW reverse grant (or changes
-// the reverse grant), the forward created_at is bumped. This is intended behavior:
-// the accept transaction writes both grants atomically, and the forward grant's
-// timestamp reflects the transaction that last touched the pair's grant relationship,
 // even if the forward grant content didn't change (#340 P3-b).
 func TestForwardGrantBumpedWhenReverseChanges(t *testing.T) {
 	ctx := context.Background()
@@ -1841,13 +1768,17 @@ func TestForwardGrantBumpedWhenReverseChanges(t *testing.T) {
 
 	// Read forward grant created_at again - it SHOULD be bumped to secondAcceptTime
 	// even though the forward grant content is identical, because the reverse grant is new.
+	// P3(b): This is intended behavior. When an accept carries a forward grant equal to the
+	// existing one but a NEW reverse grant (or changes the reverse grant), acceptInviteInTx
+	// writes both grants atomically in the same transaction. The forward grant's created_at
+	// is set to the transaction time (now) even though its content didn't change, because
+	// the timestamp reflects the last transaction that touched the pair's grant relationship.
 	var newForwardCreatedAt int64
 	err = s.db.QueryRow(`SELECT created_at FROM grants WHERE owner=? AND grantee=?`, "alice", "bob").Scan(&newForwardCreatedAt)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// This is the intended behavior: forward created_at bumps when reverse grant changes.
 	if newForwardCreatedAt != secondAcceptTime {
 		t.Errorf("forward grant created_at after new reverse grant: got %d, want %d (bumped, not preserved at %d)",
 			newForwardCreatedAt, secondAcceptTime, firstAcceptTime)
