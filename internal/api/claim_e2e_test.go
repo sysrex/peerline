@@ -575,7 +575,7 @@ func TestInviterViewJSONKeys(t *testing.T) {
 
 				// Remove "error" key and use reflect.DeepEqual to compare
 				delete(view409, "error")
-				
+
 				// Marshal both to JSON and compare for deep equality
 				viewJSON, err := json.Marshal(view)
 				if err != nil {
