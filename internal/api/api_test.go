@@ -35,6 +35,33 @@ type client struct {
 	id  string
 }
 
+// newBarrier creates an N-party barrier for concurrent test synchronization.
+// All n callers block in the returned function until all arrive, then all are released together.
+// If not all arrive within timeout, the test fails.
+// Note: arrivalCount == n allows the barrier to pass; a caller arriving after release passes through immediately.
+func newBarrier(t testing.TB, n int, timeout time.Duration) func() {
+	t.Helper()
+	var arrivalCount int
+	var mu sync.Mutex
+	allArrived := make(chan struct{})
+	var closeOnce sync.Once
+
+	return func() {
+		mu.Lock()
+		arrivalCount++
+		if arrivalCount == n {
+			closeOnce.Do(func() { close(allArrived) })
+		}
+		mu.Unlock()
+
+		select {
+		case <-allArrived:
+		case <-time.After(timeout):
+			t.Error("barrier timeout: not all goroutines arrived")
+		}
+	}
+}
+
 func newServer(t *testing.T, cfg Config) *httptest.Server {
 	t.Helper()
 	st, err := store.Open(t.TempDir() + "/t.db")
@@ -2254,9 +2281,9 @@ func TestDeletedInviteCannotBeAccepted(t *testing.T) {
 
 // TestConcurrentInviteCapRace verifies the concurrent cap check race is fixed (#53).
 //
-// The barrier holds all requests before the atomic cap check. The created count
-// (> 1) catches a count-then-insert regression in CreateInviteAtomic, and the final
-// email budget assertion (4 of 6 left) catches charging the limiter before the create.
+// The barrier (via testInviteCreatedHook) holds all requests before CreateInviteAtomic.
+// The "created == 1" assertion catches a count-then-insert regression in the atomic cap check.
+// The "budgetSucceeded == 4" assertion catches charging the email limiter before the create succeeds.
 func TestConcurrentInviteCapRace(t *testing.T) {
 	cfg := Config{}
 	cfg.MaxOutstandingInvites = 2
@@ -2288,27 +2315,10 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
 	}
 
-	// Set up N-party barrier: all 5 goroutines wait until all arrive, then release together
 	const concurrent = 5
-	var arrivalCount int
-	var arrivalMu sync.Mutex
-	allArrived := make(chan struct{})
-	var closeOnce sync.Once
-
+	barrier := newBarrier(t, concurrent, 5*time.Second)
 	rawSrv.testInviteCreatedHook = func(peerID string) {
-		arrivalMu.Lock()
-		arrivalCount++
-		if arrivalCount == concurrent {
-			closeOnce.Do(func() { close(allArrived) })
-		}
-		arrivalMu.Unlock()
-
-		select {
-		case <-allArrived:
-			// All arrived, proceed
-		case <-time.After(5 * time.Second):
-			t.Error("barrier timeout: not all goroutines arrived")
-		}
+		barrier()
 	}
 
 	// Launch concurrent requests at the cap with to_email
@@ -2402,6 +2412,179 @@ func TestConcurrentInviteCapRace(t *testing.T) {
 	if budgetSucceeded != 4 {
 		t.Errorf("budget check: %d email invites succeeded, want 4 (5 total tokens - 1 consumed in race)", budgetSucceeded)
 		t.Errorf("this proves email budget was over-consumed during concurrent cap rejection")
+	}
+}
+
+// TestConcurrentInviteCapRacePairing verifies the concurrent cap check race through the generate_pairing path.
+// The hook runs before both CreateInviteAtomic and CreateInviteWithPairingAtomic, so both paths need testing.
+func TestConcurrentInviteCapRacePairing(t *testing.T) {
+	cfg := Config{}
+	cfg.MaxOutstandingInvites = 2
+
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	prepareTestConfig(t, st, &cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(rawSrv.Handler())
+	defer srv.Close()
+
+	alice := register(t, srv, "Alice")
+
+	// Create first invite to get close to cap (1/2)
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"scopes":           []string{"messages"},
+		"generate_pairing": true,
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first invite: %d %s", resp.StatusCode, b)
+	}
+
+	const concurrent = 5
+	barrier := newBarrier(t, concurrent, 5*time.Second)
+	rawSrv.testInviteCreatedHook = func(peerID string) {
+		barrier()
+	}
+
+	results := make(chan int, concurrent)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, _ := alice.do("POST", "/v1/invites", map[string]any{
+				"scopes":           []string{"messages"},
+				"generate_pairing": true,
+			}, nil)
+			results <- resp.StatusCode
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	var created, rejected int
+	for status := range results {
+		if status == http.StatusCreated {
+			created++
+		} else if status == http.StatusTooManyRequests {
+			rejected++
+		} else {
+			t.Errorf("unexpected status: %d", status)
+		}
+	}
+
+	if created != 1 {
+		t.Errorf("concurrent creates: %d succeeded, want 1", created)
+	}
+	if rejected != concurrent-1 {
+		t.Errorf("concurrent rejects: %d, want %d", rejected, concurrent-1)
+	}
+
+	rawSrv.testInviteCreatedHook = nil
+
+	resp, b = alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites: %d %s", resp.StatusCode, b)
+	}
+	var listResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(listResp.Invites) != 2 {
+		t.Errorf("final invite count: %d, want 2 (at cap)", len(listResp.Invites))
+	}
+}
+
+// TestReadyAllowRaceSharedRecipient verifies the Ready→Allow race with concurrent requests to the same recipient.
+// Ready does not consume tokens, so multiple requests can pass Ready together, but only the first Allow succeeds.
+func TestReadyAllowRaceSharedRecipient(t *testing.T) {
+	cfg := Config{}
+	cfg.MaxOutstandingInvites = 10
+	cfg.EmailPerHour = 10
+	cfg.EmailBurst = 5
+	cfg.EmailRcptPerHour = 1
+
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	prepareTestConfig(t, st, &cfg)
+	rawSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(rawSrv.Handler())
+	defer srv.Close()
+
+	alice := register(t, srv, "Alice")
+
+	const concurrent = 3
+	sharedRecipient := "shared@example.com"
+	barrier := newBarrier(t, concurrent, 5*time.Second)
+	rawSrv.testInviteCreatedHook = func(peerID string) {
+		barrier()
+	}
+
+	results := make(chan int, concurrent)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, _ := alice.do("POST", "/v1/invites", map[string]any{
+				"to_email": sharedRecipient,
+				"scopes":   []string{"messages"},
+			}, nil)
+			results <- resp.StatusCode
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	var created, rejected int
+	for status := range results {
+		if status == http.StatusCreated {
+			created++
+		} else if status == http.StatusTooManyRequests {
+			rejected++
+		} else {
+			t.Errorf("unexpected status: %d", status)
+		}
+	}
+
+	// With EmailRcptPerHour = 1 (burst also 1), only one request should succeed
+	if created != 1 {
+		t.Errorf("concurrent creates to same recipient: %d succeeded, want 1", created)
+	}
+	if rejected != concurrent-1 {
+		t.Errorf("concurrent rejects: %d, want %d", rejected, concurrent-1)
+	}
+
+	rawSrv.testInviteCreatedHook = nil
+
+	// Verify exactly 1 invite was created (the others were cleaned up)
+	resp, b := alice.do("GET", "/v1/invites", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list invites: %d %s", resp.StatusCode, b)
+	}
+	var listResp struct {
+		Invites []map[string]any `json:"invites"`
+	}
+	if err := json.Unmarshal(b, &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(listResp.Invites) != 1 {
+		t.Errorf("final invite count: %d, want 1 (others should be cleaned up)", len(listResp.Invites))
 	}
 }
 
