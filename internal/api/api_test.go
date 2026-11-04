@@ -3585,11 +3585,15 @@ func FuzzSanitizeInviterName(f *testing.F) {
 }
 
 // TestAPIClock verifies that api.Server.clk is used in createInvite.
+// TestAPIClock verifies that the API and store share one clock, and that invite
+// expiry boundaries are exact: accepted at expires_at, rejected at expires_at+1.
+// Issue #110 item 5: clock agreement and exact-boundary semantics through the API.
 func TestAPIClock(t *testing.T) {
 	fixedTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
 	clk := clocktest.New(fixedTime)
 
-	st, err := store.Open(t.TempDir() + "/t.db")
+	// Pass the same fake clock to both store and API
+	st, err := store.OpenWithOptions(t.TempDir()+"/t.db", store.OpenOptions{Clock: clk})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3607,53 +3611,88 @@ func TestAPIClock(t *testing.T) {
 	testSrv := httptest.NewServer(srv.Handler())
 	defer testSrv.Close()
 
-	// Register a peer
-	c := &client{t: t, srv: testSrv}
-	resp, body := c.do("POST", "/v1/register", map[string]string{"name": "alice"}, nil)
+	// Register two peers
+	alice := &client{t: t, srv: testSrv}
+	resp, body := alice.do("POST", "/v1/register", map[string]string{"name": "alice"}, nil)
 	want(t, resp, body, 201)
-	var reg struct{ PeerID, APIKey string }
+	var aliceReg struct{ PeerID, APIKey string }
 	if err := json.Unmarshal(body, &struct {
 		PeerID *string `json:"peer_id"`
 		APIKey *string `json:"api_key"`
-	}{&reg.PeerID, &reg.APIKey}); err != nil {
+	}{&aliceReg.PeerID, &aliceReg.APIKey}); err != nil {
 		t.Fatal(err)
 	}
-	c.id, c.key = reg.PeerID, reg.APIKey
+	alice.id, alice.key = aliceReg.PeerID, aliceReg.APIKey
 
-	// Create an invite with default TTL (1h)
-	resp, body = c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+	bob := &client{t: t, srv: testSrv}
+	resp, body = bob.do("POST", "/v1/register", map[string]string{"name": "bob"}, nil)
+	want(t, resp, body, 201)
+	var bobReg struct{ PeerID, APIKey string }
+	if err := json.Unmarshal(body, &struct {
+		PeerID *string `json:"peer_id"`
+		APIKey *string `json:"api_key"`
+	}{&bobReg.PeerID, &bobReg.APIKey}); err != nil {
+		t.Fatal(err)
+	}
+	bob.id, bob.key = bobReg.PeerID, bobReg.APIKey
+
+	// Create an invite with 100-second TTL via API
+	resp, body = alice.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 100}, nil)
 	want(t, resp, body, 201)
 
-	var inv struct {
+	var inv1 struct {
+		Code      string `json:"code"`
 		ExpiresAt string `json:"expires_at"`
 	}
-	if err := json.Unmarshal(body, &inv); err != nil {
+	if err := json.Unmarshal(body, &inv1); err != nil {
 		t.Fatal(err)
 	}
 
-	expTime, err := time.Parse(time.RFC3339, inv.ExpiresAt)
+	expTime, err := time.Parse(time.RFC3339, inv1.ExpiresAt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := fixedTime.Add(time.Hour).UTC()
+	expected := fixedTime.Add(100 * time.Second).UTC()
 	if !expTime.Equal(expected) {
 		t.Errorf("expires_at = %v, want %v", expTime, expected)
 	}
 
-	// Boundary test: advance clock by 100 seconds and create another invite
+	// Advance clock to exactly expires_at
 	clk.Advance(100 * time.Second)
-	resp, body = c.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
+
+	// Accept at exactly expires_at (now == expires_at) - should succeed
+	resp, body = bob.do("POST", "/v1/invites/accept", map[string]any{"code": inv1.Code}, nil)
+	if resp.StatusCode != 200 {
+		t.Errorf("accept at exact boundary (now == expires_at): expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	// Reset clock to fixed time and create another invite for expires_at+1 test
+	clk.Set(fixedTime)
+	resp, body = alice.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "ttl_seconds": 100}, nil)
 	want(t, resp, body, 201)
-	if err := json.Unmarshal(body, &inv); err != nil {
+
+	var inv2 struct {
+		Code      string `json:"code"`
+		ExpiresAt string `json:"expires_at"`
+	}
+	if err := json.Unmarshal(body, &inv2); err != nil {
 		t.Fatal(err)
 	}
-	expTime, err = time.Parse(time.RFC3339, inv.ExpiresAt)
+	
+	expTime2, err := time.Parse(time.RFC3339, inv2.ExpiresAt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected = fixedTime.Add(100*time.Second + time.Hour).UTC()
-	if !expTime.Equal(expected) {
-		t.Errorf("expires_at after +100s = %v, want %v", expTime, expected)
+	t.Logf("inv2 expires at %v", expTime2)
+
+	// Advance clock to expires_at + 1 second
+	clk.Advance(101 * time.Second)
+	t.Logf("clock now at %v", clk.Now())
+
+	// Accept at expires_at+1 - should be rejected with 404
+	resp, body = bob.do("POST", "/v1/invites/accept", map[string]any{"code": inv2.Code}, nil)
+	if resp.StatusCode != 404 {
+		t.Errorf("accept at expires_at+1: expected 404, got %d: %s (expires_at=%v, now=%v)", resp.StatusCode, body, expTime2, clk.Now())
 	}
 }
 

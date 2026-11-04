@@ -987,6 +987,56 @@ func TestPairingTokenExpiryWithClock(t *testing.T) {
 	}
 }
 
+// TestAcceptInviteExactBoundary verifies AcceptInvite (by code) at exact expiry boundary.
+// Issue #110 item 3: exact-boundary row for AcceptInvite (now == expires_at accepted; expires_at+1 rejected).
+func TestAcceptInviteExactBoundary(t *testing.T) {
+	ctx := context.Background()
+	currentTime := time.Unix(1000000, 0)
+	clk := clocktest.New(currentTime)
+	
+	s, err := OpenWithOptions(":memory:", OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create an invite that expires at currentTime + 100s
+	expiresAt := currentTime.Add(100 * time.Second)
+	if err := s.CreateInvite(ctx, "code_boundary", "alice", []string{"messages"}, nil, expiresAt); err != nil {
+		t.Fatal(err)
+	}
+
+	// At exactly expires_at (now == expires_at), invite should be accepted
+	clk.Set(currentTime.Add(100 * time.Second))
+	grant, err := s.AcceptInvite(ctx, "code_boundary", "bob", nil, nil)
+	if err != nil {
+		t.Fatalf("AcceptInvite at exact boundary (now == expires_at) should succeed, got %v", err)
+	}
+	if grant == nil || grant.Owner != "alice" || grant.Grantee != "bob" {
+		t.Errorf("AcceptInvite at boundary returned wrong grant: %+v", grant)
+	}
+
+	// Create another invite to test expires_at+1
+	expiresAt2 := currentTime.Add(100 * time.Second)
+	if err := s.CreateInvite(ctx, "code_boundary2", "alice", []string{"messages"}, nil, expiresAt2); err != nil {
+		t.Fatal(err)
+	}
+
+	// At expires_at+1, invite should be rejected
+	clk.Set(currentTime.Add(101 * time.Second))
+	_, err = s.AcceptInvite(ctx, "code_boundary2", "bob", nil, nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("AcceptInvite at expires_at+1 should return ErrNotFound, got %v", err)
+	}
+}
+
 // TestRollbackAfterPeerInsert verifies that when RegisterAndAcceptByPairing fails
 // after the peer insert but before commit, no orphan peer is left and the invite remains unconsumed.
 func TestRollbackAfterPeerInsert(t *testing.T) {
