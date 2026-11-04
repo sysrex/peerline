@@ -4268,10 +4268,8 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 	if resp2.StatusCode != 405 {
 		t.Errorf("HEAD with auth: want 405, got %d", resp2.StatusCode)
 	}
-	// Allow header includes DELETE because DELETE /v1/invites/{public_id} also matches
-	// the literal path "accept", and ServeMux lists all methods registered on that pattern.
-	if got := resp2.Header.Get("Allow"); got != "DELETE, POST" {
-		t.Errorf("HEAD Allow: got %q, want DELETE, POST", got)
+	if got := resp2.Header.Get("Allow"); got != "POST" {
+		t.Errorf("HEAD Allow: got %q, want POST", got)
 	}
 	if got := resp2.Header.Get("Deprecation"); got != wantDeprecation {
 		t.Errorf("HEAD Deprecation: got %q, want %q", got, wantDeprecation)
