@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sysrex/peerline/internal/clock/clocktest"
 	"github.com/sysrex/peerline/internal/msg"
 	"github.com/sysrex/peerline/internal/store"
 )
@@ -742,7 +743,7 @@ func TestFailedAuthKeyingUsesClientIP(t *testing.T) {
 		TrustedProxies:    []string{"127.0.0.0/8"},
 		AuthFailPerMinute: 2,
 		AuthFailBurst:     2,
-		Now:               func() time.Time { return frozenNow },
+		Clock:             clocktest.New(frozenNow),
 	}
 	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
 		t.Fatal(err)
@@ -833,7 +834,7 @@ func TestPairingAcceptKeyingUsesClientIP(t *testing.T) {
 		TrustedProxies: []string{"127.0.0.0/8"},
 		MsgPerMinute:   10,
 		MsgBurst:       10,
-		Now:            func() time.Time { return frozenNow },
+		Clock:          clocktest.New(frozenNow),
 	}
 	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
 		t.Fatal(err)
@@ -927,7 +928,7 @@ func TestMalformedXFFSharedBucket(t *testing.T) {
 		TrustedProxies: []string{"127.0.0.0/8"},
 		MsgPerMinute:   10,
 		MsgBurst:       10,
-		Now:            func() time.Time { return frozenNow },
+		Clock:          clocktest.New(frozenNow),
 	}
 	if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
 		t.Fatal(err)
