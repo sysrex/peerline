@@ -45,14 +45,18 @@ func TestConfirmWithStaleDigestWritesNothing(t *testing.T) {
 
 	// Verify no grants were written
 	var n int
-	s.db.QueryRow(`SELECT COUNT(*) FROM grants`).Scan(&n)
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM grants`).Scan(&n); err != nil {
+		t.Fatalf("failed to count grants: %v", err)
+	}
 	if n != 0 {
 		t.Errorf("%d grants written with stale digest", n)
 	}
 
 	// Verify code_fails was not incremented
 	var codeFails int
-	s.db.QueryRow(`SELECT code_fails FROM invites WHERE public_id=?`, c.PublicID).Scan(&codeFails)
+	if err := s.db.QueryRow(`SELECT code_fails FROM invites WHERE public_id=?`, c.PublicID).Scan(&codeFails); err != nil {
+		t.Fatalf("failed to read code_fails: %v", err)
+	}
 	if codeFails != 0 {
 		t.Errorf("code_fails=%d, want 0 (stale digest should not count)", codeFails)
 	}
@@ -71,9 +75,81 @@ func TestConfirmWithStaleDigestWritesNothing(t *testing.T) {
 	}
 
 	// Verify code_fails WAS incremented for code mismatch
-	s.db.QueryRow(`SELECT code_fails FROM invites WHERE public_id=?`, c.PublicID).Scan(&codeFails)
+	if err := s.db.QueryRow(`SELECT code_fails FROM invites WHERE public_id=?`, c.PublicID).Scan(&codeFails); err != nil {
+		t.Fatalf("failed to read code_fails after code mismatch: %v", err)
+	}
 	if codeFails != 1 {
 		t.Errorf("code_fails=%d after code mismatch, want 1", codeFails)
+	}
+}
+
+// TestConfirmStaleDigestNoDeadlock verifies that confirming with a stale digest does not
+// deadlock the single-connection store pool (#310).
+func TestConfirmStaleDigestNoDeadlock(t *testing.T) {
+	s := claimStore(t)
+	ctx := context.Background()
+	exp := time.Unix(claimNow+3600, 0)
+
+	if err := s.CreateInviteWithPairing(ctx, "code", "pair", "alice", []string{"messages"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+	s.mustExec(t, `UPDATE invites SET require_confirm=1, nonce=x'abcd'`)
+
+	// Bob claims
+	nonce := []byte{0xab, 0xcd}
+	c, err := s.ClaimByToken(ctx, "pair", "bob", nonce, []string{"messages"}, nil)
+	if err != nil || c.State != ClaimClaimed {
+		t.Fatalf("claim: %v, %v", err, c)
+	}
+
+	// Confirm with stale digest under a 2 second timeout
+	timeoutCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	staleCheck := func(claim *Claim) (CheckResult, *Claim) {
+		// Return stale digest - this would trigger InviterView call in broken code
+		return CheckDigestStale, claim
+	}
+	state, freshClaim, err := s.ConfirmClaim(timeoutCtx, c.PublicID, "alice", "bob", 3, staleCheck)
+	elapsed := time.Since(start)
+
+	// Should succeed without deadline exceeded error
+	if err != nil {
+		t.Fatalf("ConfirmClaim failed: %v (elapsed %v)", err, elapsed)
+	}
+	if state != ClaimClaimed {
+		t.Fatalf("state: %s, want claimed", state)
+	}
+	if freshClaim == nil {
+		t.Fatal("freshClaim is nil, want fresh claim")
+	}
+
+	// Should finish well under the deadline (under 500ms is generous for a single tx)
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("ConfirmClaim took %v, want < 500ms (possible connection starvation)", elapsed)
+	}
+
+	// A subsequent store call should succeed immediately (proves no connection leaked)
+	viewCtx, viewCancel := context.WithTimeout(ctx, 1*time.Second)
+	defer viewCancel()
+	viewStart := time.Now()
+	view, err := s.InviterView(viewCtx, c.PublicID, "alice")
+	viewElapsed := time.Since(viewStart)
+	if err != nil {
+		t.Fatalf("InviterView after stale digest: %v (elapsed %v)", err, viewElapsed)
+	}
+	if view == nil {
+		t.Fatal("InviterView returned nil")
+	}
+
+	// Verify code_fails is still 0
+	var codeFails int
+	if err := s.db.QueryRow(`SELECT code_fails FROM invites WHERE public_id=?`, c.PublicID).Scan(&codeFails); err != nil {
+		t.Fatalf("failed to read code_fails: %v", err)
+	}
+	if codeFails != 0 {
+		t.Errorf("code_fails=%d, want 0 (stale digest should not count)", codeFails)
 	}
 }
 
@@ -186,7 +262,9 @@ func TestDoubleConfirmIsIdempotent(t *testing.T) {
 
 	// Verify only one set of grants exists
 	var n int
-	s.db.QueryRow(`SELECT COUNT(*) FROM grants`).Scan(&n)
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM grants`).Scan(&n); err != nil {
+		t.Fatalf("failed to count grants: %v", err)
+	}
 	if n != 2 { // alice->bob and bob->alice
 		t.Errorf("%d grants, want 2", n)
 	}

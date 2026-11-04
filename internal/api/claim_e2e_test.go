@@ -1,10 +1,14 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sysrex/peerline/internal/msg"
 	"github.com/sysrex/peerline/internal/store"
@@ -33,7 +37,9 @@ func confirmInvite(t *testing.T, inviter *client) (pub, token string) {
 		PublicID   string `json:"public_id"`
 		PairingURL string `json:"pairing_url"`
 	}
-	json.Unmarshal(b, &out)
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("unmarshal invite: %v", err)
+	}
 	return out.PublicID, out.PairingURL[strings.LastIndex(out.PairingURL, "/")+1:]
 }
 
@@ -45,7 +51,9 @@ func TestClaimEndToEndRealStore(t *testing.T) {
 	resp, b := claimant.do("POST", "/v1/pairing/claim", map[string]any{"token": token, "scopes": []string{"messages"}}, nil)
 	want(t, resp, b, 200)
 	var cl struct{ Code, State string }
-	json.Unmarshal(b, &cl)
+	if err := json.Unmarshal(b, &cl); err != nil {
+		t.Fatalf("unmarshal claim: %v", err)
+	}
 	if cl.Code == "" || cl.State != "claimed" || strings.Contains(string(b), "api_key") {
 		t.Fatalf("claim: %s", b)
 	}
@@ -64,7 +72,9 @@ func TestClaimEndToEndRealStore(t *testing.T) {
 	var view struct {
 		OfferDigest string `json:"offer_digest"`
 	}
-	json.Unmarshal(b, &view)
+	if err := json.Unmarshal(b, &view); err != nil {
+		t.Fatalf("unmarshal inviter view: %v", err)
+	}
 	if view.OfferDigest == "" {
 		t.Fatal("offer_digest missing from inviter view")
 	}
@@ -90,7 +100,9 @@ func TestClaimWrongCodeThriceDeclines(t *testing.T) {
 	resp, b := claimant.do("POST", "/v1/pairing/claim", map[string]any{"token": token}, nil)
 	want(t, resp, b, 200)
 	var cl struct{ Code string }
-	json.Unmarshal(b, &cl)
+	if err := json.Unmarshal(b, &cl); err != nil {
+		t.Fatalf("unmarshal claim: %v", err)
+	}
 
 	// Get offer digest
 	resp, b = inviter.do("GET", "/v1/invites/"+pub, nil, nil)
@@ -98,7 +110,9 @@ func TestClaimWrongCodeThriceDeclines(t *testing.T) {
 	var view struct {
 		OfferDigest string `json:"offer_digest"`
 	}
-	json.Unmarshal(b, &view)
+	if err := json.Unmarshal(b, &view); err != nil {
+		t.Fatalf("unmarshal inviter view: %v", err)
+	}
 
 	for i := 0; i < maxCodeFails; i++ {
 		resp, b = inviter.do("POST", "/v1/invites/"+pub+"/confirm", map[string]string{"peer_id": claimant.id, "code": "AAAA-AAAA", "offer_digest": view.OfferDigest}, nil)
@@ -150,7 +164,9 @@ func TestConfirmInviteRefusesLegacyAcceptAndMissesAreIdentical(t *testing.T) {
 	var view struct {
 		OfferDigest string `json:"offer_digest"`
 	}
-	json.Unmarshal(b, &view)
+	if err := json.Unmarshal(b, &view); err != nil {
+		t.Fatalf("unmarshal inviter view: %v", err)
+	}
 
 	bodies := []string{
 		miss(other, "POST", "/v1/pairing/claim", map[string]string{"token": token}),
@@ -182,39 +198,87 @@ func TestConfirmWithStaleDigestDoesNotDeadlock(t *testing.T) {
 	resp, b := claimant.do("POST", "/v1/pairing/claim", map[string]any{"token": token, "scopes": []string{"messages"}}, nil)
 	want(t, resp, b, 200)
 	var cl struct{ Code string }
-	json.Unmarshal(b, &cl)
+	if err := json.Unmarshal(b, &cl); err != nil {
+		t.Fatalf("unmarshal claim response: %v", err)
+	}
+	if cl.Code == "" {
+		t.Fatal("claim returned empty code")
+	}
 
 	// Get fresh offer_digest
 	resp, b = inviter.do("GET", "/v1/invites/"+pub, nil, nil)
 	want(t, resp, b, 200)
 	var view struct {
-		OfferDigest string `json:"offer_digest"`
-		State       string `json:"state"`
+		OfferDigest string                 `json:"offer_digest"`
+		State       string                 `json:"state"`
+		Offer       map[string]interface{} `json:"offer"`
 	}
-	json.Unmarshal(b, &view)
+	if err := json.Unmarshal(b, &view); err != nil {
+		t.Fatalf("unmarshal inviter view: %v", err)
+	}
 	if view.State != "claimed" {
 		t.Fatalf("state: %s, want claimed", view.State)
 	}
+	if view.OfferDigest == "" {
+		t.Fatal("offer_digest is empty")
+	}
 
-	// Confirm with a wrong (well-formed) digest
+	// Confirm with a wrong (well-formed) digest under a 2 second timeout
 	wrongDigest := "0000000000000000000000000000000000000000000000000000000000000000"
-	resp, b = inviter.do("POST", "/v1/invites/"+pub+"/confirm", map[string]string{
+	
+	// Create a client with timeout to ensure regression would fail fast
+	timeoutClient := &http.Client{Timeout: 2 * time.Second}
+	
+	body, _ := json.Marshal(map[string]string{
 		"peer_id":      claimant.id,
 		"code":         cl.Code,
 		"offer_digest": wrongDigest,
-	}, nil)
+	})
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/invites/"+pub+"/confirm", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+inviter.key)
+	req.Header.Set("Content-Type", "application/json")
+	
+	start := time.Now()
+	resp, err := timeoutClient.Do(req)
+	elapsed := time.Since(start)
+	
+	if err != nil {
+		t.Fatalf("stale digest confirm failed: %v (elapsed %v)", err, elapsed)
+	}
+	defer resp.Body.Close()
+	b, _ = io.ReadAll(resp.Body)
 
-	// Should get 409 Conflict with fresh digest in body
+	// Should get 409 Conflict with fresh view in body
 	if resp.StatusCode != 409 {
 		t.Fatalf("stale digest: got %d, want 409: %s", resp.StatusCode, b)
 	}
-	if !strings.Contains(string(b), view.OfferDigest) {
-		t.Fatalf("409 body missing fresh digest: %s", b)
+	
+	var staleResponse struct {
+		OfferDigest string                 `json:"offer_digest"`
+		Offer       map[string]interface{} `json:"offer"`
+	}
+	if err := json.Unmarshal(b, &staleResponse); err != nil {
+		t.Fatalf("unmarshal 409 response: %v", err)
+	}
+	if staleResponse.OfferDigest != view.OfferDigest {
+		t.Fatalf("409 body digest: %s, want %s", staleResponse.OfferDigest, view.OfferDigest)
+	}
+	if staleResponse.Offer == nil {
+		t.Fatalf("409 body missing offer object: %s", b)
 	}
 
-	// Verify code_fails is still 0 by checking we can still attempt confirm 3 times
-	// If the stale digest had counted, we'd be at 1/3 already
-	// This is an indirect check, but sufficient for the API test layer
+	// Verify code_fails is still 0 by sending 3 MORE stale digest confirms
+	// If the first one had counted, these would auto-decline
+	for i := 0; i < 3; i++ {
+		r, body := inviter.do("POST", "/v1/invites/"+pub+"/confirm", map[string]string{
+			"peer_id":      claimant.id,
+			"code":         cl.Code,
+			"offer_digest": wrongDigest,
+		}, nil)
+		if r.StatusCode != 409 {
+			t.Fatalf("stale attempt %d: got %d, want 409: %s", i+1, r.StatusCode, body)
+		}
+	}
 
 	// Verify no grants were written
 	resp, b = claimant.do("GET", "/v1/grants", nil, nil)
@@ -223,7 +287,7 @@ func TestConfirmWithStaleDigestDoesNotDeadlock(t *testing.T) {
 		t.Fatal("grants written after stale digest")
 	}
 
-	// Now confirm with correct digest should succeed
+	// Now confirm with correct digest should still succeed (proving code_fails is still 0)
 	resp, b = inviter.do("POST", "/v1/invites/"+pub+"/confirm", map[string]string{
 		"peer_id":      claimant.id,
 		"code":         cl.Code,
@@ -254,14 +318,18 @@ func TestActiveReplayWithDifferentPeerReturns404(t *testing.T) {
 	resp, b := claimant.do("POST", "/v1/pairing/claim", map[string]any{"token": token, "scopes": []string{"messages"}}, nil)
 	want(t, resp, b, 200)
 	var cl struct{ Code string }
-	json.Unmarshal(b, &cl)
+	if err := json.Unmarshal(b, &cl); err != nil {
+		t.Fatalf("unmarshal claim: %v", err)
+	}
 
 	resp, b = inviter.do("GET", "/v1/invites/"+pub, nil, nil)
 	want(t, resp, b, 200)
 	var view struct {
 		OfferDigest string `json:"offer_digest"`
 	}
-	json.Unmarshal(b, &view)
+	if err := json.Unmarshal(b, &view); err != nil {
+		t.Fatalf("unmarshal inviter view: %v", err)
+	}
 
 	resp, b = inviter.do("POST", "/v1/invites/"+pub+"/confirm", map[string]string{
 		"peer_id":      claimant.id,
@@ -298,7 +366,9 @@ func TestActiveReplayWithDifferentPeerReturns404(t *testing.T) {
 	var grantList struct {
 		Grants []map[string]any `json:"grants"`
 	}
-	json.Unmarshal(b, &grantList)
+	if err := json.Unmarshal(b, &grantList); err != nil {
+		t.Fatalf("unmarshal grants: %v", err)
+	}
 	if len(grantList.Grants) != 2 || !strings.Contains(string(b), claimant.id) || strings.Contains(string(b), other.id) {
 		t.Fatalf("grants after wrong peer replay: %s", b)
 	}
@@ -315,7 +385,9 @@ func TestUppercaseHexDigestNormalized(t *testing.T) {
 	resp, b := claimant.do("POST", "/v1/pairing/claim", map[string]any{"token": token, "scopes": []string{"messages"}}, nil)
 	want(t, resp, b, 200)
 	var cl struct{ Code string }
-	json.Unmarshal(b, &cl)
+	if err := json.Unmarshal(b, &cl); err != nil {
+		t.Fatalf("unmarshal claim: %v", err)
+	}
 
 	// Get fresh offer_digest (lowercase)
 	resp, b = inviter.do("GET", "/v1/invites/"+pub, nil, nil)
@@ -323,7 +395,9 @@ func TestUppercaseHexDigestNormalized(t *testing.T) {
 	var view struct {
 		OfferDigest string `json:"offer_digest"`
 	}
-	json.Unmarshal(b, &view)
+	if err := json.Unmarshal(b, &view); err != nil {
+		t.Fatalf("unmarshal inviter view: %v", err)
+	}
 
 	// Confirm with uppercase version of the digest
 	upperDigest := strings.ToUpper(view.OfferDigest)
