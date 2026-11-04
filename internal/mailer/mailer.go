@@ -101,6 +101,14 @@ type SMTP struct {
 
 func (s *SMTP) Mode() string { return "smtp" }
 
+// checkSTARTTLS validates STARTTLS policy: returns an error if STARTTLS is required but not offered.
+func (s *SMTP) checkSTARTTLS(offered bool) error {
+	if !offered && !s.AllowPlaintext {
+		return errors.New("STARTTLS required but not offered by server (set PEERLINE_SMTP_REQUIRE_TLS=false to allow cleartext)")
+	}
+	return nil
+}
+
 // IsLoopback returns true if host is a loopback address.
 // Matches net/smtp PlainAuth: "localhost", "127.0.0.1", and "::1".
 // Hostnames are not resolved; only these three literals are recognized as loopback.
@@ -121,6 +129,17 @@ func FromEnv(lg *slog.Logger) (Sender, error) {
 	if host == "" {
 		logBody := os.Getenv("PEERLINE_DEV_LOG_EMAIL_BODY") == "1"
 		return Log{Logger: lg, LogFullBody: logBody}, nil
+	}
+	if strings.Contains(host, "[") || strings.Contains(host, "]") {
+		suggested := strings.Trim(host, "[]")
+		if suggested == "" {
+			suggested = "a valid hostname or IP"
+		}
+		return nil, fmt.Errorf("PEERLINE_SMTP_HOST: bracketed address %q not allowed (use %s)", host, suggested)
+	}
+	// Reject host:port syntax (port must be in PEERLINE_SMTP_PORT), but allow IPv6 addresses
+	if strings.Contains(host, ":") && net.ParseIP(host) == nil {
+		return nil, fmt.Errorf("PEERLINE_SMTP_HOST: host %q contains ':' (use PEERLINE_SMTP_PORT for the port)", host)
 	}
 	port := 587
 	if p := os.Getenv("PEERLINE_SMTP_PORT"); p != "" {
@@ -214,12 +233,14 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 	}
 	defer c.Close()
 	if !s.ImplicitTLS {
-		if ok, _ := c.Extension("STARTTLS"); ok {
+		hasSTARTTLS, _ := c.Extension("STARTTLS")
+		if err := s.checkSTARTTLS(hasSTARTTLS); err != nil {
+			return fmt.Errorf("smtp: %w", err)
+		}
+		if hasSTARTTLS {
 			if err := c.StartTLS(tlsCfg); err != nil {
 				return fmt.Errorf("smtp starttls: %w", err)
 			}
-		} else if !s.AllowPlaintext {
-			return errors.New("smtp: STARTTLS required but not offered by server (set PEERLINE_SMTP_REQUIRE_TLS=false to allow cleartext)")
 		}
 	}
 	if s.User != "" {
@@ -252,10 +273,7 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 // Network errors (timeouts, connection refused, resets), SMTP greeting/EHLO errors, and
 // all other transient failures return an error wrapping ErrRelayUnreachable; the caller
 // should log a warning and continue (Send will retry at runtime).
-func (s *SMTP) Probe(ctx context.Context, lg *slog.Logger) error {
-	if lg == nil {
-		lg = slog.Default()
-	}
+func (s *SMTP) Probe(ctx context.Context) error {
 	timeout := s.Timeout
 	if timeout <= 0 {
 		timeout = 10 * time.Second
@@ -290,6 +308,17 @@ func (s *SMTP) Probe(ctx context.Context, lg *slog.Logger) error {
 	if s.ImplicitTLS {
 		tlsConn := tls.Client(conn, tlsCfg)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			// Check for not-yet-valid certificate (fatal: clock skew or misconfiguration)
+			var x509Invalid x509.CertificateInvalidError
+			if errors.As(err, &x509Invalid) && x509Invalid.Reason == x509.Expired && x509Invalid.Cert != nil {
+				if time.Now().Before(x509Invalid.Cert.NotBefore) {
+					return fmt.Errorf("smtp probe: TLS handshake failed on port 465: certificate not yet valid (NotBefore=%v); check the host clock: %w", x509Invalid.Cert.NotBefore.Format(time.RFC3339), err)
+				}
+			}
+			// Check for expiry-only error (transient: relay state, not Peerline config)
+			if s.isExpiryOnlyError(ctx, err, conn, tlsCfg) {
+				return fmt.Errorf("%w: relay certificate expired (sends will fail until renewed): %v", ErrRelayUnreachable, err)
+			}
 			// Check if it's a certificate/TLS error (fatal) or a timeout/reset (transient)
 			if isTLSError(err) {
 				return fmt.Errorf("smtp probe: TLS handshake failed on port 465: %w", err)
@@ -314,9 +343,8 @@ func (s *SMTP) Probe(ctx context.Context, lg *slog.Logger) error {
 
 	if !s.ImplicitTLS {
 		hasSTARTTLS, _ := c.Extension("STARTTLS")
-		if !hasSTARTTLS && !s.AllowPlaintext {
-			// Missing STARTTLS when required is a config error
-			return fmt.Errorf("smtp probe: STARTTLS not offered by %s:%d but TLS is required (set PEERLINE_SMTP_REQUIRE_TLS=false to allow cleartext)", s.Host, s.Port)
+		if err := s.checkSTARTTLS(hasSTARTTLS); err != nil {
+			return fmt.Errorf("smtp probe: %s:%d: %w", s.Host, s.Port, err)
 		}
 		if !hasSTARTTLS && s.User != "" && !IsLoopback(s.Host) {
 			return fmt.Errorf("smtp probe: credentials are set but %s:%d offers no STARTTLS and is not loopback; PLAIN auth would be refused", s.Host, s.Port)
@@ -324,6 +352,17 @@ func (s *SMTP) Probe(ctx context.Context, lg *slog.Logger) error {
 		if hasSTARTTLS {
 			// Actually perform the handshake to verify certs
 			if err := c.StartTLS(tlsCfg); err != nil {
+				// Check for not-yet-valid certificate (fatal: clock skew or misconfiguration)
+				var x509Invalid x509.CertificateInvalidError
+				if errors.As(err, &x509Invalid) && x509Invalid.Reason == x509.Expired && x509Invalid.Cert != nil {
+					if time.Now().Before(x509Invalid.Cert.NotBefore) {
+						return fmt.Errorf("smtp probe: STARTTLS handshake failed: certificate not yet valid (NotBefore=%v); check the host clock: %w", x509Invalid.Cert.NotBefore.Format(time.RFC3339), err)
+					}
+				}
+				// Check for expiry-only error (transient: relay state, not Peerline config)
+				if s.isExpiryOnlyError(ctx, err, conn, tlsCfg) {
+					return fmt.Errorf("%w: relay certificate expired (sends will fail until renewed): %v", ErrRelayUnreachable, err)
+				}
 				if isTLSError(err) {
 					return fmt.Errorf("smtp probe: STARTTLS handshake failed: %w", err)
 				}
@@ -336,6 +375,8 @@ func (s *SMTP) Probe(ctx context.Context, lg *slog.Logger) error {
 
 // isTLSError returns true if err is a certificate validation error or TLS protocol error.
 // These are fatal configuration errors, not transient network errors.
+// Note: x509 expiry errors require special handling (see isExpiryOnlyError) because Go reports
+// expiry before checking hostname or trust, so a bare Reason == Expired check would hide config errors.
 func isTLSError(err error) bool {
 	if err == nil {
 		return false
@@ -353,6 +394,88 @@ func isTLSError(err error) bool {
 	var tlsAlert tls.AlertError
 	if errors.As(err, &tlsCertVerify) || errors.As(err, &tlsRecordHeader) || errors.As(err, &tlsAlert) {
 		return true
+	}
+	return false
+}
+
+// isExpiryOnlyError returns true if err is a certificate expiry error (past NotAfter) and that is
+// the ONLY problem (hostname and trust are valid). Go's x509 checks validity dates before
+// hostname and trust, so Reason == Expired can mask config errors (wrong host, untrusted CA).
+// We re-verify at a time when the cert would be valid to distinguish expiry-only (transient)
+// from multi-problem certs (fatal config error).
+// Not-yet-valid certificates (NotBefore in the future) are treated as fatal: they indicate
+// clock skew or misconfiguration, not relay state.
+//
+// The re-verification makes a second connection to the same host:port with a modified TLS config
+// (Time set to NotAfter - 1s). If that connection fails for any reason (network error, rate limit,
+// timeout), the expired certificate is treated as fatal (safe side). A load-balanced relay could
+// answer from a different backend with a different certificate; that is acceptable since Send
+// verifies independently.
+func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, tlsCfg *tls.Config) bool {
+	var x509Invalid x509.CertificateInvalidError
+	if !errors.As(err, &x509Invalid) || x509Invalid.Reason != x509.Expired {
+		return false
+	}
+	if x509Invalid.Cert == nil {
+		return false
+	}
+	// Not-yet-valid (NotBefore in the future) is fatal: indicates clock skew or misconfiguration
+	if time.Now().Before(x509Invalid.Cert.NotBefore) {
+		return false
+	}
+	// Cert is expired (past NotAfter). Check if it would be valid at NotAfter - 1s.
+	// If that succeeds, expiry was the only problem (transient).
+
+	recheckCfg := tlsCfg.Clone()
+	fixedTime := x509Invalid.Cert.NotAfter.Add(-time.Second)
+	recheckCfg.Time = func() time.Time { return fixedTime }
+
+	// Re-handshake on a new connection to verify at the alternate time.
+	// Use the caller's context so cancellation propagates; bound to 2s max.
+	recheckCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	d := &net.Dialer{}
+	addr := net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
+
+	if s.ImplicitTLS {
+		// For implicit TLS, dial with TLS directly
+		recheckConn, err := (&tls.Dialer{NetDialer: d, Config: recheckCfg}).DialContext(recheckCtx, "tcp", addr)
+		if err == nil {
+			recheckConn.Close()
+			return true // Handshake succeeded at alternate time, so expiry was the only problem
+		}
+		return false
+	}
+
+	// For STARTTLS, dial plaintext then upgrade
+	recheckConn, err := d.DialContext(recheckCtx, "tcp", addr)
+	if err != nil {
+		return false
+	}
+	defer recheckConn.Close()
+
+	if deadline, ok := recheckCtx.Deadline(); ok {
+		recheckConn.SetDeadline(deadline)
+	}
+
+	c, err := smtp.NewClient(recheckConn, s.Host)
+	if err != nil {
+		return false
+	}
+	defer c.Quit()
+
+	if err := c.Hello("localhost"); err != nil {
+		return false
+	}
+
+	hasSTARTTLS, _ := c.Extension("STARTTLS")
+	if !hasSTARTTLS {
+		return false
+	}
+
+	if err := c.StartTLS(recheckCfg); err == nil {
+		return true // STARTTLS succeeded at alternate time
 	}
 	return false
 }
