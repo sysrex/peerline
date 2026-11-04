@@ -3382,8 +3382,8 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"many chained viramas", strings.Repeat("क्", 32) + "का", strings.Repeat("क्", 28)},          // 65 runes → 64 (32 pairs) → backoff drops 4 clusters (bound hit) → 56 runes (28 pairs, ends in virama); was fallback on main
 
 		// Issue #206: Stacked conjunct (C V C V | C) - dropCluster removes entire stacked conjunct
-		{"stacked conjunct at 64", strings.Repeat("a", 60) + "क्क्ष" + "bbb", strings.Repeat("a", 60)},   // 60 a + क्क्ष (stacked) → 66 runes → 64 → backs off through all 3 clusters → 60 a (no trailing virama)
-		{"4-virama stack at 64", strings.Repeat("a", 56) + "स्त्र्य्म" + "bbb", strings.Repeat("a", 56)}, // 68 runes total (56 a + 9-rune stack + bbb) → 64 (म at 64) → backs off 4 clusters → 56 a (bound hit)
+		{"stacked conjunct at 64", strings.Repeat("a", 60) + "क्क्ष" + "bbb", strings.Repeat("a", 60)},            // 60 a + क्क्ष (stacked) → 66 runes → 64 → backs off through all 3 clusters → 60 a (no trailing virama)
+		{"4-virama stack at 64", strings.Repeat("a", 56) + "स्त्र्य्म" + "bbb", strings.Repeat("a", 56)},          // 68 runes total (56 a + 9-rune stack + bbb) → 64 (म at 64) → backs off 4 clusters → 56 a (bound hit)
 		{"6-virama stack at 64", strings.Repeat("a", 54) + "स्त्र्य्म्न" + "bbb", strings.Repeat("a", 54) + "स्"}, // 68 runes total (54 a + 11-rune stack + bbb) → 64 ends at ् (म् at cut) → backs off 4 clusters (म्, य्, र्, त् dropped) → 54 a + स् (56 runes, 1 cluster remains; bound hit, fails if bound≥5)
 
 		// Issue #315: Word-final virama before punctuation (should be kept, not dropped)
@@ -3397,21 +3397,21 @@ func TestSanitizerUnicode(t *testing.T) {
 
 		// Issue #332, #346: Bounded back-off for long virama runs prevents collapse.
 		// When the bound is hit, the output may end in a visible virama or half-form (#346).
-		{"40 Tamil க் bounded", strings.Repeat("க்", 40), strings.Repeat("க்", 28)},                         // 80 runes → 64 (32 pairs) → backoff drops 4 clusters → 56 runes (28 pairs, bound hit, ends in pulli)
+		{"40 Tamil க் bounded", strings.Repeat("க்", 40), strings.Repeat("க்", 28)},                            // 80 runes → 64 (32 pairs) → backoff drops 4 clusters → 56 runes (28 pairs, bound hit, ends in pulli)
 		{"40 க் + 70 ब bounded", strings.Repeat("க்", 40) + strings.Repeat("ब", 70), strings.Repeat("க்", 28)}, // 150 runes → 64 (32 க் pairs) → backoff drops 4 clusters → 56 runes (28 pairs, bound hit, ends in pulli)
-		{"ab + 40 Tamil க் bounded", "ab" + strings.Repeat("க்", 40), "ab" + strings.Repeat("க்", 27)},               // 82 runes → 64 (ab+31 pairs) → backoff drops 4 clusters → 56 runes (ab+27 pairs, bound hit, ends in pulli)
-		{"40 Devanagari क् bounded", strings.Repeat("क्", 40), strings.Repeat("क्", 28)},                   // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama; #346 pin)
-		{"ab + 40 Devanagari क् bounded", "ab" + strings.Repeat("क्", 40), "ab" + strings.Repeat("क्", 27)}, // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in virama)
+		{"ab + 40 Tamil க் bounded", "ab" + strings.Repeat("க்", 40), "ab" + strings.Repeat("க்", 27)},         // 82 runes → 64 (ab+31 pairs) → backoff drops 4 clusters → 56 runes (ab+27 pairs, bound hit, ends in pulli)
+		{"40 Devanagari क् bounded", strings.Repeat("क्", 40), strings.Repeat("क्", 28)},                       // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama; #346 pin)
+		{"ab + 40 Devanagari क् bounded", "ab" + strings.Repeat("क्", 40), "ab" + strings.Repeat("क्", 27)},    // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in virama)
 		{"40 क् + 70 ब bounded", strings.Repeat("क्", 40) + strings.Repeat("ब", 70), strings.Repeat("क्", 28)}, // 150 runes → 64 (32 क् clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama)
-		{"40 Bengali ক্ bounded", strings.Repeat("ক্", 40), strings.Repeat("ক্", 28)},                     // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in hasanta)
-		{"ab + 40 Bengali ক্ bounded", "ab" + strings.Repeat("ক্", 40), "ab" + strings.Repeat("ক্", 27)},   // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in hasanta)
+		{"40 Bengali ক্ bounded", strings.Repeat("ক্", 40), strings.Repeat("ক্", 28)},                          // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in hasanta)
+		{"ab + 40 Bengali ক্ bounded", "ab" + strings.Repeat("ক্", 40), "ab" + strings.Repeat("ক্", 27)},       // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in hasanta)
 		{"40 ক্ + 70 ব bounded", strings.Repeat("ক্", 40) + strings.Repeat("ব", 70), strings.Repeat("ক্", 28)}, // 150 runes → 64 (32 ক্ clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in hasanta)
-		{"40 Malayalam ക് bounded", strings.Repeat("ക്", 40), strings.Repeat("ക്", 28)},                   // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama)
-		{"ab + 40 Malayalam ക് bounded", "ab" + strings.Repeat("ക്", 40), "ab" + strings.Repeat("ക്", 27)}, // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in virama)
+		{"40 Malayalam ക് bounded", strings.Repeat("ക്", 40), strings.Repeat("ക്", 28)},                        // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama)
+		{"ab + 40 Malayalam ക് bounded", "ab" + strings.Repeat("ക്", 40), "ab" + strings.Repeat("ക്", 27)},     // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in virama)
 		{"40 ക് + 70 ബ bounded", strings.Repeat("ക്", 40) + strings.Repeat("ബ", 70), strings.Repeat("ക്", 28)}, // 150 runes → 64 (32 ക് clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama)
-		{"Latin 70×a at cap", strings.Repeat("a", 70), strings.Repeat("a", 64)},                           // 70 runes → 64 runes (no virama, simple cap)
-		{"64 runes Deva क् at end", strings.Repeat("a", 62) + "क्", strings.Repeat("a", 62) + "क्"},       // Exactly 64 runes ending in virama → unchanged
-		{"65 runes Deva क् at 63", strings.Repeat("a", 63) + "क्", strings.Repeat("a", 63)},               // 65 runes → 64 (virama at 64) → backoff drops 1 cluster → 63 a (word-final virama removed)
+		{"Latin 70×a at cap", strings.Repeat("a", 70), strings.Repeat("a", 64)},                                // 70 runes → 64 runes (no virama, simple cap)
+		{"64 runes Deva क् at end", strings.Repeat("a", 62) + "क्", strings.Repeat("a", 62) + "क्"},            // Exactly 64 runes ending in virama → unchanged
+		{"65 runes Deva क् at 63", strings.Repeat("a", 63) + "क्", strings.Repeat("a", 63)},                    // 65 runes → 64 (virama at 64) → backoff drops 1 cluster → 63 a (word-final virama removed)
 	}
 
 	for _, tt := range tests {
