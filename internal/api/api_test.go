@@ -3815,7 +3815,7 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 				// Now validate the dropped region
 				if startCheck < 64 {
 					droppedRegion := full[startCheck:64]
-					
+
 					// Check (a): no word boundaries in the dropped region
 					for _, r := range droppedRegion {
 						if isWordBoundary(r) {
@@ -3823,7 +3823,7 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 							break
 						}
 					}
-					
+
 					// Check (b): every base letter/number must be part of a virama cluster
 					for i, r := range droppedRegion {
 						// If this is a base character (letter or number)
