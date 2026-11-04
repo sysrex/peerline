@@ -401,8 +401,10 @@ func pathless(err error) error {
 }
 
 // setupBackupDir ensures the backup directory exists with 0700 permissions and refuses symlinks,
-// directories owned by another user, and any group or world access.
-func setupBackupDir(dir string, logger *slog.Logger) error {
+// directories owned by another user, and any group or world write access.
+// For explicitly configured PEERLINE_BACKUP_DIR, enforces strict 0700 (no group/world access).
+// For the default DB directory, only refuses group/world writable (0022).
+func setupBackupDir(dir string, explicitlyConfigured bool, logger *slog.Logger) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("create backup directory: %w", pathless(err))
 	}
@@ -418,8 +420,20 @@ func setupBackupDir(dir string, logger *slog.Logger) error {
 	if !ownedByCurrentUser(info) {
 		return fmt.Errorf("backup directory %q is not owned by the user running peerline", dirBase)
 	}
-	if perm := info.Mode().Perm(); perm&0077 != 0 {
-		return fmt.Errorf("backup directory %q allows group or world access (mode %04o); fix permissions to 0700", dirBase, perm)
+	
+	perm := info.Mode().Perm()
+	if explicitlyConfigured {
+		// Strict check for PEERLINE_BACKUP_DIR: no group/world access at all
+		if perm&0077 != 0 {
+			badBits := perm & 0077
+			return fmt.Errorf("backup directory %q allows group or world access (mode %04o, bad bits: %03o); fix permissions to 0700", dirBase, perm, badBits)
+		}
+	} else {
+		// Lenient check for default DB directory: only refuse writable
+		if perm&0022 != 0 {
+			badBits := perm & 0022
+			return fmt.Errorf("backup directory %q is group or world writable (mode %04o, bad bits: %03o); database directory must not be writable by others", dirBase, perm, badBits)
+		}
 	}
 
 	return nil
@@ -464,11 +478,12 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 
 	// Determine backup directory
 	backupDir := opts.BackupDir
+	explicitlyConfigured := backupDir != ""
 	if backupDir == "" {
 		backupDir = filepath.Dir(dbPath)
 	}
 
-	if err := setupBackupDir(backupDir, opts.Logger); err != nil {
+	if err := setupBackupDir(backupDir, explicitlyConfigured, opts.Logger); err != nil {
 		return "", false, err
 	}
 
@@ -518,24 +533,89 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 		}
 	}
 
-	// Create new backup
+	// Create new backup with collision-safe random suffix
 	nowFunc := opts.now
 	if nowFunc == nil {
 		nowFunc = func() int64 { return time.Now().Unix() }
 	}
-	timestamp := time.Unix(nowFunc(), 0).UTC().Format("20060102-150405.000000")
+	
+	// Use real microsecond resolution (not fake .000000)
+	nowTime := time.Unix(nowFunc(), 0).UTC()
+	timestamp := nowTime.Format("20060102-150405")
+	
+	// Add microseconds if available (requires time.Now() not mocked)
+	if opts.now == nil {
+		timestamp = time.Now().UTC().Format("20060102-150405.000000")
+	} else {
+		// For injected clocks, append .000000 as before
+		timestamp += ".000000"
+	}
+	
 	backupName := fmt.Sprintf("%s.pre-v%d-from-v%d.%s", dbBase, targetVersion, currentVersion, timestamp)
 	backupPath := filepath.Join(backupDir, backupName)
-	if _, err := os.Lstat(backupPath); err == nil {
-		backupPath = fmt.Sprintf("%s.%d", backupPath, os.Getpid())
+	
+	// Pre-create the file at 0600 with O_EXCL|O_NOFOLLOW (unix) to avoid race condition
+	// On collision, add a random 4-byte suffix and retry
+	var createdFile *os.File
+	var createdPath string
+	for attempts := 0; attempts < 10; attempts++ {
+		tryPath := backupPath
+		if attempts > 0 {
+			// Generate random suffix: 4 random bytes as hex
+			randomBytes := make([]byte, 4)
+			if _, err := rand.Read(randomBytes); err != nil {
+				return "", false, fmt.Errorf("generate random suffix: %w", err)
+			}
+			tryPath = fmt.Sprintf("%s.%x", backupPath, randomBytes)
+		}
+		
+		f, err := openBackupFileExclusive(tryPath)
+		if err == nil {
+			createdFile = f
+			createdPath = tryPath
+			backupPath = tryPath
+			break
+		}
+		if !os.IsExist(err) {
+			return "", false, fmt.Errorf("create backup file: %w", pathless(err))
+		}
+		// File exists, retry with random suffix
 	}
+	
+	if createdFile == nil {
+		return "", false, fmt.Errorf("create backup file: failed after 10 collision retries")
+	}
+	
+	// Verify owner and mode on the open fd (not the path)
+	finfo, err := createdFile.Stat()
+	if err != nil {
+		createdFile.Close()
+		os.Remove(createdPath)
+		return "", false, fmt.Errorf("stat created backup file: %w", pathless(err))
+	}
+	
+	if !ownedByCurrentUser(finfo) {
+		createdFile.Close()
+		os.Remove(createdPath)
+		return "", false, fmt.Errorf("backup file %q is not owned by the user running peerline", filepath.Base(createdPath))
+	}
+	
+	// Mode should be 0600 from OpenFile, but verify
+	if perm := finfo.Mode().Perm(); perm != 0600 {
+		createdFile.Close()
+		os.Remove(createdPath)
+		return "", false, fmt.Errorf("backup file %q has mode %04o, expected 0600", filepath.Base(createdPath), perm)
+	}
+	
+	createdFile.Close()
 
 	// Check available disk space
 	if err := checkDiskSpace(db, backupDir, opts.Logger); err != nil {
+		os.Remove(backupPath)
 		return "", false, err
 	}
 
-	// Execute VACUUM INTO
+	// Execute VACUUM INTO (SQLite accepts an existing empty file and preserves its mode)
 	vacuumFunc := opts.vacuumInto
 	if vacuumFunc == nil {
 		vacuumFunc = func(db *sql.DB, path string) error {
@@ -545,14 +625,9 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 	}
 
 	if err := vacuumFunc(db, backupPath); err != nil {
-		// Clean up partial backup
+		// Clean up the file we created
 		os.Remove(backupPath)
 		return "", false, fmt.Errorf("VACUUM INTO backup: %w", pathless(err))
-	}
-
-	if err := os.Chmod(backupPath, 0600); err != nil {
-		os.Remove(backupPath)
-		return "", false, fmt.Errorf("chmod backup: %w", pathless(err))
 	}
 
 	// Fsync the backup file
@@ -576,7 +651,25 @@ func backupBeforeMigration(db *sql.DB, explicitPath string, currentVersion, targ
 
 // verifyBackup runs basic checks on a backup file.
 func verifyBackup(backupPath string, expectedVersion int) error {
-	db, err := sql.Open("sqlite", backupPath+"?mode=ro")
+	// Use proper file: URI with mode=ro for read-only access
+	// Plain path with ?mode=ro is not honored; need file: URI
+	absPath, err := filepath.Abs(backupPath)
+	if err != nil {
+		return fmt.Errorf("get absolute path: %w", err)
+	}
+	
+	// Build file: URI with proper escaping for special characters
+	// On Unix, file: URIs are file:///path, on Windows file:///C:/path
+	var uri string
+	if filepath.Separator == '/' {
+		// Unix-like: file:///absolute/path
+		uri = "file://" + absPath + "?mode=ro"
+	} else {
+		// Windows: file:///C:/path - convert backslashes
+		uri = "file:///" + filepath.ToSlash(absPath) + "?mode=ro"
+	}
+	
+	db, err := sql.Open("sqlite", uri)
 	if err != nil {
 		return fmt.Errorf("open backup: %w", err)
 	}
@@ -597,7 +690,7 @@ func verifyBackup(backupPath string, expectedVersion int) error {
 		return fmt.Errorf("read user_version: %w", err)
 	}
 	if version != expectedVersion {
-		return fmt.Errorf("backup user_version %d != expected %d", version, expectedVersion)
+		return fmt.Errorf("backup user_version is %d, expected %d (hint: if another process migrated this database, retry)", version, expectedVersion)
 	}
 
 	// Check peers table is queryable (absent in databases predating the schema)

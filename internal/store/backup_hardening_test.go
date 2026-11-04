@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -110,5 +111,137 @@ func TestCorruptDatabaseRefusedBeforeMigration(t *testing.T) {
 	opts.SkipMigrationBackup = true
 	if _, err := OpenWithOptions(p, opts); err == nil {
 		t.Fatal("corrupt database must be refused")
+	}
+}
+
+func TestVacuumIntoFailureRemovesOnlyCreatedFile(t *testing.T) {
+	dir := secureTempDir(t)
+	p := makeV2DB(t, dir)
+
+	// Pre-create a valid backup that must not be deleted
+	preExisting := filepath.Join(dir, "x.db.pre-v6-from-v2.20260101-120000.000000")
+	if err := os.WriteFile(preExisting, []byte("do not delete"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inject vacuumInto that creates partial file then fails
+	var capturedPath string
+	opts := openOpts(dir)
+	opts.vacuumInto = func(db *sql.DB, backupPath string) error {
+		capturedPath = backupPath
+		// Write partial data
+		if err := os.WriteFile(backupPath, []byte("partial"), 0600); err != nil {
+			return err
+		}
+		return fmt.Errorf("disk full")
+	}
+
+	if _, err := OpenWithOptions(p, opts); err == nil {
+		t.Fatal("expected failure")
+	}
+
+	// Pre-existing must survive
+	if data, err := os.ReadFile(preExisting); err != nil || string(data) != "do not delete" {
+		t.Errorf("pre-existing backup modified or deleted: %v, %q", err, data)
+	}
+
+	// Partial must be removed
+	if capturedPath != "" {
+		if _, err := os.Stat(capturedPath); !os.IsNotExist(err) {
+			t.Errorf("partial backup at %q should be removed", capturedPath)
+		}
+	}
+
+	// Count backups
+	entries, _ := os.ReadDir(dir)
+	count := 0
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".pre-v") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected 1 backup (pre-existing), got %d", count)
+	}
+}
+
+func TestCollisionRetryWithRandomSuffix(t *testing.T) {
+	dir := secureTempDir(t)
+	p := makeV2DB(t, dir)
+
+	// Pre-create multiple colliding files to force random suffix generation
+	base := "x.db.pre-v6-from-v2.20260101-120000.000000"
+	for _, name := range []string{base, base + ".12345678", base + ".deadbeef"} {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("collision"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Open should succeed with a random suffix
+	opts := openOpts(dir)
+	opts.now = func() int64 { return 1704110400 } // Fixed timestamp matching the pre-created files
+	
+	s, err := OpenWithOptions(p, opts)
+	if err != nil {
+		t.Fatalf("Open should succeed with random suffix: %v", err)
+	}
+	defer s.Close()
+
+	// Verify a new backup was created
+	if s.LastBackupPath() == "" {
+		t.Fatal("no backup created")
+	}
+
+	// Verify pre-existing files were not deleted
+	for _, name := range []string{base, base + ".12345678", base + ".deadbeef"} {
+		path := filepath.Join(dir, name)
+		if data, err := os.ReadFile(path); err != nil || string(data) != "collision" {
+			t.Errorf("pre-existing file %q was modified or deleted: %v", name, err)
+		}
+	}
+
+	// Verify total backups >= 4 (3 pre-existing + 1 new)
+	entries, _ := os.ReadDir(dir)
+	count := 0
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".pre-v6-from-v2.") {
+			count++
+		}
+	}
+	if count < 4 {
+		t.Errorf("expected at least 4 backup files, got %d", count)
+	}
+}
+
+func TestOwnerCheckOnCreatedFile(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("test requires non-root")
+	}
+
+	dir := secureTempDir(t)
+	p := makeV2DB(t, dir)
+
+	// The owner check happens on the open fd after O_EXCL create
+	// We can't easily make a file owned by another user without root,
+	// but we can verify the check runs by ensuring Open succeeds normally
+	// (the fd owner matches current user)
+	
+	opts := openOpts(dir)
+	s, err := OpenWithOptions(p, opts)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	s.Close()
+
+	// Verify backup was created and is owned by current user
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".pre-v") {
+			info, _ := e.Info()
+			if !ownedByCurrentUser(info) {
+				t.Errorf("backup %q not owned by current user", e.Name())
+			}
+		}
 	}
 }

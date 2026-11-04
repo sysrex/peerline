@@ -125,7 +125,7 @@ func TestStats(t *testing.T) {
 // Databases created before notify_email must gain the column on open.
 func TestNotifyEmailMigration(t *testing.T) {
 	ctx := context.Background()
-	path := secureTempDir(t) + "/old.db"
+	path := t.TempDir() + "/old.db"
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
@@ -152,10 +152,10 @@ func TestNotifyEmailMigration(t *testing.T) {
 	if err != nil || email != "" {
 		t.Fatalf("migrated email %q %v", email, err)
 	}
-	if err := s.SetNotifyEmail(ctx, "p_old", "old@example.com", ""); err != nil {
+	if err := s.SetNotifyEmail(ctx, "p_old", "old@example.com", "tok1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetNotifyEmail(ctx, "missing", "a@b.co", ""); !errors.Is(err, ErrNotFound) {
+	if err := s.SetNotifyEmail(ctx, "missing", "a@b.co", "tok2"); !errors.Is(err, ErrNotFound) {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -2201,13 +2201,22 @@ func TestBrandNewDatabaseSkipsBackup(t *testing.T) {
 // TestBackupFailureAbortsStartup verifies that if the backup fails (e.g., unwritable directory),
 // the migration is aborted, nothing is migrated, and no stray backup file is left.
 func TestBackupFailureAbortsStartup(t *testing.T) {
-	baseDir := secureTempDir(t)
-	readOnlyDir := baseDir + "/readonly"
-	if err := os.Mkdir(readOnlyDir, 0755); err != nil {
+	if os.Getuid() == 0 {
+		t.Skip("test requires non-root (chmod doesn't restrict root)")
+	}
+
+	tempDir := secureTempDir(t)
+	dbDir := tempDir + "/db"
+	backupDir := tempDir + "/backups"
+	
+	if err := os.Mkdir(dbDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(backupDir, 0700); err != nil {
 		t.Fatal(err)
 	}
 
-	path := readOnlyDir + "/test.db"
+	path := dbDir + "/test.db"
 
 	// Create a v2 database
 	db, err := sql.Open("sqlite", path)
@@ -2225,48 +2234,50 @@ func TestBackupFailureAbortsStartup(t *testing.T) {
 
 	db.Close()
 
-	// Make directory read-only on Unix
-	if os.PathSeparator == '/' {
-		if err := os.Chmod(readOnlyDir, 0555); err != nil {
-			t.Fatal(err)
-		}
-		defer os.Chmod(readOnlyDir, 0755) // Restore for cleanup
+	// Inject a vacuumInto that fails (simulates disk full or I/O error)
+	// This actually tests backup failure, not directory permission failure
+	vacuumHook := func(db *sql.DB, backupPath string) error {
+		return fmt.Errorf("simulated VACUUM INTO failure")
 	}
 
-	// Attempt to open - should fail due to backup failure
-	_, err = Open(path)
-	if err == nil && os.PathSeparator == '/' {
-		t.Fatal("expected error when backup directory is read-only")
+	opts := OpenOptions{
+		BackupDir:  backupDir,
+		vacuumInto: vacuumHook,
 	}
 
-	// If we got an error on Unix, verify the database wasn't migrated and no backup file was left
-	if os.PathSeparator == '/' && err != nil {
-		// Restore write permissions to check
-		os.Chmod(readOnlyDir, 0755)
+	// Attempt to open - should fail due to VACUUM INTO failure
+	_, err = OpenWithOptions(path, opts)
+	if err == nil {
+		t.Fatal("expected error when VACUUM INTO fails")
+	}
 
-		db, err := sql.Open("sqlite", path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer db.Close()
+	if !strings.Contains(err.Error(), "VACUUM INTO backup") {
+		t.Errorf("error should mention VACUUM INTO backup failure, got: %v", err)
+	}
 
-		var version int
-		if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
-			t.Fatal(err)
-		}
-		if version != 2 {
-			t.Errorf("database was migrated despite backup failure: version = %d, want 2", version)
-		}
+	// Verify the database wasn't migrated
+	db2, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
 
-		// Verify no stray backup file was left
-		files, err := os.ReadDir(readOnlyDir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, f := range files {
-			if strings.HasPrefix(f.Name(), "test.db.pre-v") {
-				t.Errorf("stray backup file left behind: %s", f.Name())
-			}
+	var version int
+	if err := db2.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 2 {
+		t.Errorf("database was migrated despite backup failure: version = %d, want 2", version)
+	}
+
+	// Verify no stray backup file was left
+	files, err := os.ReadDir(backupDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "test.db.pre-v") {
+			t.Errorf("stray backup file left behind: %s", f.Name())
 		}
 	}
 }
@@ -2725,8 +2736,8 @@ func TestPurgeExpiredInvitesRetention(t *testing.T) {
 
 	// Create and immediately accept invites at different points in time
 
-	// 1. Unused expired invite (expires 400s ago, past the 5-minute grace) - should be purged
-	exp1 := time.Unix(currentTime-400, 0)
+	// 1. Unused expired invite (expires 500s ago, beyond 5-minute grace) - should be purged
+	exp1 := time.Unix(currentTime-500, 0)
 	if err := s.CreateInvite(ctx, "code1", "alice", []string{"messages"}, nil, exp1); err != nil {
 		t.Fatal(err)
 	}
@@ -3282,14 +3293,39 @@ func TestBackupFileMode(t *testing.T) {
 	}
 	db.Close()
 
+	// Hook vacuumInto to verify the file mode BEFORE SQLite writes to it
+	// This proves the pre-create is at 0600, not just the post-chmod
+	var modeBeforeVacuum os.FileMode
+	vacuumHook := func(db *sql.DB, backupPath string) error {
+		// Check mode before VACUUM INTO writes
+		info, err := os.Stat(backupPath)
+		if err != nil {
+			return err
+		}
+		modeBeforeVacuum = info.Mode().Perm()
+		
+		// Now run the actual VACUUM INTO
+		_, err = db.Exec(`VACUUM INTO ?`, backupPath)
+		return err
+	}
+
+	opts := OpenOptions{
+		vacuumInto: vacuumHook,
+	}
+
 	// Open triggers migration and creates backup
-	st, err := Open(path)
+	st, err := OpenWithOptions(path, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
 
-	// Find the backup file
+	// Verify the mode was 0600 BEFORE VACUUM INTO wrote to it
+	if modeBeforeVacuum != 0600 {
+		t.Errorf("backup file mode before VACUUM INTO = %04o, want 0600 (umask window detected)", modeBeforeVacuum)
+	}
+
+	// Also verify final mode is still 0600
 	backupBase := st.LastBackupPath()
 	if backupBase == "" {
 		t.Fatal("no backup was created")
@@ -3301,10 +3337,9 @@ func TestBackupFileMode(t *testing.T) {
 		t.Fatalf("cannot stat backup: %v", err)
 	}
 
-	// Verify mode is exactly 0600
 	mode := info.Mode() & os.ModePerm
 	if mode != 0600 {
-		t.Errorf("backup file mode = %04o, want 0600", mode)
+		t.Errorf("backup file final mode = %04o, want 0600", mode)
 	}
 }
 

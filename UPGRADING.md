@@ -7,7 +7,7 @@ This document describes how to safely upgrade Peerline across versions, with a f
 - [General Upgrade Process](#general-upgrade-process)
 - [Schema Migrations and Backups](#schema-migrations-and-backups)
 - [Backup Files](#backup-files)
-- [Rolling Deployments](#rolling-deployments)
+- [Deployment and Schema Upgrades](#deployment-and-schema-upgrades)
 - [Rollback Procedure](#rollback-procedure)
 - [Environment Variables](#environment-variables)
 - [Troubleshooting](#troubleshooting)
@@ -17,9 +17,10 @@ This document describes how to safely upgrade Peerline across versions, with a f
 1. **Stop the Peerline service** (recommended for single-instance deployments)
 2. **Back up your database file** manually as a precaution (in addition to automatic pre-migration backups)
 3. **Replace the binary** with the new version
-4. **Start the service** – schema migrations run automatically on the first Open()
+4. **Fix directory permissions if needed** (see [Docker /data directories](#docker-data-directories) below)
+5. **Start the service** – schema migrations run automatically on the first Open()
 
-For zero-downtime deployments, see [Rolling Deployments](#rolling-deployments).
+For zero-downtime deployments, see [Deployment and Schema Upgrades](#deployment-and-schema-upgrades).
 
 ## Schema Migrations and Backups
 
@@ -40,7 +41,7 @@ Each backup is a complete, consistent snapshot of your database taken via `VACUU
 - **All tables**: `peers`, `invites`, `grants`, `messages`, `bags`
 - **All indexes** and constraints
 - **Schema version** (`PRAGMA user_version`) matching the pre-migration state
-- **WAL journal mode** (same as the source database)
+- **Journal mode**: `delete` (backups are not in WAL mode, regardless of source database mode)
 
 Backups are **verified** after creation:
 - SQLite `PRAGMA quick_check` to detect corruption
@@ -49,10 +50,17 @@ Backups are **verified** after creation:
 
 ### Backup Security
 
-- Created with **0600 permissions** (owner-only access) to prevent world-readable windows
-- **Contain sensitive data**: Backups contain API key hashes (unsalted SHA-256), invite/pairing-token hashes, notify email addresses, full message bodies, and bag contents. No passwords are stored anywhere in Peerline.
+- Created with **0600 permissions** (owner-only access) via `O_CREATE|O_EXCL|O_NOFOLLOW` before SQLite writes to them
+- **Contain sensitive data**: Backups contain API key hashes (unsalted SHA-256), invite/pairing-token hashes, notify email addresses, **full message bodies, and bag contents**. No passwords are stored anywhere in Peerline.
+- **Backups retain deleted data**: Backups preserve data that retention purging or peer deletion has since removed from the live database. This data persists until the backup rotates out (up to `PEERLINE_BACKUP_KEEP` files, no age limit). Operators should:
+  - Delete old backups after confirming successful upgrades
+  - Include backup files in your backup and encryption policy
+  - Securely wipe (`shred` or equivalent) backups before disposal
 - Should be stored on encrypted volumes in production
-- Backup directory (including the default, the database directory) must be a real directory (not a symlink), owned by the user running Peerline, with no group or world access (mode 0700); checked on startup
+- Backup directory requirements:
+  - Must be a real directory (not a symlink), owned by the user running Peerline
+  - For `PEERLINE_BACKUP_DIR`: must have mode 0700 (no group or world access)
+  - For default database directory: must not be group or world writable (mode 0022 bits clear)
 - Excluded from Git via `.gitignore` (`*.db.pre-v*`)
 
 ## Backup Files
@@ -62,14 +70,15 @@ Backups are **verified** after creation:
 Backup filenames encode the migration context:
 
 ```
-<database>.pre-v<to>-from-v<from>.<timestamp>
+<database>.pre-v<to>-from-v<from>.<timestamp>[.<random>]
 ```
 
-Example: `peerline.db.pre-v3-from-v2.20260130-120000.123456`
+Example: `peerline.db.pre-v3-from-v2.20260130-120000.123456` or `peerline.db.pre-v3-from-v2.20260130-120000.000000.a1b2c3d4` (with random suffix on collision)
 
 - `pre-v3`: Backup taken before migrating **to** version 3
 - `from-v2`: Database was at version 2 when backup was created
-- Timestamp: UTC in `YYYYMMDD-HHMMSS.microseconds` format
+- Timestamp: UTC in `YYYYMMDD-HHMMSS.microseconds` format (microseconds are real only with system clock; injected test clocks show `.000000`)
+- Random suffix: 8 hex digits added automatically on filename collision (rare in production; common in fast restart loops)
 
 ### Backup Reuse (Restart-Loop Guard)
 
@@ -107,15 +116,38 @@ Peerline checks for sufficient disk space before creating a backup and will abor
 
 On Unix systems, this check uses `statfs(2)`. On unsupported platforms, the check is skipped and VACUUM INTO will fail if space runs out.
 
+## Docker /data Directories
+
+Docker volumes typically create directories with mode **0755** (world-readable). This is compatible with Peerline's backup system when using the default backup location (the database directory itself), because the backup directory permission check only refuses **writable** bits (0022), not readable bits.
+
+**What happens on upgrade with a 0755 /data directory:**
+- ✅ **With this PR's fix**: Startup succeeds. The 0755 directory passes the default-directory check (only 0022 bits are refused), backups are written at 0600, and migration proceeds normally.
+- ❌ **Before this fix** (PR #86 as originally merged): Startup failed with "backup directory allows group or world access (mode 0755)".
+
+**If startup still fails** with a directory permission error:
+1. Check the actual directory mode: `ls -ld /data`
+2. If it's group-writable (0775) or world-writable (0777), fix it: `chmod 755 /data`
+3. If even 0755 is refused (you're using an explicit `PEERLINE_BACKUP_DIR` pointing to a 0755 directory), either:
+   - Fix the backup directory: `chmod 700 "$PEERLINE_BACKUP_DIR"`
+   - Or leave the database directory at 0755 and unset `PEERLINE_BACKUP_DIR` to use the default location
+
+**Recommended for production Docker deployments:**
+```dockerfile
+# In your Dockerfile or docker-compose volume setup:
+RUN mkdir -p /data && chmod 700 /data
+# OR in an entrypoint script:
+chmod 700 /data
+```
+
+This ensures the backup directory has strict permissions from the start.
+
 ## Deployment and Schema Upgrades
 
 ### Important: SQLite Single-Instance Constraint
 
 **Peerline requires a single-instance SQLite database.** Do not run multiple Peerline instances writing to the same database file, even in WAL mode. SQLite's locking is designed for single-host access; network filesystem locks are unreliable and can cause corruption.
 
-For high availability, use:
-- Active/standby with filesystem replication, or
-- Load-balanced read replicas with a single writer
+**Single-instance deployment only.** Peerline does not support active/standby with filesystem replication or read replicas; SQLite requires a single writer instance.
 
 ### Standard Deployment Procedure
 
@@ -130,15 +162,17 @@ Peerline will create a pre-migration backup before applying any schema changes, 
 
 ### First Deployment with Schema Guard (This Release)
 
-**Special case for the first deployment that adds the fail-closed schema version guard:**
+**Important: This release includes both the fail-closed schema version guard AND schema v4 (email verification).**
 
 Binaries from before this release (before the schema guard was introduced) will **silently open** databases with any schema version, including future versions they don't understand. This means:
 
-1. **Deploy this release's binary first** (adds version guard, no schema changes yet)
-2. **Restart the service** with this binary
-3. **Only after this binary is running, deploy future schema versions** that introduce schema changes
+1. **Deploy this release's binary first** (adds version guard and migrates to v4)
+2. **Verify the startup log line** confirms the migration: `database opened ... schema_version=4 max_supported=6 backup=<filename or none>`
+3. **Only after confirming this binary is deployed and running everywhere**, deploy the next release (v5: table rebuild for #3)
 
 This ensures no old binary without the guard can open a migrated database. **Binaries from this release onward refuse to open newer schemas** and will exit with code 2 and error message: `database schema version X is newer than this binary supports (max Y); upgrade the peerline binary or restore from backup`
+
+**Pre-guard binaries run on v4+ databases silently**: The only rollback path after deploying this release is restore-from-backup, never "run the old binary".
 
 ## Rollback Procedure
 
