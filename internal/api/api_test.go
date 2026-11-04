@@ -3448,8 +3448,8 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 		if rsp.StatusCode != 405 {
 			t.Errorf("%s: want 405, got %d", method, rsp.StatusCode)
 		}
-		if rsp.Header.Get("Allow") == "" {
-			t.Errorf("%s: missing Allow header", method)
+		if got := rsp.Header.Get("Allow"); got != "DELETE, POST" {
+			t.Errorf("%s: Allow = %q, want DELETE, POST", method, got)
 		}
 	}
 	// DELETE: no handler in authed mux, should get 404
