@@ -217,7 +217,7 @@ func (s *Server) confirmClaim(w http.ResponseWriter, r *http.Request) {
 	pub := r.PathValue("public_id")
 	// Normalize offer_digest to lowercase for comparison
 	normalizedDigest := strings.ToLower(in.OfferDigest)
-	
+
 	state, freshClaim, err := s.claims.ConfirmClaim(r.Context(), pub, auth.PeerID(r.Context()), in.PeerID, maxCodeFails, func(c *ClaimInvite) (store.CheckResult, *ClaimInvite) {
 		// Check digest FIRST, before evaluating code (prevents code oracle)
 		// Use normalized (lowercase) digest for comparison
