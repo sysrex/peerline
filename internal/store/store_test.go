@@ -2208,7 +2208,7 @@ func TestBackupFailureAbortsStartup(t *testing.T) {
 	tempDir := secureTempDir(t)
 	dbDir := tempDir + "/db"
 	backupDir := tempDir + "/backups"
-	
+
 	if err := os.Mkdir(dbDir, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -3303,7 +3303,7 @@ func TestBackupFileMode(t *testing.T) {
 			return err
 		}
 		modeBeforeVacuum = info.Mode().Perm()
-		
+
 		// Now run the actual VACUUM INTO
 		_, err = db.Exec(`VACUUM INTO ?`, backupPath)
 		return err
