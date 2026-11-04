@@ -405,6 +405,10 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
 
+	// Tighten permissions on existing database files if needed (Unix only)
+	// Called early so files are secured before migration/backup
+	tightenDatabaseFilePermissions(path, opts.Logger)
+
 	// Guard: check version BEFORE executing schema
 	currentVersion, err := checkSchemaVersion(db)
 	if err != nil {
