@@ -3286,10 +3286,11 @@ func TestBackupDirPermissionsCheck(t *testing.T) {
 }
 
 // TestInvalidBackupKeepValue verifies that invalid BackupRetentionCount values are adjusted to default (3)
-// and that the adjusted value is actually used.
+// and that the adjusted value is actually enforced during retention.
 func TestInvalidBackupKeepValue(t *testing.T) {
 	dir := secureTempDir(t)
 	dbPath := dir + "/test.db"
+	dbBase := "test.db"
 
 	// Create a v2 database that will trigger migration
 	db, err := sql.Open("sqlite", dbPath)
@@ -3306,11 +3307,35 @@ func TestInvalidBackupKeepValue(t *testing.T) {
 	}
 	db.Close()
 
-	// Open with invalid BackupRetentionCount (0)
+	// Seed backup dir with 4 older backups (all older than the migration backup we'll create)
+	// These use proper naming format that retention will count
+	// Set mtimes to match their timestamps so retention sorts them correctly
+	seededBackups := []struct {
+		name  string
+		mtime time.Time
+	}{
+		{dbBase + ".pre-v6-from-v2.20260101-100000.000000", time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)}, // oldest
+		{dbBase + ".pre-v6-from-v2.20260101-110000.000000", time.Date(2026, 1, 1, 11, 0, 0, 0, time.UTC)},
+		{dbBase + ".pre-v6-from-v2.20260101-120000.000000", time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)},
+		{dbBase + ".pre-v6-from-v2.20260101-130000.000000", time.Date(2026, 1, 1, 13, 0, 0, 0, time.UTC)}, // newest seeded
+	}
+	for _, backup := range seededBackups {
+		path := dir + "/" + backup.name
+		if err := os.WriteFile(path, []byte("seeded backup"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, backup.mtime, backup.mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Open with invalid BackupRetentionCount (0) using fixed clock so new backup is newest
+	fixedTime := time.Date(2026, 1, 1, 14, 0, 0, 0, time.UTC) // 140000 - newer than all seeded
 	opts := OpenOptions{
 		BackupRetentionCount: 0, // Invalid: should be adjusted to 3
 		BackupDir:            dir,
 		Logger:               slog.Default(),
+		Clock:                clocktest.New(fixedTime),
 	}
 
 	st, err := OpenWithOptions(dbPath, opts)
@@ -3319,26 +3344,55 @@ func TestInvalidBackupKeepValue(t *testing.T) {
 	}
 	defer st.Close()
 
-	// Verify a backup was created (proves the adjusted value was used for migration)
+	// Count remaining backups
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	backupCount := 0
+	var remainingBackups []string
 	for _, entry := range entries {
-		if strings.Contains(entry.Name(), ".pre-v") && !strings.HasSuffix(entry.Name(), ".partial") {
-			backupCount++
+		name := entry.Name()
+		if strings.Contains(name, dbBase+".pre-v") && !strings.HasSuffix(name, ".partial") {
+			remainingBackups = append(remainingBackups, name)
 		}
 	}
 
-	// Should have created exactly 1 backup (the migration backup)
-	if backupCount != 1 {
-		t.Errorf("expected 1 backup after migration with adjusted retention, got %d", backupCount)
+	// Should have exactly 3 backups (the adjusted default):
+	// - The new migration backup (140000 - newest)
+	// - The 2 newest seeded backups (130000, 120000)
+	// The 2 oldest seeded (100000, 110000) should be deleted
+	if len(remainingBackups) != 3 {
+		t.Errorf("expected exactly 3 backups with adjusted retention (default), got %d: %v", len(remainingBackups), remainingBackups)
 	}
 
-	// The open succeeded, which means the adjusted value (3) was valid
-	// Testing that retention actually keeps 3 is done in other retention tests
+	// Verify the 2 oldest seeded backups were deleted
+	for _, oldBackup := range seededBackups[:2] {
+		path := dir + "/" + oldBackup.name
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("old backup %q should have been deleted but still exists", oldBackup.name)
+		}
+	}
+
+	// Verify the 2 newest seeded backups still exist
+	for _, keptBackup := range seededBackups[2:] {
+		path := dir + "/" + keptBackup.name
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("newer backup %q should still exist: %v", keptBackup.name, err)
+		}
+	}
+
+	// Verify the new migration backup exists (starts with 140000)
+	foundNew := false
+	for _, name := range remainingBackups {
+		if strings.Contains(name, "20260101-140000") {
+			foundNew = true
+			break
+		}
+	}
+	if !foundNew {
+		t.Errorf("new migration backup (140000) not found in remaining backups: %v", remainingBackups)
+	}
 }
 
 // TestBackupFileMode is now in backup_mode_test_unix.go (Unix-specific mode assertions)
