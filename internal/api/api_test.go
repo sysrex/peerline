@@ -3384,7 +3384,7 @@ func TestSanitizerUnicode(t *testing.T) {
 		// Issue #206: Stacked conjunct (C V C V | C) - dropCluster removes entire stacked conjunct
 		{"stacked conjunct at 64", strings.Repeat("a", 60) + "क्क्ष" + "bbb", strings.Repeat("a", 60)},   // 60 a + क्क्ष (stacked) → 66 runes → 64 → backs off through all 3 clusters → 60 a (no trailing virama)
 		{"4-virama stack at 64", strings.Repeat("a", 56) + "स्त्र्य्म" + "bbb", strings.Repeat("a", 56)}, // 68 runes total (56 a + 9-rune stack + bbb) → 64 (म at 64) → backs off 4 clusters → 56 a (bound hit)
-		{"6-virama stack at 64", strings.Repeat("a", 54) + "स्त्र्य्म्न" + "bbb", strings.Repeat("a", 54)}, // 68 runes total (54 a + 11-rune stack + bbb) → 64 (न at 64) → backs off 4 clusters (म्न + य् dropped) → 54 a (bound hit, fails if bound=5)
+		{"6-virama stack at 64", strings.Repeat("a", 54) + "स्त्र्य्म्न" + "bbb", strings.Repeat("a", 54) + "स्"}, // 68 runes total (54 a + 11-rune stack + bbb) → 64 ends at ् (म् at cut) → backs off 4 clusters (म्, य्, र्, त् dropped) → 54 a + स् (56 runes, 1 cluster remains; bound hit, fails if bound≥5)
 
 		// Issue #315: Word-final virama before punctuation (should be kept, not dropped)
 		// क् is 2 runes (क at 62, ् at 63), so with 62 'a' + क् + punctuation, the virama is at 63 and punctuation at 64
