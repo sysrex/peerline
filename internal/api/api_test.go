@@ -3137,7 +3137,7 @@ func TestSanitizerUnicode(t *testing.T) {
 		// Issue #315: Word-final virama before punctuation (should be kept, not dropped)
 		// क् is 2 runes (क at 62, ् at 63), so with 62 'a' + क् + punctuation, the virama is at 63 and punctuation at 64
 		// The cap is 64 runes (positions 0-63), so we keep the virama but not the punctuation at position 64
-		{"word-final virama before dot", strings.Repeat("a", 62) + "क्." + "bbb", strings.Repeat("a", 62) + "क्"},   // क at 62, ् at 63, . at 64 → keep virama (word-final)
+		{"word-final virama before dot", strings.Repeat("a", 62) + "क्." + "bbb", strings.Repeat("a", 62) + "क्"},  // क at 62, ् at 63, . at 64 → keep virama (word-final)
 		{"word-final virama before dash", strings.Repeat("a", 62) + "ம்-" + "bbb", strings.Repeat("a", 62) + "ம்"}, // ம at 62, ் at 63, - at 64 → keep virama (word-final)
 		{"word-final virama before comma", strings.Repeat("a", 62) + "क्," + "bbb", strings.Repeat("a", 62) + "क्"},
 		{"word-final virama before underscore", strings.Repeat("a", 62) + "ம்_" + "bbb", strings.Repeat("a", 62) + "ம்"},
@@ -3611,14 +3611,14 @@ func TestSanitizerWordFinalViramaWithSpace(t *testing.T) {
 		want  string
 	}{
 		{
-			name:  "virama at 63, space at 64, forced path",
+			name: "virama at 63, space at 64, forced path",
 			// 61 'a' + "क्" (2 runes: क + ्) + " " (1 rune) = 64 runes before trimming
 			// The virama is word-final (space follows), so it's kept, but trailing space is trimmed
 			input: strings.Repeat("a", 61) + "क् " + strings.Repeat("ब", 70),
 			want:  strings.Repeat("a", 61) + "क्",
 		},
 		{
-			name:  "Tamil virama at 63, space at 64, forced path",
+			name: "Tamil virama at 63, space at 64, forced path",
 			// "xx" + 20×"ம் " + "ம்" + " " = 2 + 60 + 2 = 64 runes before trimming
 			// The virama is word-final (space follows), so it's kept, but trailing space is trimmed
 			input: "xx" + strings.Repeat("ம் ", 20) + "ம் " + strings.Repeat("ब", 70),
@@ -3652,10 +3652,10 @@ func FuzzSanitizeInviterName(f *testing.F) {
 	f.Add(strings.Repeat("ब", 70))                         // Force 64-rune cap path
 	f.Add(strings.Repeat("a", 59) + "क् ष्" + "bbbbbbbbb") // Word-final virama: keep complete words
 	// Issue #315: Fuzz seeds for word-final virama before punctuation
-	f.Add("xx" + strings.Repeat("ம் ", 40))                      // 40 × "ம் " → virama at 63, space at 64 (word-final)
-	f.Add(strings.Repeat("a", 62) + "क् " + "bbbbbbbbbb")       // virama at 63, space at 64, then more text
-	f.Add(strings.Repeat("a", 62) + "क्." + "bbbbbbbbbb")       // virama at 63, dot at 64 (word-final before punctuation)
-	f.Add(strings.Repeat("a", 62) + "ம்-" + "bbbbbbbbbb")       // virama at 63, dash at 64 (word-final before punctuation)
+	f.Add("xx" + strings.Repeat("ம் ", 40))               // 40 × "ம் " → virama at 63, space at 64 (word-final)
+	f.Add(strings.Repeat("a", 62) + "क् " + "bbbbbbbbbb") // virama at 63, space at 64, then more text
+	f.Add(strings.Repeat("a", 62) + "क्." + "bbbbbbbbbb") // virama at 63, dot at 64 (word-final before punctuation)
+	f.Add(strings.Repeat("a", 62) + "ம்-" + "bbbbbbbbbb") // virama at 63, dash at 64 (word-final before punctuation)
 
 	f.Fuzz(func(t *testing.T, input string) {
 		got := sanitizeInviterName(input)
