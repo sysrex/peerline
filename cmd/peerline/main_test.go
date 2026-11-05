@@ -5,7 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -412,6 +416,26 @@ func TestBuildTrustedProxySettings(t *testing.T) {
 			wantAllowBroad: false,
 			wantWarnCount:  0,
 		},
+		{
+			name:          "bad CIDR",
+			proxiesEnv:    "not-a-cidr",
+			allowBroadEnv: "0",
+			wantErr:       true,
+		},
+		{
+			name:          "broad CIDR without opt-in",
+			proxiesEnv:    "2a06:98c0::/29",
+			allowBroadEnv: "0",
+			wantErr:       true,
+		},
+		{
+			name:           "broad CIDR with opt-in accepted",
+			proxiesEnv:     "2a06:98c0::/29",
+			allowBroadEnv:  "1",
+			wantProxies:    []string{"2a06:98c0::/29"},
+			wantAllowBroad: true,
+			wantWarnCount:  0,
+		},
 	}
 
 	for _, tt := range tests {
@@ -466,39 +490,34 @@ func TestBuildTrustedProxySettings(t *testing.T) {
 // TestBuildAPIConfig verifies that buildAPIConfig returns the exact config
 // main() passes to api.New, with no field assignments in between.
 func TestBuildAPIConfig(t *testing.T) {
+	// Tripwire: if api.Config's field count changes, update this test.
+	// buildAPIConfig sets 20 fields; MsgPerMinute, MsgBurst, EmailBurst,
+	// EmailRcptPerHour, and NotifyBurst are defaulted in api.New.
+	if got, want := reflect.TypeOf(api.Config{}).NumField(), 25; got != want {
+		t.Fatalf("api.Config has %d fields, expected %d; update TestBuildAPIConfig expected configs", got, want)
+	}
+
 	testClock := clocktest.New(time.Unix(1234567890, 0))
 	testMailer := &testMailerStub{}
+	testLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	tests := []struct {
-		name                string
-		envVars             map[string]string
-		trustedProxies      []string
-		allowBroadIPv6      bool
-		clock               clock.Clock
-		mailer              mailer.Sender
-		versionDetail       string
-		publicURL           string
-		maxBagsPerPeer      int
-		maxBagBytesPerPeer  int64
-		retentionSeconds    int64
-		wantRegisterToken   string
-		wantCodePepper      string
-		wantEmailPerHour    int
-		wantNotifyPerHour   int
-		wantMaxOutstanding  int
-		wantAuthFailMin     int
-		wantAuthFailBurst   int
-		wantWriteMin        int
-		wantWriteBurst      int
-		wantKeyIndexRebuild int
-		wantVersionDetail   string
-		wantPublicURL       string
-		wantMaxBagsPerPeer  int
-		wantMaxBagBytes     int64
-		wantRetentionSec    int64
-		wantBuildErr        bool
-		wantNewErr          bool
-		wantNewErrContains  string
+		name               string
+		envVars            map[string]string
+		trustedProxies     []string
+		allowBroadIPv6     bool
+		clock              clock.Clock
+		mailer             mailer.Sender
+		logger             *slog.Logger
+		versionDetail      string
+		publicURL          string
+		maxBagsPerPeer     int
+		maxBagBytesPerPeer int64
+		retentionSeconds   int64
+		want               api.Config
+		wantBuildErr       bool
+		wantNewErr         bool
+		wantNewErrContains string
 	}{
 		{
 			name: "all fields set",
@@ -514,37 +533,77 @@ func TestBuildAPIConfig(t *testing.T) {
 				"PEERLINE_WRITE_BURST":             "5",
 				"PEERLINE_KEY_INDEX_REBUILD_HOURS": "12",
 			},
-			trustedProxies:      []string{"10.0.0.0/8"},
-			allowBroadIPv6:      true,
-			clock:               testClock,
-			mailer:              testMailer,
-			versionDetail:       "full",
-			publicURL:           "https://test.example.com",
-			maxBagsPerPeer:      200,
-			maxBagBytesPerPeer:  2097152,
-			retentionSeconds:    5184000,
-			wantRegisterToken:   "test_reg_token_abc123",
-			wantCodePepper:      "test_pepper_xyz789",
-			wantEmailPerHour:    50,
-			wantNotifyPerHour:   30,
-			wantMaxOutstanding:  15,
-			wantAuthFailMin:     20,
-			wantAuthFailBurst:   8,
-			wantWriteMin:        15,
-			wantWriteBurst:      5,
-			wantKeyIndexRebuild: 12,
-			wantVersionDetail:   "full",
-			wantPublicURL:       "https://test.example.com",
-			wantMaxBagsPerPeer:  200,
-			wantMaxBagBytes:     2097152,
-			wantRetentionSec:    5184000,
+			trustedProxies:     []string{"10.0.0.0/8"},
+			allowBroadIPv6:     true,
+			clock:              testClock,
+			mailer:             testMailer,
+			logger:             testLogger,
+			versionDetail:      "full",
+			publicURL:          "https://test.example.com",
+			maxBagsPerPeer:     200,
+			maxBagBytesPerPeer: 2097152,
+			retentionSeconds:   5184000,
+			want: api.Config{
+				RegisterToken:         "test_reg_token_abc123",
+				MsgPerMinute:          0,
+				MsgBurst:              0,
+				Logger:                testLogger,
+				Mailer:                testMailer,
+				PublicURL:             "https://test.example.com",
+				EmailPerHour:          50,
+				EmailBurst:            0,
+				EmailRcptPerHour:      0,
+				NotifyPerHour:         30,
+				NotifyBurst:           0,
+				TrustedProxies:        []string{"10.0.0.0/8"},
+				AllowBroadIPv6:        true,
+				Clock:                 testClock,
+				MaxOutstandingInvites: 15,
+				RetentionSeconds:      5184000,
+				AuthFailPerMinute:     20,
+				AuthFailBurst:         8,
+				WritePerMinute:        15,
+				WriteBurst:            5,
+				KeyIndexRebuildHours:  12,
+				VersionDetail:         "full",
+				CodePepper:            []byte("test_pepper_xyz789"),
+				MaxBagsPerPeer:        200,
+				MaxBagBytesPerPeer:    2097152,
+			},
 		},
 		{
-			name:                "key index rebuild default",
-			envVars:             map[string]string{},
-			trustedProxies:      nil,
-			allowBroadIPv6:      false,
-			wantKeyIndexRebuild: 6,
+			name:           "key index rebuild default",
+			envVars:        map[string]string{},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			want: api.Config{
+				RegisterToken:         "",
+				MsgPerMinute:          0,
+				MsgBurst:              0,
+				Logger:                testLogger,
+				Mailer:                nil,
+				PublicURL:             "",
+				EmailPerHour:          0,
+				EmailBurst:            0,
+				EmailRcptPerHour:      0,
+				NotifyPerHour:         0,
+				NotifyBurst:           0,
+				TrustedProxies:        nil,
+				AllowBroadIPv6:        false,
+				Clock:                 nil,
+				MaxOutstandingInvites: 0,
+				RetentionSeconds:      0,
+				AuthFailPerMinute:     0,
+				AuthFailBurst:         0,
+				WritePerMinute:        0,
+				WriteBurst:            0,
+				KeyIndexRebuildHours:  6,
+				VersionDetail:         "",
+				CodePepper:            []byte{},
+				MaxBagsPerPeer:        0,
+				MaxBagBytesPerPeer:    0,
+			},
 		},
 		{
 			name: "invalid auth fail per minute",
@@ -553,6 +612,7 @@ func TestBuildAPIConfig(t *testing.T) {
 			},
 			trustedProxies: nil,
 			allowBroadIPv6: false,
+			logger:         testLogger,
 			wantBuildErr:   true,
 		},
 		{
@@ -562,6 +622,7 @@ func TestBuildAPIConfig(t *testing.T) {
 			},
 			trustedProxies: nil,
 			allowBroadIPv6: false,
+			logger:         testLogger,
 			wantBuildErr:   true,
 		},
 		{
@@ -569,14 +630,70 @@ func TestBuildAPIConfig(t *testing.T) {
 			envVars:            map[string]string{},
 			trustedProxies:     []string{"2a06:98c0::/29"},
 			allowBroadIPv6:     false,
+			logger:             testLogger,
 			wantNewErr:         true,
 			wantNewErrContains: "must be at least /32",
+			want: api.Config{
+				RegisterToken:         "",
+				MsgPerMinute:          0,
+				MsgBurst:              0,
+				Logger:                testLogger,
+				Mailer:                nil,
+				PublicURL:             "",
+				EmailPerHour:          0,
+				EmailBurst:            0,
+				EmailRcptPerHour:      0,
+				NotifyPerHour:         0,
+				NotifyBurst:           0,
+				TrustedProxies:        []string{"2a06:98c0::/29"},
+				AllowBroadIPv6:        false,
+				Clock:                 nil,
+				MaxOutstandingInvites: 0,
+				RetentionSeconds:      0,
+				AuthFailPerMinute:     0,
+				AuthFailBurst:         0,
+				WritePerMinute:        0,
+				WriteBurst:            0,
+				KeyIndexRebuildHours:  6,
+				VersionDetail:         "",
+				CodePepper:            []byte{},
+				MaxBagsPerPeer:        0,
+				MaxBagBytesPerPeer:    0,
+			},
 		},
 		{
 			name:           "/29 with opt-in accepted",
 			envVars:        map[string]string{},
 			trustedProxies: []string{"2a06:98c0::/29"},
 			allowBroadIPv6: true,
+			logger:         testLogger,
+			want: api.Config{
+				RegisterToken:         "",
+				MsgPerMinute:          0,
+				MsgBurst:              0,
+				Logger:                testLogger,
+				Mailer:                nil,
+				PublicURL:             "",
+				EmailPerHour:          0,
+				EmailBurst:            0,
+				EmailRcptPerHour:      0,
+				NotifyPerHour:         0,
+				NotifyBurst:           0,
+				TrustedProxies:        []string{"2a06:98c0::/29"},
+				AllowBroadIPv6:        true,
+				Clock:                 nil,
+				MaxOutstandingInvites: 0,
+				RetentionSeconds:      0,
+				AuthFailPerMinute:     0,
+				AuthFailBurst:         0,
+				WritePerMinute:        0,
+				WriteBurst:            0,
+				KeyIndexRebuildHours:  6,
+				VersionDetail:         "",
+				CodePepper:            []byte{},
+				MaxBagsPerPeer:        0,
+				MaxBagBytesPerPeer:    0,
+			},
 		},
 	}
 
@@ -589,11 +706,11 @@ func TestBuildAPIConfig(t *testing.T) {
 				return ""
 			}
 
-			h := &captureHandler{}
-			log := slog.New(h)
+			// log is only used for buildTrustedProxySettings warning; buildAPIConfig gets logger parameter
+			log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 			// Build config exactly as main() does
-			cfg, err := buildAPIConfig(getenv, log, tt.clock, tt.mailer, tt.versionDetail, tt.publicURL, tt.maxBagsPerPeer, tt.maxBagBytesPerPeer, tt.retentionSeconds, tt.trustedProxies, tt.allowBroadIPv6)
+			cfg, err := buildAPIConfig(getenv, log, tt.clock, tt.mailer, tt.versionDetail, tt.publicURL, tt.maxBagsPerPeer, tt.maxBagBytesPerPeer, tt.retentionSeconds, tt.trustedProxies, tt.allowBroadIPv6, tt.logger)
 			if tt.wantBuildErr {
 				if err == nil {
 					t.Errorf("buildAPIConfig() succeeded, want error")
@@ -604,113 +721,61 @@ func TestBuildAPIConfig(t *testing.T) {
 				t.Fatalf("buildAPIConfig() error = %v, want nil", err)
 			}
 
-			// Assert the exact config values
-			if cfg.RegisterToken != tt.wantRegisterToken {
-				t.Errorf("cfg.RegisterToken = %q, want %q (mutation: RegisterToken dropped)", cfg.RegisterToken, tt.wantRegisterToken)
+			// Compare Logger, Clock, and Mailer by identity
+			if cfg.Logger != tt.want.Logger {
+				t.Errorf("cfg.Logger = %p, want %p (mutation: Logger dropped or replaced)", cfg.Logger, tt.want.Logger)
 			}
-			if string(cfg.CodePepper) != tt.wantCodePepper {
-				t.Errorf("cfg.CodePepper = %q, want %q (mutation: CodePepper dropped)", string(cfg.CodePepper), tt.wantCodePepper)
+			if cfg.Clock != tt.want.Clock {
+				t.Errorf("cfg.Clock = %p, want %p (mutation: Clock dropped or replaced)", cfg.Clock, tt.want.Clock)
 			}
-			if tt.wantEmailPerHour != 0 && cfg.EmailPerHour != tt.wantEmailPerHour {
-				t.Errorf("cfg.EmailPerHour = %d, want %d", cfg.EmailPerHour, tt.wantEmailPerHour)
-			}
-			if tt.wantNotifyPerHour != 0 && cfg.NotifyPerHour != tt.wantNotifyPerHour {
-				t.Errorf("cfg.NotifyPerHour = %d, want %d", cfg.NotifyPerHour, tt.wantNotifyPerHour)
-			}
-			if tt.wantMaxOutstanding != 0 && cfg.MaxOutstandingInvites != tt.wantMaxOutstanding {
-				t.Errorf("cfg.MaxOutstandingInvites = %d, want %d", cfg.MaxOutstandingInvites, tt.wantMaxOutstanding)
-			}
-			if tt.wantAuthFailMin != 0 && cfg.AuthFailPerMinute != tt.wantAuthFailMin {
-				t.Errorf("cfg.AuthFailPerMinute = %d, want %d", cfg.AuthFailPerMinute, tt.wantAuthFailMin)
-			}
-			if tt.wantAuthFailBurst != 0 && cfg.AuthFailBurst != tt.wantAuthFailBurst {
-				t.Errorf("cfg.AuthFailBurst = %d, want %d (mutation: WriteBurst dropped)", cfg.AuthFailBurst, tt.wantAuthFailBurst)
-			}
-			if tt.wantWriteMin != 0 && cfg.WritePerMinute != tt.wantWriteMin {
-				t.Errorf("cfg.WritePerMinute = %d, want %d", cfg.WritePerMinute, tt.wantWriteMin)
-			}
-			if tt.wantWriteBurst != 0 && cfg.WriteBurst != tt.wantWriteBurst {
-				t.Errorf("cfg.WriteBurst = %d, want %d (mutation: WriteBurst dropped)", cfg.WriteBurst, tt.wantWriteBurst)
-			}
-			if tt.wantKeyIndexRebuild != 0 && cfg.KeyIndexRebuildHours != tt.wantKeyIndexRebuild {
-				t.Errorf("cfg.KeyIndexRebuildHours = %d, want %d", cfg.KeyIndexRebuildHours, tt.wantKeyIndexRebuild)
-			}
-			if cfg.AllowBroadIPv6 != tt.allowBroadIPv6 {
-				t.Errorf("cfg.AllowBroadIPv6 = %v, want %v", cfg.AllowBroadIPv6, tt.allowBroadIPv6)
-			}
-			if !equalStringSlices(cfg.TrustedProxies, tt.trustedProxies) {
-				t.Errorf("cfg.TrustedProxies = %v, want %v", cfg.TrustedProxies, tt.trustedProxies)
-			}
-			// Assert pass-through values
-			if tt.wantVersionDetail != "" && cfg.VersionDetail != tt.wantVersionDetail {
-				t.Errorf("cfg.VersionDetail = %q, want %q (mutation: VersionDetail dropped)", cfg.VersionDetail, tt.wantVersionDetail)
-			}
-			if tt.wantPublicURL != "" && cfg.PublicURL != tt.wantPublicURL {
-				t.Errorf("cfg.PublicURL = %q, want %q (mutation: PublicURL dropped)", cfg.PublicURL, tt.wantPublicURL)
-			}
-			if tt.wantMaxBagsPerPeer != 0 && cfg.MaxBagsPerPeer != tt.wantMaxBagsPerPeer {
-				t.Errorf("cfg.MaxBagsPerPeer = %d, want %d (mutation: MaxBagsPerPeer dropped)", cfg.MaxBagsPerPeer, tt.wantMaxBagsPerPeer)
-			}
-			if tt.wantMaxBagBytes != 0 && cfg.MaxBagBytesPerPeer != tt.wantMaxBagBytes {
-				t.Errorf("cfg.MaxBagBytesPerPeer = %d, want %d (mutation: MaxBagBytesPerPeer dropped)", cfg.MaxBagBytesPerPeer, tt.wantMaxBagBytes)
-			}
-			if tt.wantRetentionSec != 0 && cfg.RetentionSeconds != tt.wantRetentionSec {
-				t.Errorf("cfg.RetentionSeconds = %d, want %d (mutation: RetentionSeconds dropped)", cfg.RetentionSeconds, tt.wantRetentionSec)
-			}
-			if tt.clock != nil && cfg.Clock != tt.clock {
-				t.Errorf("cfg.Clock = %v, want %v (mutation: Clock dropped)", cfg.Clock, tt.clock)
-			}
-			if tt.mailer != nil && cfg.Mailer != tt.mailer {
-				t.Errorf("cfg.Mailer = %v, want %v (mutation: Mailer dropped)", cfg.Mailer, tt.mailer)
+			if cfg.Mailer != tt.want.Mailer {
+				t.Errorf("cfg.Mailer = %p, want %p (mutation: Mailer dropped or replaced)", cfg.Mailer, tt.want.Mailer)
 			}
 
-			// Verify that api.New works with the config (only for non-error cases)
-			if !tt.wantNewErr {
-				st, stErr := store.Open(":memory:")
-				if stErr != nil {
-					t.Fatal(stErr)
-				}
-				defer st.Close()
-				if _, _, stErr := st.LoadKeyIndex(context.Background()); stErr != nil {
-					t.Fatal(stErr)
-				}
+			// Nil out identity fields and compare the rest with DeepEqual
+			cfg.Logger = nil
+			cfg.Clock = nil
+			cfg.Mailer = nil
+			wantCopy := tt.want
+			wantCopy.Logger = nil
+			wantCopy.Clock = nil
+			wantCopy.Mailer = nil
 
-				// Set Logger for api.New
+			if !reflect.DeepEqual(cfg, wantCopy) {
+				t.Errorf("buildAPIConfig() returned config mismatch:\ngot:  %+v\nwant: %+v", cfg, wantCopy)
+			}
+
+			// Restore Logger for api.New test (it was nil'd out for DeepEqual)
+			cfg.Logger = tt.want.Logger
+			if cfg.Logger == nil {
 				var logBuf bytes.Buffer
 				cfg.Logger = slog.New(slog.NewTextHandler(&logBuf, nil))
-
-				srv, newErr := api.New(st, cfg)
-				if newErr != nil {
-					t.Errorf("api.New failed: %v", newErr)
-				}
-				if srv != nil {
-					defer srv.Stop()
-				}
 			}
 
-			// For wantNewErr cases, test that api.New rejects the config
+			// Verify that api.New accepts or rejects the config as expected
+			st, stErr := store.Open(":memory:")
+			if stErr != nil {
+				t.Fatal(stErr)
+			}
+			defer st.Close()
+			if _, _, stErr := st.LoadKeyIndex(context.Background()); stErr != nil {
+				t.Fatal(stErr)
+			}
+
+			srv, newErr := api.New(st, cfg)
 			if tt.wantNewErr {
-				st, stErr := store.Open(":memory:")
-				if stErr != nil {
-					t.Fatal(stErr)
-				}
-				defer st.Close()
-				if _, _, stErr := st.LoadKeyIndex(context.Background()); stErr != nil {
-					t.Fatal(stErr)
-				}
-
-				var logBuf bytes.Buffer
-				cfg.Logger = slog.New(slog.NewTextHandler(&logBuf, nil))
-
-				srv, newErr := api.New(st, cfg)
 				if newErr == nil {
 					t.Errorf("api.New succeeded, want error containing %q", tt.wantNewErrContains)
 				} else if !strings.Contains(newErr.Error(), tt.wantNewErrContains) {
 					t.Errorf("api.New error = %q, want error containing %q", newErr.Error(), tt.wantNewErrContains)
 				}
-				if srv != nil {
-					srv.Stop()
+			} else {
+				if newErr != nil {
+					t.Errorf("api.New failed: %v", newErr)
 				}
+			}
+			if srv != nil {
+				srv.Stop()
 			}
 		})
 	}
@@ -800,6 +865,93 @@ func TestDescribeSMTPMode(t *testing.T) {
 			}
 			if gotMsg != tt.wantMsg {
 				t.Errorf("describeSMTPMode() msg = %q, want %q", gotMsg, tt.wantMsg)
+			}
+		})
+	}
+}
+
+// TestBroadProxyBehavior verifies that the main glue (buildTrustedProxySettings + buildAPIConfig + api.New)
+// works end-to-end: a /29 proxy with ALLOW_BROAD=1 is accepted, and the server starts.
+// Detailed XFF extraction behavior is tested in internal/api/clientip_test.go.
+func TestBroadProxyBehavior(t *testing.T) {
+	tests := []struct {
+		name         string
+		allowBroad   string
+		trustedProxy string
+		wantNewErr   bool
+	}{
+		{
+			name:         "broad /29 without opt-in rejected at buildTrustedProxySettings",
+			allowBroad:   "0",
+			trustedProxy: "2a06:98c0::/29",
+			wantNewErr:   true,
+		},
+		{
+			name:         "broad /29 with opt-in accepted",
+			allowBroad:   "1",
+			trustedProxy: "2a06:98c0::/29",
+			wantNewErr:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st, err := store.Open(":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			if _, _, err := st.LoadKeyIndex(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+
+			// Build config exactly as main() does
+			getenv := func(key string) string {
+				switch key {
+				case "PEERLINE_TRUSTED_PROXIES":
+					return tt.trustedProxy
+				case "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD":
+					return tt.allowBroad
+				default:
+					return ""
+				}
+			}
+
+			log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+			trustedProxies, allowBroadIPv6, err := buildTrustedProxySettings(getenv, log)
+			if tt.wantNewErr {
+				if err == nil {
+					t.Fatal("buildTrustedProxySettings succeeded, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("buildTrustedProxySettings error = %v", err)
+			}
+
+			cfg, err := buildAPIConfig(getenv, log, nil, nil, "minimal", "", 0, 0, 0, trustedProxies, allowBroadIPv6, log)
+			if err != nil {
+				t.Fatalf("buildAPIConfig error = %v", err)
+			}
+
+			srv, newErr := api.New(st, cfg)
+			if newErr != nil {
+				t.Fatalf("api.New failed: %v", newErr)
+			}
+			defer srv.Stop()
+
+			// Verify the server starts and responds
+			httpSrv := httptest.NewServer(srv.Handler())
+			defer httpSrv.Close()
+
+			resp, err := http.Get(httpSrv.URL + "/version")
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != 200 {
+				t.Errorf("version endpoint status = %d, want 200", resp.StatusCode)
 			}
 		})
 	}

@@ -83,6 +83,7 @@ func describeTLSMode(smtp *mailer.SMTP) string {
 
 // buildTrustedProxySettings extracts and validates trusted proxy configuration from environment.
 // It parses PEERLINE_TRUSTED_PROXIES and PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD exactly once,
+// validates CIDRs (rejecting malformed entries and entries that are too broad for the opt-in setting),
 // emits startup warnings, and returns the values. Called from main before mailer.FromEnv.
 func buildTrustedProxySettings(getenv func(string) string, log *slog.Logger) (proxies []string, allowBroad bool, err error) {
 	tp := getenv("PEERLINE_TRUSTED_PROXIES")
@@ -98,6 +99,11 @@ func buildTrustedProxySettings(getenv func(string) string, log *slog.Logger) (pr
 
 	if tp != "" {
 		proxies = strings.Split(tp, ",")
+		// Validate CIDRs before mailer and SMTP probe to fail fast on typos or broad ranges
+		_, _, err = api.ParseTrustedProxiesWithOpts(proxies, allowBroad)
+		if err != nil {
+			return nil, false, fmt.Errorf("invalid PEERLINE_TRUSTED_PROXIES: %w", err)
+		}
 	}
 	return proxies, allowBroad, nil
 }
@@ -105,7 +111,7 @@ func buildTrustedProxySettings(getenv func(string) string, log *slog.Logger) (pr
 // buildAPIConfig constructs the api.Config that main() passes to api.New.
 // It parses all environment variables, validates them, and returns the exact config.
 // Called once from main(); the returned config is passed verbatim to api.New with no field assignments in between.
-func buildAPIConfig(getenv func(string) string, log *slog.Logger, clk clock.Clock, ml mailer.Sender, versionDetail, publicURL string, maxBagsPerPeer int, maxBagBytesPerPeer, retentionSeconds int64, trustedProxies []string, allowBroadIPv6 bool) (api.Config, error) {
+func buildAPIConfig(getenv func(string) string, log *slog.Logger, clk clock.Clock, ml mailer.Sender, versionDetail, publicURL string, maxBagsPerPeer int, maxBagBytesPerPeer, retentionSeconds int64, trustedProxies []string, allowBroadIPv6 bool, logger *slog.Logger) (api.Config, error) {
 
 	regTok := getenv("PEERLINE_REGISTER_TOKEN")
 	maxOutstandingInvites, _ := strconv.Atoi(getenv("PEERLINE_MAX_OUTSTANDING_INVITES"))
@@ -137,7 +143,7 @@ func buildAPIConfig(getenv func(string) string, log *slog.Logger, clk clock.Cloc
 	return api.Config{
 		RegisterToken:         regTok,
 		CodePepper:            []byte(getenv("PEERLINE_CODE_PEPPER")),
-		Logger:                log,
+		Logger:                logger,
 		Mailer:                ml,
 		PublicURL:             publicURL,
 		EmailPerHour:          emailPerHour,
@@ -371,9 +377,9 @@ func main() {
 	}
 
 	// Build api.Config with all parsed environment variables
-	cfg, err := buildAPIConfig(os.Getenv, log, clk, ml, versionDetail, publicURL, maxBagsPerPeer, maxBagBytesPerPeer, retentionSeconds, trustedProxies, allowBroadIPv6)
+	cfg, err := buildAPIConfig(os.Getenv, log, clk, ml, versionDetail, publicURL, maxBagsPerPeer, maxBagBytesPerPeer, retentionSeconds, trustedProxies, allowBroadIPv6, log)
 	if err != nil {
-		log.Error("invalid rate limiter config", "err", err)
+		log.Error("api config", "err", err)
 		os.Exit(1)
 	}
 
