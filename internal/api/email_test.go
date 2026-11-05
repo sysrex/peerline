@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -297,4 +298,98 @@ func TestInviteEmailDirect(t *testing.T) {
 			}
 		})
 	}
+}
+
+// echoMailer is a mailer whose Send error embeds the full message body,
+// simulating a custom mailer or relay that echoes DATA back in the error.
+type echoMailer struct{}
+
+func (echoMailer) Mode() string { return "smtp" }
+func (echoMailer) Send(_ context.Context, m mailer.Message) error {
+	return errors.New("mailer error: failed to send message with body: " + m.Body)
+}
+
+// TestMailerErrorRedaction verifies that when a Mailer.Send error embeds the message body
+// (including an invite code), the logged error is redacted and no invite code leaks into logs.
+// This is a defense-in-depth measure for issue #353.
+func TestMailerErrorRedaction(t *testing.T) {
+	testBothHandlers := func(t *testing.T, name string, newHandler func(*syncBuf) slog.Handler) {
+		t.Run(name, func(t *testing.T) {
+			var logs syncBuf
+			logger := slog.New(newHandler(&logs))
+			srv := newServer(t, Config{Logger: logger, Mailer: echoMailer{}})
+			a := register(t, srv, "alice")
+
+			// Create an invite with to_email, triggering the email send path
+			resp, body := a.do("POST", "/v1/invites", map[string]any{
+				"scopes":   []string{"messages"},
+				"to_email": "test@example.com",
+			}, nil)
+			want(t, resp, body, 201)
+
+			var inv inviteResp
+			if err := json.Unmarshal(body, &inv); err != nil || inv.Code == "" {
+				t.Fatalf("invite response: %v %s", err, body)
+			}
+			if inv.Email["status"] != "failed" {
+				t.Errorf("email status = %q, want failed", inv.Email["status"])
+			}
+
+			// The invite code is created and returned, but should never appear in logs
+			logStr := logs.String()
+
+			// Assert logs were captured
+			if logStr == "" {
+				t.Fatal("no logs captured (logging not wired)")
+			}
+
+			// Assert "invite email failed" log line is present
+			if !strings.Contains(logStr, "invite email failed") {
+				t.Error("logs should contain 'invite email failed' line")
+			}
+
+			// Assert the redaction marker is present
+			if !strings.Contains(logStr, "[REDACTED:inv_") {
+				t.Error("logs should contain redaction marker '[REDACTED:inv_'")
+			}
+
+			// Assert no invite code reaches logs (exact substring check)
+			if strings.Contains(logStr, inv.Code) {
+				t.Errorf("invite code %s leaked in logs (exact match)", inv.Code)
+			}
+
+			// Assert no invite code reaches logs (prefix check)
+			if len(inv.Code) >= 10 && strings.Contains(logStr, inv.Code[:10]) {
+				t.Errorf("invite code prefix leaked in logs")
+			}
+
+			// Assert no invite code reaches logs (suffix check)
+			if len(inv.Code) >= 10 && strings.Contains(logStr, inv.Code[len(inv.Code)-10:]) {
+				t.Errorf("invite code suffix leaked in logs")
+			}
+
+			// Assert no invite code pattern leaks via regex
+			invCodeRegex := `inv_[A-Za-z0-9_-]{6,}`
+			// We expect the pattern to match the redaction marker, but not the real code
+			// Extract potential matches and verify they're all redacted
+			re := regexp.MustCompile(invCodeRegex)
+			matches := re.FindAllString(logStr, -1)
+			for _, match := range matches {
+				// If this looks like a real code (not a redaction marker), fail
+				if !strings.Contains(match, "[REDACTED") && match != inv.Code[:10] {
+					// Double-check it's not part of the actual code leaking
+					if strings.HasPrefix(inv.Code, match) || strings.HasSuffix(inv.Code, match) {
+						t.Errorf("invite code fragment leaked: %s", match[:4]+"...")
+					}
+				}
+			}
+		})
+	}
+
+	testBothHandlers(t, "JSONHandler", func(buf *syncBuf) slog.Handler {
+		return slog.NewJSONHandler(buf, nil)
+	})
+	testBothHandlers(t, "TextHandler", func(buf *syncBuf) slog.Handler {
+		return slog.NewTextHandler(buf, nil)
+	})
 }

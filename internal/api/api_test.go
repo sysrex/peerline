@@ -244,6 +244,104 @@ func extractVerifyToken(body string) string {
 	return body[tokenStart : tokenStart+tokenEnd]
 }
 
+func TestRedactSecrets(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		exactCodes []string
+		want       string
+	}{
+		{
+			name:  "single invite code",
+			input: "error sending message: inv_abc123xyz",
+			want:  "error sending message: [REDACTED:inv_...]",
+		},
+		{
+			name:  "multiple invite codes",
+			input: "failed: inv_code123 and inv_code456 and inv_code789xyz",
+			want:  "failed: [REDACTED:inv_...] and [REDACTED:inv_...] and [REDACTED:inv_...]",
+		},
+		{
+			name:  "email verification token",
+			input: "smtp error: eml_verifytoken123",
+			want:  "smtp error: [REDACTED:eml_...]",
+		},
+		{
+			name:  "pairing token",
+			input: "relay error echoed: pair_pairingtoken456",
+			want:  "relay error echoed: [REDACTED:pair_...]",
+		},
+		{
+			name:  "mixed tokens",
+			input: "body contains inv_abc123 and eml_xyz789 and pair_def456",
+			want:  "body contains [REDACTED:inv_...] and [REDACTED:eml_...] and [REDACTED:pair_...]",
+		},
+		{
+			name:  "code at start",
+			input: "inv_startcode rest of message",
+			want:  "[REDACTED:inv_...] rest of message",
+		},
+		{
+			name:  "code at end",
+			input: "message ends with inv_endcode",
+			want:  "message ends with [REDACTED:inv_...]",
+		},
+		{
+			name:  "no code",
+			input: "normal error message without tokens",
+			want:  "normal error message without tokens",
+		},
+		{
+			name:  "non-invite token preserved (too short)",
+			input: "error: inv_x (too short to match)",
+			want:  "error: inv_x (too short to match)",
+		},
+		{
+			name:  "exact code match with exactCodes",
+			input: "failed to send: the code is inv_exact123456",
+			exactCodes: []string{"inv_exact123456"},
+			want:  "failed to send: the code is [REDACTED:inv_...]",
+		},
+		{
+			name:  "exact code replaced before regex",
+			input: "message body: inv_exact123456 was sent",
+			exactCodes: []string{"inv_exact123456"},
+			want:  "message body: [REDACTED:inv_...] was sent",
+		},
+		{
+			name:  "multiple exact codes",
+			input: "codes: inv_code1abc and eml_code2xyz",
+			exactCodes: []string{"inv_code1abc", "eml_code2xyz"},
+			want:  "codes: [REDACTED:inv_...] and [REDACTED:eml_...]",
+		},
+		{
+			name:  "empty exactCodes",
+			input: "error: inv_testcode",
+			exactCodes: []string{""},
+			want:  "error: [REDACTED:inv_...]",
+		},
+		{
+			name:  "real-world mailer error",
+			input: "mailer error: failed to send message with body: Alice invited you. Code: inv_realcode123. Accept at /v1/invites/accept",
+			want:  "mailer error: failed to send message with body: Alice invited you. Code: [REDACTED:inv_...]. Accept at /v1/invites/accept",
+		},
+		{
+			name:  "smtp reply with embedded token",
+			input: "550 5.7.1 Message rejected: inv_badcode789",
+			want:  "550 5.7.1 Message rejected: [REDACTED:inv_...]",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := redactSecrets(tt.input, tt.exactCodes...)
+			if got != tt.want {
+				t.Errorf("redactSecrets() =\n%q\nwant\n%q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAuthRequired(t *testing.T) {
 	srv := newServer(t, Config{})
 	c := &client{t: t, srv: srv}
