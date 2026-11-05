@@ -118,7 +118,7 @@ func TestDSNParsingMatchesDriver(t *testing.T) {
 			if tt.expectedPath == "" {
 				// Memory-only: the specific file from this test should NOT exist
 				// (We don't check if directory is empty because other tests may have created files)
-				
+
 				// For memory tests, we don't have an expectedPath, so we can't check a specific file.
 				// Instead, verify that dbFilePath predicted memory
 				if !isMemory {
