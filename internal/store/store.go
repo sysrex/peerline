@@ -226,10 +226,10 @@ func dbFilePath(dsn string) (path string, isMemory bool, err error) {
 		}
 
 		// Refuse fragments in file: URIs
-		// Fragments cause buildDSN's appended pragmas to be silently ignored by SQLite,
-		// breaking production configurations. Use %23 to encode a literal # in the filename.
+		// Fragments create ambiguity in URI parsing where SQLite and validation code
+		// can disagree about the file path and parameters. Use %23 to encode a literal # in the filename.
 		if strings.ContainsRune(uriPath, '#') {
-			return "", false, fmt.Errorf("file: URI contains fragment (#); fragments are not allowed because they cause pragmas to be ignored; use %%23 to encode a literal # in the filename")
+			return "", false, fmt.Errorf("file: URI contains a fragment (#), which is not supported; use %%23 to encode a literal # in the filename")
 		}
 
 		// Extract query string

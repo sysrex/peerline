@@ -32,8 +32,8 @@ For zero-downtime deployments, see [Deployment and Schema Upgrades](#deployment-
 **Impact:** `file:` URIs containing a fragment (`#`) now fail fast at startup with a clear error. Use `%23` to encode a literal `#` in the filename.
 
 **What changed:**
-- Before: Fragments in `file:` URIs caused SQLite to silently ignore query pragmas appended by `buildDSN`, disabling `busy_timeout` and `foreign_keys` protections
-- After: Any `file:` URI with `#` is refused with error: `"file: URI contains fragment (#); fragments are not allowed because they cause pragmas to be ignored; use %23 to encode a literal # in the filename"`
+- Before: Fragments in `file:` URIs could cause ambiguity where SQLite and the validation code disagree about the file path and parameters
+- After: Any `file:` URI with `#` is refused with error: `"file: URI contains a fragment (#), which is not supported; use %23 to encode a literal # in the filename"`
 
 **Examples:**
 ```bash
@@ -47,7 +47,20 @@ file:/data/x%23y.db  # Opens x#y.db
 
 **Note:** Plain (non-`file:`) paths with `#` are passed to SQLite as literal filenames and remain unchanged.
 
-**Why this change:** Fragments in `file:` URIs are a security bypass that disables critical database pragmas. Refusing them outright prevents misconfiguration and ensures production settings are always applied.
+**Why this change:** Fragments in `file:` URIs create ambiguity in URI parsing that can lead to mismatches between validation and SQLite's actual behavior. Refusing them outright prevents these edge cases.
+
+### IPv4 6to4 relay anycast prefix rejected in PEERLINE_TRUSTED_PROXIES (#331)
+
+**Affected versions:** All versions upgrading to include the #331 fix
+
+**Impact:** If `PEERLINE_TRUSTED_PROXIES` contains or overlaps `192.88.99.0/24`, startup now fails with `overlaps 6to4 relay anycast prefix 192.88.99.0/24`. Remove the entry (or, if a wider entry contains it, split it; see How to fix); this is the deprecated 6to4 relay anycast range and is not a reverse-proxy range.
+
+**What changed:**
+- IPv4 6to4 relay anycast prefix (`192.88.99.0/24`) is now explicitly rejected at startup (RFC 7526).
+- There is no override; any entry that overlaps this range will prevent the server from starting.
+
+**How to fix:**
+Remove the overlapping entry from `PEERLINE_TRUSTED_PROXIES`. If a wider entry contains the range (e.g., `192.0.0.0/8` or `192.88.0.0/16`), split it into ranges that exclude `192.88.99.0/24`. This range covers arbitrary 6to4 relay clients and is not a legitimate reverse-proxy network.
 
 ### IPv6 transition/translation prefixes rejected in PEERLINE_TRUSTED_PROXIES (#320)
 
