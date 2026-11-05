@@ -890,14 +890,11 @@ func TestSMTPSendWrongHostnamePort465TrustedChain(t *testing.T) {
 		t.Fatalf("error should be x509.HostnameError, got: %T: %v", err, err)
 	}
 
-	// Verify no AUTH, MAIL FROM, RCPT or DATA were sent
-	// The handshake should fail before any SMTP commands
+	// Secondary check: the server can't read any SMTP commands after handshake failure.
+	// The primary assertion is errors.As HostnameError above.
 	cmds := fs.receivedCommands()
-	for _, cmd := range cmds {
-		if strings.HasPrefix(cmd, "AUTH") || strings.HasPrefix(cmd, "MAIL") ||
-			strings.HasPrefix(cmd, "RCPT") || cmd == "DATA" {
-			t.Fatalf("command %q should not have been sent after hostname error: %v", cmd, cmds)
-		}
+	if len(cmds) != 0 {
+		t.Fatalf("expected no commands after handshake failure, got: %v", cmds)
 	}
 }
 
@@ -1391,6 +1388,7 @@ func TestSMTPProbe(t *testing.T) {
 		}
 	})
 
+	// Warn-path control: 'STARTTLS with expired cert = ErrRelayUnreachable'
 	t.Run("STARTTLS expired+wrong-host = fatal", func(t *testing.T) {
 		cert := genExpiredTestCert(t, "wronghost.example.com")
 		srv := newFakeServer(t, true, &cert)
@@ -1415,6 +1413,16 @@ func TestSMTPProbe(t *testing.T) {
 		}
 		if errors.Is(err, ErrRelayUnreachable) {
 			t.Fatalf("expired+wrong-host should be fatal, not ErrRelayUnreachable: %v", err)
+		}
+		// The re-check at alternate time must still fail on hostname, but the original
+		// error (expiry) is what gets returned. Verify it's a certificate error.
+		var x509Invalid x509.CertificateInvalidError
+		if !errors.As(err, &x509Invalid) {
+			t.Fatalf("error should contain x509.CertificateInvalidError, got: %T: %v", err, err)
+		}
+		// Verify it's expired (not a different invalid reason)
+		if x509Invalid.Reason != x509.Expired {
+			t.Fatalf("certificate error reason should be Expired, got: %v", x509Invalid.Reason)
 		}
 	})
 
@@ -1602,47 +1610,6 @@ func TestSMTPProbe(t *testing.T) {
 		}
 		if errors.Is(err, ErrRelayUnreachable) {
 			t.Fatalf("expired+untrusted should be fatal, not ErrRelayUnreachable: %v", err)
-		}
-	})
-
-	// Control: 'STARTTLS expired+wrong-host = fatal' (above) proves the re-check
-	// succeeds for expiry-only; this test proves the re-check fails when the hostname
-	// is also wrong (STARTTLS with expired cert = ErrRelayUnreachable).
-	t.Run("STARTTLS expired+wrong-hostname on TRUSTED chain = fatal", func(t *testing.T) {
-		cert := genExpiredTestCert(t, "wronghost.example.com")
-		srv := newFakeServer(t, true, &cert)
-		defer srv.close()
-
-		certPool := x509.NewCertPool()
-		parsed, err := x509.ParseCertificate(cert.Certificate[0])
-		if err != nil {
-			t.Fatalf("failed to parse test cert: %v", err)
-		}
-		certPool.AddCert(parsed)
-
-		s := &SMTP{
-			Host:      "127.0.0.1",
-			Port:      srv.port(),
-			Timeout:   2 * time.Second,
-			TLSConfig: &tls.Config{RootCAs: certPool, ServerName: "localhost"},
-		}
-		err = s.Probe(context.Background())
-		if err == nil {
-			t.Fatal("probe should fail on expired+wrong-hostname cert")
-		}
-		if errors.Is(err, ErrRelayUnreachable) {
-			t.Fatalf("expired+wrong-hostname should be fatal, not ErrRelayUnreachable: %v", err)
-		}
-		// The re-check at alternate time must still fail on hostname, but the original
-		// error (expiry) is what gets returned. Verify it's a certificate error.
-		var x509Invalid x509.CertificateInvalidError
-		if !errors.As(err, &x509Invalid) {
-			// Report actual final type
-			t.Fatalf("error should contain x509.CertificateInvalidError, got: %T: %v", err, err)
-		}
-		// Verify it's expired (not a different invalid reason)
-		if x509Invalid.Reason != x509.Expired {
-			t.Fatalf("certificate error reason should be Expired, got: %v", x509Invalid.Reason)
 		}
 	})
 
