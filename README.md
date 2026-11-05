@@ -88,7 +88,7 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 | `PEERLINE_NOTIFY_PER_HOUR` | `20` | Wake-up emails per recipient peer per hour; see [Message notifications](#message-notifications) |
 | `PEERLINE_TRUSTED_PROXIES` | unset | Comma-separated CIDR ranges from which X-Forwarded-For is honored (e.g. `172.18.0.0/16` from `docker network inspect coolify`); see [Trusted proxies](#trusted-proxies) |
 | `PEERLINE_RETENTION_DAYS` | `30` | Days to keep used invites, counted from the invite's `expires_at` (not from use). 0 or unset = 30. |
-| `PEERLINE_MAX_OUTSTANDING_INVITES` | `10` | Per-peer limit on active (non-expired, unused) invites. 0 or negative = 10 (no unlimited). Breach returns 429. |
+| `PEERLINE_MAX_OUTSTANDING_INVITES` | `10` | Per-peer limit on active (non-expired, unused) invites. 0 = 10 (no unlimited). Negative values are rejected at startup. Breach returns 429. |
 | `PEERLINE_AUTH_FAIL_PER_MINUTE` | `30` | Per-IP rate limit for authentication failures (invalid Bearer tokens), per minute |
 | `PEERLINE_AUTH_FAIL_BURST` | `10` | Burst allowance for authentication failures |
 | `PEERLINE_WRITE_PER_MINUTE` | `10` | Per-peer rate limit for authenticated write operations, per minute |
