@@ -167,6 +167,13 @@ func TestParseStartupLimits(t *testing.T) {
 			wantRetentionDays: 36500,
 			wantErr:           false,
 		},
+		{
+			name:          "RETENTION_DAYS at max+1",
+			keyIndexWarn:  "1000000",
+			retentionDays: "36501",
+			wantErr:       true,
+			errContains:   []string{"PEERLINE_RETENTION_DAYS", "36501", "36500"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -1056,6 +1063,17 @@ func TestBuildAPIConfig(t *testing.T) {
 				MaxBagsPerPeer:        0,
 				MaxBagBytesPerPeer:    0,
 			},
+		},
+		{
+			name: "KEY_INDEX_REBUILD_HOURS at max+1",
+			envVars: map[string]string{
+				"PEERLINE_KEY_INDEX_REBUILD_HOURS": "8761",
+			},
+			trustedProxies:     nil,
+			allowBroadIPv6:     false,
+			logger:             testLogger,
+			wantBuildErr:       true,
+			wantBuildErrSubstr: []string{"PEERLINE_KEY_INDEX_REBUILD_HOURS", "8761", "8760"},
 		},
 		{
 			name:               "/29 without opt-in rejected by api.New",
