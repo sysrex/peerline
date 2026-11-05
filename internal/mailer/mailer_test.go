@@ -826,8 +826,9 @@ func TestSMTPSendWrongHostnameTrustedChain(t *testing.T) {
 	if err == nil {
 		t.Fatal("Send should fail on hostname mismatch")
 	}
-	if !strings.Contains(err.Error(), "certificate") {
-		t.Fatalf("error should mention certificate, got: %v", err)
+	var hostnameErr x509.HostnameError
+	if !errors.As(err, &hostnameErr) {
+		t.Fatalf("error should be x509.HostnameError, got: %T: %v", err, err)
 	}
 
 	// Verify STARTTLS was attempted
@@ -844,6 +845,54 @@ func TestSMTPSendWrongHostnameTrustedChain(t *testing.T) {
 	}
 
 	// Verify no AUTH, MAIL FROM, RCPT or DATA were sent
+	for _, cmd := range cmds {
+		if strings.HasPrefix(cmd, "AUTH") || strings.HasPrefix(cmd, "MAIL") ||
+			strings.HasPrefix(cmd, "RCPT") || cmd == "DATA" {
+			t.Fatalf("command %q should not have been sent after hostname error: %v", cmd, cmds)
+		}
+	}
+}
+
+func TestSMTPSendWrongHostnamePort465TrustedChain(t *testing.T) {
+	cert := genTestCert(t, "wronghost.example.com")
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	fs := &fakeServer{ln: ln, cert: &cert, t: t, closeCh: make(chan struct{})}
+	go fs.serve()
+
+	certPool := x509.NewCertPool()
+	parsed, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("failed to parse test cert: %v", err)
+	}
+	certPool.AddCert(parsed)
+
+	s := &SMTP{
+		Host:        "127.0.0.1",
+		Port:        ln.Addr().(*net.TCPAddr).Port,
+		From:        "test@example.com",
+		User:        "testuser",
+		Pass:        "testpass",
+		Timeout:     2 * time.Second,
+		ImplicitTLS: true,
+		TLSConfig:   &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+	}
+	err = s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
+	if err == nil {
+		t.Fatal("Send should fail on hostname mismatch")
+	}
+	var hostnameErr x509.HostnameError
+	if !errors.As(err, &hostnameErr) {
+		t.Fatalf("error should be x509.HostnameError, got: %T: %v", err, err)
+	}
+
+	// Verify no AUTH, MAIL FROM, RCPT or DATA were sent
+	// The handshake should fail before any SMTP commands
+	cmds := fs.receivedCommands()
 	for _, cmd := range cmds {
 		if strings.HasPrefix(cmd, "AUTH") || strings.HasPrefix(cmd, "MAIL") ||
 			strings.HasPrefix(cmd, "RCPT") || cmd == "DATA" {
@@ -1556,6 +1605,9 @@ func TestSMTPProbe(t *testing.T) {
 		}
 	})
 
+	// Control: 'STARTTLS expired+wrong-host = fatal' (above) proves the re-check
+	// succeeds for expiry-only; this test proves the re-check fails when the hostname
+	// is also wrong (STARTTLS with expired cert = ErrRelayUnreachable).
 	t.Run("STARTTLS expired+wrong-hostname on TRUSTED chain = fatal", func(t *testing.T) {
 		cert := genExpiredTestCert(t, "wronghost.example.com")
 		srv := newFakeServer(t, true, &cert)
