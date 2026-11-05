@@ -851,7 +851,6 @@ func TestIdenticalReAcceptKeepsCreatedAt(t *testing.T) {
 		t.Errorf("second invite not consumed: used_by=%v, want bob", used)
 	}
 
-
 	// Verify list order via ListGrants API: bob (firstAcceptTime), then charlie
 	aliceGrants, err := s.ListGrants(ctx, "alice")
 	if err != nil {
