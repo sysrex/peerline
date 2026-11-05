@@ -2,10 +2,23 @@ package store
 
 import (
 	"database/sql"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// percentEncodePath percent-encodes a file path for use in a file: URI.
+// SQLite decodes file: URIs, so we must encode special characters like # and % in directory names.
+func percentEncodePath(path string) string {
+	// Split path into components, encode each, then rejoin
+	parts := strings.Split(path, string(filepath.Separator))
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	return strings.Join(parts, "/")
+}
 
 // TestDSNParsingMatchesDriver verifies that our dbFilePath helper correctly predicts
 // what the actual modernc.org/sqlite driver will do with various DSN formats.
@@ -46,21 +59,21 @@ func TestDSNParsingMatchesDriver(t *testing.T) {
 		},
 		{
 			name:        "file:x.db?MODE=memory creates REAL file (uppercase key)",
-			buildDSN:    func(dir string) string { return "file:" + filepath.Join(dir, "test.db") + "?MODE=memory" },
+			buildDSN:    func(dir string) string { return "file:" + percentEncodePath(dir) + "/test.db?MODE=memory" },
 			expectFile:  "test.db",
 			journalMode: "delete",
 		},
 		{
 			name: "file:x.db?mode=MEMORY fails with SQLite error (uppercase value)",
 			buildDSN: func(dir string) string {
-				return "file:" + filepath.Join(dir, "test.db") + "?mode=MEMORY"
+				return "file:" + percentEncodePath(dir) + "/test.db?mode=MEMORY"
 			},
 			expectOpenError: true,
 		},
 		{
 			name: "file:x.db?mode=memory is memory only (named path)",
 			buildDSN: func(dir string) string {
-				return "file:" + filepath.Join(dir, "memory.db") + "?mode=memory"
+				return "file:" + percentEncodePath(dir) + "/memory.db?mode=memory"
 			},
 			expectMemory: true,
 			expectFile:   "memory.db", // For asserting file does NOT exist
@@ -68,37 +81,37 @@ func TestDSNParsingMatchesDriver(t *testing.T) {
 		},
 		{
 			name:        "file: percent-encoded path",
-			buildDSN:    func(dir string) string { return "file:" + filepath.Join(dir, "my%20file.db") },
+			buildDSN:    func(dir string) string { return "file:" + percentEncodePath(dir) + "/my%20file.db" },
 			expectFile:  "my file.db",
 			journalMode: "delete",
 		},
 		{
 			name:        "file://localhost/abs",
-			buildDSN:    func(dir string) string { return "file://localhost" + filepath.Join(dir, "test.db") },
+			buildDSN:    func(dir string) string { return "file://localhost" + percentEncodePath(dir) + "/test.db" },
 			expectFile:  "test.db",
 			journalMode: "delete",
 		},
 		{
 			name:            "file URI with fragment refused",
-			buildDSN:        func(dir string) string { return "file:" + filepath.Join(dir, "test.db") + "#section" },
+			buildDSN:        func(dir string) string { return "file:" + percentEncodePath(dir) + "/test.db#section" },
 			expectDbPathErr: true,
 		},
 		{
 			name: "file URI fragment before query refused",
 			buildDSN: func(dir string) string {
-				return "file:" + filepath.Join(dir, "test.db") + "#?mode=memory"
+				return "file:" + percentEncodePath(dir) + "/test.db#?mode=memory"
 			},
 			expectDbPathErr: true,
 		},
 		{
 			name:            "file URI fragment with query refused",
-			buildDSN:        func(dir string) string { return "file:" + filepath.Join(dir, "test.db") + "#f?a=1" },
+			buildDSN:        func(dir string) string { return "file:" + percentEncodePath(dir) + "/test.db#f?a=1" },
 			expectDbPathErr: true,
 		},
 		{
 			name: "file: URI with mode=memory&mode=rwc creates REAL file",
 			buildDSN: func(dir string) string {
-				return "file:" + filepath.Join(dir, "test.db") + "?mode=memory&mode=rwc"
+				return "file:" + percentEncodePath(dir) + "/test.db?mode=memory&mode=rwc"
 			},
 			expectFile:  "test.db",
 			journalMode: "delete",
@@ -106,20 +119,18 @@ func TestDSNParsingMatchesDriver(t *testing.T) {
 		{
 			name: "file: URI with mode=rwc&mode=memory is memory only (named path)",
 			buildDSN: func(dir string) string {
-				return "file:" + filepath.Join(dir, "memory2.db") + "?mode=rwc&mode=memory"
+				return "file:" + percentEncodePath(dir) + "/memory2.db?mode=rwc&mode=memory"
 			},
 			expectMemory: true,
 			expectFile:   "memory2.db", // For asserting file does NOT exist
 			journalMode:  "memory",
 		},
-		// Note: %23 encoding test is commented out due to SQLite CANTOPEN errors in test environment
-		// while it works in standalone tests. The core functionality (refusing #) is tested above.
-		// {
-		// 	name:        "file: URI with %23 literal hash in filename",
-		// 	buildDSN:    func(dir string) string { return "file:" + filepath.Join(dir, "x%23y.db") },
-		// 	expectFile:  "x#y.db",
-		// 	journalMode: "delete",
-		// },
+		{
+			name:        "file URI with encoded hash in filename",
+			buildDSN:    func(dir string) string { return "file:" + percentEncodePath(dir) + "/x%23y.db" },
+			expectFile:  "x#y.db",
+			journalMode: "delete",
+		},
 		{
 			name: "uppercase FILE: treated as plain path (not URI)",
 			buildDSN: func(dir string) string {
@@ -140,6 +151,12 @@ func TestDSNParsingMatchesDriver(t *testing.T) {
 
 			// Each test gets its own directory
 			rowDir := t.TempDir()
+
+			// Guard: rowDir must not contain %, #, or ? (t.TempDir builds from test name)
+			// SQLite decodes file: URIs, so these chars would break the path
+			if strings.ContainsAny(rowDir, "%#?") {
+				t.Fatalf("rowDir contains special chars that break file: URIs: %q", rowDir)
+			}
 
 			// Handle relative path with os.Chdir for FILE: test
 			if tt.nonParallel {
