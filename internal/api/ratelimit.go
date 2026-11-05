@@ -15,7 +15,7 @@ import (
 
 // rejectedIPv4Prefixes lists IPv4 transition ranges that are rejected
 // from trusted proxy lists because they cover arbitrary clients.
-var rejectedIPv4Prefixes = [1]struct {
+var rejectedIPv4Prefixes = [...]struct {
 	prefix netip.Prefix
 	errMsg string
 }{
@@ -24,7 +24,7 @@ var rejectedIPv4Prefixes = [1]struct {
 
 // rejectedIPv6Prefixes lists IPv6 transition/translation ranges that are rejected
 // from trusted proxy lists because they cover arbitrary clients.
-var rejectedIPv6Prefixes = [4]struct {
+var rejectedIPv6Prefixes = [...]struct {
 	prefix netip.Prefix
 	errMsg string
 }{

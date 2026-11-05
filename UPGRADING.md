@@ -36,7 +36,7 @@ For zero-downtime deployments, see [Deployment and Schema Upgrades](#deployment-
 - There is no override; any entry that overlaps this range will prevent the server from starting.
 
 **How to fix:**
-Remove the overlapping entry from `PEERLINE_TRUSTED_PROXIES`. This range covers arbitrary 6to4 relay clients and is not a legitimate reverse-proxy network.
+Remove the overlapping entry from `PEERLINE_TRUSTED_PROXIES`. If a wider entry contains the range (e.g., `192.0.0.0/8` or `192.88.0.0/16`), split it into ranges that exclude `192.88.99.0/24`. This range covers arbitrary 6to4 relay clients and is not a legitimate reverse-proxy network.
 
 ### IPv6 transition/translation prefixes rejected in PEERLINE_TRUSTED_PROXIES (#320)
 
