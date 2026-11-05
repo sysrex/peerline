@@ -239,10 +239,10 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 			if err != nil {
 				return nil, nil, fmt.Errorf("parsing %q: %w", cidr, err)
 			}
-		// Bare IPv4-mapped IPv6 addresses like ::ffff:10.0.0.1 should unmap to IPv4/32
-		if addr.Is4In6() {
-			addr = addr.Unmap()
-		}
+			// Bare IPv4-mapped IPv6 addresses like ::ffff:10.0.0.1 should unmap to IPv4/32
+			if addr.Is4In6() {
+				addr = addr.Unmap()
+			}
 			if addr.Is4() {
 				prefix = netip.PrefixFrom(addr, 32)
 			} else {
@@ -266,9 +266,9 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 			if ipv4PrefixLen < 8 {
 				return nil, nil, fmt.Errorf("parsing %q: IPv4-mapped prefix must map to at least /8 in IPv4 (need /%d or longer)", cidr, 96+8)
 			}
-		// Unmap to native IPv4 prefix
-		unmapped := addr.Unmap()
-		prefix = netip.PrefixFrom(unmapped, ipv4PrefixLen)
+			// Unmap to native IPv4 prefix
+			unmapped := addr.Unmap()
+			prefix = netip.PrefixFrom(unmapped, ipv4PrefixLen)
 		}
 
 		// Normalize the prefix (mask it)
@@ -288,13 +288,13 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 			if thisNet.Overlaps(prefix) {
 				return nil, nil, fmt.Errorf("parsing %q: overlaps 0.0.0.0/8 (this network)", cidr)
 			}
-		// Reject IPv4 transition prefixes that cover arbitrary clients
-		// (after floor check, so overly broad prefixes get the floor error)
-		for _, rejected := range rejectedIPv4Prefixes {
-			if rejected.prefix.Overlaps(prefix) {
-				return nil, nil, fmt.Errorf("parsing %q: %s", cidr, rejected.errMsg)
+			// Reject IPv4 transition prefixes that cover arbitrary clients
+			// (after floor check, so overly broad prefixes get the floor error)
+			for _, rejected := range rejectedIPv4Prefixes {
+				if rejected.prefix.Overlaps(prefix) {
+					return nil, nil, fmt.Errorf("parsing %q: %s", cidr, rejected.errMsg)
+				}
 			}
-		}
 		} else {
 			// IPv6: apply floor and additional checks
 			addr := prefix.Addr()
