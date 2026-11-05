@@ -3239,180 +3239,190 @@ func TestSingleLogLineUnauthenticatedPairing(t *testing.T) {
 	}
 }
 
+// TestMaxViramaBackoffBound verifies that the production maxViramaBackoff constant
+// matches the test expectation. This tripwire catches changes to the production bound
+// so they don't silently alter sanitizer behavior.
+func TestMaxViramaBackoffBound(t *testing.T) {
+	const wantViramaBackoff = 4
+	if maxViramaBackoff != wantViramaBackoff {
+		t.Errorf("production maxViramaBackoff is %d but tests expect %d", maxViramaBackoff, wantViramaBackoff)
+	}
+}
+
 // TestSanitizerUnicode verifies Unicode handling in sanitizeInviterName
 func TestSanitizerUnicode(t *testing.T) {
 	tests := []struct {
-		name               string
-		input              string
-		want               string
-		skipInvariantCheck bool // Set true for fallback rows (no base characters) where invariant checks don't apply
+		name  string
+		input string
+		want  string
 	}{
 		// Basic cases
-		{"ASCII", "Alice Smith", "Alice Smith", false},
-		{"Unicode letters", "José García", "José García", false},
-		{"Chinese", "李明", "李明", false},
-		{"Japanese", "田中太郎", "田中太郎", false},
-		{"Arabic", "محمد علي", "محمد علي", false},
-		{"Mixed valid", "Alice-O'Neil, Jr.", "Alice-O'Neil, Jr.", false},
-		{"Hindi with combining marks", "राजेश कुमार", "राजेश कुमार", false},
-		{"Thai with combining marks", "สมชาย ใจดี", "สมชาย ใจดี", false},
+		{"ASCII", "Alice Smith", "Alice Smith"},
+		{"Unicode letters", "José García", "José García"},
+		{"Chinese", "李明", "李明"},
+		{"Japanese", "田中太郎", "田中太郎"},
+		{"Arabic", "محمد علي", "محمد علي"},
+		{"Mixed valid", "Alice-O'Neil, Jr.", "Alice-O'Neil, Jr."},
+		{"Hindi with combining marks", "राजेश कुमार", "राजेश कुमार"},
+		{"Thai with combining marks", "สมชาย ใจดี", "สมชาย ใจดี"},
 		// Issue #68: Devanagari test
-		{"Devanagari", "हिन्दी", "हिन्दी", false},
+		{"Devanagari", "हिन्दी", "हिन्दी"},
 
 		// Bidi controls (Cf category) - all filtered
-		{"Bidi LRE", "Alice\u202AEvil", "AliceEvil", false},
-		{"Bidi RLE", "Alice\u202BEvil", "AliceEvil", false},
-		{"Bidi PDF", "Alice\u202CEvil", "AliceEvil", false},
-		{"Bidi LRO", "Alice\u202DEvil", "AliceEvil", false},
-		{"Bidi RLO", "Alice\u202EEvil", "AliceEvil", false},
-		{"Bidi LRI", "Alice\u2066Evil", "AliceEvil", false},
-		{"Bidi RLI", "Alice\u2067Evil", "AliceEvil", false},
-		{"Bidi FSI", "Alice\u2068Evil", "AliceEvil", false},
-		{"Bidi PDI", "Alice\u2069Evil", "AliceEvil", false},
-		{"Bidi LRM", "Alice\u200EEvil", "AliceEvil", false},
-		{"Bidi RLM", "Alice\u200FEvil", "AliceEvil", false},
+		{"Bidi LRE", "Alice\u202AEvil", "AliceEvil"},
+		{"Bidi RLE", "Alice\u202BEvil", "AliceEvil"},
+		{"Bidi PDF", "Alice\u202CEvil", "AliceEvil"},
+		{"Bidi LRO", "Alice\u202DEvil", "AliceEvil"},
+		{"Bidi RLO", "Alice\u202EEvil", "AliceEvil"},
+		{"Bidi LRI", "Alice\u2066Evil", "AliceEvil"},
+		{"Bidi RLI", "Alice\u2067Evil", "AliceEvil"},
+		{"Bidi FSI", "Alice\u2068Evil", "AliceEvil"},
+		{"Bidi PDI", "Alice\u2069Evil", "AliceEvil"},
+		{"Bidi LRM", "Alice\u200EEvil", "AliceEvil"},
+		{"Bidi RLM", "Alice\u200FEvil", "AliceEvil"},
 
 		// Zero-width and format characters (Cf category)
-		{"Zero-width space", "Alice\u200BEvil", "AliceEvil", false},
-		{"Zero-width non-joiner", "Alice\u200CEvil", "AliceEvil", false},
-		{"Zero-width joiner", "Alice\u200DEvil", "AliceEvil", false},
-		{"BOM", "Alice\uFEFFEvil", "AliceEvil", false},
+		{"Zero-width space", "Alice\u200BEvil", "AliceEvil"},
+		{"Zero-width non-joiner", "Alice\u200CEvil", "AliceEvil"},
+		{"Zero-width joiner", "Alice\u200DEvil", "AliceEvil"},
+		{"BOM", "Alice\uFEFFEvil", "AliceEvil"},
 
 		// Tag characters
-		{"Tag space", "Alice\U000E0020Evil", "AliceEvil", false},
-		{"Tag char", "Alice\U000E0041Evil", "AliceEvil", false},
+		{"Tag space", "Alice\U000E0020Evil", "AliceEvil"},
+		{"Tag char", "Alice\U000E0041Evil", "AliceEvil"},
 
 		// Hangul fillers
-		{"Hangul filler U+115F", "Alice\u115FEvil", "AliceEvil", false},
-		{"Hangul filler U+1160", "Alice\u1160Evil", "AliceEvil", false},
-		{"Hangul filler U+3164", "Alice\u3164Evil", "AliceEvil", false},
-		{"Hangul filler U+FFA0", "Alice\uFFA0Evil", "AliceEvil", false},
+		{"Hangul filler U+115F", "Alice\u115FEvil", "AliceEvil"},
+		{"Hangul filler U+1160", "Alice\u1160Evil", "AliceEvil"},
+		{"Hangul filler U+3164", "Alice\u3164Evil", "AliceEvil"},
+		{"Hangul filler U+FFA0", "Alice\uFFA0Evil", "AliceEvil"},
 
 		// Variation selectors
-		{"Variation selector FE00", "Alice\uFE00Evil", "AliceEvil", false},
-		{"Variation selector FE0F", "Alice\uFE0FEvil", "AliceEvil", false},
-		{"Variation selector E0100", "Alice\U000E0100Evil", "AliceEvil", false},
+		{"Variation selector FE00", "Alice\uFE00Evil", "AliceEvil"},
+		{"Variation selector FE0F", "Alice\uFE0FEvil", "AliceEvil"},
+		{"Variation selector E0100", "Alice\U000E0100Evil", "AliceEvil"},
 
 		// Issue #35: Additional Cf characters and Zl/Zp
-		{"U+061C Arabic letter mark", "Alice\u061CEvil", "AliceEvil", false},
-		{"U+2060 Word joiner", "Alice\u2060Evil", "AliceEvil", false},
-		{"U+00AD Soft hyphen", "Alice\u00ADEvil", "AliceEvil", false},
-		{"U+2028 Line separator", "Alice\u2028Evil", "AliceEvil", false},
-		{"U+2029 Paragraph separator", "Alice\u2029Evil", "AliceEvil", false},
+		{"U+061C Arabic letter mark", "Alice\u061CEvil", "AliceEvil"},
+		{"U+2060 Word joiner", "Alice\u2060Evil", "AliceEvil"},
+		{"U+00AD Soft hyphen", "Alice\u00ADEvil", "AliceEvil"},
+		{"U+2028 Line separator", "Alice\u2028Evil", "AliceEvil"},
+		{"U+2029 Paragraph separator", "Alice\u2029Evil", "AliceEvil"},
 
 		// Issue #63 & #84: Invisible Mn characters
-		{"U+034F COMBINING GRAPHEME JOINER", "a\u034Fb", "ab", false},
-		{"U+0334 Combining tilde overlay", "a\u0334b", "a\u0334b", false},
-		{"U+180B Mongolian FVS1", "a\u180Bb", "ab", false},
-		{"U+180C Mongolian FVS2", "a\u180Cb", "ab", false},
-		{"U+180D Mongolian FVS3", "a\u180Db", "ab", false},
-		{"U+180F Mongolian FVS4", "a\u180Fb", "ab", false},
-		{"U+17B4 Khmer inherent vowel", "a\u17B4b", "ab", false},
-		{"U+17B5 Khmer inherent vowel", "a\u17B5b", "ab", false},
+		{"U+034F COMBINING GRAPHEME JOINER", "a\u034Fb", "ab"},
+		{"U+0334 Combining tilde overlay", "a\u0334b", "a\u0334b"},
+		{"U+180B Mongolian FVS1", "a\u180Bb", "ab"},
+		{"U+180C Mongolian FVS2", "a\u180Cb", "ab"},
+		{"U+180D Mongolian FVS3", "a\u180Db", "ab"},
+		{"U+180F Mongolian FVS4", "a\u180Fb", "ab"},
+		{"U+17B4 Khmer inherent vowel", "a\u17B4b", "ab"},
+		{"U+17B5 Khmer inherent vowel", "a\u17B5b", "ab"},
 
 		// Issue #84: Combining marks constraints
 		// Mark limit is checked in NFD (decomposed) form to ensure visible result has max 3 marks per base
-		{"3 marks allowed", "a\u0301\u0302\u0303", "á\u0302\u0303", false},                         // a + 3 marks -> á + 2 marks (NFC composition)
-		{"20 marks capped at 3", "a" + strings.Repeat("\u0301", 20), "á́́", false},                 // a + 20 marks -> a + 3 marks (may compose)
-		{"64 marks alone becomes fallback", strings.Repeat("\u0301", 64), "A Peerline peer", true}, // No base -> fallback (issue #68); skip invariants
-		{"100 marks capped at 3", "a" + strings.Repeat("\u0301", 100), "á́́", false},               // a + 100 marks -> a + 3 marks
-		{"Mark after space dropped", "a \u0301b", "a b", false},
-		{"Mark at start dropped", "\u0301abc", "abc", false},
-		{"Mark after punctuation dropped", "a.\u0301b", "a.b", false},
-		{"Mark after letter then punctuation", "a\u0301.b", "á.b", false}, // a+mark -> á (NFC)
+		{"3 marks allowed", "a\u0301\u0302\u0303", "á\u0302\u0303"},                          // a + 3 marks -> á + 2 marks (NFC composition)
+		{"20 marks capped at 3", "a" + strings.Repeat("\u0301", 20), "á́́"},                  // a + 20 marks -> a + 3 marks (may compose)
+		{"64 marks alone becomes fallback", strings.Repeat("\u0301", 64), "A Peerline peer"}, // No base -> fallback (issue #68)
+		{"100 marks capped at 3", "a" + strings.Repeat("\u0301", 100), "á́́"},                // a + 100 marks -> a + 3 marks
+		{"Mark after space dropped", "a \u0301b", "a b"},
+		{"Mark at start dropped", "\u0301abc", "abc"},
+		{"Mark after punctuation dropped", "a.\u0301b", "a.b"},
+		{"Mark after letter then punctuation", "a\u0301.b", "á.b"}, // a+mark -> á (NFC)
 
 		// Issue #68: Tab and newline handling
-		{"Tab becomes space", "Alice\tSmith", "Alice Smith", false},
-		{"Newline becomes space", "Alice\nSmith", "Alice Smith", false},
-		{"Carriage return becomes space", "Alice\rSmith", "Alice Smith", false},
-		{"Tab with spaces", "Alice  \t  Smith", "Alice Smith", false},
+		{"Tab becomes space", "Alice\tSmith", "Alice Smith"},
+		{"Newline becomes space", "Alice\nSmith", "Alice Smith"},
+		{"Carriage return becomes space", "Alice\rSmith", "Alice Smith"},
+		{"Tab with spaces", "Alice  \t  Smith", "Alice Smith"},
 
 		// Issue #68: Empty result fallback
-		{"Only symbols becomes fallback", "★★★", "A Peerline peer", true},              // Skip invariants (no base)
-		{"Only filtered chars", "\u200B\u200C\uFEFF", "A Peerline peer", true},         // Skip invariants (all filtered)
-		{"Only marks becomes fallback", "\u0301\u0302\u0303", "A Peerline peer", true}, // Skip invariants (no base)
+		{"Only symbols becomes fallback", "★★★", "A Peerline peer"},
+		{"Only filtered chars", "\u200B\u200C\uFEFF", "A Peerline peer"},
+		{"Only marks becomes fallback", "\u0301\u0302\u0303", "A Peerline peer"},
 
 		// NFKC normalization
-		{"Fullwidth ASCII", "Ａｌｉｃｅ", "Alice", false},  // Fullwidth → ASCII
-		{"Superscript", "Alice²", "Alice2", false},    // ² → 2
-		{"Ligature", "ﬁle", "file", false},            // ﬁ → fi
-		{"Circled number", "Alice①", "Alice1", false}, // ① → 1
-		{"Compatibility ideograph", "塚", "塚", false},  // U+FA10 → U+585A
+		{"Fullwidth ASCII", "Ａｌｉｃｅ", "Alice"},  // Fullwidth → ASCII
+		{"Superscript", "Alice²", "Alice2"},    // ² → 2
+		{"Ligature", "ﬁle", "file"},            // ﬁ → fi
+		{"Circled number", "Alice①", "Alice1"}, // ① → 1
+		{"Compatibility ideograph", "塚", "塚"},  // U+FA10 → U+585A
 
 		// Space collapsing
-		{"Multiple spaces", "Alice   Smith", "Alice Smith", false},
-		{"Leading spaces", "   Alice", "Alice", false},
-		{"Trailing spaces", "Alice   ", "Alice", false},
+		{"Multiple spaces", "Alice   Smith", "Alice Smith"},
+		{"Leading spaces", "   Alice", "Alice"},
+		{"Trailing spaces", "Alice   ", "Alice"},
 
 		// Emoji and symbols (filtered out)
-		{"Emoji removed", "Alice 😀 Smith", "Alice Smith", false},
-		{"Symbol removed", "Alice ★ Smith", "Alice Smith", false},
+		{"Emoji removed", "Alice 😀 Smith", "Alice Smith"},
+		{"Symbol removed", "Alice ★ Smith", "Alice Smith"},
 
 		// Edge cases
-		{"Empty string", "", "A Peerline peer", true},   // Skip invariants (empty)
-		{"Only spaces", "   ", "A Peerline peer", true}, // Skip invariants (only spaces)
+		{"Empty string", "", "A Peerline peer"},
+		{"Only spaces", "   ", "A Peerline peer"},
 
 		// Issue #68: Length tests (64 runes max, counted on final NFC output)
-		{"70 ASCII letters", strings.Repeat("a", 70), strings.Repeat("a", 64), false},
-		{"30 CJK chars under byte limit", strings.Repeat("日", 30), strings.Repeat("日", 30), false},
+		{"70 ASCII letters", strings.Repeat("a", 70), strings.Repeat("a", 64)},
+		{"30 CJK chars under byte limit", strings.Repeat("日", 30), strings.Repeat("日", 30)},
 		// 64 runes (not bytes): "日" is 3 bytes, 64 copies = 192 bytes, should keep exactly 64 runes
-		{"Long multibyte truncated at 64 runes", strings.Repeat("日", 70), strings.Repeat("日", 64), false},
+		{"Long multibyte truncated at 64 runes", strings.Repeat("日", 70), strings.Repeat("日", 64)},
 		// Precomposed characters: é (U+00E9) is 1 rune in NFC
-		{"70 precomposed é gives 64", strings.Repeat("é", 70), strings.Repeat("é", 64), false},
+		{"70 precomposed é gives 64", strings.Repeat("é", 70), strings.Repeat("é", 64)},
 		// Hangul syllables: 한 (U+D55C) is 1 rune in NFC, decomposes to 3 jamo in NFD
-		{"70 Hangul syllables gives 64", strings.Repeat("한", 70), strings.Repeat("한", 64), false},
+		{"70 Hangul syllables gives 64", strings.Repeat("한", 70), strings.Repeat("한", 64)},
 		// a+acute recomposes to á in NFC, 70 gives 64
-		{"70 a+acute recomposes to 64 á", strings.Repeat("a\u0301", 70), strings.Repeat("á", 64), false},
+		{"70 a+acute recomposes to 64 á", strings.Repeat("a\u0301", 70), strings.Repeat("á", 64)},
 
 		// Issue #181: Edge cases for combining-mark cluster boundaries
-		{"cluster ending at rune 64 kept whole", strings.Repeat("a", 63) + "e\u0300", strings.Repeat("a", 63) + "è", false},
-		{"cluster + trailing space at cut", strings.Repeat("a", 63) + "e\u0300 zzz", strings.Repeat("a", 63) + "è", false},
-		{"4 marks on one base capped at 3", "a\u0300\u0301\u0302\u0303", "\u00e0\u0301\u0302", false}, // 4 marks -> 3 marks
+		{"cluster ending at rune 64 kept whole", strings.Repeat("a", 63) + "e\u0300", strings.Repeat("a", 63) + "è"},
+		{"cluster + trailing space at cut", strings.Repeat("a", 63) + "e\u0300 zzz", strings.Repeat("a", 63) + "è"},
+		{"4 marks on one base capped at 3", "a\u0300\u0301\u0302\u0303", "\u00e0\u0301\u0302"}, // 4 marks -> 3 marks
 
 		// Emoji with ZWJ, flags, skin tone modifiers (all filtered: ZWJ is Cf, regional indicators and modifiers are So/Sk)
-		{"ZWJ emoji filtered", "Alice👨‍👩‍👧Smith", "AliceSmith", false},
-		{"Flag emoji filtered", "Alice🇺🇸Smith", "AliceSmith", false},
-		{"Skin tone modifier filtered", "Alice👍🏻Smith", "AliceSmith", false},
+		{"ZWJ emoji filtered", "Alice👨‍👩‍👧Smith", "AliceSmith"},
+		{"Flag emoji filtered", "Alice🇺🇸Smith", "AliceSmith"},
+		{"Skin tone modifier filtered", "Alice👍🏻Smith", "AliceSmith"},
 
 		// NFKC expansion: U+FDFA (ﷺ) expands to 18 characters in NFKC
-		{"ﷺ×5 NFKC expands", strings.Repeat("\uFDFA", 5), "صلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى الله ع", false}, // 5*18=90 -> 64
+		{"ﷺ×5 NFKC expands", strings.Repeat("\uFDFA", 5), "صلى الله عليه وسلمصلى الله عليه وسلمصلى الله عليه وسلمصلى الله ع"}, // 5*18=90 -> 64
 
 		// Issue #182/#206: Virama cut (CCC 9) - should not leave dangling virama
-		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62), false},       // क + virama + ष cut before the conjunct
-		{"chained virama at 64", strings.Repeat("a", 60) + "क्ष्म" + "bbb", strings.Repeat("a", 60), false}, // क्ष्म (stacked) → 65 runes → 64 → backs off through all 3 clusters → 60 a (no trailing virama)
-		{"many chained viramas", strings.Repeat("क्", 32) + "का", strings.Repeat("क्", 28), false},          // 65 runes → 64 (32 pairs) → backoff drops 4 clusters (bound hit) → 56 runes (28 pairs, ends in virama); was fallback on main
+		{"virama cut at 64", strings.Repeat("a", 62) + "क्ष" + "bbb", strings.Repeat("a", 62)},       // क + virama + ष cut before the conjunct
+		{"chained virama at 64", strings.Repeat("a", 60) + "क्ष्म" + "bbb", strings.Repeat("a", 60)}, // क्ष्म (stacked) → 65 runes → 64 → backs off through all 3 clusters → 60 a (no trailing virama)
+		{"many chained viramas", strings.Repeat("क्", 32) + "का", strings.Repeat("क्", 28)},          // 65 runes → 64 (32 pairs) → backoff drops 4 clusters (bound hit) → 56 runes (28 pairs, ends in virama); was fallback on main
 
 		// Issue #206: Stacked conjunct (C V C V | C) - dropCluster removes entire stacked conjunct
-		{"stacked conjunct at 64", strings.Repeat("a", 60) + "क्क्ष" + "bbb", strings.Repeat("a", 60), false},            // 60 a + क्क्ष (stacked) → 66 runes → 64 → backs off through all 3 clusters → 60 a (no trailing virama)
-		{"4-virama stack at 64", strings.Repeat("a", 56) + "स्त्र्य्म" + "bbb", strings.Repeat("a", 56), false},          // 68 runes total (56 a + 9-rune stack + bbb) → 64 (म at 64) → backs off 4 clusters → 56 a (bound hit)
-		{"6-virama stack at 64", strings.Repeat("a", 54) + "स्त्र्य्म्न" + "bbb", strings.Repeat("a", 54) + "स्", false}, // 68 runes total (54 a + 11-rune stack + bbb) → 64 ends at ् (म् at cut) → backs off 4 clusters (म्, य्, र्, त् dropped) → 54 a + स् (56 runes, 1 cluster remains; bound hit, fails if bound≥5)
+		{"stacked conjunct at 64", strings.Repeat("a", 60) + "क्क्ष" + "bbb", strings.Repeat("a", 60)},                           // 60 a + क्क्ष (stacked) → 66 runes → 64 → backs off through all 3 clusters → 60 a (no trailing virama)
+		{"4-virama stack at 64", strings.Repeat("a", 56) + "स्त्र्य्म" + "bbb", strings.Repeat("a", 56)},                         // 68 runes total (56 a + 9-rune stack + bbb) → 64 (म at 64) → backs off 4 clusters → 56 a (bound hit)
+		{"5-virama stack at 64", strings.Repeat("a", 54) + "स्त्र्य्म्न" + "bbb", strings.Repeat("a", 54) + "स्"},                // 68 runes total (54 a + 11-rune stack + bbb) → 64 ends at ् (म् at cut) → backs off 4 clusters (म्, य्, र्, त् dropped) → 54 a + स् (56 runes, 1 cluster remains; bound hit, fails if bound≥5)
+		{"split cluster counts toward bound", strings.Repeat("a", 55) + strings.Repeat("क्", 5), strings.Repeat("a", 55) + "क्"}, // 65 runes (55 a + 4 complete क् + क at 63, ् at 64) → split-cluster drop (क) counts as 1, loop drops 3 more क् → 55 a + क् (57 runes)
 
 		// Issue #315: Word-final virama before punctuation (should be kept, not dropped)
 		// क् is 2 runes (क at 62, ् at 63), so with 62 'a' + क् + punctuation, the virama is at 63 and punctuation at 64
 		// The cap is 64 runes (positions 0-63), so we keep the virama but not the punctuation at position 64
-		{"word-final virama before dot", strings.Repeat("a", 62) + "क्." + "bbb", strings.Repeat("a", 62) + "क्", false},  // क at 62, ् at 63, . at 64 → keep virama (word-final)
-		{"word-final virama before dash", strings.Repeat("a", 62) + "ம்-" + "bbb", strings.Repeat("a", 62) + "ம்", false}, // ம at 62, ் at 63, - at 64 → keep virama (word-final)
-		{"word-final virama before comma", strings.Repeat("a", 62) + "क्," + "bbb", strings.Repeat("a", 62) + "क्", false},
-		{"word-final virama before underscore", strings.Repeat("a", 62) + "ம்_" + "bbb", strings.Repeat("a", 62) + "ம்", false},
-		{"word-final virama before apostrophe", strings.Repeat("a", 62) + "क्'" + "bbb", strings.Repeat("a", 62) + "क्", false},
+		{"word-final virama before dot", strings.Repeat("a", 62) + "क्." + "bbb", strings.Repeat("a", 62) + "क्"},  // क at 62, ् at 63, . at 64 → keep virama (word-final)
+		{"word-final virama before dash", strings.Repeat("a", 62) + "ம்-" + "bbb", strings.Repeat("a", 62) + "ம்"}, // ம at 62, ் at 63, - at 64 → keep virama (word-final)
+		{"word-final virama before comma", strings.Repeat("a", 62) + "क्," + "bbb", strings.Repeat("a", 62) + "क्"},
+		{"word-final virama before underscore", strings.Repeat("a", 62) + "ம்_" + "bbb", strings.Repeat("a", 62) + "ம்"},
+		{"word-final virama before apostrophe", strings.Repeat("a", 62) + "क्'" + "bbb", strings.Repeat("a", 62) + "क्"},
 
 		// Issue #332, #346: Bounded back-off for long virama runs prevents collapse.
 		// When the bound is hit, the output may end in a visible virama or half-form (#346).
-		{"40 Tamil க் bounded", strings.Repeat("க்", 40), strings.Repeat("க்", 28), false},                            // 80 runes → 64 (32 pairs) → backoff drops 4 clusters → 56 runes (28 pairs, bound hit, ends in pulli)
-		{"40 க் + 70 ब bounded", strings.Repeat("க்", 40) + strings.Repeat("ब", 70), strings.Repeat("க்", 28), false}, // 150 runes → 64 (32 க் pairs) → backoff drops 4 clusters → 56 runes (28 pairs, bound hit, ends in pulli)
-		{"ab + 40 Tamil க் bounded", "ab" + strings.Repeat("க்", 40), "ab" + strings.Repeat("க்", 27), false},         // 82 runes → 64 (ab+31 pairs) → backoff drops 4 clusters → 56 runes (ab+27 pairs, bound hit, ends in pulli)
-		{"40 Devanagari क् bounded", strings.Repeat("क्", 40), strings.Repeat("क्", 28), false},                       // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama; #346 pin)
-		{"ab + 40 Devanagari क् bounded", "ab" + strings.Repeat("क्", 40), "ab" + strings.Repeat("क्", 27), false},    // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in virama)
-		{"40 क् + 70 ब bounded", strings.Repeat("क्", 40) + strings.Repeat("ब", 70), strings.Repeat("क्", 28), false}, // 150 runes → 64 (32 क् clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama)
-		{"40 Bengali ক্ bounded", strings.Repeat("ক্", 40), strings.Repeat("ক্", 28), false},                          // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in hasanta)
-		{"ab + 40 Bengali ক্ bounded", "ab" + strings.Repeat("ক্", 40), "ab" + strings.Repeat("ক্", 27), false},       // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in hasanta)
-		{"40 ক্ + 70 ব bounded", strings.Repeat("ক্", 40) + strings.Repeat("ব", 70), strings.Repeat("ক্", 28), false}, // 150 runes → 64 (32 ক্ clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in hasanta)
-		{"40 Malayalam ക് bounded", strings.Repeat("ക്", 40), strings.Repeat("ക്", 28), false},                        // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama)
-		{"ab + 40 Malayalam ക് bounded", "ab" + strings.Repeat("ക്", 40), "ab" + strings.Repeat("ക്", 27), false},     // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in virama)
-		{"40 ക് + 70 ബ bounded", strings.Repeat("ക്", 40) + strings.Repeat("ബ", 70), strings.Repeat("ക്", 28), false}, // 150 runes → 64 (32 ക് clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama)
-		{"Latin 70×a at cap", strings.Repeat("a", 70), strings.Repeat("a", 64), false},                                // 70 runes → 64 runes (no virama, simple cap)
-		{"64 runes Deva क् at end", strings.Repeat("a", 62) + "क्", strings.Repeat("a", 62) + "क्", false},            // Exactly 64 runes ending in virama → unchanged
-		{"65 runes Deva क् at 63", strings.Repeat("a", 63) + "क्", strings.Repeat("a", 63), false},                    // 65 runes → 64 (virama at 64) → backoff drops 1 cluster → 63 a (word-final virama removed)
+		{"40 Tamil க் bounded", strings.Repeat("க்", 40), strings.Repeat("க்", 28)},                            // 80 runes → 64 (32 pairs) → backoff drops 4 clusters → 56 runes (28 pairs, bound hit, ends in pulli)
+		{"40 க் + 70 ब bounded", strings.Repeat("க்", 40) + strings.Repeat("ब", 70), strings.Repeat("க்", 28)}, // 150 runes → 64 (32 க் pairs) → backoff drops 4 clusters → 56 runes (28 pairs, bound hit, ends in pulli)
+		{"ab + 40 Tamil க் bounded", "ab" + strings.Repeat("க்", 40), "ab" + strings.Repeat("க்", 27)},         // 82 runes → 64 (ab+31 pairs) → backoff drops 4 clusters → 56 runes (ab+27 pairs, bound hit, ends in pulli)
+		{"40 Devanagari क् bounded", strings.Repeat("क्", 40), strings.Repeat("क्", 28)},                       // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama; #346 pin)
+		{"ab + 40 Devanagari क् bounded", "ab" + strings.Repeat("क्", 40), "ab" + strings.Repeat("क्", 27)},    // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in virama)
+		{"40 क् + 70 ब bounded", strings.Repeat("क्", 40) + strings.Repeat("ब", 70), strings.Repeat("क्", 28)}, // 150 runes → 64 (32 क् clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama)
+		{"40 Bengali ক্ bounded", strings.Repeat("ক্", 40), strings.Repeat("ক্", 28)},                          // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in hasanta)
+		{"ab + 40 Bengali ক্ bounded", "ab" + strings.Repeat("ক্", 40), "ab" + strings.Repeat("ক্", 27)},       // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in hasanta)
+		{"40 ক্ + 70 ব bounded", strings.Repeat("ক্", 40) + strings.Repeat("ব", 70), strings.Repeat("ক্", 28)}, // 150 runes → 64 (32 ক্ clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in hasanta)
+		{"40 Malayalam ക് bounded", strings.Repeat("ക്", 40), strings.Repeat("ക്", 28)},                        // 80 runes → 64 (32 clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama)
+		{"ab + 40 Malayalam ക് bounded", "ab" + strings.Repeat("ക്", 40), "ab" + strings.Repeat("ക്", 27)},     // 82 runes → 64 (ab+31 clusters) → backoff drops 4 clusters → 56 runes (ab+27 clusters, bound hit, ends in virama)
+		{"40 ക് + 70 ബ bounded", strings.Repeat("ക്", 40) + strings.Repeat("ബ", 70), strings.Repeat("ക്", 28)}, // 150 runes → 64 (32 ക് clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama)
+		{"Latin 70×a at cap", strings.Repeat("a", 70), strings.Repeat("a", 64)},                                // 70 runes → 64 runes (no virama, simple cap)
+		{"64 runes Deva क् at end", strings.Repeat("a", 62) + "क्", strings.Repeat("a", 62) + "क्"},            // Exactly 64 runes ending in virama → unchanged
+		{"65 runes Deva क् at 63", strings.Repeat("a", 63) + "क्", strings.Repeat("a", 63)},                    // 65 runes → 64 (क at 63, virama at 64) → split-cluster check drops क to avoid separating it from its virama → 63 a
 	}
 
 	for _, tt := range tests {
@@ -3422,11 +3432,8 @@ func TestSanitizerUnicode(t *testing.T) {
 				t.Errorf("sanitizeInviterName(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 
-			// Check all invariants (idempotence, prefix, ≤64 runes, no Cf) unless skipped
-			// Skip only for fallback rows (no base characters) where structural checks don't apply
-			if !tt.skipInvariantCheck {
-				checkSanitizeInvariants(t, tt.input, got, "table", true)
-			}
+			// Check all invariants (idempotence, prefix, ≤64 runes, no Cf)
+			checkSanitizeInvariants(t, tt.input, got, "table", true)
 
 			// For tests involving combining marks, verify that NFD form has at most 3 marks per base
 			if strings.Contains(tt.name, "marks") || strings.Contains(tt.name, "Devanagari") || strings.Contains(tt.name, "Thai") || strings.Contains(tt.name, "Hindi") {
@@ -3761,6 +3768,11 @@ func isWordBoundaryTest(r rune) bool {
 func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama bool) {
 	t.Helper()
 
+	// Local test constant for the expected virama back-off bound.
+	// This is independent of the production maxViramaBackoff so a change
+	// to the production bound is caught by the tests.
+	const wantViramaBackoff = 4
+
 	// Invariant 1: Output is valid UTF-8
 	if !utf8.ValidString(got) {
 		t.Errorf("sanitizeInviterName(%q) [%s] returned invalid UTF-8: %q", input, label, got)
@@ -3960,8 +3972,8 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 					}
 				}
 
-				// Bounded case only applies when ≥ maxViramaBackoff clusters were dropped
-				isBoundedCase = isBoundedCase && clustersInDropped >= maxViramaBackoff
+				// Bounded case only applies when ≥ wantViramaBackoff clusters were dropped
+				isBoundedCase = isBoundedCase && clustersInDropped >= wantViramaBackoff
 
 				if !isWordFinal && !isBoundedCase {
 					t.Errorf("sanitizeInviterName(%q) [%s] ends in mid-word CCC 9 (virama) rune U+%04X at non-bounded length %d, next rune is U+%04X (not a word boundary): output=%q full=%q", input, label, lastRune, len(out), nextRune, got, string(full))
@@ -4318,12 +4330,17 @@ func TestInviteAcceptGETWithScopesReturns405(t *testing.T) {
 }
 
 // TestInviteAcceptPathsNeverLogCode verifies that invite codes never appear in
-// logs across all accept paths, including success, error, and failure cases (issue #28, #146, #174).
-// This test captures only the slog logger; there is no http.Server.ErrorLog or access-log middleware today.
+// logs across all accept paths, including success, error, and failure cases (issue #28, #146, #174, #303).
+// This test captures both the explicit logger and slog.Default(); there is no http.Server.ErrorLog or access-log middleware today.
 func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	var logs syncBuf
 	// Share one logger with both API and mailer for a single unified log stream
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	// Capture slog.Default too, so code logging through the default is checked
+	oldDefault := slog.Default()
+	slog.SetDefault(logger)
+	t.Cleanup(func() { slog.SetDefault(oldDefault) })
+
 	srv := newServer(t, Config{Logger: logger, Mailer: mailer.Log{Logger: logger}})
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
 	c := register(t, srv, "carol")
@@ -4411,6 +4428,99 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	resp, body = c.do("POST", "/v1/invites/accept?code="+inv3.Code, map[string]any{"code": inv4.Code}, nil)
 	want(t, resp, body, 400)
 
+	// Helper to detect invite code leaks using regex
+	invCodeRegex := regexp.MustCompile(`inv_[A-Za-z0-9_-]{6,}`)
+	detectLeak := func(logs string, codes ...string) (leaked string, found bool) {
+		for _, code := range codes {
+			if strings.Contains(logs, code) {
+				return fmt.Sprintf("inv_<redacted len=%d>", len(code)), true
+			}
+			if len(code) >= 10 && strings.Contains(logs, code[:10]) {
+				return fmt.Sprintf("inv_<redacted prefix len=10>"), true
+			}
+			if len(code) >= 10 && strings.Contains(logs, code[len(code)-10:]) {
+				return fmt.Sprintf("inv_<redacted suffix len=10>"), true
+			}
+		}
+		return "", false
+	}
+
+	// 10. Invalid to_email (rejected before code generation)
+	var invalidEmailLogs syncBuf
+	invalidEmailLogger := slog.New(slog.NewJSONHandler(&invalidEmailLogs, nil))
+	invalidEmailSrv := newServer(t, Config{Logger: invalidEmailLogger, Mailer: mailer.Log{Logger: invalidEmailLogger}})
+	a2 := register(t, invalidEmailSrv, "alice2")
+	resp, body = a2.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "not-an-email"}, nil)
+	want(t, resp, body, 400)
+	// Assert logs were captured (registration produces logs)
+	invalidEmailLogStr := invalidEmailLogs.String()
+	if invalidEmailLogStr == "" {
+		t.Error("invalid to_email: no logs captured (logging unwired)")
+	}
+	if !strings.Contains(invalidEmailLogStr, "peer registered") {
+		t.Error("invalid to_email: expected 'peer registered' log not found")
+	}
+	// No code is generated, but assert no inv_ pattern appears
+	if invCodeRegex.MatchString(invalidEmailLogStr) {
+		t.Errorf("invalid to_email: inv_ pattern found in logs (regex matched)")
+	}
+
+	// 11. Send-failure path with failMailer
+	var failLogs syncBuf
+	failLogger := slog.New(slog.NewJSONHandler(&failLogs, nil))
+	failSrv := newServer(t, Config{Logger: failLogger, Mailer: failMailer{}})
+	a3 := register(t, failSrv, "alice3")
+	resp, body = a3.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "fail@example.com"}, nil)
+	want(t, resp, body, 201)
+	var inv6 struct {
+		Code  string
+		Email map[string]string
+	}
+	if err := json.Unmarshal(body, &inv6); err != nil || inv6.Code == "" {
+		t.Fatalf("inv6: %v %s", err, body)
+	}
+	if inv6.Email["status"] != "failed" {
+		t.Errorf("send-failure: email.status = %q, want failed", inv6.Email["status"])
+	}
+	failLogStr := failLogs.String()
+	if !strings.Contains(failLogStr, "invite email failed") {
+		t.Error("send-failure logs should contain 'invite email failed'")
+	}
+	if leaked, found := detectLeak(failLogStr, inv6.Code); found {
+		t.Errorf("send-failure: code leaked in logs: %s", leaked)
+	}
+
+	// 12. Mail rate-limit (429) path
+	var rateLimitLogs syncBuf
+	rateLimitLogger := slog.New(slog.NewJSONHandler(&rateLimitLogs, nil))
+	rateLimitSrv := newServer(t, Config{
+		Logger:           rateLimitLogger,
+		Mailer:           mailer.Log{Logger: rateLimitLogger},
+		EmailPerHour:     1,
+		EmailBurst:       1,
+		EmailRcptPerHour: 10,
+	})
+	a4 := register(t, rateLimitSrv, "alice4")
+	// First invite succeeds
+	resp, body = a4.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "first@example.com"}, nil)
+	want(t, resp, body, 201)
+	// Second invite hits rate limit: Ready() returns false, triggering rejectEmailRateLimited
+	// (code is created but then deleted before the response is sent)
+	resp, body = a4.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "second@example.com"}, nil)
+	want(t, resp, body, 429)
+	// Assert logs were captured
+	rateLimitLogStr := rateLimitLogs.String()
+	if rateLimitLogStr == "" {
+		t.Error("rate-limit: no logs captured (logging unwired)")
+	}
+	if !strings.Contains(rateLimitLogStr, "invite email") {
+		t.Error("rate-limit: expected 'invite email' log line not found")
+	}
+	// No code should appear (it was deleted)
+	if invCodeRegex.MatchString(rateLimitLogStr) {
+		t.Errorf("rate-limit: inv_ pattern found in logs (regex matched)")
+	}
+
 	// Positive control: assert logs captured expected events
 	logStr := logs.String()
 	if !strings.Contains(logStr, "pairing accepted") {
@@ -4419,18 +4529,156 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	if !strings.Contains(logStr, "peer registered") {
 		t.Error("logs should contain 'peer registered' (positive control)")
 	}
+	// Parse JSON logs and check for invite email with status=logged
+	foundInviteEmail := false
+	for _, line := range strings.Split(logStr, "\n") {
+		if line == "" {
+			continue
+		}
+		var entry map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if entry["msg"] == "invite email" && entry["status"] == "logged" {
+			foundInviteEmail = true
+			break
+		}
+	}
+	if !foundInviteEmail {
+		t.Error("logs should contain JSON line with msg='invite email' and status='logged' (positive control)")
+	}
 	if !strings.Contains(logStr, "body_len") {
 		t.Error("logs should contain mailer 'body_len' (positive control for to_email path)")
 	}
 
-	// Check logs don't contain any of the codes or their prefixes
-	for _, code := range []string{inv1.Code, inv2.Code, inv3.Code, inv4.Code, inv5.Code, unknownCode} {
-		if strings.Contains(logStr, code) {
-			t.Errorf("invite code %s found in logs", code)
+	// Before planting test codes, check that the main buffer contains no inv_ leaks
+	// (apart from the codes we intentionally planted in per-path buffers)
+	logStr = logs.String()
+	realCodes := []string{inv1.Code, inv2.Code, inv3.Code, inv4.Code, inv5.Code, unknownCode}
+	if leaked, found := detectLeak(logStr, realCodes...); found {
+		t.Errorf("main buffer leaked before planting: %s", leaked)
+	}
+	// Additionally check with regex for any inv_ pattern not in our known codes
+	if invCodeRegex.MatchString(logStr) {
+		// Regex found an inv_ pattern; verify it's not from real codes
+		matches := invCodeRegex.FindAllString(logStr, -1)
+		for _, m := range matches {
+			isKnown := false
+			for _, c := range realCodes {
+				if strings.Contains(c, m) || strings.Contains(m, c) {
+					isKnown = true
+					break
+				}
+			}
+			if !isKnown {
+				t.Errorf("main buffer contains unknown inv_ pattern before planting: %s", m[:4]+"<redacted>")
+			}
 		}
-		if len(code) >= 10 && strings.Contains(logStr, code[:10]) {
-			t.Errorf("invite code prefix %s found in logs", code[:10])
+	}
+
+	// Plant codes in logs to verify the detector fires
+	plantedCode := auth.NewSecret("inv_")
+	logger.Info("test planted code", "code", plantedCode)
+	plantedCode2 := auth.NewSecret("inv_")
+	logger.Info("test planted suffix", "suffix", plantedCode2[len(plantedCode2)-10:])
+	plantedCode3 := auth.NewSecret("inv_")
+	logger.Info("test planted prefix", "prefix", plantedCode3[:10])
+	logStr = logs.String()
+
+	// Verify the regex also matches the planted code
+	if !invCodeRegex.MatchString(logStr) {
+		t.Error("positive control: regex does not match planted code (regex broken)")
+	}
+
+	// Check logs don't contain any of the codes or their prefixes/suffixes
+	// The planted codes are intentionally in the logs to verify the detector works
+	allCodes := []struct {
+		code     string
+		expected bool // true if we expect to find it (planted), false otherwise
+		name     string
+	}{
+		{inv1.Code, false, "inv1"},
+		{inv2.Code, false, "inv2"},
+		{inv3.Code, false, "inv3"},
+		{inv4.Code, false, "inv4"},
+		{inv5.Code, false, "inv5"},
+		{unknownCode, false, "unknown"},
+		{plantedCode, true, "planted"},
+		{plantedCode2, true, "planted-suffix"},
+		{plantedCode3, true, "planted-prefix"},
+	}
+	for _, tc := range allCodes {
+		if leaked, found := detectLeak(logStr, tc.code); found != tc.expected {
+			if tc.expected {
+				t.Errorf("positive control: %s code not detected (detector broken)", tc.name)
+			} else {
+				t.Errorf("%s code leaked: %s", tc.name, leaked)
+			}
 		}
+	}
+
+	// 13. Text-handler format test (optional: verify detector works on both JSON and text)
+	var textLogs syncBuf
+	textLogger := slog.New(slog.NewTextHandler(&textLogs, nil))
+	textSrv := newServer(t, Config{Logger: textLogger, Mailer: mailer.Log{Logger: textLogger}})
+	a5 := register(t, textSrv, "alice5")
+	resp, body = a5.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "text@example.com"}, nil)
+	want(t, resp, body, 201)
+	var inv7 struct{ Code string }
+	if err := json.Unmarshal(body, &inv7); err != nil || inv7.Code == "" {
+		t.Fatalf("inv7: %v %s", err, body)
+	}
+	textLogStr := textLogs.String()
+	if textLogStr == "" {
+		t.Error("text-handler: no logs captured (logging unwired)")
+	}
+	if !strings.Contains(textLogStr, `msg="invite email"`) {
+		t.Error("text-handler: expected 'msg=\"invite email\"' not found")
+	}
+	if !strings.Contains(textLogStr, `status=logged`) {
+		t.Error("text-handler: expected 'status=logged' not found")
+	}
+	if leaked, found := detectLeak(textLogStr, inv7.Code); found {
+		t.Errorf("text-handler: code leaked: %s", leaked)
+	}
+}
+
+// TestAPINewDefaultMailerDoesNotLogBody verifies that api.New with no Mailer configured
+// builds a default mailer that does not log the full email body (issue #303).
+func TestAPINewDefaultMailerDoesNotLogBody(t *testing.T) {
+	var logs syncBuf
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	cfg := Config{Logger: logger} // No Mailer set
+	prepareTestConfig(t, st, &cfg)
+	apiSrv, err := New(st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(apiSrv.Stop)
+	srv := httptest.NewServer(apiSrv.Handler())
+	t.Cleanup(srv.Close)
+
+	a := register(t, srv, "alice")
+	resp, body := a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "test@example.com"}, nil)
+	want(t, resp, body, 201)
+	var inv struct{ Code string }
+	if err := json.Unmarshal(body, &inv); err != nil || inv.Code == "" {
+		t.Fatalf("invite: %v %s", err, body)
+	}
+
+	// The default mailer should log metadata but not the full body
+	logStr := logs.String()
+	if !strings.Contains(logStr, "body_len") {
+		t.Error("logs should contain 'body_len' (metadata logged)")
+	}
+	// The body should not contain the invite code (because LogFullBody should be false by default)
+	if strings.Contains(logStr, inv.Code) {
+		t.Error("default mailer logged full body containing invite code")
 	}
 }
 
@@ -4627,7 +4875,7 @@ func TestInviteAccept405Comprehensive(t *testing.T) {
 		if rsp.StatusCode != 405 {
 			t.Errorf("%s: want 405, got %d", method, rsp.StatusCode)
 		}
-		// Allow header includes DELETE because DELETE /v1/invites/{public_id} also matches
+		// Allow header includes DELETE because DELETE /v1/invites/{id} also matches
 		// the literal path segment "accept", and ServeMux lists all methods registered on that pattern.
 		if got := rsp.Header.Get("Allow"); got != "DELETE, POST" {
 			t.Errorf("%s: Allow = %q, want DELETE, POST", method, got)
