@@ -25,6 +25,23 @@ For zero-downtime deployments, see [Deployment and Schema Upgrades](#deployment-
 
 ## Breaking Changes
 
+### Environment variable validation now rejects invalid numeric values (#355)
+
+**Affected versions:** All versions upgrading to include the #355 fix
+
+**Impact:** If `PEERLINE_EMAIL_PER_HOUR`, `PEERLINE_NOTIFY_PER_HOUR`, `PEERLINE_MAX_OUTSTANDING_INVITES`, `PEERLINE_KEY_INDEX_REBUILD_HOURS`, `PEERLINE_KEY_INDEX_WARN`, or `PEERLINE_RETENTION_DAYS` is set to a non-numeric value (e.g., `1O` with capital O) or a negative value, startup now fails with a clear error message naming the variable and the invalid value.
+
+**What changed:**
+- Before: These variables silently fell back to their defaults when parsing failed. For example, `PEERLINE_EMAIL_PER_HOUR=1O` would be ignored and the default (20) would be used. `PEERLINE_MAX_OUTSTANDING_INVITES` accepted negative values and treated them as "use default 10".
+- After: Startup fails immediately with an error like `PEERLINE_EMAIL_PER_HOUR must be numeric, got: 1O` or `PEERLINE_MAX_OUTSTANDING_INVITES must be non-negative, got: -1`.
+- **Zero is still valid** and means "use the default" as documented (e.g., `PEERLINE_RETENTION_DAYS=0` → 30 days).
+
+**New upper bounds:**
+- `PEERLINE_KEY_INDEX_REBUILD_HOURS` must be ≤ 8760 (hours in a year) to prevent overflow in `time.Duration` conversion
+- `PEERLINE_RETENTION_DAYS` must be ≤ 36500 (100 years) to prevent overflow in seconds conversion
+
+**Action required:** If you have set any of these variables to invalid values (typos or negative numbers), correct them before upgrading. Note that `PEERLINE_MAX_OUTSTANDING_INVITES` no longer accepts negative values; use `0` for the default instead. Unset, empty, or `0` variables continue to use their defaults as before.
+
 ### Fragment (#) in file: URI DSNs is now refused (#327, #349)
 
 **Affected versions:** All versions upgrading to include the #327/#349 fix
