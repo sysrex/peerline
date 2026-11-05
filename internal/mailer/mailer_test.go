@@ -483,6 +483,54 @@ func genTestCertWithValidity(t *testing.T, hostname string, notBefore, notAfter 
 	}
 }
 
+func genTestCertDNSOnly(t *testing.T, hostname string) tls.Certificate {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: hostname},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{hostname},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{
+		Certificate: [][]byte{certDER},
+		PrivateKey:  priv,
+	}
+}
+
+func genTestCertIPOnly(t *testing.T, ip string) tls.Certificate {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: ip},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP(ip)},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{
+		Certificate: [][]byte{certDER},
+		PrivateKey:  priv,
+	}
+}
+
 // genTestCertChain generates a certificate chain: root CA -> intermediate CA -> leaf cert.
 // Returns the leaf tls.Certificate (with full chain) and the root cert for building a trust pool.
 func genTestCertChain(t *testing.T, hostname string, leafNotBefore, leafNotAfter, intermediateNotBefore, intermediateNotAfter time.Time) (tls.Certificate, *x509.Certificate) {
@@ -854,7 +902,76 @@ func TestSMTPSendWrongHostnameTrustedChain(t *testing.T) {
 }
 
 func TestSMTPSendWrongHostnamePort465TrustedChain(t *testing.T) {
-	cert := genTestCert(t, "wronghost.example.com")
+	tests := []struct {
+		name       string
+		serverName string // empty means use default from Host
+	}{
+		{"explicit ServerName", "localhost"},
+		{"default ServerName from Host", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cert := genTestCertDNSOnly(t, "wronghost.example.com")
+			ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+
+			fs := &fakeServer{ln: ln, cert: &cert, t: t, closeCh: make(chan struct{})}
+			go fs.serve()
+
+			certPool := x509.NewCertPool()
+			parsed, err := x509.ParseCertificate(cert.Certificate[0])
+			if err != nil {
+				t.Fatalf("failed to parse test cert: %v", err)
+			}
+			certPool.AddCert(parsed)
+
+			tlsCfg := &tls.Config{RootCAs: certPool}
+			if tt.serverName != "" {
+				tlsCfg.ServerName = tt.serverName
+			}
+
+			s := &SMTP{
+				Host:        "127.0.0.1",
+				Port:        ln.Addr().(*net.TCPAddr).Port,
+				From:        "test@example.com",
+				User:        "testuser",
+				Pass:        "testpass",
+				Timeout:     2 * time.Second,
+				ImplicitTLS: true,
+				TLSConfig:   tlsCfg,
+			}
+			err = s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
+			if err == nil {
+				t.Fatal("Send should fail on hostname mismatch")
+			}
+			var hostnameErr x509.HostnameError
+			if !errors.As(err, &hostnameErr) {
+				t.Fatalf("error should be x509.HostnameError, got: %T: %v", err, err)
+			}
+
+			// The handshake fails before any SMTP command is read, so no EHLO, AUTH, MAIL or DATA is sent.
+			cmds := fs.receivedCommands()
+			if len(cmds) != 0 {
+				t.Fatalf("expected no commands after handshake failure, got: %v", cmds)
+			}
+
+			// Verify the server accepted exactly one connection (proves the empty-commands check isn't vacuous).
+			fs.mu.Lock()
+			connCount := fs.connCount
+			fs.mu.Unlock()
+			if connCount != 1 {
+				t.Fatalf("expected exactly 1 connection, got %d", connCount)
+			}
+		})
+	}
+}
+
+func TestSMTPSendPort465IPSANTrustedChain(t *testing.T) {
+	cert := genTestCertIPOnly(t, "127.0.0.1")
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
 	if err != nil {
 		t.Fatal(err)
@@ -871,6 +988,7 @@ func TestSMTPSendWrongHostnamePort465TrustedChain(t *testing.T) {
 	}
 	certPool.AddCert(parsed)
 
+	// No ServerName, so it uses Host 127.0.0.1, which matches the IP SAN
 	s := &SMTP{
 		Host:        "127.0.0.1",
 		Port:        ln.Addr().(*net.TCPAddr).Port,
@@ -879,22 +997,28 @@ func TestSMTPSendWrongHostnamePort465TrustedChain(t *testing.T) {
 		Pass:        "testpass",
 		Timeout:     2 * time.Second,
 		ImplicitTLS: true,
-		TLSConfig:   &tls.Config{RootCAs: certPool, ServerName: "localhost"},
+		TLSConfig:   &tls.Config{RootCAs: certPool},
 	}
 	err = s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
-	if err == nil {
-		t.Fatal("Send should fail on hostname mismatch")
-	}
-	var hostnameErr x509.HostnameError
-	if !errors.As(err, &hostnameErr) {
-		t.Fatalf("error should be x509.HostnameError, got: %T: %v", err, err)
+	if err != nil {
+		var hostnameErr x509.HostnameError
+		if errors.As(err, &hostnameErr) {
+			t.Fatalf("Send should succeed with matching IP SAN, got HostnameError: %v", err)
+		}
+		t.Fatalf("Send should succeed with matching IP SAN, got: %v", err)
 	}
 
-	// Secondary check: the server can't read any SMTP commands after handshake failure.
-	// The primary assertion is errors.As HostnameError above.
+	// Verify handshake succeeded and SMTP commands were sent
 	cmds := fs.receivedCommands()
-	if len(cmds) != 0 {
-		t.Fatalf("expected no commands after handshake failure, got: %v", cmds)
+	hasEHLO := false
+	for _, cmd := range cmds {
+		if strings.HasPrefix(cmd, "EHLO") || strings.HasPrefix(cmd, "HELO") {
+			hasEHLO = true
+			break
+		}
+	}
+	if !hasEHLO {
+		t.Fatalf("expected EHLO/HELO after successful handshake, got: %v", cmds)
 	}
 }
 
@@ -1388,8 +1512,8 @@ func TestSMTPProbe(t *testing.T) {
 		}
 	})
 
-	// Warn-path control: 'STARTTLS with expired cert = ErrRelayUnreachable'
 	t.Run("STARTTLS expired+wrong-host = fatal", func(t *testing.T) {
+		// Control: see 'STARTTLS with expired cert = ErrRelayUnreachable' (same cert expiry, matching host -> warn)
 		cert := genExpiredTestCert(t, "wronghost.example.com")
 		srv := newFakeServer(t, true, &cert)
 		defer srv.close()
