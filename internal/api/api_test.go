@@ -374,10 +374,10 @@ func TestRedactSecrets(t *testing.T) {
 			want:  "key leak: [REDACTED:pl_...]",
 		},
 		{
-			name:  "negative: fragment shorter than 10 chars",
-			input: "error: " + strings.Repeat("a", 9),
+			name:       "negative: fragment shorter than 10 chars",
+			input:      "error: " + strings.Repeat("a", 9),
 			exactCodes: []string{"inv_" + strings.Repeat("a", 32)},
-			want:  "error: " + strings.Repeat("a", 9),
+			want:       "error: " + strings.Repeat("a", 9),
 		},
 		{
 			name:  "negative: unrelated long identifier",

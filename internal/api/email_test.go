@@ -574,7 +574,7 @@ func TestNotifyEmailErrorRedaction(t *testing.T) {
 			hsrv, _, st, db := newServerWithDB(t, Config{Logger: logger, Mailer: echoMailer{}})
 			defer st.Close()
 			defer db.Close()
-			
+
 			a := register(t, hsrv, "alice")
 			b := register(t, hsrv, "bob")
 

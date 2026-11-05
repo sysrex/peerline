@@ -430,11 +430,11 @@ func redactSecrets(s string, exactCodes ...string) string {
 			}
 		}
 	}
-	
+
 	// Then redact any remaining tokens matching the patterns (case-insensitive).
 	// We use secretTokenInBody and apiKeyInBody (no \b, {16,}/{8,}) to align with bodyPreview.
 	lower := strings.ToLower(s)
-	
+
 	// Redact secret tokens (inv_, eml_, pair_)
 	matches := secretTokenInBody.FindAllStringIndex(lower, -1)
 	for i := len(matches) - 1; i >= 0; i-- {
@@ -442,7 +442,7 @@ func redactSecrets(s string, exactCodes ...string) string {
 		original := s[start:end]
 		s = s[:start] + redactMarker(original) + s[end:]
 	}
-	
+
 	// Redact API keys (pl_)
 	matches = apiKeyInBody.FindAllStringIndex(lower, -1)
 	for i := len(matches) - 1; i >= 0; i-- {
@@ -450,7 +450,7 @@ func redactSecrets(s string, exactCodes ...string) string {
 		original := s[start:end]
 		s = s[:start] + redactMarker(original) + s[end:]
 	}
-	
+
 	return s
 }
 
