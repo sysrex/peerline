@@ -25,6 +25,18 @@ For zero-downtime deployments, see [Deployment and Schema Upgrades](#deployment-
 
 ## Breaking Changes
 
+### Environment variable validation now rejects invalid numeric values (#355)
+
+**Affected versions:** All versions upgrading to include the #355 fix
+
+**Impact:** If `PEERLINE_EMAIL_PER_HOUR`, `PEERLINE_NOTIFY_PER_HOUR`, `PEERLINE_MAX_OUTSTANDING_INVITES`, `PEERLINE_KEY_INDEX_REBUILD_HOURS`, `PEERLINE_KEY_INDEX_WARN`, or `PEERLINE_RETENTION_DAYS` is set to a non-numeric value (e.g., `1O` with capital O), zero, or a negative value, startup now fails with a clear error message naming the variable and the invalid value.
+
+**What changed:**
+- Before: These variables silently fell back to their defaults when parsing failed. For example, `PEERLINE_EMAIL_PER_HOUR=1O` would be ignored and the default (20) would be used.
+- After: Startup fails immediately with an error like `PEERLINE_EMAIL_PER_HOUR must be numeric, got: 1O` or `PEERLINE_EMAIL_PER_HOUR must be positive, got: 0`.
+
+**Action required:** If you have set any of these variables to invalid values (typos, zero, or negative numbers), correct them before upgrading. Unset or empty variables continue to use their defaults as before.
+
 ### Fragment (#) in file: URI DSNs is now refused (#327, #349)
 
 **Affected versions:** All versions upgrading to include the #327/#349 fix

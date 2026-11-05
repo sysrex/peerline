@@ -43,6 +43,22 @@ func parseInt(val, name string) (int, error) {
 	return n, nil
 }
 
+// parsePositiveInt parses an env var as a positive int (> 0), returning an error if set but non-numeric or non-positive.
+// Returns (0, nil) if unset (caller provides default).
+func parsePositiveInt(val, name string) (int, error) {
+	if val == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(val)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be numeric, got: %s", name, val)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("%s must be positive, got: %d", name, n)
+	}
+	return n, nil
+}
+
 // parseVersionDetail validates and normalizes PEERLINE_VERSION_DETAIL.
 // Accepts "minimal", "full", or "off" (case-insensitive, whitespace-trimmed).
 // Returns an error for any other value to fail-closed on typos.
@@ -114,10 +130,22 @@ func buildTrustedProxySettings(getenv func(string) string, log *slog.Logger) (pr
 func buildAPIConfig(getenv func(string) string, clk clock.Clock, ml mailer.Sender, versionDetail, publicURL string, maxBagsPerPeer int, maxBagBytesPerPeer, retentionSeconds int64, trustedProxies []string, allowBroadIPv6 bool, logger *slog.Logger) (api.Config, error) {
 
 	regTok := getenv("PEERLINE_REGISTER_TOKEN")
-	maxOutstandingInvites, _ := strconv.Atoi(getenv("PEERLINE_MAX_OUTSTANDING_INVITES"))
-	emailPerHour, _ := strconv.Atoi(getenv("PEERLINE_EMAIL_PER_HOUR"))
-	notifyPerHour, _ := strconv.Atoi(getenv("PEERLINE_NOTIFY_PER_HOUR"))
-	keyIndexRebuildHours, _ := strconv.Atoi(getenv("PEERLINE_KEY_INDEX_REBUILD_HOURS"))
+	maxOutstandingInvites, err := parsePositiveInt(getenv("PEERLINE_MAX_OUTSTANDING_INVITES"), "PEERLINE_MAX_OUTSTANDING_INVITES")
+	if err != nil {
+		return api.Config{}, err
+	}
+	emailPerHour, err := parsePositiveInt(getenv("PEERLINE_EMAIL_PER_HOUR"), "PEERLINE_EMAIL_PER_HOUR")
+	if err != nil {
+		return api.Config{}, err
+	}
+	notifyPerHour, err := parsePositiveInt(getenv("PEERLINE_NOTIFY_PER_HOUR"), "PEERLINE_NOTIFY_PER_HOUR")
+	if err != nil {
+		return api.Config{}, err
+	}
+	keyIndexRebuildHours, err := parsePositiveInt(getenv("PEERLINE_KEY_INDEX_REBUILD_HOURS"), "PEERLINE_KEY_INDEX_REBUILD_HOURS")
+	if err != nil {
+		return api.Config{}, err
+	}
 	if keyIndexRebuildHours <= 0 {
 		keyIndexRebuildHours = 6 // default
 	}
@@ -296,7 +324,11 @@ func main() {
 		"backup", backupInfo)
 
 	// Load key index at startup (#112)
-	keyIndexWarn, _ := strconv.Atoi(os.Getenv("PEERLINE_KEY_INDEX_WARN"))
+	keyIndexWarn, err := parsePositiveInt(os.Getenv("PEERLINE_KEY_INDEX_WARN"), "PEERLINE_KEY_INDEX_WARN")
+	if err != nil {
+		log.Error("config", "err", err)
+		os.Exit(1)
+	}
 	if keyIndexWarn <= 0 {
 		keyIndexWarn = 1_000_000
 	}
@@ -366,7 +398,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	retentionDays, _ := strconv.Atoi(os.Getenv("PEERLINE_RETENTION_DAYS"))
+	retentionDays, err := parsePositiveInt(os.Getenv("PEERLINE_RETENTION_DAYS"), "PEERLINE_RETENTION_DAYS")
+	if err != nil {
+		log.Error("config", "err", err)
+		os.Exit(1)
+	}
 	if retentionDays <= 0 {
 		retentionDays = 30 // default
 	}
