@@ -26,6 +26,83 @@ type testMailerStub struct{}
 func (testMailerStub) Send(ctx context.Context, m mailer.Message) error { return nil }
 func (testMailerStub) Mode() string                                     { return "test" }
 
+func TestParsePositiveInt(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		varName string
+		want    int
+		wantErr bool
+	}{
+		{"empty string", "", "TEST_VAR", 0, false},
+		{"valid positive", "10", "TEST_VAR", 10, false},
+		{"valid large", "1000000", "TEST_VAR", 1000000, false},
+		{"zero", "0", "TEST_VAR", 0, true},
+		{"negative", "-5", "TEST_VAR", 0, true},
+		{"non-numeric", "abc", "TEST_VAR", 0, true},
+		{"typo O for 0", "1O", "TEST_VAR", 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parsePositiveInt(tt.input, tt.varName)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("parsePositiveInt(%q, %q) = %d, nil; want error", tt.input, tt.varName, got)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("parsePositiveInt(%q, %q) = %d, %v; want %d, nil", tt.input, tt.varName, got, err, tt.want)
+				} else if got != tt.want {
+					t.Errorf("parsePositiveInt(%q, %q) = %d; want %d", tt.input, tt.varName, got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+// TestEnvVarValidation verifies that PEERLINE_KEY_INDEX_WARN and PEERLINE_RETENTION_DAYS
+// are validated at startup and reject invalid values.
+func TestEnvVarValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		varName string
+		value   string
+		wantErr bool
+	}{
+		// PEERLINE_KEY_INDEX_WARN
+		{"KEY_INDEX_WARN valid", "PEERLINE_KEY_INDEX_WARN", "500000", false},
+		{"KEY_INDEX_WARN unset", "PEERLINE_KEY_INDEX_WARN", "", false},
+		{"KEY_INDEX_WARN non-numeric", "PEERLINE_KEY_INDEX_WARN", "abc", true},
+		{"KEY_INDEX_WARN typo", "PEERLINE_KEY_INDEX_WARN", "1OOO", true},
+		{"KEY_INDEX_WARN zero", "PEERLINE_KEY_INDEX_WARN", "0", true},
+		{"KEY_INDEX_WARN negative", "PEERLINE_KEY_INDEX_WARN", "-100", true},
+
+		// PEERLINE_RETENTION_DAYS
+		{"RETENTION_DAYS valid", "PEERLINE_RETENTION_DAYS", "90", false},
+		{"RETENTION_DAYS unset", "PEERLINE_RETENTION_DAYS", "", false},
+		{"RETENTION_DAYS non-numeric", "PEERLINE_RETENTION_DAYS", "xyz", true},
+		{"RETENTION_DAYS typo", "PEERLINE_RETENTION_DAYS", "3O", true},
+		{"RETENTION_DAYS zero", "PEERLINE_RETENTION_DAYS", "0", true},
+		{"RETENTION_DAYS negative", "PEERLINE_RETENTION_DAYS", "-7", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parsePositiveInt(tt.value, tt.varName)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("parsePositiveInt(%q, %q) succeeded with %d, want error", tt.value, tt.varName, got)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("parsePositiveInt(%q, %q) failed with error %v, want success", tt.value, tt.varName, err)
+				}
+			}
+		})
+	}
+}
+
 func TestParseNonNegativeInt(t *testing.T) {
 	tests := []struct {
 		input   string
@@ -618,6 +695,126 @@ func TestBuildAPIConfig(t *testing.T) {
 			name: "invalid write burst",
 			envVars: map[string]string{
 				"PEERLINE_WRITE_BURST": "abc",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			wantBuildErr:   true,
+		},
+		{
+			name: "EMAIL_PER_HOUR non-numeric",
+			envVars: map[string]string{
+				"PEERLINE_EMAIL_PER_HOUR": "1O",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			wantBuildErr:   true,
+		},
+		{
+			name: "EMAIL_PER_HOUR zero",
+			envVars: map[string]string{
+				"PEERLINE_EMAIL_PER_HOUR": "0",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			wantBuildErr:   true,
+		},
+		{
+			name: "EMAIL_PER_HOUR negative",
+			envVars: map[string]string{
+				"PEERLINE_EMAIL_PER_HOUR": "-5",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			wantBuildErr:   true,
+		},
+		{
+			name: "NOTIFY_PER_HOUR non-numeric",
+			envVars: map[string]string{
+				"PEERLINE_NOTIFY_PER_HOUR": "abc",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			wantBuildErr:   true,
+		},
+		{
+			name: "NOTIFY_PER_HOUR zero",
+			envVars: map[string]string{
+				"PEERLINE_NOTIFY_PER_HOUR": "0",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			wantBuildErr:   true,
+		},
+		{
+			name: "NOTIFY_PER_HOUR negative",
+			envVars: map[string]string{
+				"PEERLINE_NOTIFY_PER_HOUR": "-10",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			wantBuildErr:   true,
+		},
+		{
+			name: "MAX_OUTSTANDING_INVITES non-numeric",
+			envVars: map[string]string{
+				"PEERLINE_MAX_OUTSTANDING_INVITES": "xyz",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			wantBuildErr:   true,
+		},
+		{
+			name: "MAX_OUTSTANDING_INVITES zero",
+			envVars: map[string]string{
+				"PEERLINE_MAX_OUTSTANDING_INVITES": "0",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			wantBuildErr:   true,
+		},
+		{
+			name: "MAX_OUTSTANDING_INVITES negative",
+			envVars: map[string]string{
+				"PEERLINE_MAX_OUTSTANDING_INVITES": "-1",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			wantBuildErr:   true,
+		},
+		{
+			name: "KEY_INDEX_REBUILD_HOURS non-numeric",
+			envVars: map[string]string{
+				"PEERLINE_KEY_INDEX_REBUILD_HOURS": "notanumber",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			wantBuildErr:   true,
+		},
+		{
+			name: "KEY_INDEX_REBUILD_HOURS zero",
+			envVars: map[string]string{
+				"PEERLINE_KEY_INDEX_REBUILD_HOURS": "0",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			wantBuildErr:   true,
+		},
+		{
+			name: "KEY_INDEX_REBUILD_HOURS negative",
+			envVars: map[string]string{
+				"PEERLINE_KEY_INDEX_REBUILD_HOURS": "-3",
 			},
 			trustedProxies: nil,
 			allowBroadIPv6: false,
