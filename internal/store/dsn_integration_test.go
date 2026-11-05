@@ -67,27 +67,23 @@ func TestDSNParsingMatchesDriver(t *testing.T) {
 			buildDSN:   func(dir string) string { return "file://localhost" + filepath.Join(dir, "test.db") },
 			expectFile: "test.db",
 		},
-		// TODO: Fragment tests fail in test environment but work manually
-		// The driver creates memory databases instead of files when fragments are present
-		// This appears to be a test environment issue, not a dbFilePath bug
-		// Manual testing confirms: file:/tmp/test.db#section creates /tmp/test.db
-		// {
-		// 	name:       "file:...#frag",
-		// 	buildDSN:   func(dir string) string { return "file:" + filepath.Join(dir, "test.db") + "#section" },
-		// 	expectFile: "test.db",
-		// },
-		// {
-		// 	name: "file:...#?mode=memory NOT memory (# before ?)",
-		// 	buildDSN: func(dir string) string {
-		// 		return "file:" + filepath.Join(dir, "test.db") + "#?mode=memory"
-		// 	},
-		// 	expectFile: "test.db",
-		// },
-		// {
-		// 	name:       "file:...#f?a=1 NOT memory (# before ?)",
-		// 	buildDSN:   func(dir string) string { return "file:" + filepath.Join(dir, "test.db") + "#f?a=1" },
-		// 	expectFile: "test.db",
-		// },
+		{
+			name:       "file URI with fragment",
+			buildDSN:   func(dir string) string { return "file:" + filepath.Join(dir, "test.db") + "#section" },
+			expectFile: "test.db",
+		},
+		{
+			name: "file URI fragment before query NOT memory",
+			buildDSN: func(dir string) string {
+				return "file:" + filepath.Join(dir, "test.db") + "#?mode=memory"
+			},
+			expectFile: "test.db",
+		},
+		{
+			name:       "file URI fragment with query NOT memory",
+			buildDSN:   func(dir string) string { return "file:" + filepath.Join(dir, "test.db") + "#f?a=1" },
+			expectFile: "test.db",
+		},
 		{
 			name: "file: URI with mode=memory&mode=rwc creates REAL file",
 			buildDSN: func(dir string) string {
@@ -134,6 +130,20 @@ func TestDSNParsingMatchesDriver(t *testing.T) {
 			}
 			defer db.Close()
 
+			// Get SQLite's actual backing file using PRAGMA database_list
+			var seq int
+			var dbName string
+			var sqliteFile string
+			if err := db.QueryRow("PRAGMA database_list").Scan(&seq, &dbName, &sqliteFile); err != nil {
+				if tt.expectOpenError {
+					return
+				}
+				t.Fatalf("PRAGMA database_list failed: %v", err)
+			}
+			t.Logf("SQLite backing file: %q", sqliteFile)
+			t.Logf("dbFilePath returned: %q", dbPath)
+			t.Logf("rowDir: %q", rowDir)
+
 			// Try to write
 			if _, err := db.Exec("CREATE TABLE IF NOT EXISTS t (id INTEGER); INSERT INTO t VALUES (1)"); err != nil {
 				if tt.expectOpenError {
@@ -155,6 +165,20 @@ func TestDSNParsingMatchesDriver(t *testing.T) {
 				t.Fatalf("expected at least 1 row, got %d", count)
 			}
 
+			// Resolve symlinks if present (TempDir might use them)
+			sqliteFileResolved := sqliteFile
+			if sqliteFile != "" {
+				if resolved, err := filepath.EvalSymlinks(sqliteFile); err == nil {
+					sqliteFileResolved = resolved
+				}
+			}
+			dbPathResolved := dbPath
+			if dbPath != "" {
+				if resolved, err := filepath.EvalSymlinks(dbPath); err == nil {
+					dbPathResolved = resolved
+				}
+			}
+
 			// Close to flush
 			db.Close()
 
@@ -165,18 +189,26 @@ func TestDSNParsingMatchesDriver(t *testing.T) {
 			}
 
 			if tt.expectMemory {
-				// Memory: directory must be empty
+				// Memory: SQLite's file column must be empty
+				if sqliteFile != "" {
+					t.Errorf("expected memory database (empty file column), but PRAGMA database_list returned %q", sqliteFile)
+				}
+
+				// Verify dbFilePath predicted memory
+				if !isMemory {
+					t.Errorf("dbFilePath predicted file %q, but driver used memory", dbPath)
+				}
+				if dbPath != "" {
+					t.Errorf("dbFilePath returned path %q, but driver used memory (expected empty path)", dbPath)
+				}
+
+				// Directory must be empty
 				if len(entries) > 0 {
 					var fileNames []string
 					for _, e := range entries {
 						fileNames = append(fileNames, e.Name())
 					}
 					t.Errorf("expected memory-only (empty dir), found: %v", fileNames)
-				}
-
-				// Verify dbFilePath predicted memory
-				if !isMemory {
-					t.Errorf("dbFilePath predicted file %q, but driver used memory", dbPath)
 				}
 
 				// If named path, verify that specific file doesn't exist
@@ -187,13 +219,23 @@ func TestDSNParsingMatchesDriver(t *testing.T) {
 					}
 				}
 			} else {
-				// File: verify expected file exists
+				// File: verify SQLite's backing file matches dbFilePath
 				expectedPath := filepath.Join(rowDir, tt.expectFile)
-				if _, err := os.Stat(expectedPath); err != nil {
-					t.Errorf("expected file %q, but it doesn't exist: %v", expectedPath, err)
+				expectedPathResolved := expectedPath
+				if resolved, err := filepath.EvalSymlinks(expectedPath); err == nil {
+					expectedPathResolved = resolved
 				}
 
-				// Verify dbFilePath matches
+				if sqliteFile == "" {
+					t.Errorf("expected file-backed database, but PRAGMA database_list returned empty (memory)")
+				} else if sqliteFileResolved != dbPathResolved {
+					t.Errorf("PRAGMA database_list file %q doesn't match dbFilePath %q", sqliteFileResolved, dbPathResolved)
+				}
+				if sqliteFileResolved != expectedPathResolved {
+					t.Errorf("PRAGMA database_list file %q doesn't match expected %q", sqliteFileResolved, expectedPathResolved)
+				}
+
+				// Verify dbFilePath predicted file
 				if isMemory {
 					t.Errorf("dbFilePath predicted memory, but driver created file %q", expectedPath)
 				}
@@ -201,7 +243,12 @@ func TestDSNParsingMatchesDriver(t *testing.T) {
 					t.Errorf("dbFilePath returned %q, want %q", dbPath, expectedPath)
 				}
 
-				// Verify only expected files exist
+				// Verify expected file exists
+				if _, err := os.Stat(expectedPath); err != nil {
+					t.Errorf("expected file %q doesn't exist: %v", expectedPath, err)
+				}
+
+				// Verify only expected files exist in directory
 				allowedFiles := map[string]bool{
 					tt.expectFile:              true,
 					tt.expectFile + "-wal":     true,
