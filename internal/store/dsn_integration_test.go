@@ -412,13 +412,13 @@ func TestDSNParsingErrors(t *testing.T) {
 	}
 }
 
-// TestTxlockImmediate verifies that _txlock=immediate causes BEGIN to acquire
-// a RESERVED lock immediately, blocking concurrent transactions at BEGIN time.
+// TestTxlockImmediate verifies that _txlock=immediate in buildDSN causes BEGIN
+// to acquire a RESERVED lock immediately, blocking concurrent transactions at BEGIN time.
 func TestTxlockImmediate(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
-	// Open connection A with our buildDSN (includes _txlock=immediate)
+	// Open connection A with buildDSN (should include _txlock=immediate)
 	dsnA := buildDSN(dbPath)
 	dbA, err := sql.Open("sqlite", dsnA)
 	if err != nil {
@@ -439,13 +439,8 @@ func TestTxlockImmediate(t *testing.T) {
 	}
 	defer txA.Rollback()
 
-	// Make A actually hold the lock by writing (BEGIN IMMEDIATE takes RESERVED, but verify)
-	if _, err := txA.Exec("INSERT INTO test VALUES (1)"); err != nil {
-		t.Fatalf("write on A failed: %v", err)
-	}
-
-	// Open connection B with _txlock=immediate and low busy_timeout for fast failure
-	dsnB := dbPath + "?_txlock=immediate&_pragma=busy_timeout(100)&_pragma=foreign_keys(1)"
+	// Open connection B via buildDSN, then set busy_timeout to 100ms for fast failure
+	dsnB := buildDSN(dbPath)
 	dbB, err := sql.Open("sqlite", dsnB)
 	if err != nil {
 		t.Fatalf("open dbB failed: %v", err)
@@ -453,13 +448,27 @@ func TestTxlockImmediate(t *testing.T) {
 	defer dbB.Close()
 	dbB.SetMaxOpenConns(1)
 
+	// Override busy_timeout to 100ms for fast failure
+	if _, err := dbB.Exec("PRAGMA busy_timeout = 100"); err != nil {
+		t.Fatalf("set busy_timeout failed: %v", err)
+	}
+
+	// Verify busy_timeout is 100
+	var busyTimeout int
+	if err := dbB.QueryRow("PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+		t.Fatalf("query busy_timeout failed: %v", err)
+	}
+	if busyTimeout != 100 {
+		t.Fatalf("busy_timeout = %d, want 100", busyTimeout)
+	}
+
 	// BeginTx on B must fail at BEGIN with 'database is locked'
-	// Without _txlock=immediate, BEGIN would succeed and only the first write would block
+	// Without _txlock=immediate in buildDSN, BEGIN would succeed and only the first write would block
 	ctx := context.Background()
 	txB, err := dbB.BeginTx(ctx, nil)
 	if err == nil {
 		txB.Rollback()
-		t.Fatal("BEGIN on B should have failed because A holds RESERVED lock (with _txlock=immediate)")
+		t.Fatal("BEGIN on B should have failed because A holds RESERVED lock (buildDSN must include _txlock=immediate)")
 	}
 	if !strings.Contains(err.Error(), "database is locked") {
 		t.Errorf("expected 'database is locked' error at BEGIN, got: %v", err)
