@@ -398,8 +398,8 @@ func checkDatabasePath(dsn string) error {
 								return fmt.Errorf("database symlink %s is dangling and target's parent directory is group- or world-writable", filepath.Base(path))
 							}
 
-						// Dangling symlink with all safe directories is OK
-						return nil
+							// Dangling symlink with all safe directories is OK
+							return nil
 						}
 						return pathless(targetStatErr)
 					}
@@ -418,10 +418,10 @@ func checkDatabasePath(dsn string) error {
 					break
 				}
 
-			// If we exhausted maxHops without resolving, the chain is too long
-			if !resolved {
-				return fmt.Errorf("database symlink %s chain exceeds maximum depth of %d", filepath.Base(path), maxHops)
-			}
+				// If we exhausted maxHops without resolving, the chain is too long
+				if !resolved {
+					return fmt.Errorf("database symlink %s chain exceeds maximum depth of %d", filepath.Base(path), maxHops)
+				}
 			} else {
 				return pathless(statErr)
 			}
