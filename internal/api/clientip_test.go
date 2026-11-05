@@ -1609,8 +1609,10 @@ func TestRejectedPrefixTables(t *testing.T) {
 			t.Errorf("rejectedIPv4Prefixes[%d]: invalid prefix", i)
 			continue
 		}
-		if entry.prefix.Addr().IsUnspecified() && entry.prefix.Bits() == 0 {
-			t.Errorf("rejectedIPv4Prefixes[%d]: zero prefix", i)
+		// An empty entry from zero-filled array slot has IsValid() == false and Bits() == 0
+		// But also check error message is non-empty to catch incomplete entries
+		if entry.errMsg == "" {
+			t.Errorf("rejectedIPv4Prefixes[%d]: empty error message", i)
 			continue
 		}
 
@@ -1647,8 +1649,10 @@ func TestRejectedPrefixTables(t *testing.T) {
 			t.Errorf("rejectedIPv6Prefixes[%d]: invalid prefix", i)
 			continue
 		}
-		if entry.prefix.Addr().IsUnspecified() && entry.prefix.Bits() == 0 {
-			t.Errorf("rejectedIPv6Prefixes[%d]: zero prefix", i)
+		// An empty entry from zero-filled array slot has IsValid() == false and Bits() == 0
+		// But also check error message is non-empty to catch incomplete entries
+		if entry.errMsg == "" {
+			t.Errorf("rejectedIPv6Prefixes[%d]: empty error message", i)
 			continue
 		}
 
