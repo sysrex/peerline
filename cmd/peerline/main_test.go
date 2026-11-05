@@ -28,13 +28,13 @@ func (testMailerStub) Mode() string                                     { return
 
 func TestParseNonNegativeInt(t *testing.T) {
 	tests := []struct {
-		name         string
-		input        string
-		varName      string
-		max          int
-		want         int
-		wantErr      bool
-		errContains  []string // must all be present in error message
+		name        string
+		input       string
+		varName     string
+		max         int
+		want        int
+		wantErr     bool
+		errContains []string // must all be present in error message
 	}{
 		{"empty string", "", "TEST_VAR", 0, 0, false, nil},
 		{"zero", "0", "TEST_VAR", 0, 0, false, nil},
@@ -160,9 +160,9 @@ func TestParseStartupLimits(t *testing.T) {
 			errContains:   []string{"PEERLINE_RETENTION_DAYS", "50000", "36500"},
 		},
 		{
-			name:          "RETENTION_DAYS at max",
-			keyIndexWarn:  "1000000",
-			retentionDays: "36500",
+			name:              "RETENTION_DAYS at max",
+			keyIndexWarn:      "1000000",
+			retentionDays:     "36500",
 			wantKeyIndexWarn:  1000000,
 			wantRetentionDays: 36500,
 			wantErr:           false,

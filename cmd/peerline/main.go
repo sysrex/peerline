@@ -425,7 +425,6 @@ func main() {
 		os.Exit(1)
 	}
 
-
 	if os.Getenv("PEERLINE_CODE_PEPPER") == "" {
 		log.Warn("PEERLINE_CODE_PEPPER unset: confirm-mode short codes use a per-process secret, so pending claims cannot be confirmed across a restart")
 	}
