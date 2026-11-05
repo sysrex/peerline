@@ -3239,6 +3239,16 @@ func TestSingleLogLineUnauthenticatedPairing(t *testing.T) {
 	}
 }
 
+// TestMaxViramaBackoffBound verifies that the production maxViramaBackoff constant
+// matches the test expectation. This tripwire catches changes to the production bound
+// so they don't silently alter sanitizer behavior.
+func TestMaxViramaBackoffBound(t *testing.T) {
+	const wantViramaBackoff = 4
+	if maxViramaBackoff != wantViramaBackoff {
+		t.Errorf("production maxViramaBackoff is %d but tests expect %d", maxViramaBackoff, wantViramaBackoff)
+	}
+}
+
 // TestSanitizerUnicode verifies Unicode handling in sanitizeInviterName
 func TestSanitizerUnicode(t *testing.T) {
 	tests := []struct {
@@ -3382,9 +3392,10 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"many chained viramas", strings.Repeat("क्", 32) + "का", strings.Repeat("क्", 28)},          // 65 runes → 64 (32 pairs) → backoff drops 4 clusters (bound hit) → 56 runes (28 pairs, ends in virama); was fallback on main
 
 		// Issue #206: Stacked conjunct (C V C V | C) - dropCluster removes entire stacked conjunct
-		{"stacked conjunct at 64", strings.Repeat("a", 60) + "क्क्ष" + "bbb", strings.Repeat("a", 60)},            // 60 a + क्क्ष (stacked) → 66 runes → 64 → backs off through all 3 clusters → 60 a (no trailing virama)
-		{"4-virama stack at 64", strings.Repeat("a", 56) + "स्त्र्य्म" + "bbb", strings.Repeat("a", 56)},          // 68 runes total (56 a + 9-rune stack + bbb) → 64 (म at 64) → backs off 4 clusters → 56 a (bound hit)
-		{"6-virama stack at 64", strings.Repeat("a", 54) + "स्त्र्य्म्न" + "bbb", strings.Repeat("a", 54) + "स्"}, // 68 runes total (54 a + 11-rune stack + bbb) → 64 ends at ् (म् at cut) → backs off 4 clusters (म्, य्, र्, त् dropped) → 54 a + स् (56 runes, 1 cluster remains; bound hit, fails if bound≥5)
+		{"stacked conjunct at 64", strings.Repeat("a", 60) + "क्क्ष" + "bbb", strings.Repeat("a", 60)},                           // 60 a + क्क्ष (stacked) → 66 runes → 64 → backs off through all 3 clusters → 60 a (no trailing virama)
+		{"4-virama stack at 64", strings.Repeat("a", 56) + "स्त्र्य्म" + "bbb", strings.Repeat("a", 56)},                         // 68 runes total (56 a + 9-rune stack + bbb) → 64 (म at 64) → backs off 4 clusters → 56 a (bound hit)
+		{"5-virama stack at 64", strings.Repeat("a", 54) + "स्त्र्य्म्न" + "bbb", strings.Repeat("a", 54) + "स्"},                // 68 runes total (54 a + 11-rune stack + bbb) → 64 ends at ् (म् at cut) → backs off 4 clusters (म्, य्, र्, त् dropped) → 54 a + स् (56 runes, 1 cluster remains; bound hit, fails if bound≥5)
+		{"split cluster counts toward bound", strings.Repeat("a", 55) + strings.Repeat("क्", 5), strings.Repeat("a", 55) + "क्"}, // 65 runes (55 a + 4 complete क् + क at 63, ् at 64) → split-cluster drop (क) counts as 1, loop drops 3 more क् → 55 a + क् (57 runes)
 
 		// Issue #315: Word-final virama before punctuation (should be kept, not dropped)
 		// क् is 2 runes (क at 62, ् at 63), so with 62 'a' + क् + punctuation, the virama is at 63 and punctuation at 64
@@ -3761,11 +3772,6 @@ func checkSanitizeInvariants(t *testing.T, input, got, label string, checkVirama
 	// This is independent of the production maxViramaBackoff so a change
 	// to the production bound is caught by the tests.
 	const wantViramaBackoff = 4
-
-	// Assert that production maxViramaBackoff matches the test expectation
-	if maxViramaBackoff != wantViramaBackoff {
-		t.Errorf("production maxViramaBackoff is %d but tests expect %d", maxViramaBackoff, wantViramaBackoff)
-	}
 
 	// Invariant 1: Output is valid UTF-8
 	if !utf8.ValidString(got) {
