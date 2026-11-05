@@ -398,6 +398,51 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	return true
 }
 
+// redactMarker returns the redaction marker for a token, e.g. "[REDACTED:inv_...]".
+func redactMarker(token string) string {
+	prefix := token
+	if idx := strings.IndexByte(token, '_'); idx > 0 && idx < len(token)-1 {
+		prefix = token[:idx+1]
+	}
+	return "[REDACTED:" + prefix + "...]"
+}
+
+// redactSecrets replaces secret tokens in s with "[REDACTED:<prefix>...]" to prevent them from
+// leaking into logs. It redacts via fragments (10+ chars from exactCodes) and case-insensitive
+// regex patterns (secretTokenInBodyCI and apiKeyInBodyCI).
+func redactSecrets(s string, exactCodes ...string) string {
+	// First redact fragments for any specific codes passed (e.g., the code being sent).
+	// Fragment match: redact any substring of 10+ characters to catch truncated echoes.
+	// Work from longest to shortest to handle overlaps correctly.
+	// Note: the first iteration (length = len(code)) is the exact match.
+	for _, code := range exactCodes {
+		if code == "" {
+			continue
+		}
+		marker := redactMarker(code)
+		if len(code) >= 10 {
+			for length := len(code); length >= 10; length-- {
+				for start := 0; start+length <= len(code); start++ {
+					fragment := code[start : start+length]
+					s = strings.ReplaceAll(s, fragment, marker)
+				}
+			}
+		}
+	}
+
+	// Then redact any remaining tokens matching the patterns (case-insensitive via (?i) flag).
+	// We use secretTokenInBodyCI and apiKeyInBodyCI ({16,}/{8,}, no \b) to align with bodyPreview.
+	// The (?i) flag handles INV_/Inv_/etc without ToLower (which breaks byte offsets for İ, K).
+
+	// Redact secret tokens (inv_, eml_, pair_)
+	s = secretTokenInBodyCI.ReplaceAllStringFunc(s, redactMarker)
+
+	// Redact API keys (pl_)
+	s = apiKeyInBodyCI.ReplaceAllStringFunc(s, redactMarker)
+
+	return s
+}
+
 func (s *Server) internal(w http.ResponseWriter, err error) {
 	s.log.Error("internal error", "err", err)
 	writeErr(w, http.StatusInternalServerError, "internal error")
@@ -464,7 +509,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		msg := s.verificationEmail(id, notify, verifyURL)
 		ctx := r.Context()
 		if err := s.cfg.Mailer.Send(ctx, msg); err != nil {
-			s.log.Error("verification email failed", "peer", id, "err", err)
+			s.log.Error("verification email failed", "peer", id, "err", redactSecrets(err.Error(), rawToken))
 			// Continue - verification can be resent
 		} else {
 			s.log.Info("verification email sent", "peer", id)
@@ -591,7 +636,7 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
 		// Detach from client cancellation
 		ctx := r.Context()
 		if err := s.cfg.Mailer.Send(ctx, msg); err != nil {
-			s.log.Error("verification email failed", "peer", me, "err", err)
+			s.log.Error("verification email failed", "peer", me, "err", redactSecrets(err.Error(), rawToken))
 			// Continue - verification can be resent
 		} else {
 			s.log.Info("verification email sent", "peer", me)
@@ -828,7 +873,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		m := inviteEmail(s.inviterName(r.Context(), me), me, to, code, s.publicBase(r), sc, bg, exp)
 		// Detach from client cancellation; the SMTP sender has its own timeout.
 		if err := s.cfg.Mailer.Send(r.Context(), m); err != nil {
-			s.log.Error("invite email failed", "inviter", me, "err", err)
+			s.log.Error("invite email failed", "inviter", me, "err", redactSecrets(err.Error(), code))
 			status = "failed"
 		} else {
 			s.log.Info("invite email", "inviter", me, "status", status)
@@ -1430,6 +1475,10 @@ var apiKeyInBody = regexp.MustCompile(regexp.QuoteMeta(auth.KeyPrefix) + `[A-Za-
 // Uses {16,} to handle generator changes; greedy match captures the whole token.
 var secretTokenInBody = regexp.MustCompile(`(?:` + regexp.QuoteMeta(auth.InvitePrefix) + `|` + regexp.QuoteMeta(auth.PairingPrefix) + `|` + regexp.QuoteMeta(auth.EmailVerifyPrefix) + `)[A-Za-z0-9_-]{16,}`)
 
+// Case-insensitive versions for redactSecrets, to catch INV_/Inv_/etc without ToLower byte-length issues.
+var secretTokenInBodyCI = regexp.MustCompile("(?i)" + secretTokenInBody.String())
+var apiKeyInBodyCI = regexp.MustCompile("(?i)" + apiKeyInBody.String())
+
 const notifyPreviewMax = 200
 
 func (s *Server) notifyNewMessage(ctx context.Context, m *store.Message) {
@@ -1462,7 +1511,7 @@ func (s *Server) notifyNewMessage(ctx context.Context, m *store.Message) {
 		status = "logged"
 	}
 	if err := s.cfg.Mailer.Send(ctx, s.notifyEmail(m, email)); err != nil {
-		s.log.Error("notify email failed", "recipient", m.To, "message_id", m.ID, "err", err)
+		s.log.Error("notify email failed", "recipient", m.To, "message_id", m.ID, "err", redactSecrets(err.Error()))
 		return
 	}
 	s.log.Info("notify email", "recipient", m.To, "message_id", m.ID, "status", status)
