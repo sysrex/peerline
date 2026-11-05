@@ -966,13 +966,9 @@ func TestDBPathRefusesTwoHopDanglingSymlinkUnsafeIntermediate(t *testing.T) {
 func TestDBPathRefusesSymlinkLoopExceedingHopCap(t *testing.T) {
 	dir := t.TempDir()
 
-	// Lower the cap for testing so we hit our limit before kernel ELOOP
-	oldMaxHops := symlinkMaxHops
-	symlinkMaxHops = 3
-	t.Cleanup(func() { symlinkMaxHops = oldMaxHops })
-
 	// Create a chain of 4 symlinks (exceeds cap of 3) with safe intermediate directories
 	const chainLength = 4
+	const capForTest = 3
 	paths := make([]string, chainLength+1)
 	paths[0] = filepath.Join(dir, "link0.db")
 
@@ -992,17 +988,15 @@ func TestDBPathRefusesSymlinkLoopExceedingHopCap(t *testing.T) {
 		}
 	}
 
-	// Open should fail with our custom "exceeds maximum depth" error
-	_, err := Open(paths[0])
+	// checkDatabasePathWithCap should fail with our custom "exceeds maximum depth" error
+	err := checkDatabasePathWithCap(paths[0], capForTest)
 	if err == nil {
-		t.Fatal("Open should fail with symlink chain exceeding maximum depth")
+		t.Fatal("checkDatabasePathWithCap should fail with symlink chain exceeding maximum depth")
 	}
 	errMsg := err.Error()
-	if !strings.Contains(errMsg, "exceeds maximum depth") {
-		t.Errorf("error should mention exceeds maximum depth, got: %v", err)
-	}
-	if !strings.Contains(errMsg, "3") {
-		t.Errorf("error should mention the cap of 3, got: %v", err)
+	expectedMsg := fmt.Sprintf("exceeds maximum depth of %d", capForTest)
+	if !strings.Contains(errMsg, expectedMsg) {
+		t.Errorf("error should contain %q, got: %v", expectedMsg, err)
 	}
 	// Must NOT accept kernel ELOOP
 	if strings.Contains(errMsg, "too many levels of symbolic links") {

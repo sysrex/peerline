@@ -143,9 +143,9 @@ func TestDBFilePath(t *testing.T) {
 			wantMem:  false,
 		},
 		{
-			name:    "file URI with fragment refused",
-			dsn:     "file:/tmp/test.db#section",
-			wantErr: true,
+			name:            "file URI with fragment refused",
+			dsn:             "file:/tmp/test.db#section",
+			wantErr:         true,
 			wantErrContains: "%23",
 		},
 		{

@@ -31,10 +31,6 @@ var ErrTooManyInvites = errors.New("too many outstanding invites")
 var ErrBagLimitExceeded = errors.New("bag limit exceeded")
 var ErrStorageQuotaExceeded = errors.New("storage quota exceeded")
 
-// symlinkMaxHops is the maximum symlink chain depth for dangling symlinks.
-// Lowered by tests to deterministically exercise the cap before hitting kernel ELOOP.
-var symlinkMaxHops = 40
-
 // ErrSchemaTooNew is returned when the database schema version is newer than this binary supports.
 type ErrSchemaTooNew struct {
 	Have int
@@ -322,6 +318,11 @@ func dbFilePath(dsn string) (path string, isMemory bool, err error) {
 // ":memory:" and SQLite URI paths are skipped.
 // A missing path is acceptable (will be created).
 func checkDatabasePath(dsn string) error {
+	return checkDatabasePathWithCap(dsn, 40)
+}
+
+// checkDatabasePathWithCap is like checkDatabasePath but allows tests to override the symlink hop cap.
+func checkDatabasePathWithCap(dsn string, maxHops int) error {
 	// Parse the DSN to get the actual file path
 	path, isMemory, err := dbFilePath(dsn)
 	if err != nil {
@@ -354,10 +355,8 @@ func checkDatabasePath(dsn string) error {
 		targetInfo, statErr := os.Stat(path)
 		if statErr != nil {
 			if os.IsNotExist(statErr) {
-				// Dangling symlink: resolve the full chain (up to 40 hops) and check
+				// Dangling symlink: resolve the full chain (up to maxHops) and check
 				// every directory crossed for group/world-writable permissions.
-				maxHops := symlinkMaxHops
-
 				currentPath := path
 				resolved := false
 				for hop := 0; hop < maxHops; hop++ {

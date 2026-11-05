@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"net/url"
 	"os"
@@ -424,6 +425,7 @@ func TestTxlockImmediate(t *testing.T) {
 		t.Fatalf("open dbA failed: %v", err)
 	}
 	defer dbA.Close()
+	dbA.SetMaxOpenConns(1)
 
 	// Create schema
 	if _, err := dbA.Exec("CREATE TABLE test (id INTEGER)"); err != nil {
@@ -437,32 +439,29 @@ func TestTxlockImmediate(t *testing.T) {
 	}
 	defer txA.Rollback()
 
-	// Open connection B with low busy_timeout to detect blocking
-	dsnB := dbPath + "?_pragma=busy_timeout(100)"
+	// Make A actually hold the lock by writing (BEGIN IMMEDIATE takes RESERVED, but verify)
+	if _, err := txA.Exec("INSERT INTO test VALUES (1)"); err != nil {
+		t.Fatalf("write on A failed: %v", err)
+	}
+
+	// Open connection B with _txlock=immediate and low busy_timeout for fast failure
+	dsnB := dbPath + "?_txlock=immediate&_pragma=busy_timeout(100)&_pragma=foreign_keys(1)"
 	dbB, err := sql.Open("sqlite", dsnB)
 	if err != nil {
 		t.Fatalf("open dbB failed: %v", err)
 	}
 	defer dbB.Close()
+	dbB.SetMaxOpenConns(1)
 
-	// Attempt to begin on B should fail or block because A holds RESERVED lock
-	// Without _txlock=immediate, BEGIN would succeed and the first write would block
-	txB, err := dbB.Begin()
-	if err != nil {
-		// Expected: BEGIN failed because A holds RESERVED lock
-		if !strings.Contains(err.Error(), "database is locked") {
-			t.Errorf("expected 'database is locked' error, got: %v", err)
-		}
-		return
-	}
-	defer txB.Rollback()
-
-	// If BEGIN succeeded, try to write on B (should fail immediately)
-	_, err = txB.Exec("INSERT INTO test VALUES (1)")
+	// BeginTx on B must fail at BEGIN with 'database is locked'
+	// Without _txlock=immediate, BEGIN would succeed and only the first write would block
+	ctx := context.Background()
+	txB, err := dbB.BeginTx(ctx, nil)
 	if err == nil {
-		t.Fatal("write on B should have failed while A holds transaction")
+		txB.Rollback()
+		t.Fatal("BEGIN on B should have failed because A holds RESERVED lock (with _txlock=immediate)")
 	}
 	if !strings.Contains(err.Error(), "database is locked") {
-		t.Errorf("expected 'database is locked' error on write, got: %v", err)
+		t.Errorf("expected 'database is locked' error at BEGIN, got: %v", err)
 	}
 }
