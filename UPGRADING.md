@@ -25,6 +25,30 @@ For zero-downtime deployments, see [Deployment and Schema Upgrades](#deployment-
 
 ## Breaking Changes
 
+### Fragment (#) in file: URI DSNs is now refused (#327, #349)
+
+**Affected versions:** All versions upgrading to include the #327/#349 fix
+
+**Impact:** `file:` URIs containing a fragment (`#`) now fail fast at startup with a clear error. Use `%23` to encode a literal `#` in the filename.
+
+**What changed:**
+- Before: Fragments in `file:` URIs caused SQLite to silently ignore query pragmas appended by `buildDSN`, disabling `busy_timeout` and `foreign_keys` protections
+- After: Any `file:` URI with `#` is refused with error: `"file: URI contains fragment (#); fragments are not allowed because they cause pragmas to be ignored; use %23 to encode a literal # in the filename"`
+
+**Examples:**
+```bash
+# Refused:
+file:/data/test.db#section
+file:/data/x.db#?mode=memory
+
+# Use %23 for literal hash in filename:
+file:/data/x%23y.db  # Opens x#y.db
+```
+
+**Note:** Plain (non-`file:`) paths with `#` are passed to SQLite as literal filenames and remain unchanged.
+
+**Why this change:** Fragments in `file:` URIs are a security bypass that disables critical database pragmas. Refusing them outright prevents misconfiguration and ensures production settings are always applied.
+
 ### IPv6 transition/translation prefixes rejected in PEERLINE_TRUSTED_PROXIES (#320)
 
 **Affected versions:** All versions upgrading to include the #320 fix

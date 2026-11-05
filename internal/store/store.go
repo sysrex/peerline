@@ -225,27 +225,23 @@ func dbFilePath(dsn string) (path string, isMemory bool, err error) {
 			return "", true, nil
 		}
 
-		// In URI syntax, fragment (#) precedes query (?) in the parse order.
-		// If '#' appears before '?', everything after '#' is fragment (including any '?').
-		// Cut at '#' first, then extract query from what remains.
-		fragmentStart := strings.IndexRune(uriPath, '#')
+		// Refuse fragments in file: URIs
+		// Fragments cause buildDSN's appended pragmas to be silently ignored by SQLite,
+		// breaking production configurations. Use %23 to encode a literal # in the filename.
+		if strings.ContainsRune(uriPath, '#') {
+			return "", false, fmt.Errorf("file: URI contains fragment (#); fragments are not allowed because they cause pragmas to be ignored; use %%23 to encode a literal # in the filename")
+		}
+
+		// Extract query string
 		uriQueryStart := strings.IndexRune(uriPath, '?')
 
-		// Determine the actual path part (before any query or fragment)
+		// Determine the actual path part (before any query)
 		pathPart := uriPath
 		var query string
 
-		if fragmentStart >= 0 && (uriQueryStart < 0 || fragmentStart < uriQueryStart) {
-			// Fragment comes first (or no query): cut at fragment
-			pathPart = uriPath[:fragmentStart]
-			// No query to parse (anything after # is fragment)
-		} else if uriQueryStart >= 0 {
-			// Query comes first: extract it
-			end := len(uriPath)
-			if fragmentStart >= 0 && fragmentStart > uriQueryStart {
-				end = fragmentStart
-			}
-			query = uriPath[uriQueryStart+1 : end]
+		if uriQueryStart >= 0 {
+			// Extract query
+			query = uriPath[uriQueryStart+1:]
 			pathPart = uriPath[:uriQueryStart]
 		}
 
@@ -359,6 +355,7 @@ func checkDatabasePath(dsn string) error {
 				const maxHops = 40
 
 				currentPath := path
+				resolved := false
 				for hop := 0; hop < maxHops; hop++ {
 					// Check the current link's parent directory
 					linkDir := filepath.Dir(currentPath)
@@ -401,8 +398,8 @@ func checkDatabasePath(dsn string) error {
 								return fmt.Errorf("database symlink %s is dangling and target's parent directory is group- or world-writable", filepath.Base(path))
 							}
 
-							// Dangling symlink with all safe directories is OK
-							return nil
+						// Dangling symlink with all safe directories is OK
+						return nil
 						}
 						return pathless(targetStatErr)
 					}
@@ -417,13 +414,14 @@ func checkDatabasePath(dsn string) error {
 					// Target exists and is not a symlink: we've reached the end
 					// This means it's not actually dangling; fall through to regular check
 					info = targetInfo
+					resolved = true
 					break
 				}
 
-				// If we exhausted maxHops, the chain is too long
-				if hop := maxHops; hop >= maxHops {
-					return fmt.Errorf("database symlink %s chain exceeds maximum depth of %d", filepath.Base(path), maxHops)
-				}
+			// If we exhausted maxHops without resolving, the chain is too long
+			if !resolved {
+				return fmt.Errorf("database symlink %s chain exceeds maximum depth of %d", filepath.Base(path), maxHops)
+			}
 			} else {
 				return pathless(statErr)
 			}

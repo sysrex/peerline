@@ -12,6 +12,7 @@ func TestDBFilePath(t *testing.T) {
 		dsn      string
 		wantPath string
 		wantMem  bool
+		wantErr  bool
 	}{
 		{
 			name:     "plain memory",
@@ -140,16 +141,14 @@ func TestDBFilePath(t *testing.T) {
 			wantMem:  false,
 		},
 		{
-			name:     "file URI with fragment",
-			dsn:      "file:/tmp/test.db#section",
-			wantPath: "/tmp/test.db",
-			wantMem:  false,
+			name:    "file URI with fragment refused",
+			dsn:     "file:/tmp/test.db#section",
+			wantErr: true,
 		},
 		{
-			name:     "file URI with query and fragment",
-			dsn:      "file:/tmp/test.db?mode=ro#section",
-			wantPath: "/tmp/test.db",
-			wantMem:  false,
+			name:    "file URI with query and fragment refused",
+			dsn:     "file:/tmp/test.db?mode=ro#section",
+			wantErr: true,
 		},
 		{
 			name:     "file://localhost/path",
@@ -164,15 +163,14 @@ func TestDBFilePath(t *testing.T) {
 			wantMem:  false,
 		},
 		{
-			name:     "file URI with # before ? treats as fragment NOT memory",
-			dsn:      "file:/data/x.db#?mode=memory",
-			wantPath: "/data/x.db",
-			wantMem:  false,
+			name:    "file URI with # before ? refused",
+			dsn:     "file:/data/x.db#?mode=memory",
+			wantErr: true,
 		},
 		{
-			name:     "file URI with # before ? keeps only path",
-			dsn:      "file:/data/x.db#f?a=1",
-			wantPath: "/data/x.db",
+			name:     "file URI with %23 literal hash in filename",
+			dsn:      "file:x%23y.db",
+			wantPath: "x#y.db",
 			wantMem:  false,
 		},
 		{
@@ -186,6 +184,12 @@ func TestDBFilePath(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			gotPath, gotMem, err := dbFilePath(tt.dsn)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("dbFilePath(%q) expected error but got nil", tt.dsn)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("dbFilePath(%q) error: %v", tt.dsn, err)
 			}
