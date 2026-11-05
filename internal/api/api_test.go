@@ -244,6 +244,171 @@ func extractVerifyToken(body string) string {
 	return body[tokenStart : tokenStart+tokenEnd]
 }
 
+func TestRedactSecrets(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		exactCodes []string
+		want       string
+	}{
+		{
+			name:  "single invite code",
+			input: "error sending message: inv_" + strings.Repeat("a", 32),
+			want:  "error sending message: [REDACTED:inv_...]",
+		},
+		{
+			name:  "multiple invite codes",
+			input: "failed: inv_" + strings.Repeat("a", 32) + " and inv_" + strings.Repeat("b", 32) + " and inv_" + strings.Repeat("c", 32),
+			want:  "failed: [REDACTED:inv_...] and [REDACTED:inv_...] and [REDACTED:inv_...]",
+		},
+		{
+			name:  "email verification token",
+			input: "smtp error: eml_" + strings.Repeat("v", 32),
+			want:  "smtp error: [REDACTED:eml_...]",
+		},
+		{
+			name:  "pairing token",
+			input: "relay error echoed: pair_" + strings.Repeat("p", 32),
+			want:  "relay error echoed: [REDACTED:pair_...]",
+		},
+		{
+			name:  "mixed tokens",
+			input: "body contains inv_" + strings.Repeat("a", 32) + " and eml_" + strings.Repeat("b", 32) + " and pair_" + strings.Repeat("c", 32),
+			want:  "body contains [REDACTED:inv_...] and [REDACTED:eml_...] and [REDACTED:pair_...]",
+		},
+		{
+			name:  "code at start",
+			input: "inv_" + strings.Repeat("s", 32) + " rest of message",
+			want:  "[REDACTED:inv_...] rest of message",
+		},
+		{
+			name:  "code at end",
+			input: "message ends with inv_" + strings.Repeat("e", 32),
+			want:  "message ends with [REDACTED:inv_...]",
+		},
+		{
+			name:  "no code",
+			input: "normal error message without tokens",
+			want:  "normal error message without tokens",
+		},
+		{
+			name:  "non-invite token preserved (too short)",
+			input: "error: inv_x (too short to match)",
+			want:  "error: inv_x (too short to match)",
+		},
+		{
+			name:       "exact code match with exactCodes",
+			input:      "failed to send: the code is inv_" + strings.Repeat("x", 32),
+			exactCodes: []string{"inv_" + strings.Repeat("x", 32)},
+			want:       "failed to send: the code is [REDACTED:inv_...]",
+		},
+		{
+			name:       "exact code replaced before regex",
+			input:      "message body: inv_" + strings.Repeat("y", 32) + " was sent",
+			exactCodes: []string{"inv_" + strings.Repeat("y", 32)},
+			want:       "message body: [REDACTED:inv_...] was sent",
+		},
+		{
+			name:       "multiple exact codes",
+			input:      "codes: inv_" + strings.Repeat("c", 32) + " and eml_" + strings.Repeat("d", 32),
+			exactCodes: []string{"inv_" + strings.Repeat("c", 32), "eml_" + strings.Repeat("d", 32)},
+			want:       "codes: [REDACTED:inv_...] and [REDACTED:eml_...]",
+		},
+		{
+			name:       "empty exactCodes",
+			input:      "error: inv_" + strings.Repeat("t", 32),
+			exactCodes: []string{""},
+			want:       "error: [REDACTED:inv_...]",
+		},
+		{
+			name:  "real-world mailer error",
+			input: "mailer error: failed to send message with body: Alice invited you. Code: inv_" + strings.Repeat("r", 32) + ". Accept at /v1/invites/accept",
+			want:  "mailer error: failed to send message with body: Alice invited you. Code: [REDACTED:inv_...]. Accept at /v1/invites/accept",
+		},
+		{
+			name:  "smtp reply with embedded token",
+			input: "550 5.7.1 Message rejected: inv_" + strings.Repeat("x", 32),
+			want:  "550 5.7.1 Message rejected: [REDACTED:inv_...]",
+		},
+		{
+			name:  "short token not redacted (15 chars after prefix)",
+			input: "error in pair_programming session",
+			want:  "error in pair_programming session",
+		},
+		{
+			name:  "token with 16-31 chars now redacted",
+			input: "relay error: pair_" + strings.Repeat("a", 16),
+			want:  "relay error: [REDACTED:pair_...]",
+		},
+		{
+			name:       "boundary check: token without word boundary",
+			input:      "error:xinv_" + strings.Repeat("a", 32) + " should be caught by exact match",
+			exactCodes: []string{"inv_" + strings.Repeat("a", 32)},
+			want:       "error:x[REDACTED:inv_...] should be caught by exact match",
+		},
+		{
+			name:       "truncated code (10+ char fragment)",
+			input:      "smtp 550 rejected: " + strings.Repeat("a", 32)[:15],
+			exactCodes: []string{"inv_" + strings.Repeat("a", 32)},
+			want:       "smtp 550 rejected: [REDACTED:inv_...]",
+		},
+		{
+			name:  "case-insensitive with İ (U+0130, 2 bytes)",
+			input: "İ inv_" + strings.Repeat("Q", 32),
+			want:  "İ [REDACTED:inv_...]",
+		},
+		{
+			name:  "case-insensitive with K (U+212A Kelvin, 3 bytes)",
+			input: "K inv_" + strings.Repeat("R", 32),
+			want:  "K [REDACTED:inv_...]",
+		},
+		{
+			name:  "multiple İ and K before token",
+			input: "İİKK inv_" + strings.Repeat("S", 32) + " end",
+			want:  "İİKK [REDACTED:inv_...] end",
+		},
+		{
+			name:  "case-changed prefix (INV_)",
+			input: "Error: INV_" + strings.Repeat("c", 32),
+			want:  "Error: [REDACTED:INV_...]",
+		},
+		{
+			name:  "case-changed body (Inv_)",
+			input: "failed: Inv_" + strings.Repeat("D", 32),
+			want:  "failed: [REDACTED:Inv_...]",
+		},
+		{
+			name:  "API key pl_ redacted",
+			input: "key leak: pl_" + strings.Repeat("k", 32),
+			want:  "key leak: [REDACTED:pl_...]",
+		},
+		{
+			name:       "negative: fragment shorter than 10 chars",
+			input:      "error: " + strings.Repeat("a", 9),
+			exactCodes: []string{"inv_" + strings.Repeat("a", 32)},
+			want:       "error: " + strings.Repeat("a", 9),
+		},
+		{
+			name:  "negative: unrelated long identifier",
+			input: "error in long_identifier_" + strings.Repeat("x", 20),
+			want:  "error in long_identifier_" + strings.Repeat("x", 20),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := redactSecrets(tt.input, tt.exactCodes...)
+			if got != tt.want {
+				t.Errorf("redactSecrets() =\n%q\nwant\n%q", got, tt.want)
+			}
+			// Verify output is valid UTF-8 (catches byte-offset bugs with İ, K)
+			if !utf8.ValidString(got) {
+				t.Error("redactSecrets() output is invalid UTF-8")
+			}
+		})
+	}
+}
+
 func TestAuthRequired(t *testing.T) {
 	srv := newServer(t, Config{})
 	c := &client{t: t, srv: srv}

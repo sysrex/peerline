@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -69,6 +71,21 @@ func (c *captureAndLog) Send(ctx context.Context, m mailer.Message) error {
 		return err
 	}
 	return c.log.Send(ctx, m)
+}
+
+// captureAndEcho wraps a capture mailer and also echoes via echoMailer for testing error redaction
+type captureAndEcho struct {
+	capture *captureMailer
+	echo    echoMailer
+}
+
+func (c *captureAndEcho) Mode() string { return "smtp" }
+
+func (c *captureAndEcho) Send(ctx context.Context, m mailer.Message) error {
+	if err := c.capture.Send(ctx, m); err != nil {
+		return err
+	}
+	return c.echo.Send(ctx, m)
 }
 
 // Dev mode: no SMTP configured -> email is logged, invite still created and usable.
@@ -297,4 +314,387 @@ func TestInviteEmailDirect(t *testing.T) {
 			}
 		})
 	}
+}
+
+// echoMailer is a mailer whose Send error embeds the full message body,
+// simulating a custom mailer or relay that echoes DATA back in the error.
+type echoMailer struct{}
+
+func (echoMailer) Mode() string { return "smtp" }
+func (echoMailer) Send(_ context.Context, m mailer.Message) error {
+	return errors.New("mailer error: failed to send message with body: " + m.Body)
+}
+
+// echoMailerWithSecret is a mailer whose error embeds a secret that bodyPreview doesn't strip.
+type echoMailerWithSecret struct {
+	secret string
+}
+
+func (e echoMailerWithSecret) Mode() string { return "smtp" }
+func (e echoMailerWithSecret) Send(_ context.Context, m mailer.Message) error {
+	return errors.New("mailer error: failed to send. quoted: " + e.secret)
+}
+
+// TestMailerErrorRedaction verifies that when a Mailer.Send error embeds the message body
+// (including an invite code), the logged error is redacted and no invite code leaks into logs.
+// This is a defense-in-depth measure for issue #353.
+func TestMailerErrorRedaction(t *testing.T) {
+	testBothHandlers := func(t *testing.T, name string, newHandler func(*syncBuf) slog.Handler) {
+		t.Run(name, func(t *testing.T) {
+			var logs syncBuf
+			logger := slog.New(newHandler(&logs))
+			srv := newServer(t, Config{Logger: logger, Mailer: echoMailer{}})
+			a := register(t, srv, "alice")
+
+			// Create an invite with to_email, triggering the email send path
+			resp, body := a.do("POST", "/v1/invites", map[string]any{
+				"scopes":   []string{"messages"},
+				"to_email": "test@example.com",
+			}, nil)
+			want(t, resp, body, 201)
+
+			var inv inviteResp
+			if err := json.Unmarshal(body, &inv); err != nil || inv.Code == "" {
+				t.Fatalf("invite response: %v %s", err, body)
+			}
+			if inv.Email["status"] != "failed" {
+				t.Errorf("email status = %q, want failed", inv.Email["status"])
+			}
+
+			// The invite code is created and returned, but should never appear in logs
+			logStr := logs.String()
+
+			// Assert logs were captured
+			if logStr == "" {
+				t.Fatal("no logs captured (logging not wired)")
+			}
+
+			// Assert "invite email failed" log line is present
+			if !strings.Contains(logStr, "invite email failed") {
+				t.Error("logs should contain 'invite email failed' line")
+			}
+
+			// Assert the redaction marker is present
+			if !strings.Contains(logStr, "[REDACTED:inv_") {
+				t.Error("logs should contain redaction marker '[REDACTED:inv_'")
+			}
+
+			// Assert no invite code reaches logs (exact substring check)
+			if strings.Contains(logStr, inv.Code) {
+				t.Errorf("invite code leaked in logs (exact match, len=%d)", len(inv.Code))
+			}
+
+			// Assert no invite code reaches logs (prefix check)
+			if len(inv.Code) >= 10 && strings.Contains(logStr, inv.Code[:10]) {
+				t.Errorf("invite code prefix leaked in logs (len=%d)", len(inv.Code))
+			}
+
+			// Assert no invite code reaches logs (suffix check)
+			if len(inv.Code) >= 10 && strings.Contains(logStr, inv.Code[len(inv.Code)-10:]) {
+				t.Errorf("invite code suffix leaked in logs (len=%d)", len(inv.Code))
+			}
+
+			// Assert no invite code reaches logs (middle check: 10-char windows)
+			if len(inv.Code) >= 10 {
+				for k := 1; k+10 <= len(inv.Code); k++ {
+					fragment := inv.Code[k : k+10]
+					if strings.Contains(logStr, fragment) {
+						t.Errorf("invite code middle fragment leaked in logs (pos=%d, len=10)", k)
+						break
+					}
+				}
+			}
+
+			// Assert no unredacted inv_ pattern with proper length appears in logs
+			invCodeRegex := regexp.MustCompile(`inv_[A-Za-z0-9_-]{32,}`)
+			if invCodeRegex.MatchString(logStr) {
+				t.Error("logs contain unredacted inv_ token matching real token pattern")
+			}
+		})
+	}
+
+	testBothHandlers(t, "JSONHandler", func(buf *syncBuf) slog.Handler {
+		return slog.NewJSONHandler(buf, nil)
+	})
+	testBothHandlers(t, "TextHandler", func(buf *syncBuf) slog.Handler {
+		return slog.NewTextHandler(buf, nil)
+	})
+}
+
+// TestVerificationEmailErrorRedaction verifies that when verification emails fail to send
+// and the error embeds the eml_ token, logs are redacted (registration path).
+func TestVerificationEmailErrorRedaction(t *testing.T) {
+	testBothHandlers := func(t *testing.T, name string, newHandler func(*syncBuf) slog.Handler) {
+		t.Run(name, func(t *testing.T) {
+			var logs syncBuf
+			logger := slog.New(newHandler(&logs))
+			capture := &captureMailer{}
+			srv := newServer(t, Config{Logger: logger, Mailer: &captureAndEcho{
+				capture: capture,
+				echo:    echoMailer{},
+			}})
+
+			// Register with notify_email triggers verification email send
+			resp, err := http.Post(
+				srv.URL+"/v1/register",
+				"application/json",
+				strings.NewReader(`{"name":"alice","notify_email":"alice@example.com"}`),
+			)
+			if err != nil {
+				t.Fatalf("http.Post error: %v", err)
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != 201 {
+				t.Fatalf("register failed: %d %s", resp.StatusCode, body)
+			}
+
+			// Extract the real token from the captured email
+			msgs := capture.messages()
+			if len(msgs) != 1 {
+				t.Fatalf("expected 1 email, got %d", len(msgs))
+			}
+			token := extractVerifyToken(msgs[0].Body)
+			if token == "" || !strings.HasPrefix(token, "eml_") {
+				t.Fatalf("could not extract eml_ token from email body")
+			}
+
+			logStr := logs.String()
+
+			// Assert logs were captured
+			if logStr == "" {
+				t.Fatal("no logs captured (logging not wired)")
+			}
+
+			// Assert "verification email failed" log line is present
+			if !strings.Contains(logStr, "verification email failed") {
+				t.Error("logs should contain 'verification email failed' line")
+			}
+
+			// Assert the redaction marker is present
+			if !strings.Contains(logStr, "[REDACTED:eml_") {
+				t.Error("logs should contain redaction marker '[REDACTED:eml_'")
+			}
+
+			// Assert no eml_ token reaches logs (exact substring check)
+			if strings.Contains(logStr, token) {
+				t.Errorf("eml_ token leaked in logs (exact match, len=%d)", len(token))
+			}
+
+			// Assert no eml_ token reaches logs (fragment check: 10+ chars)
+			if len(token) >= 10 {
+				for i := 10; i <= len(token); i++ {
+					fragment := token[:i]
+					if strings.Contains(logStr, fragment) {
+						t.Errorf("eml_ token fragment leaked in logs (prefix len=%d)", i)
+						break
+					}
+				}
+			}
+
+			// Assert no unredacted eml_ token with proper length appears in logs
+			emlTokenRegex := regexp.MustCompile(`(?i)eml_[A-Za-z0-9_-]{16,}`)
+			if emlTokenRegex.MatchString(logStr) {
+				t.Error("logs contain unredacted eml_ token matching real token pattern")
+			}
+		})
+	}
+
+	testBothHandlers(t, "JSONHandler", func(buf *syncBuf) slog.Handler {
+		return slog.NewJSONHandler(buf, nil)
+	})
+	testBothHandlers(t, "TextHandler", func(buf *syncBuf) slog.Handler {
+		return slog.NewTextHandler(buf, nil)
+	})
+}
+
+// TestVerificationEmailUpdateErrorRedaction verifies that when verification emails fail
+// during PUT /v1/me notify_email updates, logs are redacted.
+func TestVerificationEmailUpdateErrorRedaction(t *testing.T) {
+	testBothHandlers := func(t *testing.T, name string, newHandler func(*syncBuf) slog.Handler) {
+		t.Run(name, func(t *testing.T) {
+			var logs syncBuf
+			logger := slog.New(newHandler(&logs))
+			capture := &captureMailer{}
+			srv := newServer(t, Config{Logger: logger, Mailer: &captureAndEcho{
+				capture: capture,
+				echo:    echoMailer{},
+			}})
+			a := register(t, srv, "alice")
+
+			// Update notify_email triggers verification email send
+			resp, body := a.do("PUT", "/v1/me", map[string]any{"notify_email": "alice@example.com"}, nil)
+			want(t, resp, body, 200)
+
+			// Extract the real token from the captured email
+			msgs := capture.messages()
+			if len(msgs) != 1 {
+				t.Fatalf("expected 1 email, got %d", len(msgs))
+			}
+			token := extractVerifyToken(msgs[0].Body)
+			if token == "" || !strings.HasPrefix(token, "eml_") {
+				t.Fatalf("could not extract eml_ token from email body")
+			}
+
+			logStr := logs.String()
+
+			// Assert logs were captured
+			if logStr == "" {
+				t.Fatal("no logs captured (logging not wired)")
+			}
+
+			// Assert "verification email failed" log line is present
+			if !strings.Contains(logStr, "verification email failed") {
+				t.Error("logs should contain 'verification email failed' line")
+			}
+
+			// Assert the redaction marker is present
+			if !strings.Contains(logStr, "[REDACTED:eml_") {
+				t.Error("logs should contain redaction marker '[REDACTED:eml_'")
+			}
+
+			// Assert no eml_ token reaches logs (exact substring check)
+			if strings.Contains(logStr, token) {
+				t.Errorf("eml_ token leaked in logs (exact match, len=%d)", len(token))
+			}
+
+			// Assert no eml_ token reaches logs (fragment check: 10+ chars, prefix/suffix/middle)
+			if len(token) >= 10 {
+				// Check prefix fragments
+				for i := 10; i <= len(token); i++ {
+					fragment := token[:i]
+					if strings.Contains(logStr, fragment) {
+						t.Errorf("eml_ token prefix fragment leaked (len=%d)", i)
+						break
+					}
+				}
+				// Check suffix fragments
+				for i := 10; i <= len(token); i++ {
+					fragment := token[len(token)-i:]
+					if strings.Contains(logStr, fragment) {
+						t.Errorf("eml_ token suffix fragment leaked (len=%d)", i)
+						break
+					}
+				}
+				// Check middle fragments (10-char windows at every position)
+				for k := 1; k+10 <= len(token); k++ {
+					fragment := token[k : k+10]
+					if strings.Contains(logStr, fragment) {
+						t.Errorf("eml_ token middle fragment leaked (pos=%d, len=10)", k)
+						break
+					}
+				}
+			}
+
+			// Assert no unredacted eml_ token with proper length appears in logs
+			emlTokenRegex := regexp.MustCompile(`(?i)eml_[A-Za-z0-9_-]{16,}`)
+			if emlTokenRegex.MatchString(logStr) {
+				t.Error("logs contain unredacted eml_ token matching real token pattern")
+			}
+		})
+	}
+
+	testBothHandlers(t, "JSONHandler", func(buf *syncBuf) slog.Handler {
+		return slog.NewJSONHandler(buf, nil)
+	})
+	testBothHandlers(t, "TextHandler", func(buf *syncBuf) slog.Handler {
+		return slog.NewTextHandler(buf, nil)
+	})
+}
+
+// TestNotifyEmailErrorRedaction verifies that when notify emails fail to send
+// and the error embeds a secret (that bodyPreview wouldn't strip), logs are redacted.
+func TestNotifyEmailErrorRedaction(t *testing.T) {
+	testBothHandlers := func(t *testing.T, name string, newHandler func(*syncBuf) slog.Handler) {
+		t.Run(name, func(t *testing.T) {
+			var logs syncBuf
+			logger := slog.New(newHandler(&logs))
+
+			// Generate secrets that the mailer will embed in its error
+			invSecret := "inv_" + strings.Repeat("X", 32)
+			plSecret := "pl_" + strings.Repeat("Y", 32)
+
+			hsrv, _, st, db := newServerWithDB(t, Config{
+				Logger: logger,
+				Mailer: echoMailerWithSecret{secret: invSecret + " and " + plSecret},
+			})
+			defer st.Close()
+			defer db.Close()
+
+			a := register(t, hsrv, "alice")
+			b := register(t, hsrv, "bob")
+
+			// Pair alice and bob
+			pairUp(t, a, b, []string{"messages"}, nil, []string{"messages"})
+
+			// Manually set bob's notify_email as verified
+			ctx := context.Background()
+			if err := st.SetNotifyEmail(ctx, b.id, "bob@example.com", ""); err != nil {
+				t.Fatalf("failed to set notify email: %v", err)
+			}
+			_, err := db.Exec("UPDATE peers SET notify_email_verified = 1 WHERE id = ?", b.id)
+			if err != nil {
+				t.Fatalf("failed to mark email as verified: %v", err)
+			}
+
+			logs.Reset()
+
+			// Alice sends a message to Bob (triggers notify)
+			resp, body := a.do("POST", "/v1/peers/"+b.id+"/messages", map[string]any{
+				"type": "note",
+				"body": "Test message",
+			}, nil)
+			want(t, resp, body, 201)
+
+			// Give notify goroutine time to run
+			time.Sleep(200 * time.Millisecond)
+
+			logStr := logs.String()
+
+			// Assert logs were captured
+			if logStr == "" {
+				t.Fatal("no logs captured (logging not wired)")
+			}
+
+			// Assert "notify email failed" log line is present
+			if !strings.Contains(logStr, "notify email failed") {
+				t.Error("logs should contain 'notify email failed' line")
+			}
+
+			// Assert the redaction markers are present
+			if !strings.Contains(logStr, "[REDACTED:inv_") {
+				t.Error("logs should contain redaction marker '[REDACTED:inv_'")
+			}
+			if !strings.Contains(logStr, "[REDACTED:pl_") {
+				t.Error("logs should contain redaction marker '[REDACTED:pl_'")
+			}
+
+			// Assert no inv_ secret reaches logs (exact match)
+			if strings.Contains(logStr, invSecret) {
+				t.Errorf("inv_ secret leaked in logs (exact match, len=%d)", len(invSecret))
+			}
+
+			// Assert no pl_ secret reaches logs (exact match)
+			if strings.Contains(logStr, plSecret) {
+				t.Errorf("pl_ secret leaked in logs (exact match, len=%d)", len(plSecret))
+			}
+
+			// Assert no unredacted patterns appear in logs
+			invTokenRegex := regexp.MustCompile(`(?i)inv_[A-Za-z0-9_-]{16,}`)
+			if invTokenRegex.MatchString(logStr) {
+				t.Error("logs contain unredacted inv_ token matching real token pattern")
+			}
+			plTokenRegex := regexp.MustCompile(`(?i)pl_[A-Za-z0-9_-]{8,}`)
+			if plTokenRegex.MatchString(logStr) {
+				t.Error("logs contain unredacted pl_ token matching real token pattern")
+			}
+		})
+	}
+
+	testBothHandlers(t, "JSONHandler", func(buf *syncBuf) slog.Handler {
+		return slog.NewJSONHandler(buf, nil)
+	})
+	testBothHandlers(t, "TextHandler", func(buf *syncBuf) slog.Handler {
+		return slog.NewTextHandler(buf, nil)
+	})
 }
