@@ -355,33 +355,123 @@ func TestMailerErrorRedaction(t *testing.T) {
 
 			// Assert no invite code reaches logs (exact substring check)
 			if strings.Contains(logStr, inv.Code) {
-				t.Errorf("invite code %s leaked in logs (exact match)", inv.Code)
+				t.Errorf("invite code leaked in logs (exact match, len=%d)", len(inv.Code))
 			}
 
 			// Assert no invite code reaches logs (prefix check)
 			if len(inv.Code) >= 10 && strings.Contains(logStr, inv.Code[:10]) {
-				t.Errorf("invite code prefix leaked in logs")
+				t.Errorf("invite code prefix leaked in logs (len=%d)", len(inv.Code))
 			}
 
 			// Assert no invite code reaches logs (suffix check)
 			if len(inv.Code) >= 10 && strings.Contains(logStr, inv.Code[len(inv.Code)-10:]) {
-				t.Errorf("invite code suffix leaked in logs")
+				t.Errorf("invite code suffix leaked in logs (len=%d)", len(inv.Code))
 			}
 
-			// Assert no invite code pattern leaks via regex
-			invCodeRegex := `inv_[A-Za-z0-9_-]{6,}`
-			// We expect the pattern to match the redaction marker, but not the real code
-			// Extract potential matches and verify they're all redacted
-			re := regexp.MustCompile(invCodeRegex)
-			matches := re.FindAllString(logStr, -1)
-			for _, match := range matches {
-				// If this looks like a real code (not a redaction marker), fail
-				if !strings.Contains(match, "[REDACTED") && match != inv.Code[:10] {
-					// Double-check it's not part of the actual code leaking
-					if strings.HasPrefix(inv.Code, match) || strings.HasSuffix(inv.Code, match) {
-						t.Errorf("invite code fragment leaked: %s", match[:4]+"...")
-					}
-				}
+			// Assert no unredacted inv_ pattern with proper length appears in logs
+			invCodeRegex := regexp.MustCompile(`inv_[A-Za-z0-9_-]{32,}`)
+			if invCodeRegex.MatchString(logStr) {
+				t.Error("logs contain unredacted inv_ token matching real token pattern")
+			}
+		})
+	}
+
+	testBothHandlers(t, "JSONHandler", func(buf *syncBuf) slog.Handler {
+		return slog.NewJSONHandler(buf, nil)
+	})
+	testBothHandlers(t, "TextHandler", func(buf *syncBuf) slog.Handler {
+		return slog.NewTextHandler(buf, nil)
+	})
+}
+
+// TestVerificationEmailErrorRedaction verifies that when verification emails fail to send
+// and the error embeds the eml_ token, logs are redacted (registration path).
+func TestVerificationEmailErrorRedaction(t *testing.T) {
+	testBothHandlers := func(t *testing.T, name string, newHandler func(*syncBuf) slog.Handler) {
+		t.Run(name, func(t *testing.T) {
+			var logs syncBuf
+			logger := slog.New(newHandler(&logs))
+			srv := newServer(t, Config{Logger: logger, Mailer: echoMailer{}})
+
+			// Register with notify_email triggers verification email send
+			resp, body := http.Post(
+				srv.URL+"/v1/register",
+				"application/json",
+				strings.NewReader(`{"name":"alice","notify_email":"alice@example.com"}`),
+			)
+			if resp.StatusCode != 201 {
+				t.Fatalf("register failed: %d %s", resp.StatusCode, body)
+			}
+			resp.Body.Close()
+
+			logStr := logs.String()
+
+			// Assert logs were captured
+			if logStr == "" {
+				t.Fatal("no logs captured (logging not wired)")
+			}
+
+			// Assert "verification email failed" log line is present
+			if !strings.Contains(logStr, "verification email failed") {
+				t.Error("logs should contain 'verification email failed' line")
+			}
+
+			// Assert the redaction marker is present
+			if !strings.Contains(logStr, "[REDACTED:eml_") {
+				t.Error("logs should contain redaction marker '[REDACTED:eml_'")
+			}
+
+			// Assert no unredacted eml_ token with proper length appears in logs
+			emlTokenRegex := regexp.MustCompile(`eml_[A-Za-z0-9_-]{32,}`)
+			if emlTokenRegex.MatchString(logStr) {
+				t.Error("logs contain unredacted eml_ token matching real token pattern")
+			}
+		})
+	}
+
+	testBothHandlers(t, "JSONHandler", func(buf *syncBuf) slog.Handler {
+		return slog.NewJSONHandler(buf, nil)
+	})
+	testBothHandlers(t, "TextHandler", func(buf *syncBuf) slog.Handler {
+		return slog.NewTextHandler(buf, nil)
+	})
+}
+
+// TestVerificationEmailUpdateErrorRedaction verifies that when verification emails fail
+// during PUT /v1/me notify_email updates, logs are redacted.
+func TestVerificationEmailUpdateErrorRedaction(t *testing.T) {
+	testBothHandlers := func(t *testing.T, name string, newHandler func(*syncBuf) slog.Handler) {
+		t.Run(name, func(t *testing.T) {
+			var logs syncBuf
+			logger := slog.New(newHandler(&logs))
+			srv := newServer(t, Config{Logger: logger, Mailer: echoMailer{}})
+			a := register(t, srv, "alice")
+
+			// Update notify_email triggers verification email send
+			resp, body := a.do("PUT", "/v1/me", map[string]any{"notify_email": "alice@example.com"}, nil)
+			want(t, resp, body, 200)
+
+			logStr := logs.String()
+
+			// Assert logs were captured
+			if logStr == "" {
+				t.Fatal("no logs captured (logging not wired)")
+			}
+
+			// Assert "verification email failed" log line is present
+			if !strings.Contains(logStr, "verification email failed") {
+				t.Error("logs should contain 'verification email failed' line")
+			}
+
+			// Assert the redaction marker is present
+			if !strings.Contains(logStr, "[REDACTED:eml_") {
+				t.Error("logs should contain redaction marker '[REDACTED:eml_'")
+			}
+
+			// Assert no unredacted eml_ token with proper length appears in logs
+			emlTokenRegex := regexp.MustCompile(`eml_[A-Za-z0-9_-]{32,}`)
+			if emlTokenRegex.MatchString(logStr) {
+				t.Error("logs contain unredacted eml_ token matching real token pattern")
 			}
 		})
 	}

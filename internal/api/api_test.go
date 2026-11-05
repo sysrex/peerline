@@ -253,37 +253,37 @@ func TestRedactSecrets(t *testing.T) {
 	}{
 		{
 			name:  "single invite code",
-			input: "error sending message: inv_abc123xyz",
+			input: "error sending message: inv_" + strings.Repeat("a", 32),
 			want:  "error sending message: [REDACTED:inv_...]",
 		},
 		{
 			name:  "multiple invite codes",
-			input: "failed: inv_code123 and inv_code456 and inv_code789xyz",
+			input: "failed: inv_" + strings.Repeat("a", 32) + " and inv_" + strings.Repeat("b", 32) + " and inv_" + strings.Repeat("c", 32),
 			want:  "failed: [REDACTED:inv_...] and [REDACTED:inv_...] and [REDACTED:inv_...]",
 		},
 		{
 			name:  "email verification token",
-			input: "smtp error: eml_verifytoken123",
+			input: "smtp error: eml_" + strings.Repeat("v", 32),
 			want:  "smtp error: [REDACTED:eml_...]",
 		},
 		{
 			name:  "pairing token",
-			input: "relay error echoed: pair_pairingtoken456",
+			input: "relay error echoed: pair_" + strings.Repeat("p", 32),
 			want:  "relay error echoed: [REDACTED:pair_...]",
 		},
 		{
 			name:  "mixed tokens",
-			input: "body contains inv_abc123 and eml_xyz789 and pair_def456",
+			input: "body contains inv_" + strings.Repeat("a", 32) + " and eml_" + strings.Repeat("b", 32) + " and pair_" + strings.Repeat("c", 32),
 			want:  "body contains [REDACTED:inv_...] and [REDACTED:eml_...] and [REDACTED:pair_...]",
 		},
 		{
 			name:  "code at start",
-			input: "inv_startcode rest of message",
+			input: "inv_" + strings.Repeat("s", 32) + " rest of message",
 			want:  "[REDACTED:inv_...] rest of message",
 		},
 		{
 			name:  "code at end",
-			input: "message ends with inv_endcode",
+			input: "message ends with inv_" + strings.Repeat("e", 32),
 			want:  "message ends with [REDACTED:inv_...]",
 		},
 		{
@@ -298,37 +298,48 @@ func TestRedactSecrets(t *testing.T) {
 		},
 		{
 			name:       "exact code match with exactCodes",
-			input:      "failed to send: the code is inv_exact123456",
-			exactCodes: []string{"inv_exact123456"},
+			input:      "failed to send: the code is inv_" + strings.Repeat("x", 32),
+			exactCodes: []string{"inv_" + strings.Repeat("x", 32)},
 			want:       "failed to send: the code is [REDACTED:inv_...]",
 		},
 		{
 			name:       "exact code replaced before regex",
-			input:      "message body: inv_exact123456 was sent",
-			exactCodes: []string{"inv_exact123456"},
+			input:      "message body: inv_" + strings.Repeat("y", 32) + " was sent",
+			exactCodes: []string{"inv_" + strings.Repeat("y", 32)},
 			want:       "message body: [REDACTED:inv_...] was sent",
 		},
 		{
 			name:       "multiple exact codes",
-			input:      "codes: inv_code1abc and eml_code2xyz",
-			exactCodes: []string{"inv_code1abc", "eml_code2xyz"},
+			input:      "codes: inv_" + strings.Repeat("c", 32) + " and eml_" + strings.Repeat("d", 32),
+			exactCodes: []string{"inv_" + strings.Repeat("c", 32), "eml_" + strings.Repeat("d", 32)},
 			want:       "codes: [REDACTED:inv_...] and [REDACTED:eml_...]",
 		},
 		{
 			name:       "empty exactCodes",
-			input:      "error: inv_testcode",
+			input:      "error: inv_" + strings.Repeat("t", 32),
 			exactCodes: []string{""},
 			want:       "error: [REDACTED:inv_...]",
 		},
 		{
 			name:  "real-world mailer error",
-			input: "mailer error: failed to send message with body: Alice invited you. Code: inv_realcode123. Accept at /v1/invites/accept",
+			input: "mailer error: failed to send message with body: Alice invited you. Code: inv_" + strings.Repeat("r", 32) + ". Accept at /v1/invites/accept",
 			want:  "mailer error: failed to send message with body: Alice invited you. Code: [REDACTED:inv_...]. Accept at /v1/invites/accept",
 		},
 		{
 			name:  "smtp reply with embedded token",
-			input: "550 5.7.1 Message rejected: inv_badcode789",
+			input: "550 5.7.1 Message rejected: inv_" + strings.Repeat("x", 32),
 			want:  "550 5.7.1 Message rejected: [REDACTED:inv_...]",
+		},
+		{
+			name:  "short token not redacted (pair_programming)",
+			input: "error in pair_programming session",
+			want:  "error in pair_programming session",
+		},
+		{
+			name:  "boundary check: token without word boundary",
+			input: "error:xinv_" + strings.Repeat("a", 32) + " should be caught by exact match",
+			exactCodes: []string{"inv_" + strings.Repeat("a", 32)},
+			want:  "error:x[REDACTED:inv_...] should be caught by exact match",
 		},
 	}
 
