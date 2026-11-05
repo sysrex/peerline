@@ -3411,7 +3411,7 @@ func TestSanitizerUnicode(t *testing.T) {
 		{"40 ക് + 70 ബ bounded", strings.Repeat("ക്", 40) + strings.Repeat("ബ", 70), strings.Repeat("ക്", 28)}, // 150 runes → 64 (32 ക് clusters) → backoff drops 4 clusters → 56 runes (28 clusters, bound hit, ends in virama)
 		{"Latin 70×a at cap", strings.Repeat("a", 70), strings.Repeat("a", 64)},                                // 70 runes → 64 runes (no virama, simple cap)
 		{"64 runes Deva क् at end", strings.Repeat("a", 62) + "क्", strings.Repeat("a", 62) + "क्"},            // Exactly 64 runes ending in virama → unchanged
-		{"65 runes Deva क् at 63", strings.Repeat("a", 63) + "क्", strings.Repeat("a", 63)},                    // 65 runes → 64 (virama at 64) → split-cluster check drops 1 cluster → 63 a (trailing virama removed)
+		{"65 runes Deva क् at 63", strings.Repeat("a", 63) + "क्", strings.Repeat("a", 63)},                    // 65 runes → 64 (क at 63, virama at 64) → split-cluster check drops क to avoid separating it from its virama → 63 a
 	}
 
 	for _, tt := range tests {

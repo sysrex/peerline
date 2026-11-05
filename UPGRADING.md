@@ -94,7 +94,7 @@ This prevents time-of-check-time-of-use vulnerabilities and silent grant overwri
 
 **Affected versions:** All versions upgrading to include the #332 fix
 
-**Impact:** Inviter names longer than 64 runes are truncated. When a name has a run of 32 or more consonant+virama clusters with no word boundary and is cut at the 64-rune cap (32 clusters = 64 runes), the output ends in a visible virama or half-form consonant instead of collapsing to the fallback "A Peerline peer". This happens because truncation back-off is bounded to exactly 4 clusters. The output is always a prefix of the full sanitized name and idempotent.
+**Impact:** Inviter names longer than 64 runes are truncated. When the 64-rune cut lands inside a boundary-free run of more than 4 consonant+virama clusters, truncation back-off is bounded to exactly 4 clusters, leaving at least one cluster from the run still in the output. The result ends in a visible virama or half-form consonant instead of collapsing to the fallback "A Peerline peer". Examples: the "6-virama stack at 64" test (54 a + स्त्र्य्म्न + bbb → 54 a + स्, a 6-cluster run reduced to 1 cluster) and the "40 Devanagari क् bounded" test (80 runes = 40 क् clusters → 56 runes = 28 क् clusters, a 40-cluster run reduced to 28 clusters). The output is always a prefix of the full sanitized name and idempotent.
 
 **What changed:**
 - Before: Long virama runs without word boundaries collapsed to the fallback "A Peerline peer"
