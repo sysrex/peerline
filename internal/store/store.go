@@ -212,11 +212,10 @@ func dbFilePath(dsn string) (path string, isMemory bool, err error) {
 		return "", true, nil
 	}
 
-	// Extract query string and fragment
+	// Extract query string position for plain file paths
 	queryStart := strings.IndexRune(dsn, '?')
-	fragmentStart := strings.IndexRune(dsn, '#')
 
-	// Handle file: URIs
+	// Handle file: URIs (prefix check is case-sensitive in modernc.org/sqlite v1.61.0)
 	if strings.HasPrefix(dsn, "file:") {
 		// Strip "file:" prefix
 		uriPath := dsn[5:]
@@ -226,16 +225,34 @@ func dbFilePath(dsn string) (path string, isMemory bool, err error) {
 			return "", true, nil
 		}
 
-		// Extract and check query for mode=memory (file: URIs only)
+		// In URI syntax, fragment (#) precedes query (?) in the parse order.
+		// If '#' appears before '?', everything after '#' is fragment (including any '?').
+		// Cut at '#' first, then extract query from what remains.
+		fragmentStart := strings.IndexRune(uriPath, '#')
+		uriQueryStart := strings.IndexRune(uriPath, '?')
+
+		// Determine the actual path part (before any query or fragment)
+		pathPart := uriPath
 		var query string
-		if queryStart >= 0 {
-			end := len(dsn)
-			if fragmentStart >= 0 && fragmentStart > queryStart {
+
+		if fragmentStart >= 0 && (uriQueryStart < 0 || fragmentStart < uriQueryStart) {
+			// Fragment comes first (or no query): cut at fragment
+			pathPart = uriPath[:fragmentStart]
+			// No query to parse (anything after # is fragment)
+		} else if uriQueryStart >= 0 {
+			// Query comes first: extract it
+			end := len(uriPath)
+			if fragmentStart >= 0 && fragmentStart > uriQueryStart {
 				end = fragmentStart
 			}
-			query = dsn[queryStart+1 : end]
+			query = uriPath[uriQueryStart+1 : end]
+			pathPart = uriPath[:uriQueryStart]
+		}
 
-			// Check for mode=memory: exact key match "mode", last value wins, case-insensitive value
+		// Check for mode=memory in query (file: URIs only)
+		if query != "" {
+			// Check for mode=memory: exact key match "mode", last value wins, case-sensitive value
+			// SQLite only accepts lowercase "memory" - uppercase values like "MEMORY" cause errors
 			var lastModeValue string
 			for _, param := range strings.Split(query, "&") {
 				if kv := strings.SplitN(param, "=", 2); len(kv) == 2 {
@@ -244,18 +261,13 @@ func dbFilePath(dsn string) (path string, isMemory bool, err error) {
 					}
 				}
 			}
-			if strings.ToLower(lastModeValue) == "memory" {
+			if lastModeValue == "memory" {
 				return "", true, nil
 			}
-
-			// Strip query and fragment from uriPath
-			if queryStart >= 5 {
-				uriPath = uriPath[:queryStart-5]
-			}
-		} else if fragmentStart >= 0 {
-			// Strip fragment only
-			uriPath = uriPath[:fragmentStart-5]
 		}
+
+		// Now decode the path part
+		uriPath = pathPart
 
 		// Decode URI: handle file:/// (3 slashes), file://host/ (authority), file:/ (1 slash), file:rel
 		if strings.HasPrefix(uriPath, "//") {
@@ -342,53 +354,83 @@ func checkDatabasePath(dsn string) error {
 		targetInfo, statErr := os.Stat(path)
 		if statErr != nil {
 			if os.IsNotExist(statErr) {
-				// Dangling symlink: check BOTH the link's directory and the target's parent directory
-				// SQLite will create the DB in the target's parent, not the link's parent
+				// Dangling symlink: resolve the full chain (up to 40 hops) and check
+				// every directory crossed for group/world-writable permissions.
+				const maxHops = 40
 
-				// Check link's parent directory
-				linkDir := filepath.Dir(path)
-				linkDirInfo, linkDirErr := os.Stat(linkDir)
-				if linkDirErr != nil {
-					// Can't check link's parent, err on the safe side and refuse
-					return pathless(statErr)
-				}
-				if linkDirInfo.Mode().Perm()&0o022 != 0 {
-					return fmt.Errorf("database symlink %s is dangling and link's parent directory is group- or world-writable", filepath.Base(path))
-				}
-
-				// Resolve the target path to check its parent
-				targetPath, resolveErr := filepath.EvalSymlinks(path)
-				if resolveErr != nil {
-					// EvalSymlinks should fail for dangling links, but we already know it's dangling
-					// Try to construct the target path from the symlink value
-					targetPath, resolveErr = os.Readlink(path)
-					if resolveErr != nil {
-						return pathless(statErr)
+				currentPath := path
+				for hop := 0; hop < maxHops; hop++ {
+					// Check the current link's parent directory
+					linkDir := filepath.Dir(currentPath)
+					linkDirInfo, linkDirErr := os.Stat(linkDir)
+					if linkDirErr != nil {
+						if os.IsNotExist(linkDirErr) {
+							return fmt.Errorf("database symlink %s is dangling and intermediate directory %s does not exist", filepath.Base(path), filepath.Base(linkDir))
+						}
+						return pathless(linkDirErr)
 					}
+					if linkDirInfo.Mode().Perm()&0o022 != 0 {
+						return fmt.Errorf("database symlink %s is dangling and directory %s is group- or world-writable", filepath.Base(path), filepath.Base(linkDir))
+					}
+
+					// Read the symlink target
+					targetPath, resolveErr := os.Readlink(currentPath)
+					if resolveErr != nil {
+						return pathless(resolveErr)
+					}
+
 					// Make it absolute if relative
 					if !filepath.IsAbs(targetPath) {
 						targetPath = filepath.Join(linkDir, targetPath)
 					}
+
+					// Check if this target exists
+					targetInfo, targetStatErr := os.Lstat(targetPath)
+					if targetStatErr != nil {
+						if os.IsNotExist(targetStatErr) {
+							// Final target doesn't exist: check its parent directory
+							targetDir := filepath.Dir(targetPath)
+							targetDirInfo, targetDirErr := os.Stat(targetDir)
+							if targetDirErr != nil {
+								if os.IsNotExist(targetDirErr) {
+									return fmt.Errorf("database symlink %s is dangling and target's parent directory %s does not exist", filepath.Base(path), filepath.Base(targetDir))
+								}
+								return pathless(targetDirErr)
+							}
+							if targetDirInfo.Mode().Perm()&0o022 != 0 {
+								return fmt.Errorf("database symlink %s is dangling and target's parent directory is group- or world-writable", filepath.Base(path))
+							}
+
+							// Dangling symlink with all safe directories is OK
+							return nil
+						}
+						return pathless(targetStatErr)
+					}
+
+					// Target exists: check if it's another symlink
+					if targetInfo.Mode()&os.ModeSymlink != 0 {
+						// Continue following the chain
+						currentPath = targetPath
+						continue
+					}
+
+					// Target exists and is not a symlink: we've reached the end
+					// This means it's not actually dangling; fall through to regular check
+					info = targetInfo
+					break
 				}
 
-				// Check target's parent directory
-				targetDir := filepath.Dir(targetPath)
-				targetDirInfo, targetDirErr := os.Stat(targetDir)
-				if targetDirErr != nil {
-					// Can't check target's parent, err on the safe side and refuse
-					return pathless(statErr)
+				// If we exhausted maxHops, the chain is too long
+				if hop := maxHops; hop >= maxHops {
+					return fmt.Errorf("database symlink %s chain exceeds maximum depth of %d", filepath.Base(path), maxHops)
 				}
-				if targetDirInfo.Mode().Perm()&0o022 != 0 {
-					return fmt.Errorf("database symlink %s is dangling and target's parent directory is group- or world-writable", filepath.Base(path))
-				}
-
-				// Dangling symlink with safe directories is OK
-				return nil
+			} else {
+				return pathless(statErr)
 			}
-			return pathless(statErr)
+		} else {
+			// Symlink target exists and is accessible
+			info = targetInfo
 		}
-		// Check if target is a regular file
-		info = targetInfo
 	}
 
 	// Refuse non-regular files (FIFO, socket, device, directory)

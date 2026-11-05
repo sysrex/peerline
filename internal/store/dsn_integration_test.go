@@ -13,42 +13,79 @@ func TestDSNParsingMatchesDriver(t *testing.T) {
 	dir := t.TempDir()
 
 	tests := []struct {
-		name             string
-		dsn              string
-		expectFileOnDisk bool
+		name         string
+		dsn          string
+		expectedPath string // Expected file path on disk, or "" for memory-only
 	}{
 		{
-			name:             "plain path with ?mode=memory creates REAL file",
-			dsn:              filepath.Join(dir, "plain_mode_memory.db") + "?mode=memory",
-			expectFileOnDisk: true,
+			name:         ":memory:",
+			dsn:          ":memory:",
+			expectedPath: "",
 		},
 		{
-			name:             "file: URI with ?mode=memory is memory only",
-			dsn:              "file:" + filepath.Join(dir, "file_mode_memory.db") + "?mode=memory",
-			expectFileOnDisk: false,
+			name:         "file::memory:",
+			dsn:          "file::memory:",
+			expectedPath: "",
 		},
 		{
-			name:             "file: URI with mode=memory&mode=rwc creates REAL file",
-			dsn:              "file:" + filepath.Join(dir, "file_override.db") + "?mode=memory&mode=rwc",
-			expectFileOnDisk: true,
+			name:         "plain x.db?MODE=memory creates REAL file",
+			dsn:          filepath.Join(dir, "plain_mode_memory.db") + "?MODE=memory",
+			expectedPath: filepath.Join(dir, "plain_mode_memory.db"),
 		},
 		{
-			name:             "file: URI with mode=rwc&mode=memory is memory only",
-			dsn:              "file:" + filepath.Join(dir, "file_memory_last.db") + "?mode=rwc&mode=memory",
-			expectFileOnDisk: false,
+			name:         "file:x.db?MODE=memory creates REAL file (uppercase key)",
+			dsn:          "file:" + filepath.Join(dir, "file_MODE_memory.db") + "?MODE=memory",
+			expectedPath: filepath.Join(dir, "file_MODE_memory.db"),
+		},
+		{
+			name:         "file: percent-encoded path",
+			dsn:          "file:" + filepath.Join(dir, "my%20file.db"),
+			expectedPath: filepath.Join(dir, "my file.db"),
+		},
+		{
+			name:         "file://localhost/abs",
+			dsn:          "file://localhost" + filepath.Join(dir, "localhost.db"),
+			expectedPath: filepath.Join(dir, "localhost.db"),
+		},
+		{
+			name:         "file:...#frag",
+			dsn:          "file:" + filepath.Join(dir, "fragment.db") + "#section",
+			expectedPath: filepath.Join(dir, "fragment.db"),
+		},
+		{
+			name:         "file:...#?mode=memory NOT memory",
+			dsn:          "file:" + filepath.Join(dir, "hash_question.db") + "#?mode=memory",
+			expectedPath: filepath.Join(dir, "hash_question.db"),
+		},
+		{
+			name:         "file:...#f?a=1 NOT memory",
+			dsn:          "file:" + filepath.Join(dir, "hash_f_q.db") + "#f?a=1",
+			expectedPath: filepath.Join(dir, "hash_f_q.db"),
+		},
+		{
+			name:         "file: URI with mode=memory&mode=rwc creates REAL file",
+			dsn:          "file:" + filepath.Join(dir, "override.db") + "?mode=memory&mode=rwc",
+			expectedPath: filepath.Join(dir, "override.db"),
+		},
+		{
+			name:         "file: URI with mode=rwc&mode=memory is memory only",
+			dsn:          "file:" + filepath.Join(dir, "memory_last.db") + "?mode=rwc&mode=memory",
+			expectedPath: "",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Predict what will happen using our helper
-			path, isMemory, err := dbFilePath(tt.dsn)
+			// Get dbFilePath prediction
+			dbPath, isMemory, err := dbFilePath(tt.dsn)
 			if err != nil {
 				t.Fatalf("dbFilePath(%q) error: %v", tt.dsn, err)
 			}
 
-			// Our prediction
-			ourPrediction := !isMemory // File on disk if NOT memory
+			// Verify dbFilePath matches expected path
+			if dbPath != tt.expectedPath {
+				t.Errorf("dbFilePath(%q) = %q, want %q", tt.dsn, dbPath, tt.expectedPath)
+			}
 
 			// Build DSN the same way OpenWithOptions does
 			fullDSN := buildDSN(tt.dsn)
@@ -77,22 +114,29 @@ func TestDSNParsingMatchesDriver(t *testing.T) {
 			// Close to ensure flush
 			db.Close()
 
-			// Check if file exists on disk
-			fileExists := false
-			if path != "" {
-				if _, err := os.Stat(path); err == nil {
-					fileExists = true
+			// Verify driver behavior matches expectations
+			if tt.expectedPath == "" {
+				// Memory-only: the specific file from this test should NOT exist
+				// (We don't check if directory is empty because other tests may have created files)
+				
+				// For memory tests, we don't have an expectedPath, so we can't check a specific file.
+				// Instead, verify that dbFilePath predicted memory
+				if !isMemory {
+					t.Errorf("dbFilePath predicted file %q, but test expects memory", dbPath)
 				}
-			}
+			} else {
+				// File on disk: verify file exists at expected path
+				if _, err := os.Stat(tt.expectedPath); err != nil {
+					t.Errorf("expected file at %q, but it doesn't exist: %v", tt.expectedPath, err)
+				}
 
-			// Verify driver behavior matches expectation
-			if fileExists != tt.expectFileOnDisk {
-				t.Errorf("driver created file on disk: %v, expected: %v", fileExists, tt.expectFileOnDisk)
-			}
-
-			// Verify our helper prediction matches actual behavior
-			if ourPrediction != tt.expectFileOnDisk {
-				t.Errorf("dbFilePath predicted file on disk: %v, actual: %v", ourPrediction, fileExists)
+				// Verify dbFilePath also predicted this path
+				if isMemory {
+					t.Errorf("dbFilePath predicted memory, but driver created file at %q", tt.expectedPath)
+				}
+				if dbPath != tt.expectedPath {
+					t.Errorf("dbFilePath returned %q, but driver created file at %q", dbPath, tt.expectedPath)
+				}
 			}
 		})
 	}

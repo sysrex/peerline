@@ -755,3 +755,207 @@ func TestSymlinkWALAndSHMLocation(t *testing.T) {
 	// logs above prove they were created next to the target and tightened to 0600
 	t.Logf("WAL/SHM files created next to target and tightened (see logs)")
 }
+
+// TestDBPathAcceptsDanglingSymlinkRelativeTarget verifies that a dangling symlink
+// with a relative target path works correctly.
+func TestDBPathAcceptsDanglingSymlinkRelativeTarget(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a subdirectory for the target with safe permissions
+	targetDir := filepath.Join(dir, "target_dir")
+	if err := os.Mkdir(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(dir, "test.db")
+
+	// Create a dangling symlink with a RELATIVE target
+	relativeTarget := "target_dir/nonexistent.db"
+	if err := os.Symlink(relativeTarget, dbPath); err != nil {
+		t.Skip("symlink not supported:", err)
+	}
+
+	// Verify it's dangling
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatal("symlink should be dangling")
+	}
+
+	// Open should succeed and create the database at the target
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed with relative dangling symlink: %v", err)
+	}
+	defer s.Close()
+
+	// Verify the target file was created
+	targetPath := filepath.Join(dir, relativeTarget)
+	if _, err := os.Stat(targetPath); err != nil {
+		t.Errorf("target file was not created: %v", err)
+	}
+}
+
+// TestDBPathRefusesDanglingSymlinkWithStickyLinkDir verifies that a dangling symlink
+// is refused if the link's parent directory has the sticky bit with world-writable (1777).
+func TestDBPathRefusesDanglingSymlinkWithStickyLinkDir(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a sticky world-writable subdirectory for the LINK
+	linkDir := filepath.Join(dir, "link_dir")
+	if err := os.Mkdir(linkDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// Explicitly chmod to 1777 (sticky + world-writable)
+	if err := os.Chmod(linkDir, 01777); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a safe subdirectory for the target
+	targetDir := filepath.Join(dir, "target_dir")
+	if err := os.Mkdir(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(linkDir, "test.db")
+	targetPath := filepath.Join(targetDir, "nonexistent.db")
+
+	// Create a dangling symlink
+	if err := os.Symlink(targetPath, dbPath); err != nil {
+		t.Skip("symlink not supported:", err)
+	}
+
+	// Open should fail because link's parent has world-write bit (even with sticky)
+	_, err := Open(dbPath)
+	if err == nil {
+		t.Fatal("Open should fail with dangling symlink in sticky world-writable directory")
+	}
+	if !strings.Contains(err.Error(), "group- or world-writable") {
+		t.Errorf("error should mention writable directory, got: %v", err)
+	}
+}
+
+// TestDBPathRefusesDanglingSymlinkMissingTargetDir verifies that a dangling symlink
+// is refused with a clear error if the target's parent directory doesn't exist.
+func TestDBPathRefusesDanglingSymlinkMissingTargetDir(t *testing.T) {
+	dir := t.TempDir()
+
+	dbPath := filepath.Join(dir, "test.db")
+	// Target path with non-existent parent directory
+	targetPath := filepath.Join(dir, "nonexistent_dir", "target.db")
+
+	// Create a dangling symlink
+	if err := os.Symlink(targetPath, dbPath); err != nil {
+		t.Skip("symlink not supported:", err)
+	}
+
+	// Open should fail with clear error about missing directory
+	_, err := Open(dbPath)
+	if err == nil {
+		t.Fatal("Open should fail with dangling symlink to non-existent directory")
+	}
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "does not exist") {
+		t.Errorf("error should mention missing directory, got: %v", err)
+	}
+}
+
+// TestDBPathAcceptsTwoHopDanglingSymlink verifies that multi-hop dangling symlink
+// chains are resolved correctly when all intermediate directories are safe.
+func TestDBPathAcceptsTwoHopDanglingSymlink(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create safe directories for intermediate and final targets
+	intermediateDir := filepath.Join(dir, "intermediate_dir")
+	if err := os.Mkdir(intermediateDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	targetDir := filepath.Join(dir, "target_dir")
+	if err := os.Mkdir(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a 2-hop dangling symlink chain:
+	// dbPath -> intermediate -> finalTarget (doesn't exist)
+	dbPath := filepath.Join(dir, "test.db")
+	intermediatePath := filepath.Join(intermediateDir, "intermediate.db")
+	finalTarget := filepath.Join(targetDir, "final.db")
+
+	// Create intermediate symlink (dangling)
+	if err := os.Symlink(finalTarget, intermediatePath); err != nil {
+		t.Skip("symlink not supported:", err)
+	}
+
+	// Create first symlink pointing to intermediate
+	if err := os.Symlink(intermediatePath, dbPath); err != nil {
+		t.Skip("symlink not supported:", err)
+	}
+
+	// Verify it's dangling (2 hops)
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatal("symlink chain should be dangling")
+	}
+
+	// Open should succeed and create the database at the final target
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed with 2-hop dangling symlink: %v", err)
+	}
+	defer s.Close()
+
+	// Verify the final target file was created
+	if _, err := os.Stat(finalTarget); err != nil {
+		t.Errorf("final target file was not created: %v", err)
+	}
+
+	// Verify it's usable
+	ctx := context.Background()
+	if err := s.CreatePeer(ctx, "peer1", "Test Peer", "hash1", "", ""); err != nil {
+		t.Fatalf("CreatePeer failed: %v", err)
+	}
+}
+
+// TestDBPathRefusesTwoHopDanglingSymlinkUnsafeIntermediate verifies that a 2-hop
+// dangling symlink is refused if an intermediate directory is world-writable.
+func TestDBPathRefusesTwoHopDanglingSymlinkUnsafeIntermediate(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create UNSAFE intermediate directory (world-writable)
+	intermediateDir := filepath.Join(dir, "intermediate_dir")
+	if err := os.Mkdir(intermediateDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(intermediateDir, 0777); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create safe target directory
+	targetDir := filepath.Join(dir, "target_dir")
+	if err := os.Mkdir(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a 2-hop dangling symlink chain:
+	// dbPath -> intermediate (in unsafe dir) -> finalTarget (doesn't exist)
+	dbPath := filepath.Join(dir, "test.db")
+	intermediatePath := filepath.Join(intermediateDir, "intermediate.db")
+	finalTarget := filepath.Join(targetDir, "final.db")
+
+	// Create intermediate symlink (dangling)
+	if err := os.Symlink(finalTarget, intermediatePath); err != nil {
+		t.Skip("symlink not supported:", err)
+	}
+
+	// Create first symlink pointing to intermediate
+	if err := os.Symlink(intermediatePath, dbPath); err != nil {
+		t.Skip("symlink not supported:", err)
+	}
+
+	// Open should fail because intermediate directory is world-writable
+	_, err := Open(dbPath)
+	if err == nil {
+		t.Fatal("Open should fail with 2-hop dangling symlink through unsafe directory")
+	}
+	if !strings.Contains(err.Error(), "group- or world-writable") {
+		t.Errorf("error should mention writable directory, got: %v", err)
+	}
+}

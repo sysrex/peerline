@@ -134,10 +134,10 @@ func TestDBFilePath(t *testing.T) {
 			wantMem:  false,
 		},
 		{
-			name:     "file URI with mode=MEMORY case-insensitive value IS memory",
+			name:     "file URI with mode=MEMORY wrong value case NOT memory",
 			dsn:      "file:x.db?mode=MEMORY",
-			wantPath: "",
-			wantMem:  true,
+			wantPath: "x.db",
+			wantMem:  false,
 		},
 		{
 			name:     "file URI with fragment",
@@ -161,6 +161,24 @@ func TestDBFilePath(t *testing.T) {
 			name:     "file:// empty authority",
 			dsn:      "file:///tmp/test.db",
 			wantPath: "/tmp/test.db",
+			wantMem:  false,
+		},
+		{
+			name:     "file URI with # before ? treats as fragment NOT memory",
+			dsn:      "file:/data/x.db#?mode=memory",
+			wantPath: "/data/x.db",
+			wantMem:  false,
+		},
+		{
+			name:     "file URI with # before ? keeps only path",
+			dsn:      "file:/data/x.db#f?a=1",
+			wantPath: "/data/x.db",
+			wantMem:  false,
+		},
+		{
+			name:     "uppercase FILE: treated as plain path not URI",
+			dsn:      "FILE:test.db",
+			wantPath: "FILE:test.db",
 			wantMem:  false,
 		},
 	}
