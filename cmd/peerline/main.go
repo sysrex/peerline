@@ -111,7 +111,7 @@ func buildTrustedProxySettings(getenv func(string) string, log *slog.Logger) (pr
 // buildAPIConfig constructs the api.Config that main() passes to api.New.
 // It parses all environment variables, validates them, and returns the exact config.
 // Called once from main(); the returned config is passed verbatim to api.New with no field assignments in between.
-func buildAPIConfig(getenv func(string) string, log *slog.Logger, clk clock.Clock, ml mailer.Sender, versionDetail, publicURL string, maxBagsPerPeer int, maxBagBytesPerPeer, retentionSeconds int64, trustedProxies []string, allowBroadIPv6 bool, logger *slog.Logger) (api.Config, error) {
+func buildAPIConfig(getenv func(string) string, clk clock.Clock, ml mailer.Sender, versionDetail, publicURL string, maxBagsPerPeer int, maxBagBytesPerPeer, retentionSeconds int64, trustedProxies []string, allowBroadIPv6 bool, logger *slog.Logger) (api.Config, error) {
 
 	regTok := getenv("PEERLINE_REGISTER_TOKEN")
 	maxOutstandingInvites, _ := strconv.Atoi(getenv("PEERLINE_MAX_OUTSTANDING_INVITES"))
@@ -377,7 +377,7 @@ func main() {
 	}
 
 	// Build api.Config with all parsed environment variables
-	cfg, err := buildAPIConfig(os.Getenv, log, clk, ml, versionDetail, publicURL, maxBagsPerPeer, maxBagBytesPerPeer, retentionSeconds, trustedProxies, allowBroadIPv6, log)
+	cfg, err := buildAPIConfig(os.Getenv, clk, ml, versionDetail, publicURL, maxBagsPerPeer, maxBagBytesPerPeer, retentionSeconds, trustedProxies, allowBroadIPv6, log)
 	if err != nil {
 		log.Error("api config", "err", err)
 		os.Exit(1)

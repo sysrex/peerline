@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -706,11 +705,8 @@ func TestBuildAPIConfig(t *testing.T) {
 				return ""
 			}
 
-			// log is only used for buildTrustedProxySettings warning; buildAPIConfig gets logger parameter
-			log := slog.New(slog.NewTextHandler(io.Discard, nil))
-
 			// Build config exactly as main() does
-			cfg, err := buildAPIConfig(getenv, log, tt.clock, tt.mailer, tt.versionDetail, tt.publicURL, tt.maxBagsPerPeer, tt.maxBagBytesPerPeer, tt.retentionSeconds, tt.trustedProxies, tt.allowBroadIPv6, tt.logger)
+			cfg, err := buildAPIConfig(getenv, tt.clock, tt.mailer, tt.versionDetail, tt.publicURL, tt.maxBagsPerPeer, tt.maxBagBytesPerPeer, tt.retentionSeconds, tt.trustedProxies, tt.allowBroadIPv6, tt.logger)
 			if tt.wantBuildErr {
 				if err == nil {
 					t.Errorf("buildAPIConfig() succeeded, want error")
@@ -745,12 +741,10 @@ func TestBuildAPIConfig(t *testing.T) {
 				t.Errorf("buildAPIConfig() returned config mismatch:\ngot:  %+v\nwant: %+v", cfg, wantCopy)
 			}
 
-			// Restore Logger for api.New test (it was nil'd out for DeepEqual)
+			// Restore Logger, Clock, and Mailer for api.New test (they were nil'd out for DeepEqual)
 			cfg.Logger = tt.want.Logger
-			if cfg.Logger == nil {
-				var logBuf bytes.Buffer
-				cfg.Logger = slog.New(slog.NewTextHandler(&logBuf, nil))
-			}
+			cfg.Clock = tt.want.Clock
+			cfg.Mailer = tt.want.Mailer
 
 			// Verify that api.New accepts or rejects the config as expected
 			st, stErr := store.Open(":memory:")
@@ -871,8 +865,9 @@ func TestDescribeSMTPMode(t *testing.T) {
 }
 
 // TestBroadProxyBehavior verifies that the main glue (buildTrustedProxySettings + buildAPIConfig + api.New)
-// works end-to-end: a /29 proxy with ALLOW_BROAD=1 is accepted, and the server starts.
-// Detailed XFF extraction behavior is tested in internal/api/clientip_test.go.
+// honors X-Forwarded-For from inside a trusted /29 proxy with ALLOW_BROAD=1.
+// It uses per-IP rate limiting to observe the resolved client IP: requests with different XFF values
+// are rate-limited separately, proving XFF is honored.
 func TestBroadProxyBehavior(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -887,7 +882,7 @@ func TestBroadProxyBehavior(t *testing.T) {
 			wantNewErr:   true,
 		},
 		{
-			name:         "broad /29 with opt-in accepted",
+			name:         "broad /29 with opt-in honors XFF for rate limiting",
 			allowBroad:   "1",
 			trustedProxy: "2a06:98c0::/29",
 			wantNewErr:   false,
@@ -905,13 +900,17 @@ func TestBroadProxyBehavior(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			// Build config exactly as main() does
+			// Build config exactly as main() does, with low auth-fail rate limit for testing
 			getenv := func(key string) string {
 				switch key {
 				case "PEERLINE_TRUSTED_PROXIES":
 					return tt.trustedProxy
 				case "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD":
 					return tt.allowBroad
+				case "PEERLINE_AUTH_FAIL_PER_MINUTE":
+					return "2" // Low limit for testing
+				case "PEERLINE_AUTH_FAIL_BURST":
+					return "2"
 				default:
 					return ""
 				}
@@ -930,7 +929,7 @@ func TestBroadProxyBehavior(t *testing.T) {
 				t.Fatalf("buildTrustedProxySettings error = %v", err)
 			}
 
-			cfg, err := buildAPIConfig(getenv, log, nil, nil, "minimal", "", 0, 0, 0, trustedProxies, allowBroadIPv6, log)
+			cfg, err := buildAPIConfig(getenv, nil, nil, "minimal", "", 0, 0, 0, trustedProxies, allowBroadIPv6, log)
 			if err != nil {
 				t.Fatalf("buildAPIConfig error = %v", err)
 			}
@@ -941,17 +940,49 @@ func TestBroadProxyBehavior(t *testing.T) {
 			}
 			defer srv.Stop()
 
-			// Verify the server starts and responds
-			httpSrv := httptest.NewServer(srv.Handler())
-			defer httpSrv.Close()
+			// Create test HTTP server with custom transport to control RemoteAddr
+			handler := srv.Handler()
+			testSrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Rewrite RemoteAddr to be inside the trusted /29
+				r.RemoteAddr = "[2a06:98c0::1]:12345"
+				handler.ServeHTTP(w, r)
+			}))
+			testSrv.Start()
+			defer testSrv.Close()
 
-			resp, err := http.Get(httpSrv.URL + "/version")
-			if err != nil {
-				t.Fatalf("request failed: %v", err)
+			// Helper to send auth-fail request with XFF
+			sendAuthFail := func(xffIP string) int {
+				body := strings.NewReader(`{"email":"test@example.com","mode":"claim"}`)
+				req, _ := http.NewRequest("POST", testSrv.URL+"/v1/invite", body)
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Authorization", "Bearer pl_invalid_key")
+				if xffIP != "" {
+					req.Header.Set("X-Forwarded-For", xffIP)
+				}
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatalf("request failed: %v", err)
+				}
+				defer resp.Body.Close()
+				io.Copy(io.Discard, resp.Body)
+				return resp.StatusCode
 			}
-			defer resp.Body.Close()
-			if resp.StatusCode != 200 {
-				t.Errorf("version endpoint status = %d, want 200", resp.StatusCode)
+
+			// XFF IP A: exhaust rate limit (2 requests, burst 2)
+			if status := sendAuthFail("203.0.113.1"); status != 401 {
+				t.Errorf("XFF A request 1 status = %d, want 401", status)
+			}
+			if status := sendAuthFail("203.0.113.1"); status != 401 {
+				t.Errorf("XFF A request 2 status = %d, want 401", status)
+			}
+			// XFF IP A: should be rate-limited now
+			if status := sendAuthFail("203.0.113.1"); status != 429 {
+				t.Errorf("XFF A request 3 (rate-limited) status = %d, want 429", status)
+			}
+
+			// XFF IP B: should NOT be rate-limited (different client IP)
+			if status := sendAuthFail("203.0.113.2"); status != 401 {
+				t.Errorf("XFF B request 1 status = %d, want 401 (proving XFF is honored)", status)
 			}
 		})
 	}
