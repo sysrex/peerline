@@ -4506,6 +4506,20 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	slog.SetDefault(logger)
 	t.Cleanup(func() { slog.SetDefault(oldDefault) })
 
+	// Verify the slog.Default capture works: log a planted code and assert it's found
+	plantedDefaultCode := auth.NewSecret("inv_")
+	slog.Info("test slog.Default capture", "planted_code", plantedDefaultCode)
+	if plantedDefaultCode == "" {
+		t.Fatal("plantedDefaultCode empty (auth.NewSecret failed)")
+	}
+	defaultCaptureLog := logs.String()
+	if !strings.Contains(defaultCaptureLog, plantedDefaultCode) {
+		t.Errorf("slog.Default capture: planted code not found in logs (capture unwired)")
+	}
+	if !strings.Contains(defaultCaptureLog, "test slog.Default capture") {
+		t.Errorf("slog.Default capture: test message not found (capture unwired)")
+	}
+
 	srv := newServer(t, Config{Logger: logger, Mailer: mailer.Log{Logger: logger}})
 	a, b := register(t, srv, "alice"), register(t, srv, "bob")
 	c := register(t, srv, "carol")
@@ -4515,35 +4529,35 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	want(t, resp, body, 201)
 	var inv1 struct{ Code string }
 	if err := json.Unmarshal(body, &inv1); err != nil || inv1.Code == "" {
-		t.Fatalf("inv1: %v %s", err, body)
+		t.Fatalf("inv1: %v (body length %d)", err, len(body))
 	}
 
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv2 struct{ Code string }
 	if err := json.Unmarshal(body, &inv2); err != nil || inv2.Code == "" {
-		t.Fatalf("inv2: %v %s", err, body)
+		t.Fatalf("inv2: %v (body length %d)", err, len(body))
 	}
 
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv3 struct{ Code string }
 	if err := json.Unmarshal(body, &inv3); err != nil || inv3.Code == "" {
-		t.Fatalf("inv3: %v %s", err, body)
+		t.Fatalf("inv3: %v (body length %d)", err, len(body))
 	}
 
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}}, nil)
 	want(t, resp, body, 201)
 	var inv4 struct{ Code string }
 	if err := json.Unmarshal(body, &inv4); err != nil || inv4.Code == "" {
-		t.Fatalf("inv4: %v %s", err, body)
+		t.Fatalf("inv4: %v (body length %d)", err, len(body))
 	}
 
 	resp, body = a.do("POST", "/v1/invites", map[string]any{"scopes": []string{"messages"}, "to_email": "test@example.com"}, nil)
 	want(t, resp, body, 201)
 	var inv5 struct{ Code string }
 	if err := json.Unmarshal(body, &inv5); err != nil || inv5.Code == "" {
-		t.Fatalf("inv5: %v %s", err, body)
+		t.Fatalf("inv5: %v (body length %d)", err, len(body))
 	}
 
 	// Test all accept paths:
@@ -4642,7 +4656,7 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 		Email map[string]string
 	}
 	if err := json.Unmarshal(body, &inv6); err != nil || inv6.Code == "" {
-		t.Fatalf("inv6: %v %s", err, body)
+		t.Fatalf("inv6: %v (body length %d)", err, len(body))
 	}
 	if inv6.Email["status"] != "failed" {
 		t.Errorf("send-failure: email.status = %q, want failed", inv6.Email["status"])
@@ -4717,19 +4731,21 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	}
 
 	// Before planting test codes, check that the main buffer contains no inv_ leaks
-	// (apart from the codes we intentionally planted in per-path buffers)
+	// (apart from the codes we intentionally planted in per-path buffers and plantedDefaultCode)
 	logStr = logs.String()
 	realCodes := []string{inv1.Code, inv2.Code, inv3.Code, inv4.Code, inv5.Code, unknownCode}
 	if leaked, found := detectLeak(logStr, realCodes...); found {
 		t.Errorf("main buffer leaked before planting: %s", leaked)
 	}
 	// Additionally check with regex for any inv_ pattern not in our known codes
+	// (including plantedDefaultCode which was intentionally logged at the start)
+	knownCodes := append(realCodes, plantedDefaultCode)
 	if invCodeRegex.MatchString(logStr) {
-		// Regex found an inv_ pattern; verify it's not from real codes
+		// Regex found an inv_ pattern; verify it's from known codes
 		matches := invCodeRegex.FindAllString(logStr, -1)
 		for _, m := range matches {
 			isKnown := false
-			for _, c := range realCodes {
+			for _, c := range knownCodes {
 				if strings.Contains(c, m) || strings.Contains(m, c) {
 					isKnown = true
 					break
@@ -4768,6 +4784,7 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 		{inv4.Code, false, "inv4"},
 		{inv5.Code, false, "inv5"},
 		{unknownCode, false, "unknown"},
+		{plantedDefaultCode, true, "planted-default"},
 		{plantedCode, true, "planted"},
 		{plantedCode2, true, "planted-suffix"},
 		{plantedCode3, true, "planted-prefix"},
@@ -4791,7 +4808,7 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	want(t, resp, body, 201)
 	var inv7 struct{ Code string }
 	if err := json.Unmarshal(body, &inv7); err != nil || inv7.Code == "" {
-		t.Fatalf("inv7: %v %s", err, body)
+		t.Fatalf("inv7: %v (body length %d)", err, len(body))
 	}
 	textLogStr := textLogs.String()
 	if textLogStr == "" {
