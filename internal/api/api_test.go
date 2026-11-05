@@ -4850,7 +4850,7 @@ func TestAPINewDefaultMailerDoesNotLogBody(t *testing.T) {
 	want(t, resp, body, 201)
 	var inv struct{ Code string }
 	if err := json.Unmarshal(body, &inv); err != nil || inv.Code == "" {
-		t.Fatalf("invite: %v %s", err, body)
+		t.Fatalf("invite: %v (body length %d)", err, len(body))
 	}
 
 	// The default mailer should log metadata but not the full body
