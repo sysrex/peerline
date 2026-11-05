@@ -189,72 +189,99 @@ CREATE INDEX IF NOT EXISTS invites_expires_at ON invites(expires_at);
 
 // dbFilePath extracts the actual file path from a database DSN (data source name).
 // It matches the DSN parsing done by modernc.org/sqlite v1.61.0 driver's newConn function
-// (conn.go lines 103-119).
+// (conn.go lines 73-91).
 //
 // Returns:
 //   - path: the file system path SQLite will actually open, empty for memory databases
-//   - isMemory: true for ":memory:", "file::memory:", or "?mode=memory" databases
-//   - err: parsing errors (currently always nil)
+//   - isMemory: true for ":memory:", "file::memory:", or file: URIs with "mode=memory" query parameter
+//   - err: parsing errors for invalid URIs
 //
-// The driver behavior:
+// The driver behavior (from modernc.org/sqlite@v1.61.0/conn.go:73-91):
 //   - Query string (after '?') is extracted
+//   - If DSN does NOT start with "file:", the query is stripped: dsn = dsn[:pos]
 //   - If DSN starts with "file:", the full DSN (including query) is passed to sqlite3_open_v2
-//     with SQLITE_OPEN_URI flag, and SQLite decodes the URI
-//   - Otherwise, the query is stripped before passing to sqlite3_open_v2
+//     with SQLITE_OPEN_URI flag, and SQLite decodes the URI and interprets mode=memory
 //
 // Memory databases:
-//   - ":memory:" (plain)
-//   - "file::memory:" or "file::memory:?params" (URI)
-//   - Any DSN with "mode=memory" query parameter (case-insensitive, last value wins)
+//   - ":memory:" (plain path)
+//   - "file::memory:" or "file::memory:?params" (file: URI)
+//   - file: URIs with "mode=memory" query parameter (exact key match, last value wins, case-insensitive value)
 func dbFilePath(dsn string) (path string, isMemory bool, err error) {
 	// Plain :memory:
 	if dsn == ":memory:" {
 		return "", true, nil
 	}
 
-	// Extract query string
+	// Extract query string and fragment
 	queryStart := strings.IndexRune(dsn, '?')
-	var query string
-	if queryStart >= 0 {
-		query = dsn[queryStart+1:]
-	}
-
-	// Check for mode=memory in query (case-insensitive, last value wins)
-	if query != "" {
-		// Parse query parameters
-		for _, param := range strings.Split(query, "&") {
-			if kv := strings.SplitN(param, "=", 2); len(kv) == 2 {
-				if strings.ToLower(kv[0]) == "mode" && strings.ToLower(kv[1]) == "memory" {
-					return "", true, nil
-				}
-			}
-		}
-	}
-
+	fragmentStart := strings.IndexRune(dsn, '#')
+	
 	// Handle file: URIs
 	if strings.HasPrefix(dsn, "file:") {
 		// Strip "file:" prefix
 		uriPath := dsn[5:]
 
-		// Check for file::memory: (with or without query)
+		// Check for file::memory: (with or without query/fragment)
 		if strings.HasPrefix(uriPath, ":memory:") {
 			return "", true, nil
 		}
 
-		// Strip query if present (sqlite3_open_v2 with SQLITE_OPEN_URI handles it)
+		// Extract and check query for mode=memory (file: URIs only)
+		var query string
 		if queryStart >= 0 {
-			uriPath = uriPath[:queryStart-5] // -5 for "file:" prefix
+			end := len(dsn)
+			if fragmentStart >= 0 && fragmentStart > queryStart {
+				end = fragmentStart
+			}
+			query = dsn[queryStart+1 : end]
+			
+			// Check for mode=memory: exact key match "mode", last value wins, case-insensitive value
+			var lastModeValue string
+			for _, param := range strings.Split(query, "&") {
+				if kv := strings.SplitN(param, "=", 2); len(kv) == 2 {
+					if kv[0] == "mode" {
+						lastModeValue = kv[1]
+					}
+				}
+			}
+			if strings.ToLower(lastModeValue) == "memory" {
+				return "", true, nil
+			}
+			
+			// Strip query and fragment from uriPath
+			if queryStart >= 5 {
+				uriPath = uriPath[:queryStart-5]
+			}
+		} else if fragmentStart >= 0 {
+			// Strip fragment only
+			uriPath = uriPath[:fragmentStart-5]
 		}
 
-		// Decode URI: handle file:/// (3 slashes), file:// (2 slashes), file:/ (1 slash), file:rel
-		// SQLite URI decoding: file:///path is /path, file://host/path is UNC, file:/path is /path
-		// We implement basic percent-decoding for local paths
-		if strings.HasPrefix(uriPath, "///") {
-			// file:///absolute/path -> /absolute/path
-			uriPath = uriPath[2:] // Keep one slash
-		} else if strings.HasPrefix(uriPath, "//") {
-			// file://host/path or file://C:/path - keep as-is for now (UNC or Windows)
-			// For simplicity, we don't handle UNC paths differently
+		// Decode URI: handle file:/// (3 slashes), file://host/ (authority), file:/ (1 slash), file:rel
+		if strings.HasPrefix(uriPath, "//") {
+			// file://authority/path
+			// Extract authority (host)
+			rest := uriPath[2:]
+			slashIdx := strings.IndexRune(rest, '/')
+			var authority, pathPart string
+			if slashIdx >= 0 {
+				authority = rest[:slashIdx]
+				pathPart = rest[slashIdx:] // Includes leading /
+			} else {
+				authority = rest
+				pathPart = ""
+			}
+			
+			// Accept empty authority or "localhost", reject others
+			if authority != "" && authority != "localhost" {
+				return "", false, fmt.Errorf("file: URI with non-local host %q not supported", authority)
+			}
+			
+			// Use the path part (already has leading / if non-empty)
+			if pathPart == "" {
+				return "", false, fmt.Errorf("file: URI with authority but no path")
+			}
+			uriPath = pathPart
 		} else if strings.HasPrefix(uriPath, "/") {
 			// file:/absolute/path -> /absolute/path (already correct)
 		}
@@ -263,14 +290,13 @@ func dbFilePath(dsn string) (path string, isMemory bool, err error) {
 		// Percent-decode the path
 		decoded, decodeErr := url.PathUnescape(uriPath)
 		if decodeErr != nil {
-			// If decoding fails, use the original path
-			decoded = uriPath
+			return "", false, fmt.Errorf("invalid percent encoding in file: URI: %w", decodeErr)
 		}
 
 		return decoded, false, nil
 	}
 
-	// Plain file path: strip query if present
+	// Plain file path: strip query if present (modernc strips it before opening)
 	if queryStart >= 0 {
 		return dsn[:queryStart], false, nil
 	}
@@ -316,18 +342,47 @@ func checkDatabasePath(dsn string) error {
 		targetInfo, statErr := os.Stat(path)
 		if statErr != nil {
 			if os.IsNotExist(statErr) {
-				// Dangling symlink: check parent directory permissions
-				// Refuse only if parent is group- or world-writable
-				parentDir := filepath.Dir(path)
-				parentInfo, parentErr := os.Stat(parentDir)
-				if parentErr != nil {
-					// Can't check parent, err on the safe side and refuse
+				// Dangling symlink: check BOTH the link's directory and the target's parent directory
+				// SQLite will create the DB in the target's parent, not the link's parent
+				
+				// Check link's parent directory
+				linkDir := filepath.Dir(path)
+				linkDirInfo, linkDirErr := os.Stat(linkDir)
+				if linkDirErr != nil {
+					// Can't check link's parent, err on the safe side and refuse
 					return pathless(statErr)
 				}
-				if parentInfo.Mode().Perm()&0o022 != 0 {
-					return fmt.Errorf("database symlink %s is dangling and parent directory is group- or world-writable", filepath.Base(path))
+				if linkDirInfo.Mode().Perm()&0o022 != 0 {
+					return fmt.Errorf("database symlink %s is dangling and link's parent directory is group- or world-writable", filepath.Base(path))
 				}
-				// Dangling symlink with safe parent is OK
+				
+				// Resolve the target path to check its parent
+				targetPath, resolveErr := filepath.EvalSymlinks(path)
+				if resolveErr != nil {
+					// EvalSymlinks should fail for dangling links, but we already know it's dangling
+					// Try to construct the target path from the symlink value
+					targetPath, resolveErr = os.Readlink(path)
+					if resolveErr != nil {
+						return pathless(statErr)
+					}
+					// Make it absolute if relative
+					if !filepath.IsAbs(targetPath) {
+						targetPath = filepath.Join(linkDir, targetPath)
+					}
+				}
+				
+				// Check target's parent directory
+				targetDir := filepath.Dir(targetPath)
+				targetDirInfo, targetDirErr := os.Stat(targetDir)
+				if targetDirErr != nil {
+					// Can't check target's parent, err on the safe side and refuse
+					return pathless(statErr)
+				}
+				if targetDirInfo.Mode().Perm()&0o022 != 0 {
+					return fmt.Errorf("database symlink %s is dangling and target's parent directory is group- or world-writable", filepath.Base(path))
+				}
+				
+				// Dangling symlink with safe directories is OK
 				return nil
 			}
 			return pathless(statErr)

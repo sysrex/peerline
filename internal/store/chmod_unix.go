@@ -48,7 +48,9 @@ func tightenDatabaseFilePermissions(dbDSN string, logger *slog.Logger) {
 
 	for _, path := range paths {
 		// Open with O_NOFOLLOW (race-safe: refuse if path became a symlink after EvalSymlinks)
-		// and O_NONBLOCK to avoid blocking on FIFOs
+		// and O_NONBLOCK to avoid blocking on FIFOs.
+		// Note: O_NOFOLLOW only protects the final component. A directory-swap race
+		// (parent directory replaced with a symlink) is accepted as an edge case.
 		f, openErr := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 		if openErr != nil {
 			if os.IsNotExist(openErr) {

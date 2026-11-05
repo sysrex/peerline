@@ -216,11 +216,18 @@ func TestDBPathRefusesSymlinkToDirectory(t *testing.T) {
 	}
 }
 
-// TestDBPathAcceptsDanglingSymlink verifies that a dangling symlink is accepted (same as missing path).
+// TestDBPathAcceptsDanglingSymlink verifies that a dangling symlink with safe directories is accepted.
 func TestDBPathAcceptsDanglingSymlink(t *testing.T) {
 	dir := t.TempDir()
+	
+	// Create a subdirectory with 0700 (safe) permissions for the target
+	targetDir := filepath.Join(dir, "target_dir")
+	if err := os.Mkdir(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	
 	dbPath := filepath.Join(dir, "test.db")
-	targetPath := filepath.Join(dir, "nonexistent.db")
+	targetPath := filepath.Join(targetDir, "nonexistent.db")
 
 	// Create a dangling symlink
 	if err := os.Symlink(targetPath, dbPath); err != nil {
@@ -244,6 +251,149 @@ func TestDBPathAcceptsDanglingSymlink(t *testing.T) {
 	if err := s.CreatePeer(ctx, "peer1", "Test Peer", "hash1", "", ""); err != nil {
 		t.Fatalf("CreatePeer failed: %v", err)
 	}
+
+	// Verify the target file was created
+	if _, err := os.Stat(targetPath); err != nil {
+		t.Errorf("target file was not created: %v", err)
+	}
+}
+
+// TestDBPathRefusesDanglingSymlinkWithUnsafeLinkDir verifies that a dangling symlink
+// is refused if the link's parent directory is group- or world-writable.
+func TestDBPathRefusesDanglingSymlinkWithUnsafeLinkDir(t *testing.T) {
+	dir := t.TempDir()
+	
+	// Create a world-writable subdirectory for the link
+	linkDir := filepath.Join(dir, "link_dir")
+	if err := os.Mkdir(linkDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// Explicitly chmod to 0777 (mkdir respects umask)
+	if err := os.Chmod(linkDir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	
+	// Create a safe subdirectory for the target
+	targetDir := filepath.Join(dir, "target_dir")
+	if err := os.Mkdir(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	
+	dbPath := filepath.Join(linkDir, "test.db")
+	targetPath := filepath.Join(targetDir, "nonexistent.db")
+
+	// Create a dangling symlink
+	if err := os.Symlink(targetPath, dbPath); err != nil {
+		t.Skip("symlink not supported:", err)
+	}
+
+	// Open should fail because link's parent is world-writable
+	_, err := Open(dbPath)
+	if err == nil {
+		t.Fatal("Open should fail with dangling symlink in world-writable directory")
+	}
+	if !strings.Contains(err.Error(), "group- or world-writable") {
+		t.Errorf("error should mention writable directory, got: %v", err)
+	}
+}
+
+// TestDBPathRefusesDanglingSymlinkWithUnsafeTargetDir verifies that a dangling symlink
+// is refused if the target's parent directory is group- or world-writable.
+func TestDBPathRefusesDanglingSymlinkWithUnsafeTargetDir(t *testing.T) {
+	dir := t.TempDir()
+	
+	// Create a safe subdirectory for the link
+	linkDir := filepath.Join(dir, "link_dir")
+	if err := os.Mkdir(linkDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	
+	// Create a world-writable subdirectory for the target
+	targetDir := filepath.Join(dir, "target_dir")
+	if err := os.Mkdir(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// Explicitly chmod to 0777 (mkdir respects umask)
+	if err := os.Chmod(targetDir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	
+	dbPath := filepath.Join(linkDir, "test.db")
+	targetPath := filepath.Join(targetDir, "nonexistent.db")
+
+	// Create a dangling symlink
+	if err := os.Symlink(targetPath, dbPath); err != nil {
+		t.Skip("symlink not supported:", err)
+	}
+
+	// Open should fail because target's parent is world-writable
+	_, err := Open(dbPath)
+	if err == nil {
+		t.Fatal("Open should fail with dangling symlink pointing to world-writable directory")
+	}
+	if !strings.Contains(err.Error(), "group- or world-writable") {
+		t.Errorf("error should mention writable directory, got: %v", err)
+	}
+}
+
+// TestDBPathRefusesDanglingSymlinkWithStickyBit verifies that dangling symlinks
+// to sticky directories (like /tmp with 1777) are also refused.
+func TestDBPathRefusesDanglingSymlinkWithStickyBit(t *testing.T) {
+	dir := t.TempDir()
+	
+	// Create a sticky world-writable subdirectory for the target
+	targetDir := filepath.Join(dir, "target_dir")
+	if err := os.Mkdir(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// Explicitly chmod to 1777 (mkdir respects umask, we want sticky + world-writable)
+	if err := os.Chmod(targetDir, 01777); err != nil {
+		t.Fatal(err)
+	}
+	
+	dbPath := filepath.Join(dir, "test.db")
+	targetPath := filepath.Join(targetDir, "nonexistent.db")
+
+	// Create a dangling symlink
+	if err := os.Symlink(targetPath, dbPath); err != nil {
+		t.Skip("symlink not supported:", err)
+	}
+
+	// Open should fail because target's parent has world-write bit (even with sticky)
+	_, err := Open(dbPath)
+	if err == nil {
+		t.Fatal("Open should fail with dangling symlink pointing to sticky world-writable directory")
+	}
+	if !strings.Contains(err.Error(), "group- or world-writable") {
+		t.Errorf("error should mention writable directory, got: %v", err)
+	}
+}
+
+// TestDBPathAcceptsDanglingSymlinkWith0755TargetDir verifies that dangling symlinks
+// to directories with mode 0755 (world-readable but not writable) are accepted.
+func TestDBPathAcceptsDanglingSymlinkWith0755TargetDir(t *testing.T) {
+	dir := t.TempDir()
+	
+	// Create a 0755 subdirectory for the target (world-readable, not writable)
+	targetDir := filepath.Join(dir, "target_dir")
+	if err := os.Mkdir(targetDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	
+	dbPath := filepath.Join(dir, "test.db")
+	targetPath := filepath.Join(targetDir, "nonexistent.db")
+
+	// Create a dangling symlink
+	if err := os.Symlink(targetPath, dbPath); err != nil {
+		t.Skip("symlink not supported:", err)
+	}
+
+	// Open should succeed because neither directory is writable by group/world
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open should succeed with 0755 target directory: %v", err)
+	}
+	defer s.Close()
 
 	// Verify the target file was created
 	if _, err := os.Stat(targetPath); err != nil {
@@ -475,31 +625,46 @@ func TestDBPathAcceptsFileMemory(t *testing.T) {
 	}
 }
 
-// TestDBPathAcceptsModeMemoryMixedCase verifies that mode=memory with mixed case is detected.
-func TestDBPathAcceptsModeMemoryMixedCase(t *testing.T) {
-	// Test various case combinations - they should all be detected as memory databases
-	cases := []string{
-		"test.db?MODE=MEMORY",
-		"test.db?Mode=Memory",
-		"test.db?mode=Memory",
-		"test.db?MODE=memory",
+// TestPlainPathWithQueryIsRealFile verifies that plain paths with ?mode=memory queries
+// are treated as REAL files, not memory databases, because modernc strips the query
+// before opening non-file: URIs.
+func TestPlainPathWithQueryIsRealFile(t *testing.T) {
+	dir := t.TempDir()
+	
+	// Test various case combinations - they should all be treated as REAL files
+	cases := []struct {
+		name string
+		dsn  string
+	}{
+		{"lowercase mode=memory", "test.db?mode=memory"},
+		{"uppercase MODE=MEMORY", "test.db?MODE=MEMORY"},
+		{"mixed Mode=Memory", "test.db?Mode=Memory"},
+		{"mode=MEMORY uppercase value", "test.db?mode=MEMORY"},
 	}
 
-	for _, dsn := range cases {
-		t.Run(dsn, func(t *testing.T) {
-			// Verify checkDatabasePath accepts them (doesn't try to check the file)
-			err := checkDatabasePath(dsn)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath := filepath.Join(dir, tc.dsn)
+			
+			// Verify dbFilePath correctly identifies as NOT memory
+			path, isMemory, err := dbFilePath(dbPath)
 			if err != nil {
-				t.Errorf("checkDatabasePath(%q) failed: %v", dsn, err)
+				t.Fatalf("dbFilePath(%q) error: %v", dbPath, err)
+			}
+			if isMemory {
+				t.Errorf("dbFilePath(%q) isMemory = true, want false (plain paths with query are REAL files)", dbPath)
+			}
+			// Path should be the part before '?'
+			expectedPath := filepath.Join(dir, "test.db")
+			if path != expectedPath {
+				t.Errorf("dbFilePath(%q) path = %q, want %q", dbPath, path, expectedPath)
 			}
 
-			// Verify dbFilePath correctly identifies them as memory
-			_, isMemory, err := dbFilePath(dsn)
+			// Verify checkDatabasePath will check the file (not skip as memory)
+			// Since the file doesn't exist, it should be accepted (missing path is OK)
+			err = checkDatabasePath(dbPath)
 			if err != nil {
-				t.Errorf("dbFilePath(%q) error: %v", dsn, err)
-			}
-			if !isMemory {
-				t.Errorf("dbFilePath(%q) isMemory = false, want true", dsn)
+				t.Errorf("checkDatabasePath(%q) failed: %v (missing path should be OK)", dbPath, err)
 			}
 		})
 	}
