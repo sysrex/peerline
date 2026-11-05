@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -827,7 +828,7 @@ func TestDeleteClaimedInvite(t *testing.T) {
 	})
 
 	t.Run("delete expired not yet purged returns 204", func(t *testing.T) {
-		srv, _, clk := claimServer(t)
+		srv, st, clk := claimServer(t)
 		inviter := register(t, srv, "inviter_delete_expired")
 		pub, _ := confirmInvite(t, inviter)
 
@@ -847,6 +848,38 @@ func TestDeleteClaimedInvite(t *testing.T) {
 		resp, b = inviter.do("GET", "/v1/invites/"+pub, nil, nil)
 		if resp.StatusCode != 404 {
 			t.Fatalf("GET after DELETE: got %d, want 404; body: %s", resp.StatusCode, b)
+		}
+
+		// Recreate an expired invite for the purge test
+		pub2, _ := confirmInvite(t, inviter)
+		clk.Advance(2 * time.Hour)
+
+		// Before purge, DELETE still returns 204
+		resp, b = inviter.do("DELETE", "/v1/invites/"+pub2, nil, nil)
+		if resp.StatusCode != 204 {
+			t.Fatalf("DELETE expired invite before purge: got %d, want 204; body: %s", resp.StatusCode, b)
+		}
+
+		// Recreate another expired invite
+		pub3, _ := confirmInvite(t, inviter)
+		clk.Advance(2 * time.Hour)
+
+		// Advance past the 5-minute grace period
+		clk.Advance(6 * time.Minute)
+
+		// Run the purge
+		count, _, err := st.PurgeExpiredInvites(context.Background(), 0)
+		if err != nil {
+			t.Fatalf("PurgeExpiredInvites failed: %v", err)
+		}
+		if count == 0 {
+			t.Fatal("PurgeExpiredInvites removed 0 invites; expected at least 1")
+		}
+
+		// After purge, DELETE returns 404
+		resp, b = inviter.do("DELETE", "/v1/invites/"+pub3, nil, nil)
+		if resp.StatusCode != 404 {
+			t.Fatalf("DELETE expired invite after purge: got %d, want 404; body: %s", resp.StatusCode, b)
 		}
 	})
 
