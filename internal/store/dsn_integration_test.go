@@ -158,20 +158,9 @@ func TestDSNParsingMatchesDriver(t *testing.T) {
 				t.Fatalf("rowDir contains special chars that break file: URIs: %q", rowDir)
 			}
 
-			// Handle relative path with os.Chdir for FILE: test
+			// Handle relative path with t.Chdir for FILE: test
 			if tt.nonParallel {
-				originalDir, err := os.Getwd()
-				if err != nil {
-					t.Fatalf("os.Getwd failed: %v", err)
-				}
-				if err := os.Chdir(rowDir); err != nil {
-					t.Fatalf("os.Chdir failed: %v", err)
-				}
-				t.Cleanup(func() {
-					if err := os.Chdir(originalDir); err != nil {
-						t.Errorf("failed to restore cwd: %v", err)
-					}
-				})
+				t.Chdir(rowDir)
 			}
 
 			dsn := tt.buildDSN(rowDir)
@@ -419,5 +408,61 @@ func TestDSNParsingErrors(t *testing.T) {
 				t.Errorf("dbFilePath(%q) unexpected error: %v", tt.dsn, err)
 			}
 		})
+	}
+}
+
+// TestTxlockImmediate verifies that _txlock=immediate causes BEGIN to acquire
+// a RESERVED lock immediately, blocking concurrent transactions at BEGIN time.
+func TestTxlockImmediate(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	// Open connection A with our buildDSN (includes _txlock=immediate)
+	dsnA := buildDSN(dbPath)
+	dbA, err := sql.Open("sqlite", dsnA)
+	if err != nil {
+		t.Fatalf("open dbA failed: %v", err)
+	}
+	defer dbA.Close()
+
+	// Create schema
+	if _, err := dbA.Exec("CREATE TABLE test (id INTEGER)"); err != nil {
+		t.Fatalf("create table failed: %v", err)
+	}
+
+	// Begin transaction on A (should acquire RESERVED lock immediately with _txlock=immediate)
+	txA, err := dbA.Begin()
+	if err != nil {
+		t.Fatalf("begin on A failed: %v", err)
+	}
+	defer txA.Rollback()
+
+	// Open connection B with low busy_timeout to detect blocking
+	dsnB := dbPath + "?_pragma=busy_timeout(100)"
+	dbB, err := sql.Open("sqlite", dsnB)
+	if err != nil {
+		t.Fatalf("open dbB failed: %v", err)
+	}
+	defer dbB.Close()
+
+	// Attempt to begin on B should fail or block because A holds RESERVED lock
+	// Without _txlock=immediate, BEGIN would succeed and the first write would block
+	txB, err := dbB.Begin()
+	if err != nil {
+		// Expected: BEGIN failed because A holds RESERVED lock
+		if !strings.Contains(err.Error(), "database is locked") {
+			t.Errorf("expected 'database is locked' error, got: %v", err)
+		}
+		return
+	}
+	defer txB.Rollback()
+
+	// If BEGIN succeeded, try to write on B (should fail immediately)
+	_, err = txB.Exec("INSERT INTO test VALUES (1)")
+	if err == nil {
+		t.Fatal("write on B should have failed while A holds transaction")
+	}
+	if !strings.Contains(err.Error(), "database is locked") {
+		t.Errorf("expected 'database is locked' error on write, got: %v", err)
 	}
 }

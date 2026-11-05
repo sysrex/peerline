@@ -31,6 +31,10 @@ var ErrTooManyInvites = errors.New("too many outstanding invites")
 var ErrBagLimitExceeded = errors.New("bag limit exceeded")
 var ErrStorageQuotaExceeded = errors.New("storage quota exceeded")
 
+// symlinkMaxHops is the maximum symlink chain depth for dangling symlinks.
+// Lowered by tests to deterministically exercise the cap before hitting kernel ELOOP.
+var symlinkMaxHops = 40
+
 // ErrSchemaTooNew is returned when the database schema version is newer than this binary supports.
 type ErrSchemaTooNew struct {
 	Have int
@@ -352,7 +356,7 @@ func checkDatabasePath(dsn string) error {
 			if os.IsNotExist(statErr) {
 				// Dangling symlink: resolve the full chain (up to 40 hops) and check
 				// every directory crossed for group/world-writable permissions.
-				const maxHops = 40
+				maxHops := symlinkMaxHops
 
 				currentPath := path
 				resolved := false

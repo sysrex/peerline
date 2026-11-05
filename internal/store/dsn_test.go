@@ -1,6 +1,7 @@
 package store
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -8,11 +9,12 @@ import (
 // This matches the behavior of modernc.org/sqlite v1.61.0's newConn (conn.go:103-119).
 func TestDBFilePath(t *testing.T) {
 	tests := []struct {
-		name     string
-		dsn      string
-		wantPath string
-		wantMem  bool
-		wantErr  bool
+		name            string
+		dsn             string
+		wantPath        string
+		wantMem         bool
+		wantErr         bool
+		wantErrContains string
 	}{
 		{
 			name:     "plain memory",
@@ -144,6 +146,7 @@ func TestDBFilePath(t *testing.T) {
 			name:    "file URI with fragment refused",
 			dsn:     "file:/tmp/test.db#section",
 			wantErr: true,
+			wantErrContains: "%23",
 		},
 		{
 			name:    "file URI with query and fragment refused",
@@ -187,6 +190,9 @@ func TestDBFilePath(t *testing.T) {
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("dbFilePath(%q) expected error but got nil", tt.dsn)
+				}
+				if tt.wantErrContains != "" && !strings.Contains(err.Error(), tt.wantErrContains) {
+					t.Errorf("dbFilePath(%q) error = %q, want error containing %q", tt.dsn, err.Error(), tt.wantErrContains)
 				}
 				return
 			}
