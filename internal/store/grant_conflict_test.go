@@ -1222,6 +1222,116 @@ func inviteUsed(t *testing.T, db *sql.DB, code string) bool {
 	return used != nil
 }
 
+// TestSequentialAcceptThenRevokeSameGrant verifies the accept-then-revoke ordering
+// for the same grant: accept skips rewrite, revoke deletes → grant absent, invite used.
+func TestSequentialAcceptThenRevokeSameGrant(t *testing.T) {
+	ctx := context.Background()
+	clk := clocktest.New(time.Unix(1000000, 0))
+	s, err := OpenWithOptions(":memory:", OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create initial grant
+	code0 := "code0"
+	exp0 := clk.Now().Add(time.Hour)
+	if err := s.CreateInvite(ctx, code0, "alice", []string{"messages"}, nil, exp0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptInvite(ctx, code0, "bob", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create second invite with identical grant
+	code := "code_seq"
+	exp := clk.Now().Add(time.Hour)
+	if err := s.CreateInvite(ctx, code, "alice", []string{"messages"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Accept (takes skip path)
+	if _, err := s.AcceptInvite(ctx, code, "bob", nil, nil); err != nil {
+		t.Fatalf("accept failed: %v", err)
+	}
+
+	// Revoke
+	if err := s.RevokeGrant(ctx, "alice", "bob"); err != nil {
+		t.Fatalf("revoke failed: %v", err)
+	}
+
+	// Assert: grant absent, invite used
+	grantScopes := getGrantRow(t, s.db, "alice", "bob")
+	if grantScopes != "" {
+		t.Errorf("grant scopes = %q, want \"\" (accept-then-revoke)", grantScopes)
+	}
+	if !inviteUsed(t, s.db, code) {
+		t.Errorf("invite not consumed")
+	}
+}
+
+// TestSequentialRevokeThenAcceptSameGrant verifies the revoke-then-accept ordering
+// for the same grant: revoke deletes, accept writes → grant "messages", invite used.
+func TestSequentialRevokeThenAcceptSameGrant(t *testing.T) {
+	ctx := context.Background()
+	clk := clocktest.New(time.Unix(1000000, 0))
+	s, err := OpenWithOptions(":memory:", OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create initial grant
+	code0 := "code0"
+	exp0 := clk.Now().Add(time.Hour)
+	if err := s.CreateInvite(ctx, code0, "alice", []string{"messages"}, nil, exp0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptInvite(ctx, code0, "bob", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create second invite with identical grant
+	code := "code_seq"
+	exp := clk.Now().Add(time.Hour)
+	if err := s.CreateInvite(ctx, code, "alice", []string{"messages"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Revoke first
+	if err := s.RevokeGrant(ctx, "alice", "bob"); err != nil {
+		t.Fatalf("revoke failed: %v", err)
+	}
+
+	// Then accept
+	if _, err := s.AcceptInvite(ctx, code, "bob", nil, nil); err != nil {
+		t.Fatalf("accept failed: %v", err)
+	}
+
+	// Assert: grant exactly "messages", invite used
+	grantScopes := getGrantRow(t, s.db, "alice", "bob")
+	if grantScopes != "messages" {
+		t.Errorf("grant scopes = %q, want \"messages\" (revoke-then-accept)", grantScopes)
+	}
+	if !inviteUsed(t, s.db, code) {
+		t.Errorf("invite not consumed")
+	}
+}
+
 // TestConcurrentAcceptVsRevoke races a legacy accept against RevokeGrant to ensure
 // no mixed state occurs: the invite is either consumed with the grant written, or
 // left unused when the grant is missing (#337 item 4).
@@ -1337,9 +1447,120 @@ func TestConcurrentAcceptVsRevoke(t *testing.T) {
 	}
 }
 
+// TestSequentialAcceptThenRevokeDifferentGrant verifies accept-then-revoke when
+// the grants differ: accept returns ErrConflict, revoke deletes → grant absent, invite unused.
+func TestSequentialAcceptThenRevokeDifferentGrant(t *testing.T) {
+	ctx := context.Background()
+	clk := clocktest.New(time.Unix(1000000, 0))
+	s, err := OpenWithOptions(":memory:", OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create initial grant with "messages"
+	code0 := "code0"
+	exp0 := clk.Now().Add(time.Hour)
+	if err := s.CreateInvite(ctx, code0, "alice", []string{"messages"}, nil, exp0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptInvite(ctx, code0, "bob", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create invite with DIFFERENT grant "bags_read"
+	code := "code_seq"
+	exp := clk.Now().Add(time.Hour)
+	if err := s.CreateInvite(ctx, code, "alice", []string{"bags_read"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Accept (should return ErrConflict)
+	_, aErr := s.AcceptInvite(ctx, code, "bob", nil, nil)
+	if !errors.Is(aErr, ErrConflict) {
+		t.Fatalf("accept returned %v, want ErrConflict", aErr)
+	}
+
+	// Revoke
+	if err := s.RevokeGrant(ctx, "alice", "bob"); err != nil {
+		t.Fatalf("revoke failed: %v", err)
+	}
+
+	// Assert: grant absent, invite unused
+	grantScopes := getGrantRow(t, s.db, "alice", "bob")
+	if grantScopes != "" {
+		t.Errorf("grant scopes = %q, want \"\" (accept-then-revoke conflict)", grantScopes)
+	}
+	if inviteUsed(t, s.db, code) {
+		t.Errorf("invite was consumed despite conflict")
+	}
+}
+
+// TestSequentialRevokeThenAcceptDifferentGrant verifies revoke-then-accept when
+// the grants differ: revoke deletes, accept writes new grant → grant "bags_read", invite used.
+func TestSequentialRevokeThenAcceptDifferentGrant(t *testing.T) {
+	ctx := context.Background()
+	clk := clocktest.New(time.Unix(1000000, 0))
+	s, err := OpenWithOptions(":memory:", OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create initial grant with "messages"
+	code0 := "code0"
+	exp0 := clk.Now().Add(time.Hour)
+	if err := s.CreateInvite(ctx, code0, "alice", []string{"messages"}, nil, exp0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptInvite(ctx, code0, "bob", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create invite with DIFFERENT grant "bags_read"
+	code := "code_seq"
+	exp := clk.Now().Add(time.Hour)
+	if err := s.CreateInvite(ctx, code, "alice", []string{"bags_read"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Revoke first
+	if err := s.RevokeGrant(ctx, "alice", "bob"); err != nil {
+		t.Fatalf("revoke failed: %v", err)
+	}
+
+	// Then accept
+	if _, err := s.AcceptInvite(ctx, code, "bob", nil, nil); err != nil {
+		t.Fatalf("accept failed: %v", err)
+	}
+
+	// Assert: grant exactly "bags_read", invite used
+	grantScopes := getGrantRow(t, s.db, "alice", "bob")
+	if grantScopes != "bags_read" {
+		t.Errorf("grant scopes = %q, want \"bags_read\" (revoke-then-accept)", grantScopes)
+	}
+	if !inviteUsed(t, s.db, code) {
+		t.Errorf("invite not consumed")
+	}
+}
+
 // TestConcurrentAcceptVsRevokeDifferentGrant races accept (with a different grant)
 // against RevokeGrant. Two valid orderings: accept-then-revoke (conflict), or
-// revoke-then-accept (new grant written).
+// revoke-then-accept (new grant written). The race is skewed; TestSequential* cover both.
 func TestConcurrentAcceptVsRevokeDifferentGrant(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping concurrency test in short mode")
@@ -1588,9 +1809,115 @@ func TestConcurrentAcceptDifferentInvites(t *testing.T) {
 	}
 }
 
+// TestSequentialAcceptCode1FirstDifferentGrants verifies code1 (messages) accepted first
+// wins: code1 used, code2 unused, grant "messages", code2 gets ErrConflict.
+func TestSequentialAcceptCode1FirstDifferentGrants(t *testing.T) {
+	ctx := context.Background()
+	clk := clocktest.New(time.Unix(1000000, 0))
+	s, err := OpenWithOptions(":memory:", OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create two invites with DIFFERENT grants
+	code1 := "code1"
+	code2 := "code2"
+	exp := clk.Now().Add(time.Hour)
+	if err := s.CreateInvite(ctx, code1, "alice", []string{"messages"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateInvite(ctx, code2, "alice", []string{"bags_read"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Accept code1 first
+	if _, err := s.AcceptInvite(ctx, code1, "bob", nil, nil); err != nil {
+		t.Fatalf("code1 accept failed: %v", err)
+	}
+
+	// Accept code2 second (should conflict)
+	_, err2 := s.AcceptInvite(ctx, code2, "bob", nil, nil)
+	if !errors.Is(err2, ErrConflict) {
+		t.Fatalf("code2 returned %v, want ErrConflict", err2)
+	}
+
+	// Assert: code1 used, code2 unused, grant "messages"
+	if !inviteUsed(t, s.db, code1) {
+		t.Errorf("code1 (winner) not consumed")
+	}
+	if inviteUsed(t, s.db, code2) {
+		t.Errorf("code2 (loser) was consumed")
+	}
+	grantScopes := getGrantRow(t, s.db, "alice", "bob")
+	if grantScopes != "messages" {
+		t.Errorf("grant scopes = %q, want \"messages\" (code1 won)", grantScopes)
+	}
+}
+
+// TestSequentialAcceptCode2FirstDifferentGrants verifies code2 (bags_read) accepted first
+// wins: code2 used, code1 unused, grant "bags_read", code1 gets ErrConflict.
+func TestSequentialAcceptCode2FirstDifferentGrants(t *testing.T) {
+	ctx := context.Background()
+	clk := clocktest.New(time.Unix(1000000, 0))
+	s, err := OpenWithOptions(":memory:", OpenOptions{Clock: clk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.CreatePeer(ctx, "alice", "Alice", "ha", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreatePeer(ctx, "bob", "Bob", "hb", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create two invites with DIFFERENT grants
+	code1 := "code1"
+	code2 := "code2"
+	exp := clk.Now().Add(time.Hour)
+	if err := s.CreateInvite(ctx, code1, "alice", []string{"messages"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateInvite(ctx, code2, "alice", []string{"bags_read"}, nil, exp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Accept code2 first
+	if _, err := s.AcceptInvite(ctx, code2, "bob", nil, nil); err != nil {
+		t.Fatalf("code2 accept failed: %v", err)
+	}
+
+	// Accept code1 second (should conflict)
+	_, err1 := s.AcceptInvite(ctx, code1, "bob", nil, nil)
+	if !errors.Is(err1, ErrConflict) {
+		t.Fatalf("code1 returned %v, want ErrConflict", err1)
+	}
+
+	// Assert: code2 used, code1 unused, grant "bags_read"
+	if !inviteUsed(t, s.db, code2) {
+		t.Errorf("code2 (winner) not consumed")
+	}
+	if inviteUsed(t, s.db, code1) {
+		t.Errorf("code1 (loser) was consumed")
+	}
+	grantScopes := getGrantRow(t, s.db, "alice", "bob")
+	if grantScopes != "bags_read" {
+		t.Errorf("grant scopes = %q, want \"bags_read\" (code2 won)", grantScopes)
+	}
+}
+
 // TestConcurrentAcceptDifferentInvitesDifferentGrants races two accepts of different
 // invites with DIFFERENT grants. Exactly one should succeed, the other gets ErrConflict,
-// and the loser's invite is left unused (#340).
+// and the loser's invite is left unused (#340). The race is skewed; TestSequential* cover both orderings.
 func TestConcurrentAcceptDifferentInvitesDifferentGrants(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping concurrency test in short mode")
