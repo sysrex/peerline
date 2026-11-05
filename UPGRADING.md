@@ -25,6 +25,19 @@ For zero-downtime deployments, see [Deployment and Schema Upgrades](#deployment-
 
 ## Breaking Changes
 
+### IPv4 6to4 relay anycast prefix rejected in PEERLINE_TRUSTED_PROXIES (#331)
+
+**Affected versions:** All versions upgrading to include the #331 fix
+
+**Impact:** If `PEERLINE_TRUSTED_PROXIES` contains or overlaps `192.88.99.0/24`, startup now fails with `overlaps 6to4 relay anycast prefix 192.88.99.0/24`. Remove the entry (or, if a wider entry contains it, split it; see How to fix); this is the deprecated 6to4 relay anycast range and is not a reverse-proxy range.
+
+**What changed:**
+- IPv4 6to4 relay anycast prefix (`192.88.99.0/24`) is now explicitly rejected at startup (RFC 7526).
+- There is no override; any entry that overlaps this range will prevent the server from starting.
+
+**How to fix:**
+Remove the overlapping entry from `PEERLINE_TRUSTED_PROXIES`. If a wider entry contains the range (e.g., `192.0.0.0/8` or `192.88.0.0/16`), split it into ranges that exclude `192.88.99.0/24`. This range covers arbitrary 6to4 relay clients and is not a legitimate reverse-proxy network.
+
 ### IPv6 transition/translation prefixes rejected in PEERLINE_TRUSTED_PROXIES (#320)
 
 **Affected versions:** All versions upgrading to include the #320 fix

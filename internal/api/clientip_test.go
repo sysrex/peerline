@@ -1313,8 +1313,8 @@ func TestIPv6FloorWithOptIn(t *testing.T) {
 		{name: "NAT64 host 64:ff9b::c000:201 rejected (opt-in)", input: []string{"64:ff9b::c000:201"}, allowBroad: true, wantError: "overlaps NAT64 well-known prefix 64:ff9b::/96"},
 		{name: "NAT64 local 64:ff9b:1::/48 rejected (default)", input: []string{"64:ff9b:1::/48"}, allowBroad: false, wantError: "overlaps NAT64 local prefix 64:ff9b:1::/48"},
 		{name: "NAT64 local 64:ff9b:1::/48 rejected (opt-in)", input: []string{"64:ff9b:1::/48"}, allowBroad: true, wantError: "overlaps NAT64 local prefix 64:ff9b:1::/48"},
-		{name: "NAT64 neighbor 64:ff9b::1:0:0:0/96 allowed (default)", input: []string{"64:ff9b::1:0:0:0/96"}, allowBroad: false, wantNet: "64:ff9b:0:0:1::/96"},
-		{name: "NAT64 neighbor 64:ff9b::1:0:0:0/96 allowed (opt-in)", input: []string{"64:ff9b::1:0:0:0/96"}, allowBroad: true, wantNet: "64:ff9b:0:0:1::/96"},
+		{name: "NAT64 neighbor 64:ff9b::1:0:0/96 allowed (default)", input: []string{"64:ff9b::1:0:0/96"}, allowBroad: false, wantNet: "64:ff9b::1:0:0/96"},
+		{name: "NAT64 neighbor 64:ff9b::1:0:0/96 allowed (opt-in)", input: []string{"64:ff9b::1:0:0/96"}, allowBroad: true, wantNet: "64:ff9b::1:0:0/96"},
 		{name: "NAT64 local neighbor 64:ff9b:2::/48 allowed (default)", input: []string{"64:ff9b:2::/48"}, allowBroad: false, wantNet: "64:ff9b:2::/48"},
 		{name: "NAT64 local neighbor 64:ff9b:2::/48 allowed (opt-in)", input: []string{"64:ff9b:2::/48"}, allowBroad: true, wantNet: "64:ff9b:2::/48"},
 		{name: "6to4 2002::/16 rejected (default)", input: []string{"2002::/16"}, allowBroad: false, wantError: "must be at least /32"},
@@ -1331,6 +1331,26 @@ func TestIPv6FloorWithOptIn(t *testing.T) {
 		{name: "2001:db8::/32 allowed (opt-in)", input: []string{"2001:db8::/32"}, allowBroad: true, wantNet: "2001:db8::/32"},
 		{name: "Google 2001:4860::/32 allowed (default)", input: []string{"2001:4860::/32"}, allowBroad: false, wantNet: "2001:4860::/32"},
 		{name: "Google 2001:4860::/32 allowed (opt-in)", input: []string{"2001:4860::/32"}, allowBroad: true, wantNet: "2001:4860::/32"},
+
+		// IPv4 6to4 relay anycast rejected regardless of opt-in (#331)
+		{name: "6to4 relay 192.88.99.0/24 rejected (default)", input: []string{"192.88.99.0/24"}, allowBroad: false, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay 192.88.99.0/24 rejected (opt-in)", input: []string{"192.88.99.0/24"}, allowBroad: true, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay host 192.88.99.1 rejected (default)", input: []string{"192.88.99.1"}, allowBroad: false, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay host 192.88.99.1 rejected (opt-in)", input: []string{"192.88.99.1"}, allowBroad: true, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay host 192.88.99.200 rejected (default)", input: []string{"192.88.99.200"}, allowBroad: false, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay host 192.88.99.200 rejected (opt-in)", input: []string{"192.88.99.200"}, allowBroad: true, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay supernet 192.88.0.0/16 rejected (default)", input: []string{"192.88.0.0/16"}, allowBroad: false, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay supernet 192.88.0.0/16 rejected (opt-in)", input: []string{"192.88.0.0/16"}, allowBroad: true, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay neighbor 192.88.98.0/24 allowed (default)", input: []string{"192.88.98.0/24"}, allowBroad: false, wantNet: "192.88.98.0/24"},
+		{name: "6to4 relay neighbor 192.88.98.0/24 allowed (opt-in)", input: []string{"192.88.98.0/24"}, allowBroad: true, wantNet: "192.88.98.0/24"},
+		{name: "6to4 relay neighbor 192.88.100.0/24 allowed (default)", input: []string{"192.88.100.0/24"}, allowBroad: false, wantNet: "192.88.100.0/24"},
+		{name: "6to4 relay neighbor 192.88.100.0/24 allowed (opt-in)", input: []string{"192.88.100.0/24"}, allowBroad: true, wantNet: "192.88.100.0/24"},
+		{name: "6to4 relay IPv4-mapped ::ffff:192.88.99.1 rejected (default)", input: []string{"::ffff:192.88.99.1"}, allowBroad: false, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay IPv4-mapped ::ffff:192.88.99.1 rejected (opt-in)", input: []string{"::ffff:192.88.99.1"}, allowBroad: true, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay IPv4-mapped ::ffff:192.88.99.0/120 rejected (default)", input: []string{"::ffff:192.88.99.0/120"}, allowBroad: false, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay IPv4-mapped ::ffff:192.88.99.0/120 rejected (opt-in)", input: []string{"::ffff:192.88.99.0/120"}, allowBroad: true, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay IPv4-mapped neighbor ::ffff:192.88.98.0/120 allowed (default)", input: []string{"::ffff:192.88.98.0/120"}, allowBroad: false, wantNet: "192.88.98.0/24"},
+		{name: "6to4 relay IPv4-mapped neighbor ::ffff:192.88.98.0/120 allowed (opt-in)", input: []string{"::ffff:192.88.98.0/120"}, allowBroad: true, wantNet: "192.88.98.0/24"},
 
 		// Still rejected even with opt-in
 		{name: "::/0 rejected (opt-in)", input: []string{"::/0"}, allowBroad: true, wantError: "too broad"},
@@ -1577,4 +1597,90 @@ func safeIndex(s []string, i int) string {
 		return s[i]
 	}
 	return "<out of range>"
+}
+
+// TestRejectedPrefixTables verifies that all entries in the rejectedIPv4Prefixes
+// and rejectedIPv6Prefixes tables are valid, non-zero, and correctly rejected.
+func TestRejectedPrefixTables(t *testing.T) {
+	// Test IPv4 table
+	for i, entry := range rejectedIPv4Prefixes {
+		// Check prefix is valid and non-zero
+		if !entry.prefix.IsValid() {
+			t.Errorf("rejectedIPv4Prefixes[%d]: invalid prefix", i)
+			continue
+		}
+		// An empty entry from zero-filled array slot has IsValid() == false and Bits() == 0
+		// But also check error message is non-empty to catch incomplete entries
+		if entry.errMsg == "" {
+			t.Errorf("rejectedIPv4Prefixes[%d]: empty error message", i)
+			continue
+		}
+
+		// Check exact prefix is rejected with ALLOW_BROAD off
+		_, _, err := ParseTrustedProxiesWithOpts([]string{entry.prefix.String()}, false)
+		if err == nil {
+			t.Errorf("rejectedIPv4Prefixes[%d]: %s not rejected (ALLOW_BROAD off)", i, entry.prefix)
+		} else if !strings.Contains(err.Error(), entry.errMsg) {
+			t.Errorf("rejectedIPv4Prefixes[%d]: error %q does not contain %q", i, err.Error(), entry.errMsg)
+		}
+
+		// Check exact prefix is rejected with ALLOW_BROAD on
+		_, _, err = ParseTrustedProxiesWithOpts([]string{entry.prefix.String()}, true)
+		if err == nil {
+			t.Errorf("rejectedIPv4Prefixes[%d]: %s not rejected (ALLOW_BROAD on)", i, entry.prefix)
+		} else if !strings.Contains(err.Error(), entry.errMsg) {
+			t.Errorf("rejectedIPv4Prefixes[%d]: error %q does not contain %q", i, err.Error(), entry.errMsg)
+		}
+
+		// Check a host inside is rejected
+		if entry.prefix.Bits() < 32 {
+			hostAddr := entry.prefix.Masked().Addr()
+			_, _, err := ParseTrustedProxiesWithOpts([]string{hostAddr.String()}, false)
+			if err == nil {
+				t.Errorf("rejectedIPv4Prefixes[%d]: host %s inside %s not rejected", i, hostAddr, entry.prefix)
+			}
+		}
+	}
+
+	// Test IPv6 table
+	for i, entry := range rejectedIPv6Prefixes {
+		// Check prefix is valid and non-zero
+		if !entry.prefix.IsValid() {
+			t.Errorf("rejectedIPv6Prefixes[%d]: invalid prefix", i)
+			continue
+		}
+		// An empty entry from zero-filled array slot has IsValid() == false and Bits() == 0
+		// But also check error message is non-empty to catch incomplete entries
+		if entry.errMsg == "" {
+			t.Errorf("rejectedIPv6Prefixes[%d]: empty error message", i)
+			continue
+		}
+
+		// Check exact prefix is rejected with ALLOW_BROAD off
+		// Note: 2002::/16 hits the /32 floor first, so it may not get the overlap error
+		_, _, err := ParseTrustedProxiesWithOpts([]string{entry.prefix.String()}, false)
+		if err == nil {
+			t.Errorf("rejectedIPv6Prefixes[%d]: %s not rejected (ALLOW_BROAD off)", i, entry.prefix)
+		} else if !strings.Contains(err.Error(), entry.errMsg) && !strings.Contains(err.Error(), "must be at least") {
+			t.Errorf("rejectedIPv6Prefixes[%d]: error %q does not contain %q or floor error", i, err.Error(), entry.errMsg)
+		}
+
+		// Check exact prefix is rejected with ALLOW_BROAD on
+		// Note: 2002::/16 hits the /29 floor first with opt-in
+		_, _, err = ParseTrustedProxiesWithOpts([]string{entry.prefix.String()}, true)
+		if err == nil {
+			t.Errorf("rejectedIPv6Prefixes[%d]: %s not rejected (ALLOW_BROAD on)", i, entry.prefix)
+		} else if !strings.Contains(err.Error(), entry.errMsg) && !strings.Contains(err.Error(), "must be at least") {
+			t.Errorf("rejectedIPv6Prefixes[%d]: error %q does not contain %q or floor error", i, err.Error(), entry.errMsg)
+		}
+
+		// Check a host inside is rejected
+		if entry.prefix.Bits() < 128 {
+			hostAddr := entry.prefix.Masked().Addr()
+			_, _, err := ParseTrustedProxiesWithOpts([]string{hostAddr.String()}, false)
+			if err == nil {
+				t.Errorf("rejectedIPv6Prefixes[%d]: host %s inside %s not rejected", i, hostAddr, entry.prefix)
+			}
+		}
+	}
 }
