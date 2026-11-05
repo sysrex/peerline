@@ -13,9 +13,18 @@ import (
 	"github.com/sysrex/peerline/internal/msg"
 )
 
+// rejectedIPv4Prefixes lists IPv4 transition ranges that are rejected
+// from trusted proxy lists because they cover arbitrary clients.
+var rejectedIPv4Prefixes = [1]struct {
+	prefix netip.Prefix
+	errMsg string
+}{
+	{netip.MustParsePrefix("192.88.99.0/24"), "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+}
+
 // rejectedIPv6Prefixes lists IPv6 transition/translation ranges that are rejected
 // from trusted proxy lists because they cover arbitrary clients.
-var rejectedIPv6Prefixes = []struct {
+var rejectedIPv6Prefixes = [4]struct {
 	prefix netip.Prefix
 	errMsg string
 }{
@@ -185,6 +194,7 @@ func rateLimitKey(ip string) string {
 // converted to IPv4 (10.0.0.0/8), with the IPv4 /8 floor applied.
 // Rejects zone identifiers (e.g., fe80::1%eth0).
 // Rejects 0.0.0.0/8 ("this network") and its IPv4-mapped form.
+// Rejects IPv4 6to4 relay anycast prefix 192.88.99.0/24.
 // Rejects IPv6 transition/translation prefixes: Teredo 2001::/32,
 // NAT64 64:ff9b::/96 and 64:ff9b:1::/48, and 6to4 2002::/16.
 func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
@@ -196,6 +206,7 @@ func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 // When allowBroadIPv6 is true, the IPv6 floor is /29 (allowing Cloudflare 2a06:98c0::/29,
 // and rejecting 2000::/3 as too broad), and ULA ranges contained in fc00::/7
 // (bits >= 7) are permitted. ::/0 is always rejected.
+// IPv4 6to4 relay anycast prefix 192.88.99.0/24 is always rejected.
 // IPv6 transition/translation prefixes are always rejected: Teredo 2001::/32,
 // NAT64 64:ff9b::/96 and 64:ff9b:1::/48, and 6to4 2002::/16.
 // Returns the parsed networks and a list of entries that were accepted only because allowBroadIPv6 was true.
@@ -276,6 +287,13 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 			thisNet := netip.MustParsePrefix("0.0.0.0/8")
 			if thisNet.Overlaps(prefix) {
 				return nil, nil, fmt.Errorf("parsing %q: overlaps 0.0.0.0/8 (this network)", cidr)
+			}
+			// Reject IPv4 transition prefixes that cover arbitrary clients
+			// (after floor check, so overly broad prefixes get the floor error)
+			for _, rejected := range rejectedIPv4Prefixes {
+				if rejected.prefix.Overlaps(prefix) {
+					return nil, nil, fmt.Errorf("parsing %q: %s", cidr, rejected.errMsg)
+				}
 			}
 		} else {
 			// IPv6: apply floor and additional checks

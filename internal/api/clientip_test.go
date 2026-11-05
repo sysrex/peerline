@@ -1281,8 +1281,8 @@ func TestIPv6FloorWithOptIn(t *testing.T) {
 		{name: "NAT64 host 64:ff9b::c000:201 rejected (opt-in)", input: []string{"64:ff9b::c000:201"}, allowBroad: true, wantError: "overlaps NAT64 well-known prefix 64:ff9b::/96"},
 		{name: "NAT64 local 64:ff9b:1::/48 rejected (default)", input: []string{"64:ff9b:1::/48"}, allowBroad: false, wantError: "overlaps NAT64 local prefix 64:ff9b:1::/48"},
 		{name: "NAT64 local 64:ff9b:1::/48 rejected (opt-in)", input: []string{"64:ff9b:1::/48"}, allowBroad: true, wantError: "overlaps NAT64 local prefix 64:ff9b:1::/48"},
-		{name: "NAT64 neighbor 64:ff9b::1:0:0:0/96 allowed (default)", input: []string{"64:ff9b::1:0:0:0/96"}, allowBroad: false, wantNet: "64:ff9b:0:0:1::/96"},
-		{name: "NAT64 neighbor 64:ff9b::1:0:0:0/96 allowed (opt-in)", input: []string{"64:ff9b::1:0:0:0/96"}, allowBroad: true, wantNet: "64:ff9b:0:0:1::/96"},
+		{name: "NAT64 neighbor 64:ff9b::1:0:0/96 allowed (default)", input: []string{"64:ff9b::1:0:0/96"}, allowBroad: false, wantNet: "64:ff9b::1:0:0/96"},
+		{name: "NAT64 neighbor 64:ff9b::1:0:0/96 allowed (opt-in)", input: []string{"64:ff9b::1:0:0/96"}, allowBroad: true, wantNet: "64:ff9b::1:0:0/96"},
 		{name: "NAT64 local neighbor 64:ff9b:2::/48 allowed (default)", input: []string{"64:ff9b:2::/48"}, allowBroad: false, wantNet: "64:ff9b:2::/48"},
 		{name: "NAT64 local neighbor 64:ff9b:2::/48 allowed (opt-in)", input: []string{"64:ff9b:2::/48"}, allowBroad: true, wantNet: "64:ff9b:2::/48"},
 		{name: "6to4 2002::/16 rejected (default)", input: []string{"2002::/16"}, allowBroad: false, wantError: "must be at least /32"},
@@ -1299,6 +1299,20 @@ func TestIPv6FloorWithOptIn(t *testing.T) {
 		{name: "2001:db8::/32 allowed (opt-in)", input: []string{"2001:db8::/32"}, allowBroad: true, wantNet: "2001:db8::/32"},
 		{name: "Google 2001:4860::/32 allowed (default)", input: []string{"2001:4860::/32"}, allowBroad: false, wantNet: "2001:4860::/32"},
 		{name: "Google 2001:4860::/32 allowed (opt-in)", input: []string{"2001:4860::/32"}, allowBroad: true, wantNet: "2001:4860::/32"},
+
+		// IPv4 6to4 relay anycast rejected regardless of opt-in (#331)
+		{name: "6to4 relay 192.88.99.0/24 rejected (default)", input: []string{"192.88.99.0/24"}, allowBroad: false, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay 192.88.99.0/24 rejected (opt-in)", input: []string{"192.88.99.0/24"}, allowBroad: true, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay host 192.88.99.1 rejected (default)", input: []string{"192.88.99.1"}, allowBroad: false, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay host 192.88.99.1 rejected (opt-in)", input: []string{"192.88.99.1"}, allowBroad: true, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay host 192.88.99.200 rejected (default)", input: []string{"192.88.99.200"}, allowBroad: false, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay host 192.88.99.200 rejected (opt-in)", input: []string{"192.88.99.200"}, allowBroad: true, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay supernet 192.88.0.0/16 rejected (default)", input: []string{"192.88.0.0/16"}, allowBroad: false, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay supernet 192.88.0.0/16 rejected (opt-in)", input: []string{"192.88.0.0/16"}, allowBroad: true, wantError: "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
+		{name: "6to4 relay neighbor 192.88.98.0/24 allowed (default)", input: []string{"192.88.98.0/24"}, allowBroad: false, wantNet: "192.88.98.0/24"},
+		{name: "6to4 relay neighbor 192.88.98.0/24 allowed (opt-in)", input: []string{"192.88.98.0/24"}, allowBroad: true, wantNet: "192.88.98.0/24"},
+		{name: "6to4 relay neighbor 192.88.100.0/24 allowed (default)", input: []string{"192.88.100.0/24"}, allowBroad: false, wantNet: "192.88.100.0/24"},
+		{name: "6to4 relay neighbor 192.88.100.0/24 allowed (opt-in)", input: []string{"192.88.100.0/24"}, allowBroad: true, wantNet: "192.88.100.0/24"},
 
 		// Still rejected even with opt-in
 		{name: "::/0 rejected (opt-in)", input: []string{"::/0"}, allowBroad: true, wantError: "too broad"},
