@@ -331,15 +331,58 @@ func TestRedactSecrets(t *testing.T) {
 			want:  "550 5.7.1 Message rejected: [REDACTED:inv_...]",
 		},
 		{
-			name:  "short token not redacted (pair_programming)",
+			name:  "short token not redacted (15 chars after prefix)",
 			input: "error in pair_programming session",
 			want:  "error in pair_programming session",
+		},
+		{
+			name:  "token with 16-31 chars now redacted",
+			input: "relay error: pair_" + strings.Repeat("a", 16),
+			want:  "relay error: [REDACTED:pair_...]",
 		},
 		{
 			name:       "boundary check: token without word boundary",
 			input:      "error:xinv_" + strings.Repeat("a", 32) + " should be caught by exact match",
 			exactCodes: []string{"inv_" + strings.Repeat("a", 32)},
 			want:       "error:x[REDACTED:inv_...] should be caught by exact match",
+		},
+		{
+			name:       "truncated code (10+ char fragment)",
+			input:      "smtp 550 rejected: " + strings.Repeat("a", 32)[:15],
+			exactCodes: []string{"inv_" + strings.Repeat("a", 32)},
+			want:       "smtp 550 rejected: [REDACTED:inv_...]",
+		},
+		{
+			name:       "URL-encoded code",
+			input:      "error: code%3Dinv_" + strings.Repeat("b", 32),
+			exactCodes: []string{"inv_" + strings.Repeat("b", 32)},
+			want:       "error: code%3D[REDACTED:inv_...]",
+		},
+		{
+			name:  "case-changed prefix (INV_)",
+			input: "Error: INV_" + strings.Repeat("c", 32),
+			want:  "Error: [REDACTED:INV_...]",
+		},
+		{
+			name:  "case-changed body (Inv_)",
+			input: "failed: Inv_" + strings.Repeat("D", 32),
+			want:  "failed: [REDACTED:Inv_...]",
+		},
+		{
+			name:  "API key pl_ redacted",
+			input: "key leak: pl_" + strings.Repeat("k", 32),
+			want:  "key leak: [REDACTED:pl_...]",
+		},
+		{
+			name:  "negative: fragment shorter than 10 chars",
+			input: "error: " + strings.Repeat("a", 9),
+			exactCodes: []string{"inv_" + strings.Repeat("a", 32)},
+			want:  "error: " + strings.Repeat("a", 9),
+		},
+		{
+			name:  "negative: unrelated long identifier",
+			input: "error in long_identifier_" + strings.Repeat("x", 20),
+			want:  "error in long_identifier_" + strings.Repeat("x", 20),
 		},
 	}
 
