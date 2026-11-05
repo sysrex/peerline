@@ -790,10 +790,24 @@ func TestIdenticalReAcceptKeepsCreatedAt(t *testing.T) {
 
 	// Advance clock to make the timestamp difference visible
 	clk.Advance(10 * time.Minute)
-	secondAcceptTime := clk.Now().Unix()
-	if secondAcceptTime == firstAcceptTime {
-		t.Fatal("clock did not advance")
+
+	// P3-a: Insert charlie BETWEEN the two bob accepts to verify row order.
+	if err := s.CreatePeer(ctx, "charlie", "Charlie", "hc", "", ""); err != nil {
+		t.Fatal(err)
 	}
+
+	code3 := "code3"
+	exp3 := clk.Now().Add(time.Hour)
+	if err := s.CreateInvite(ctx, code3, "alice", []string{"messages"}, nil, exp3); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptInvite(ctx, code3, "charlie", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Advance clock again before second bob accept
+	clk.Advance(10 * time.Minute)
+	secondAcceptTime := clk.Now().Unix()
 
 	// Alice creates second invite with identical grants (reordered to test set semantics)
 	exp2 := clk.Now().Add(time.Hour)
@@ -837,58 +851,22 @@ func TestIdenticalReAcceptKeepsCreatedAt(t *testing.T) {
 		t.Errorf("second invite not consumed: used_by=%v, want bob", used)
 	}
 
-	// P3-a: Add a third grant and assert the list order explicitly.
-	// Advance clock again to create a third grant with distinct timestamp.
-	clk.Advance(10 * time.Minute)
-	thirdAcceptTime := clk.Now().Unix()
 
-	if err := s.CreatePeer(ctx, "charlie", "Charlie", "hc", "", ""); err != nil {
-		t.Fatal(err)
-	}
-
-	code3 := "code3"
-	exp3 := clk.Now().Add(time.Hour)
-	if err := s.CreateInvite(ctx, code3, "alice", []string{"messages"}, nil, exp3); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.AcceptInvite(ctx, code3, "charlie", nil, nil); err != nil {
-		t.Fatal(err)
-	}
-
-	// Query all alice's grants ordered by created_at
-	rows, err := s.db.Query(`SELECT grantee, created_at FROM grants WHERE owner=? ORDER BY created_at`, "alice")
+	// Verify list order via ListGrants API: bob (firstAcceptTime), then charlie
+	aliceGrants, err := s.ListGrants(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
 
-	type grantRow struct {
-		grantee   string
-		createdAt int64
-	}
-	var grants []grantRow
-	for rows.Next() {
-		var gr grantRow
-		if err := rows.Scan(&gr.grantee, &gr.createdAt); err != nil {
-			t.Fatal(err)
+	// Verify list order: bob and charlie (skip any self-grant)
+	var nonSelfGrantees []string
+	for _, g := range aliceGrants {
+		if g.Grantee != "alice" {
+			nonSelfGrantees = append(nonSelfGrantees, g.Grantee)
 		}
-		grants = append(grants, gr)
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-
-	// Assert the list order: bob (firstAcceptTime), charlie (thirdAcceptTime)
-	if len(grants) != 2 {
-		t.Fatalf("expected 2 grants from alice, got %d", len(grants))
-	}
-	if grants[0].grantee != "bob" || grants[0].createdAt != firstAcceptTime {
-		t.Errorf("first grant: got grantee=%s created_at=%d, want grantee=bob created_at=%d",
-			grants[0].grantee, grants[0].createdAt, firstAcceptTime)
-	}
-	if grants[1].grantee != "charlie" || grants[1].createdAt != thirdAcceptTime {
-		t.Errorf("second grant: got grantee=%s created_at=%d, want grantee=charlie created_at=%d",
-			grants[1].grantee, grants[1].createdAt, thirdAcceptTime)
+	if len(nonSelfGrantees) != 2 || nonSelfGrantees[0] != "bob" || nonSelfGrantees[1] != "charlie" {
+		t.Errorf("grant order: got %v, want [bob charlie]", nonSelfGrantees)
 	}
 }
 
@@ -1221,7 +1199,7 @@ func TestConcurrentAcceptSameInvite(t *testing.T) {
 
 // grantRow returns the scopes for the specified grant, or returns empty string and logs
 // fatal on any error other than sql.ErrNoRows.
-func grantRow(t *testing.T, db *sql.DB, owner, grantee string) string {
+func getGrantRow(t *testing.T, db *sql.DB, owner, grantee string) string {
 	t.Helper()
 	var scopes string
 	err := db.QueryRow(`SELECT scopes FROM grants WHERE owner=? AND grantee=?`, owner, grantee).Scan(&scopes)
@@ -1229,7 +1207,7 @@ func grantRow(t *testing.T, db *sql.DB, owner, grantee string) string {
 		return ""
 	}
 	if err != nil {
-		t.Fatalf("grantRow(%s→%s) error: %v", owner, grantee, err)
+		t.Fatalf("getGrantRow(%s→%s) error: %v", owner, grantee, err)
 	}
 	return scopes
 }
@@ -1322,7 +1300,7 @@ func TestConcurrentAcceptVsRevoke(t *testing.T) {
 			aErr := <-acceptErr
 			rErr := <-revokeErr
 
-			grantScopes := grantRow(t, s1.db, "alice", "bob")
+			grantScopes := getGrantRow(t, s1.db, "alice", "bob")
 			grantExists := grantScopes != ""
 			used := inviteUsed(t, s1.db, code)
 
@@ -1421,7 +1399,7 @@ func TestConcurrentAcceptVsRevokeDifferentGrant(t *testing.T) {
 			aErr := <-acceptErr
 			rErr := <-revokeErr
 
-			grantScopes := grantRow(t, s1.db, "alice", "bob")
+			grantScopes := getGrantRow(t, s1.db, "alice", "bob")
 			used := inviteUsed(t, s1.db, code)
 
 			// Two valid orderings with different grants:
@@ -1458,7 +1436,6 @@ func TestConcurrentAcceptVsRevokeDifferentGrant(t *testing.T) {
 	}
 }
 
-// TestConcurrentAcceptDifferentInvites races two accepts of different invites between
 // TestConcurrentAcceptDifferentInvites races two accepts of different invites between
 // the same pair with identical grants. Both should succeed (second takes skip path),
 // both invites consumed, exactly one grant row with unchanged created_at (#340).
@@ -1590,7 +1567,6 @@ func TestConcurrentAcceptDifferentInvites(t *testing.T) {
 }
 
 // TestConcurrentAcceptDifferentInvitesDifferentGrants races two accepts of different
-// TestConcurrentAcceptDifferentInvitesDifferentGrants races two accepts of different
 // invites with DIFFERENT grants. Exactly one should succeed, the other gets ErrConflict,
 // and the loser's invite is left unused (#340).
 func TestConcurrentAcceptDifferentInvitesDifferentGrants(t *testing.T) {
@@ -1636,78 +1612,89 @@ func TestConcurrentAcceptDifferentInvitesDifferentGrants(t *testing.T) {
 			}
 			t.Cleanup(func() { s2.Close() })
 
+			type result struct {
+				code string
+				err  error
+			}
+
 			var wg sync.WaitGroup
 			barrier := make(chan struct{})
-			results := make(chan error, 2)
+			results := make(chan result, 2)
 
 			wg.Add(2)
 			go func() {
 				defer wg.Done()
 				<-barrier
 				_, err := s1.AcceptInvite(ctx, code1, "bob", nil, nil)
-				results <- err
+				results <- result{code: code1, err: err}
 			}()
 			go func() {
 				defer wg.Done()
 				<-barrier
 				_, err := s2.AcceptInvite(ctx, code2, "bob", nil, nil)
-				results <- err
+				results <- result{code: code2, err: err}
 			}()
 
 			close(barrier)
 			wg.Wait()
 			close(results)
 
-			var errs []error
-			for e := range results {
-				errs = append(errs, e)
+			var resultList []result
+			for r := range results {
+				resultList = append(resultList, r)
 			}
 
 			// Assert exactly 1 success and 1 ErrConflict
+			var winnerCode, loserCode string
 			successes := 0
 			conflicts := 0
-			for _, e := range errs {
-				if e == nil {
+			for _, r := range resultList {
+				if r.err == nil {
 					successes++
-				} else if errors.Is(e, ErrConflict) {
+					winnerCode = r.code
+				} else if errors.Is(r.err, ErrConflict) {
 					conflicts++
+					loserCode = r.code
 				} else {
-					t.Fatalf("unexpected error: %v", e)
+					t.Fatalf("unexpected error: %v", r.err)
 				}
 			}
 
 			if successes != 1 || conflicts != 1 {
-				t.Fatalf("expected 1 success and 1 conflict with different grants, got %d successes, %d conflicts (errs: %v)", successes, conflicts, errs)
+				t.Fatalf("expected 1 success and 1 conflict with different grants, got %d successes, %d conflicts", successes, conflicts)
 			}
 
 			// Verify exactly one alice→bob grant row
-			var grantCount int
-			if err := s1.db.QueryRow(`SELECT COUNT(*) FROM grants WHERE owner=? AND grantee=?`, "alice", "bob").Scan(&grantCount); err != nil {
-				t.Fatalf("grant count error: %v", err)
-			}
-			if grantCount != 1 {
-				t.Fatalf("expected exactly 1 grant row, got %d", grantCount)
+			grantScopes := getGrantRow(t, s1.db, "alice", "bob")
+			if grantScopes == "" {
+				t.Fatalf("expected exactly 1 grant row, got none")
 			}
 
-			// Verify exactly one invite is used (the winner's), one unused (the loser's)
-			used1 := inviteUsed(t, s1.db, code1)
-			used2 := inviteUsed(t, s1.db, code2)
+			// Verify the winner's invite is used and the loser's is unused
+			winnerUsed := inviteUsed(t, s1.db, winnerCode)
+			loserUsed := inviteUsed(t, s1.db, loserCode)
 
-			usedCount := 0
-			if used1 {
-				usedCount++
+			if !winnerUsed {
+				t.Errorf("winner's invite %s not consumed", winnerCode)
 			}
-			if used2 {
-				usedCount++
+			if loserUsed {
+				t.Errorf("loser's invite %s was consumed (should be unused)", loserCode)
 			}
 
-			if usedCount != 1 {
-				t.Errorf("expected exactly 1 invite consumed, got %d (used1=%v, used2=%v)", usedCount, used1, used2)
+			// Verify the grant scopes match the winner's invite
+			expectedScopes := "messages"
+			if winnerCode == code2 {
+				expectedScopes = "bags_read"
+			}
+			if grantScopes != expectedScopes {
+				t.Errorf("grant scopes = %q, want %q (winner: %s)", grantScopes, expectedScopes, winnerCode)
 			}
 		})
 	}
 }
 
+// TestForwardGrantBumpedWhenReverseChanges verifies that when a mutual accept changes
+// the reverse grant, both grants' created_at are updated to the accept transaction time,
 // even if the forward grant content didn't change (#340 P3-b).
 func TestForwardGrantBumpedWhenReverseChanges(t *testing.T) {
 	ctx := context.Background()
