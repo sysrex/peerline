@@ -219,13 +219,13 @@ func TestDBPathRefusesSymlinkToDirectory(t *testing.T) {
 // TestDBPathAcceptsDanglingSymlink verifies that a dangling symlink with safe directories is accepted.
 func TestDBPathAcceptsDanglingSymlink(t *testing.T) {
 	dir := t.TempDir()
-	
+
 	// Create a subdirectory with 0700 (safe) permissions for the target
 	targetDir := filepath.Join(dir, "target_dir")
 	if err := os.Mkdir(targetDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	
+
 	dbPath := filepath.Join(dir, "test.db")
 	targetPath := filepath.Join(targetDir, "nonexistent.db")
 
@@ -262,7 +262,7 @@ func TestDBPathAcceptsDanglingSymlink(t *testing.T) {
 // is refused if the link's parent directory is group- or world-writable.
 func TestDBPathRefusesDanglingSymlinkWithUnsafeLinkDir(t *testing.T) {
 	dir := t.TempDir()
-	
+
 	// Create a world-writable subdirectory for the link
 	linkDir := filepath.Join(dir, "link_dir")
 	if err := os.Mkdir(linkDir, 0700); err != nil {
@@ -272,13 +272,13 @@ func TestDBPathRefusesDanglingSymlinkWithUnsafeLinkDir(t *testing.T) {
 	if err := os.Chmod(linkDir, 0777); err != nil {
 		t.Fatal(err)
 	}
-	
+
 	// Create a safe subdirectory for the target
 	targetDir := filepath.Join(dir, "target_dir")
 	if err := os.Mkdir(targetDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	
+
 	dbPath := filepath.Join(linkDir, "test.db")
 	targetPath := filepath.Join(targetDir, "nonexistent.db")
 
@@ -301,13 +301,13 @@ func TestDBPathRefusesDanglingSymlinkWithUnsafeLinkDir(t *testing.T) {
 // is refused if the target's parent directory is group- or world-writable.
 func TestDBPathRefusesDanglingSymlinkWithUnsafeTargetDir(t *testing.T) {
 	dir := t.TempDir()
-	
+
 	// Create a safe subdirectory for the link
 	linkDir := filepath.Join(dir, "link_dir")
 	if err := os.Mkdir(linkDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	
+
 	// Create a world-writable subdirectory for the target
 	targetDir := filepath.Join(dir, "target_dir")
 	if err := os.Mkdir(targetDir, 0700); err != nil {
@@ -317,7 +317,7 @@ func TestDBPathRefusesDanglingSymlinkWithUnsafeTargetDir(t *testing.T) {
 	if err := os.Chmod(targetDir, 0777); err != nil {
 		t.Fatal(err)
 	}
-	
+
 	dbPath := filepath.Join(linkDir, "test.db")
 	targetPath := filepath.Join(targetDir, "nonexistent.db")
 
@@ -340,7 +340,7 @@ func TestDBPathRefusesDanglingSymlinkWithUnsafeTargetDir(t *testing.T) {
 // to sticky directories (like /tmp with 1777) are also refused.
 func TestDBPathRefusesDanglingSymlinkWithStickyBit(t *testing.T) {
 	dir := t.TempDir()
-	
+
 	// Create a sticky world-writable subdirectory for the target
 	targetDir := filepath.Join(dir, "target_dir")
 	if err := os.Mkdir(targetDir, 0700); err != nil {
@@ -350,7 +350,7 @@ func TestDBPathRefusesDanglingSymlinkWithStickyBit(t *testing.T) {
 	if err := os.Chmod(targetDir, 01777); err != nil {
 		t.Fatal(err)
 	}
-	
+
 	dbPath := filepath.Join(dir, "test.db")
 	targetPath := filepath.Join(targetDir, "nonexistent.db")
 
@@ -373,13 +373,13 @@ func TestDBPathRefusesDanglingSymlinkWithStickyBit(t *testing.T) {
 // to directories with mode 0755 (world-readable but not writable) are accepted.
 func TestDBPathAcceptsDanglingSymlinkWith0755TargetDir(t *testing.T) {
 	dir := t.TempDir()
-	
+
 	// Create a 0755 subdirectory for the target (world-readable, not writable)
 	targetDir := filepath.Join(dir, "target_dir")
 	if err := os.Mkdir(targetDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	
+
 	dbPath := filepath.Join(dir, "test.db")
 	targetPath := filepath.Join(targetDir, "nonexistent.db")
 
@@ -630,7 +630,7 @@ func TestDBPathAcceptsFileMemory(t *testing.T) {
 // before opening non-file: URIs.
 func TestPlainPathWithQueryIsRealFile(t *testing.T) {
 	dir := t.TempDir()
-	
+
 	// Test various case combinations - they should all be treated as REAL files
 	cases := []struct {
 		name string
@@ -645,7 +645,7 @@ func TestPlainPathWithQueryIsRealFile(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dbPath := filepath.Join(dir, tc.dsn)
-			
+
 			// Verify dbFilePath correctly identifies as NOT memory
 			path, isMemory, err := dbFilePath(dbPath)
 			if err != nil {

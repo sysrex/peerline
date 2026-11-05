@@ -13,28 +13,28 @@ func TestDSNParsingMatchesDriver(t *testing.T) {
 	dir := t.TempDir()
 
 	tests := []struct {
-		name           string
-		dsn            string
+		name             string
+		dsn              string
 		expectFileOnDisk bool
 	}{
 		{
-			name:           "plain path with ?mode=memory creates REAL file",
-			dsn:            filepath.Join(dir, "plain_mode_memory.db") + "?mode=memory",
+			name:             "plain path with ?mode=memory creates REAL file",
+			dsn:              filepath.Join(dir, "plain_mode_memory.db") + "?mode=memory",
 			expectFileOnDisk: true,
 		},
 		{
-			name:           "file: URI with ?mode=memory is memory only",
-			dsn:            "file:" + filepath.Join(dir, "file_mode_memory.db") + "?mode=memory",
+			name:             "file: URI with ?mode=memory is memory only",
+			dsn:              "file:" + filepath.Join(dir, "file_mode_memory.db") + "?mode=memory",
 			expectFileOnDisk: false,
 		},
 		{
-			name:           "file: URI with mode=memory&mode=rwc creates REAL file",
-			dsn:            "file:" + filepath.Join(dir, "file_override.db") + "?mode=memory&mode=rwc",
+			name:             "file: URI with mode=memory&mode=rwc creates REAL file",
+			dsn:              "file:" + filepath.Join(dir, "file_override.db") + "?mode=memory&mode=rwc",
 			expectFileOnDisk: true,
 		},
 		{
-			name:           "file: URI with mode=rwc&mode=memory is memory only",
-			dsn:            "file:" + filepath.Join(dir, "file_memory_last.db") + "?mode=rwc&mode=memory",
+			name:             "file: URI with mode=rwc&mode=memory is memory only",
+			dsn:              "file:" + filepath.Join(dir, "file_memory_last.db") + "?mode=rwc&mode=memory",
 			expectFileOnDisk: false,
 		},
 	}
@@ -49,10 +49,10 @@ func TestDSNParsingMatchesDriver(t *testing.T) {
 
 			// Our prediction
 			ourPrediction := !isMemory // File on disk if NOT memory
-			
+
 			// Build DSN the same way OpenWithOptions does
 			fullDSN := buildDSN(tt.dsn)
-			
+
 			// Open with actual driver
 			db, err := sql.Open("sqlite", fullDSN)
 			if err != nil {

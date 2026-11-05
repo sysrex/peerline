@@ -215,7 +215,7 @@ func dbFilePath(dsn string) (path string, isMemory bool, err error) {
 	// Extract query string and fragment
 	queryStart := strings.IndexRune(dsn, '?')
 	fragmentStart := strings.IndexRune(dsn, '#')
-	
+
 	// Handle file: URIs
 	if strings.HasPrefix(dsn, "file:") {
 		// Strip "file:" prefix
@@ -234,7 +234,7 @@ func dbFilePath(dsn string) (path string, isMemory bool, err error) {
 				end = fragmentStart
 			}
 			query = dsn[queryStart+1 : end]
-			
+
 			// Check for mode=memory: exact key match "mode", last value wins, case-insensitive value
 			var lastModeValue string
 			for _, param := range strings.Split(query, "&") {
@@ -247,7 +247,7 @@ func dbFilePath(dsn string) (path string, isMemory bool, err error) {
 			if strings.ToLower(lastModeValue) == "memory" {
 				return "", true, nil
 			}
-			
+
 			// Strip query and fragment from uriPath
 			if queryStart >= 5 {
 				uriPath = uriPath[:queryStart-5]
@@ -271,12 +271,12 @@ func dbFilePath(dsn string) (path string, isMemory bool, err error) {
 				authority = rest
 				pathPart = ""
 			}
-			
+
 			// Accept empty authority or "localhost", reject others
 			if authority != "" && authority != "localhost" {
 				return "", false, fmt.Errorf("file: URI with non-local host %q not supported", authority)
 			}
-			
+
 			// Use the path part (already has leading / if non-empty)
 			if pathPart == "" {
 				return "", false, fmt.Errorf("file: URI with authority but no path")
@@ -344,7 +344,7 @@ func checkDatabasePath(dsn string) error {
 			if os.IsNotExist(statErr) {
 				// Dangling symlink: check BOTH the link's directory and the target's parent directory
 				// SQLite will create the DB in the target's parent, not the link's parent
-				
+
 				// Check link's parent directory
 				linkDir := filepath.Dir(path)
 				linkDirInfo, linkDirErr := os.Stat(linkDir)
@@ -355,7 +355,7 @@ func checkDatabasePath(dsn string) error {
 				if linkDirInfo.Mode().Perm()&0o022 != 0 {
 					return fmt.Errorf("database symlink %s is dangling and link's parent directory is group- or world-writable", filepath.Base(path))
 				}
-				
+
 				// Resolve the target path to check its parent
 				targetPath, resolveErr := filepath.EvalSymlinks(path)
 				if resolveErr != nil {
@@ -370,7 +370,7 @@ func checkDatabasePath(dsn string) error {
 						targetPath = filepath.Join(linkDir, targetPath)
 					}
 				}
-				
+
 				// Check target's parent directory
 				targetDir := filepath.Dir(targetPath)
 				targetDirInfo, targetDirErr := os.Stat(targetDir)
@@ -381,7 +381,7 @@ func checkDatabasePath(dsn string) error {
 				if targetDirInfo.Mode().Perm()&0o022 != 0 {
 					return fmt.Errorf("database symlink %s is dangling and target's parent directory is group- or world-writable", filepath.Base(path))
 				}
-				
+
 				// Dangling symlink with safe directories is OK
 				return nil
 			}
