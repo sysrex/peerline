@@ -4539,9 +4539,38 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 		t.Error("logs should contain mailer 'body_len' (positive control for to_email path)")
 	}
 
-	// Plant a code in logs to verify the detector fires
+	// Before planting test codes, check that the main buffer contains no inv_ leaks
+	// (apart from the codes we intentionally planted in per-path buffers)
+	logStr = logs.String()
+	realCodes := []string{inv1.Code, inv2.Code, inv3.Code, inv4.Code, inv5.Code, unknownCode}
+	if leaked, found := detectLeak(logStr, realCodes...); found {
+		t.Errorf("main buffer leaked before planting: %s", leaked)
+	}
+	// Additionally check with regex for any inv_ pattern not in our known codes
+	if invCodeRegex.MatchString(logStr) {
+		// Regex found an inv_ pattern; verify it's not from real codes
+		matches := invCodeRegex.FindAllString(logStr, -1)
+		for _, m := range matches {
+			isKnown := false
+			for _, c := range realCodes {
+				if strings.Contains(c, m) || strings.Contains(m, c) {
+					isKnown = true
+					break
+				}
+			}
+			if !isKnown {
+				t.Errorf("main buffer contains unknown inv_ pattern before planting: %s", m[:4]+"<redacted>")
+			}
+		}
+	}
+
+	// Plant codes in logs to verify the detector fires
 	plantedCode := auth.NewSecret("inv_")
 	logger.Info("test planted code", "code", plantedCode)
+	plantedCode2 := auth.NewSecret("inv_")
+	logger.Info("test planted suffix", "suffix", plantedCode2[len(plantedCode2)-10:])
+	plantedCode3 := auth.NewSecret("inv_")
+	logger.Info("test planted prefix", "prefix", plantedCode3[:10])
 	logStr = logs.String()
 
 	// Verify the regex also matches the planted code
@@ -4550,7 +4579,7 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 	}
 
 	// Check logs don't contain any of the codes or their prefixes/suffixes
-	// The planted code is intentionally in the logs to verify the detector works
+	// The planted codes are intentionally in the logs to verify the detector works
 	allCodes := []struct {
 		code     string
 		expected bool // true if we expect to find it (planted), false otherwise
@@ -4563,6 +4592,8 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 		{inv5.Code, false, "inv5"},
 		{unknownCode, false, "unknown"},
 		{plantedCode, true, "planted"},
+		{plantedCode2, true, "planted-suffix"},
+		{plantedCode3, true, "planted-prefix"},
 	}
 	for _, tc := range allCodes {
 		if leaked, found := detectLeak(logStr, tc.code); found != tc.expected {
@@ -4586,6 +4617,15 @@ func TestInviteAcceptPathsNeverLogCode(t *testing.T) {
 		t.Fatalf("inv7: %v %s", err, body)
 	}
 	textLogStr := textLogs.String()
+	if textLogStr == "" {
+		t.Error("text-handler: no logs captured (logging unwired)")
+	}
+	if !strings.Contains(textLogStr, `msg="invite email"`) {
+		t.Error("text-handler: expected 'msg=\"invite email\"' not found")
+	}
+	if !strings.Contains(textLogStr, `status=logged`) {
+		t.Error("text-handler: expected 'status=logged' not found")
+	}
 	if leaked, found := detectLeak(textLogStr, inv7.Code); found {
 		t.Errorf("text-handler: code leaked: %s", leaked)
 	}
