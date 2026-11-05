@@ -336,10 +336,10 @@ func TestRedactSecrets(t *testing.T) {
 			want:  "error in pair_programming session",
 		},
 		{
-			name:  "boundary check: token without word boundary",
-			input: "error:xinv_" + strings.Repeat("a", 32) + " should be caught by exact match",
+			name:       "boundary check: token without word boundary",
+			input:      "error:xinv_" + strings.Repeat("a", 32) + " should be caught by exact match",
 			exactCodes: []string{"inv_" + strings.Repeat("a", 32)},
-			want:  "error:x[REDACTED:inv_...] should be caught by exact match",
+			want:       "error:x[REDACTED:inv_...] should be caught by exact match",
 		},
 	}
 
