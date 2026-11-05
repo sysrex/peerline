@@ -1235,6 +1235,11 @@ func TestConcurrentAcceptVsRevoke(t *testing.T) {
 
 	clk := clocktest.New(time.Unix(1000000, 0))
 
+	var grantAbsent, grantPresent int
+	t.Cleanup(func() {
+		t.Logf("orderings: grant absent (accept-then-revoke) %d, grant present (revoke-then-accept) %d", grantAbsent, grantPresent)
+	})
+
 	for iter := 0; iter < 50; iter++ {
 		t.Run(fmt.Sprintf("iter%d", iter), func(t *testing.T) {
 			dbPath := t.TempDir() + "/test.db"
@@ -1299,29 +1304,36 @@ func TestConcurrentAcceptVsRevoke(t *testing.T) {
 			aErr := <-acceptErr
 			rErr := <-revokeErr
 
-		grantScopes := getGrantRow(t, s1.db, "alice", "bob")
-		used := inviteUsed(t, s1.db, code)
+			grantScopes := getGrantRow(t, s1.db, "alice", "bob")
+			used := inviteUsed(t, s1.db, code)
 
-		// Both invites carry the same grant, so accept never returns ErrConflict (takes skip path).
-		// Invariants: aErr must be nil, rErr must be nil, invite must be used.
-		// Two valid serial outcomes:
-		// (1) accept-then-revoke: grant absent (scopes "")
-		// (2) revoke-then-accept: grant exists with scopes exactly "messages"
-		if aErr != nil {
-			t.Fatalf("unexpected accept error: %v", aErr)
-		}
-		if rErr != nil {
-			t.Fatalf("unexpected revoke error: %v", rErr)
-		}
-		if !used {
-			t.Errorf("invite not consumed")
-		}
+			// Both invites carry the same grant, so accept never returns ErrConflict (takes skip path).
+			// Invariants: aErr must be nil, rErr must be nil, invite must be used.
+			// Two valid serial outcomes:
+			// (1) accept-then-revoke: grant absent (scopes "")
+			// (2) revoke-then-accept: grant exists with scopes exactly "messages"
+			if aErr != nil {
+				t.Fatalf("unexpected accept error: %v", aErr)
+			}
+			if rErr != nil {
+				t.Fatalf("unexpected revoke error: %v", rErr)
+			}
+			if !used {
+				t.Errorf("invite not consumed")
+			}
 
-		// Assert grant state matches one of the two valid orderings
-		if grantScopes != "" && grantScopes != "messages" {
-			t.Errorf("grant scopes = %q, want \"\" (accept-then-revoke) or \"messages\" (revoke-then-accept)", grantScopes)
-		}
-	})
+			// Assert grant state matches one of the two valid orderings
+			if grantScopes != "" && grantScopes != "messages" {
+				t.Errorf("grant scopes = %q, want \"\" (accept-then-revoke) or \"messages\" (revoke-then-accept)", grantScopes)
+			}
+
+			// Count ordering
+			if grantScopes == "" {
+				grantAbsent++
+			} else {
+				grantPresent++
+			}
+		})
 	}
 }
 
@@ -1337,6 +1349,11 @@ func TestConcurrentAcceptVsRevokeDifferentGrant(t *testing.T) {
 	defer cancel()
 
 	clk := clocktest.New(time.Unix(1000000, 0))
+
+	var conflictOrdering, successOrdering int
+	t.Cleanup(func() {
+		t.Logf("orderings: accept-then-revoke (conflict) %d, revoke-then-accept (success) %d", conflictOrdering, successOrdering)
+	})
 
 	for iter := 0; iter < 50; iter++ {
 		t.Run(fmt.Sprintf("iter%d", iter), func(t *testing.T) {
@@ -1421,6 +1438,7 @@ func TestConcurrentAcceptVsRevokeDifferentGrant(t *testing.T) {
 				if grantScopes != "" {
 					t.Errorf("accept conflicted, revoke succeeded, but grant still exists: %q", grantScopes)
 				}
+				conflictOrdering++
 			} else if aErr == nil {
 				// Ordering (2): revoke went first, accept succeeded
 				if rErr != nil {
@@ -1432,6 +1450,7 @@ func TestConcurrentAcceptVsRevokeDifferentGrant(t *testing.T) {
 				if !used {
 					t.Errorf("accept succeeded but invite not consumed")
 				}
+				successOrdering++
 			} else {
 				t.Fatalf("unexpected accept error: %v", aErr)
 			}
@@ -1582,6 +1601,11 @@ func TestConcurrentAcceptDifferentInvitesDifferentGrants(t *testing.T) {
 
 	clk := clocktest.New(time.Unix(1000000, 0))
 
+	var code1Wins, code2Wins int
+	t.Cleanup(func() {
+		t.Logf("orderings: code1 (messages) won %d, code2 (bags_read) won %d", code1Wins, code2Wins)
+	})
+
 	for iter := 0; iter < 50; iter++ {
 		t.Run(fmt.Sprintf("iter%d", iter), func(t *testing.T) {
 			dbPath := t.TempDir() + "/test.db"
@@ -1688,6 +1712,9 @@ func TestConcurrentAcceptDifferentInvitesDifferentGrants(t *testing.T) {
 			expectedScopes := "messages"
 			if winnerCode == code2 {
 				expectedScopes = "bags_read"
+				code2Wins++
+			} else {
+				code1Wins++
 			}
 			if grantScopes != expectedScopes {
 				t.Errorf("grant scopes = %q, want %q (winner: %s)", grantScopes, expectedScopes, winnerCode)
