@@ -1299,25 +1299,29 @@ func TestConcurrentAcceptVsRevoke(t *testing.T) {
 			aErr := <-acceptErr
 			rErr := <-revokeErr
 
-			grantScopes := getGrantRow(t, s1.db, "alice", "bob")
-			grantExists := grantScopes != ""
-			used := inviteUsed(t, s1.db, code)
+		grantScopes := getGrantRow(t, s1.db, "alice", "bob")
+		used := inviteUsed(t, s1.db, code)
 
-			// Both invites carry the same grant, so accept never returns ErrConflict (takes skip path).
-			// Two valid serial outcomes:
-			// (1) accept-then-revoke: accept nil, revoke nil, grant absent, invite used
-			// (2) revoke-then-accept: revoke nil, accept nil, grant exists, invite used
-			if aErr == nil && rErr == nil {
-				// Both succeeded. Invite must be consumed.
-				if !used {
-					t.Errorf("accept succeeded but invite not consumed (grantExists=%v)", grantExists)
-				}
-			} else if aErr != nil {
-				t.Fatalf("unexpected accept error: %v", aErr)
-			} else if rErr != nil {
-				t.Fatalf("unexpected revoke error: %v", rErr)
-			}
-		})
+		// Both invites carry the same grant, so accept never returns ErrConflict (takes skip path).
+		// Invariants: aErr must be nil, rErr must be nil, invite must be used.
+		// Two valid serial outcomes:
+		// (1) accept-then-revoke: grant absent (scopes "")
+		// (2) revoke-then-accept: grant exists with scopes exactly "messages"
+		if aErr != nil {
+			t.Fatalf("unexpected accept error: %v", aErr)
+		}
+		if rErr != nil {
+			t.Fatalf("unexpected revoke error: %v", rErr)
+		}
+		if !used {
+			t.Errorf("invite not consumed")
+		}
+
+		// Assert grant state matches one of the two valid orderings
+		if grantScopes != "" && grantScopes != "messages" {
+			t.Errorf("grant scopes = %q, want \"\" (accept-then-revoke) or \"messages\" (revoke-then-accept)", grantScopes)
+		}
+	})
 	}
 }
 
