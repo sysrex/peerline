@@ -1476,8 +1476,8 @@ var apiKeyInBody = regexp.MustCompile(regexp.QuoteMeta(auth.KeyPrefix) + `[A-Za-
 var secretTokenInBody = regexp.MustCompile(`(?:` + regexp.QuoteMeta(auth.InvitePrefix) + `|` + regexp.QuoteMeta(auth.PairingPrefix) + `|` + regexp.QuoteMeta(auth.EmailVerifyPrefix) + `)[A-Za-z0-9_-]{16,}`)
 
 // Case-insensitive versions for redactSecrets, to catch INV_/Inv_/etc without ToLower byte-length issues.
-var secretTokenInBodyCI = regexp.MustCompile(`(?i)(?:` + regexp.QuoteMeta(auth.InvitePrefix) + `|` + regexp.QuoteMeta(auth.PairingPrefix) + `|` + regexp.QuoteMeta(auth.EmailVerifyPrefix) + `)[A-Za-z0-9_-]{16,}`)
-var apiKeyInBodyCI = regexp.MustCompile(`(?i)` + regexp.QuoteMeta(auth.KeyPrefix) + `[A-Za-z0-9_-]{8,}`)
+var secretTokenInBodyCI = regexp.MustCompile("(?i)" + secretTokenInBody.String())
+var apiKeyInBodyCI = regexp.MustCompile("(?i)" + apiKeyInBody.String())
 
 const notifyPreviewMax = 200
 

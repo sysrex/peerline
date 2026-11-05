@@ -394,6 +394,17 @@ func TestMailerErrorRedaction(t *testing.T) {
 				t.Errorf("invite code suffix leaked in logs (len=%d)", len(inv.Code))
 			}
 
+			// Assert no invite code reaches logs (middle check: 10-char windows)
+			if len(inv.Code) >= 10 {
+				for k := 1; k+10 <= len(inv.Code); k++ {
+					fragment := inv.Code[k : k+10]
+					if strings.Contains(logStr, fragment) {
+						t.Errorf("invite code middle fragment leaked in logs (pos=%d, len=10)", k)
+						break
+					}
+				}
+			}
+
 			// Assert no unredacted inv_ pattern with proper length appears in logs
 			invCodeRegex := regexp.MustCompile(`inv_[A-Za-z0-9_-]{32,}`)
 			if invCodeRegex.MatchString(logStr) {
@@ -547,12 +558,29 @@ func TestVerificationEmailUpdateErrorRedaction(t *testing.T) {
 				t.Errorf("eml_ token leaked in logs (exact match, len=%d)", len(token))
 			}
 
-			// Assert no eml_ token reaches logs (fragment check: 10+ chars)
+			// Assert no eml_ token reaches logs (fragment check: 10+ chars, prefix/suffix/middle)
 			if len(token) >= 10 {
+				// Check prefix fragments
 				for i := 10; i <= len(token); i++ {
 					fragment := token[:i]
 					if strings.Contains(logStr, fragment) {
-						t.Errorf("eml_ token fragment leaked in logs (prefix len=%d)", i)
+						t.Errorf("eml_ token prefix fragment leaked (len=%d)", i)
+						break
+					}
+				}
+				// Check suffix fragments
+				for i := 10; i <= len(token); i++ {
+					fragment := token[len(token)-i:]
+					if strings.Contains(logStr, fragment) {
+						t.Errorf("eml_ token suffix fragment leaked (len=%d)", i)
+						break
+					}
+				}
+				// Check middle fragments (10-char windows at every position)
+				for k := 1; k+10 <= len(token); k++ {
+					fragment := token[k : k+10]
+					if strings.Contains(logStr, fragment) {
+						t.Errorf("eml_ token middle fragment leaked (pos=%d, len=10)", k)
 						break
 					}
 				}
