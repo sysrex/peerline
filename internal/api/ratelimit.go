@@ -355,6 +355,22 @@ func categorizeRelaxed(relaxed []string) (hasPublic bool, hasULA bool) {
 	return
 }
 
+// relaxedWarning returns the appropriate warning message based on which types
+// of relaxed entries were detected. Extracted for testing.
+func relaxedWarning(hasPublic, hasULA bool) string {
+	if hasPublic && hasULA {
+		return "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /29 lets anyone inside it spoof X-Forwarded-For; ULA (fc00::/7) ranges are also permitted and exempt from the /32 floor"
+	}
+	if hasPublic {
+		return "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /29 lets anyone inside it spoof X-Forwarded-For"
+	}
+	if hasULA {
+		return "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: ULA (fc00::/7) ranges are permitted and exempt from the /32 floor"
+	}
+	// Fallback when categorization cannot classify the relaxed entries (e.g., unparsable)
+	return "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: broader ranges are permitted"
+}
+
 // LimiterManager manages multiple rate limiters with proper lifecycle and pruning.
 type LimiterManager struct {
 	msgLim        *msg.Limiter
