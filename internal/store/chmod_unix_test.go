@@ -4,6 +4,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -139,12 +140,25 @@ func TestFreshDatabaseWithManualUmask(t *testing.T) {
 	}
 }
 
-func TestSymlinkNotFollowedDuringChmod(t *testing.T) {
+func TestSymlinkResolvedAndTightened(t *testing.T) {
 	dir := t.TempDir()
 
-	// Create a target file elsewhere
+	// Create a valid database at target with loose permissions
 	targetPath := filepath.Join(dir, "target.db")
-	if err := os.WriteFile(targetPath, []byte("target"), 0644); err != nil {
+
+	// Create the database first to make it valid
+	db, err := sql.Open("sqlite", targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE test (id INTEGER)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// Set loose permissions on the target
+	if err := os.Chmod(targetPath, 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -154,18 +168,20 @@ func TestSymlinkNotFollowedDuringChmod(t *testing.T) {
 		t.Skip("symlink not supported")
 	}
 
-	// Attempt to open the symlink - should fail or skip chmod (not follow)
-	// Our chmod helper uses Lstat which won't follow symlinks
-	// The DB open itself might fail for other reasons, but we verify the target wasn't modified
-	_, _ = OpenWithOptions(linkPath, OpenOptions{BackupDir: dir, BackupRetentionCount: 1, SkipMigrationBackup: true})
+	// Open through the symlink - should resolve and tighten the target
+	store, err := OpenWithOptions(linkPath, OpenOptions{BackupDir: dir, BackupRetentionCount: 1, SkipMigrationBackup: true})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	store.Close()
 
-	// Verify target file permissions weren't changed
+	// Verify target file permissions WERE tightened to 0600
 	info, err := os.Stat(targetPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := info.Mode().Perm(); perm != 0644 {
-		t.Errorf("symlink target was modified: got %04o, want 0644", perm)
+	if perm := info.Mode().Perm(); perm != 0600 {
+		t.Errorf("symlink target should be tightened: got %04o, want 0600", perm)
 	}
 }
 
@@ -178,6 +194,20 @@ func TestTightenSkipsFIFO(t *testing.T) {
 	if err := syscall.Mkfifo(walPath, 0644); err != nil {
 		t.Fatalf("mkfifo: %v", err)
 	}
+
+	// Cleanup: unblock any goroutine that might be blocked on the FIFO
+	t.Cleanup(func() {
+		// Open for writing non-blocking to unblock any reader
+		// ENXIO means no reader is blocked, which is fine
+		f, err := os.OpenFile(walPath, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err != nil && !errors.Is(err, syscall.ENXIO) {
+			// Log but don't fail the cleanup
+			t.Logf("cleanup: failed to unblock FIFO: %v", err)
+		}
+		if f != nil {
+			f.Close()
+		}
+	})
 
 	// Verify it's a FIFO
 	info, err := os.Lstat(walPath)

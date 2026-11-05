@@ -25,6 +25,30 @@ For zero-downtime deployments, see [Deployment and Schema Upgrades](#deployment-
 
 ## Breaking Changes
 
+### Fragment (#) in file: URI DSNs is now refused (#327, #349)
+
+**Affected versions:** All versions upgrading to include the #327/#349 fix
+
+**Impact:** `file:` URIs containing a fragment (`#`) now fail fast at startup with a clear error. Use `%23` to encode a literal `#` in the filename.
+
+**What changed:**
+- Before: Fragments in `file:` URIs could cause ambiguity where SQLite and the validation code disagree about the file path and parameters
+- After: Any `file:` URI with `#` is refused with error: `"file: URI contains a fragment (#), which is not supported; use %23 to encode a literal # in the filename"`
+
+**Examples:**
+```bash
+# Refused:
+file:/data/test.db#section
+file:/data/x.db#?mode=memory
+
+# Use %23 for literal hash in filename:
+file:/data/x%23y.db  # Opens x#y.db
+```
+
+**Note:** Plain (non-`file:`) paths with `#` are passed to SQLite as literal filenames and remain unchanged.
+
+**Why this change:** Fragments in `file:` URIs create ambiguity in URI parsing that can lead to mismatches between validation and SQLite's actual behavior. Refusing them outright prevents these edge cases.
+
 ### IPv4 6to4 relay anycast prefix rejected in PEERLINE_TRUSTED_PROXIES (#331)
 
 **Affected versions:** All versions upgrading to include the #331 fix
@@ -269,6 +293,8 @@ Docker volumes typically create directories with mode **0755** (world-readable).
 **What happens on upgrade with a 0755 /data directory:**
 - ✅ Startup succeeds. The 0755 directory passes the default-directory check (only writable bits 0022 are refused), backups are written at 0600, and migration proceeds normally.
 - **Automatic permission tightening**: On Unix, Peerline now tightens permissions on existing database files (database, -wal, -shm) at open if they are wider than 0600, removing group and other access. A warning is logged for each file that is tightened.
+  - **Symlinked databases**: If the database path is a symlink, Peerline resolves it and tightens the target file (and its -wal and -shm files, which SQLite creates next to the target, not the link). This ensures databases accessed through symlinks are properly secured.
+  - **Dangling symlinks**: A dangling symlink (link exists but target doesn't yet) is accepted if both the link's parent directory and the target's parent directory have safe permissions (not group- or world-writable, mode 0o022 bits clear). Symlinks to directories with mode 0755 are accepted; those pointing to 0777 or 1777 (sticky) directories are refused. This check runs at startup before SQLite creates the file, ensuring the database will be created in a safe location.
 - **New file creation**: This release sets `umask(0077)` on Unix at startup (process-wide), so new files Peerline creates (database, WAL, SHM, backups) are created at 0600 or 0700. This prevents other local users from reading the database even in a 0755 directory. On Windows, file permissions are handled via ACLs instead of umask.
 - **One-time manual step for backups**: After upgrading, run `chmod 600 peerline.db.pre-v*` to tighten permissions on existing backup files from earlier releases (the automatic tightening only applies to the main database files, not backups).
 
