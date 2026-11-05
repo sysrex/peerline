@@ -325,6 +325,16 @@ func (echoMailer) Send(_ context.Context, m mailer.Message) error {
 	return errors.New("mailer error: failed to send message with body: " + m.Body)
 }
 
+// echoMailerWithSecret is a mailer whose error embeds a secret that bodyPreview doesn't strip.
+type echoMailerWithSecret struct {
+	secret string
+}
+
+func (e echoMailerWithSecret) Mode() string { return "smtp" }
+func (e echoMailerWithSecret) Send(_ context.Context, m mailer.Message) error {
+	return errors.New("mailer error: failed to send. quoted: " + e.secret)
+}
+
 // TestMailerErrorRedaction verifies that when a Mailer.Send error embeds the message body
 // (including an invite code), the logged error is redacted and no invite code leaks into logs.
 // This is a defense-in-depth measure for issue #353.
@@ -565,13 +575,21 @@ func TestVerificationEmailUpdateErrorRedaction(t *testing.T) {
 }
 
 // TestNotifyEmailErrorRedaction verifies that when notify emails fail to send
-// and the error embeds message preview content, logs are redacted.
+// and the error embeds a secret (that bodyPreview wouldn't strip), logs are redacted.
 func TestNotifyEmailErrorRedaction(t *testing.T) {
 	testBothHandlers := func(t *testing.T, name string, newHandler func(*syncBuf) slog.Handler) {
 		t.Run(name, func(t *testing.T) {
 			var logs syncBuf
 			logger := slog.New(newHandler(&logs))
-			hsrv, _, st, db := newServerWithDB(t, Config{Logger: logger, Mailer: echoMailer{}})
+
+			// Generate secrets that the mailer will embed in its error
+			invSecret := "inv_" + strings.Repeat("X", 32)
+			plSecret := "pl_" + strings.Repeat("Y", 32)
+
+			hsrv, _, st, db := newServerWithDB(t, Config{
+				Logger: logger,
+				Mailer: echoMailerWithSecret{secret: invSecret + " and " + plSecret},
+			})
 			defer st.Close()
 			defer db.Close()
 
@@ -593,12 +611,10 @@ func TestNotifyEmailErrorRedaction(t *testing.T) {
 
 			logs.Reset()
 
-			// Alice sends a message to Bob with a secret in the body
-			// Note: bodyPreview already redacts inv_ tokens, so we test with a different pattern
-			// that could appear in a relay echo (e.g., a long unrelated token that looks suspicious)
+			// Alice sends a message to Bob (triggers notify)
 			resp, body := a.do("POST", "/v1/peers/"+b.id+"/messages", map[string]any{
 				"type": "note",
-				"body": "Test message with some content",
+				"body": "Test message",
 			}, nil)
 			want(t, resp, body, 201)
 
@@ -617,11 +633,33 @@ func TestNotifyEmailErrorRedaction(t *testing.T) {
 				t.Error("logs should contain 'notify email failed' line")
 			}
 
-			// The main test is that redactSecrets is called at the notify site.
-			// Since bodyPreview already redacts secrets, we verify the function is wired up
-			// by checking that the error is logged (not panicking) and contains expected structure.
-			// A proper redaction test would need a mailer error that contains something
-			// not already redacted by bodyPreview.
+			// Assert the redaction markers are present
+			if !strings.Contains(logStr, "[REDACTED:inv_") {
+				t.Error("logs should contain redaction marker '[REDACTED:inv_'")
+			}
+			if !strings.Contains(logStr, "[REDACTED:pl_") {
+				t.Error("logs should contain redaction marker '[REDACTED:pl_'")
+			}
+
+			// Assert no inv_ secret reaches logs (exact match)
+			if strings.Contains(logStr, invSecret) {
+				t.Errorf("inv_ secret leaked in logs (exact match, len=%d)", len(invSecret))
+			}
+
+			// Assert no pl_ secret reaches logs (exact match)
+			if strings.Contains(logStr, plSecret) {
+				t.Errorf("pl_ secret leaked in logs (exact match, len=%d)", len(plSecret))
+			}
+
+			// Assert no unredacted patterns appear in logs
+			invTokenRegex := regexp.MustCompile(`(?i)inv_[A-Za-z0-9_-]{16,}`)
+			if invTokenRegex.MatchString(logStr) {
+				t.Error("logs contain unredacted inv_ token matching real token pattern")
+			}
+			plTokenRegex := regexp.MustCompile(`(?i)pl_[A-Za-z0-9_-]{8,}`)
+			if plTokenRegex.MatchString(logStr) {
+				t.Error("logs contain unredacted pl_ token matching real token pattern")
+			}
 		})
 	}
 

@@ -353,10 +353,19 @@ func TestRedactSecrets(t *testing.T) {
 			want:       "smtp 550 rejected: [REDACTED:inv_...]",
 		},
 		{
-			name:       "URL-encoded code",
-			input:      "error: code%3Dinv_" + strings.Repeat("b", 32),
-			exactCodes: []string{"inv_" + strings.Repeat("b", 32)},
-			want:       "error: code%3D[REDACTED:inv_...]",
+			name:  "case-insensitive with İ (U+0130, 2 bytes)",
+			input: "İ inv_" + strings.Repeat("Q", 32),
+			want:  "İ [REDACTED:inv_...]",
+		},
+		{
+			name:  "case-insensitive with K (U+212A Kelvin, 3 bytes)",
+			input: "K inv_" + strings.Repeat("R", 32),
+			want:  "K [REDACTED:inv_...]",
+		},
+		{
+			name:  "multiple İ and K before token",
+			input: "İİKK inv_" + strings.Repeat("S", 32) + " end",
+			want:  "İİKK [REDACTED:inv_...] end",
 		},
 		{
 			name:  "case-changed prefix (INV_)",
@@ -391,6 +400,10 @@ func TestRedactSecrets(t *testing.T) {
 			got := redactSecrets(tt.input, tt.exactCodes...)
 			if got != tt.want {
 				t.Errorf("redactSecrets() =\n%q\nwant\n%q", got, tt.want)
+			}
+			// Verify output is valid UTF-8 (catches byte-offset bugs with İ, K)
+			if !utf8.ValidString(got) {
+				t.Error("redactSecrets() output is invalid UTF-8")
 			}
 		})
 	}

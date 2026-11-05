@@ -408,19 +408,18 @@ func redactMarker(token string) string {
 }
 
 // redactSecrets replaces secret tokens in s with "[REDACTED:<prefix>...]" to prevent them from
-// leaking into logs. It redacts via exact match, fragments (10+ chars), and case-insensitive
-// regex patterns (secretTokenInBody and apiKeyInBody).
+// leaking into logs. It redacts via fragments (10+ chars from exactCodes) and case-insensitive
+// regex patterns (secretTokenInBodyCI and apiKeyInBodyCI).
 func redactSecrets(s string, exactCodes ...string) string {
-	// First redact by exact match and fragments for any specific codes passed.
+	// First redact fragments for any specific codes passed (e.g., the code being sent).
+	// Fragment match: redact any substring of 10+ characters to catch truncated echoes.
+	// Work from longest to shortest to handle overlaps correctly.
+	// Note: the first iteration (length = len(code)) is the exact match.
 	for _, code := range exactCodes {
 		if code == "" {
 			continue
 		}
 		marker := redactMarker(code)
-		// Exact match (handles full code)
-		s = strings.ReplaceAll(s, code, marker)
-		// Fragment match: redact any substring of 10+ characters to catch truncated echoes.
-		// Work from longest to shortest to handle overlaps correctly.
 		if len(code) >= 10 {
 			for length := len(code); length >= 10; length-- {
 				for start := 0; start+length <= len(code); start++ {
@@ -431,25 +430,15 @@ func redactSecrets(s string, exactCodes ...string) string {
 		}
 	}
 
-	// Then redact any remaining tokens matching the patterns (case-insensitive).
-	// We use secretTokenInBody and apiKeyInBody (no \b, {16,}/{8,}) to align with bodyPreview.
-	lower := strings.ToLower(s)
+	// Then redact any remaining tokens matching the patterns (case-insensitive via (?i) flag).
+	// We use secretTokenInBodyCI and apiKeyInBodyCI ({16,}/{8,}, no \b) to align with bodyPreview.
+	// The (?i) flag handles INV_/Inv_/etc without ToLower (which breaks byte offsets for İ, K).
 
 	// Redact secret tokens (inv_, eml_, pair_)
-	matches := secretTokenInBody.FindAllStringIndex(lower, -1)
-	for i := len(matches) - 1; i >= 0; i-- {
-		start, end := matches[i][0], matches[i][1]
-		original := s[start:end]
-		s = s[:start] + redactMarker(original) + s[end:]
-	}
+	s = secretTokenInBodyCI.ReplaceAllStringFunc(s, redactMarker)
 
 	// Redact API keys (pl_)
-	matches = apiKeyInBody.FindAllStringIndex(lower, -1)
-	for i := len(matches) - 1; i >= 0; i-- {
-		start, end := matches[i][0], matches[i][1]
-		original := s[start:end]
-		s = s[:start] + redactMarker(original) + s[end:]
-	}
+	s = apiKeyInBodyCI.ReplaceAllStringFunc(s, redactMarker)
 
 	return s
 }
@@ -1485,6 +1474,10 @@ var apiKeyInBody = regexp.MustCompile(regexp.QuoteMeta(auth.KeyPrefix) + `[A-Za-
 // secretTokenInBody matches invite codes (inv_), pairing tokens (pair_), and email verify tokens (eml_).
 // Uses {16,} to handle generator changes; greedy match captures the whole token.
 var secretTokenInBody = regexp.MustCompile(`(?:` + regexp.QuoteMeta(auth.InvitePrefix) + `|` + regexp.QuoteMeta(auth.PairingPrefix) + `|` + regexp.QuoteMeta(auth.EmailVerifyPrefix) + `)[A-Za-z0-9_-]{16,}`)
+
+// Case-insensitive versions for redactSecrets, to catch INV_/Inv_/etc without ToLower byte-length issues.
+var secretTokenInBodyCI = regexp.MustCompile(`(?i)(?:` + regexp.QuoteMeta(auth.InvitePrefix) + `|` + regexp.QuoteMeta(auth.PairingPrefix) + `|` + regexp.QuoteMeta(auth.EmailVerifyPrefix) + `)[A-Za-z0-9_-]{16,}`)
+var apiKeyInBodyCI = regexp.MustCompile(`(?i)` + regexp.QuoteMeta(auth.KeyPrefix) + `[A-Za-z0-9_-]{8,}`)
 
 const notifyPreviewMax = 200
 
