@@ -521,6 +521,28 @@ func genTestCertWithValidity(t *testing.T, hostname string, notBefore, notAfter 
 	}
 }
 
+func genExpiredDNSCert(t *testing.T, hostname string) tls.Certificate {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: hostname},
+		NotBefore:    testClock.Now().Add(-2 * time.Hour),
+		NotAfter:     testClock.Now().Add(-time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{hostname},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{certDER}, PrivateKey: priv}
+}
+
 func genTestCertDNSOnly(t *testing.T, hostname string) tls.Certificate {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -2406,5 +2428,65 @@ func TestLogFullBodyDefault(t *testing.T) {
 	}
 	if !log.LogFullBody {
 		t.Error("LogFullBody should be true with PEERLINE_DEV_LOG_EMAIL_BODY=1, got false")
+	}
+}
+
+func TestProbeJoinsExpiryAndHostname(t *testing.T) {
+	cert := genExpiredDNSCert(t, "wrong.example")
+	parsed, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(parsed)
+
+	for _, implicit := range []bool{false, true} {
+		name := "STARTTLS"
+		wantPrefix := "smtp probe: STARTTLS handshake failed:"
+		if implicit {
+			name = "implicit TLS"
+			wantPrefix = "smtp probe: TLS handshake failed on port 465:"
+		}
+		t.Run(name, func(t *testing.T) {
+			var port int
+			if implicit {
+				ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				fs := &fakeServer{ln: ln, cert: &cert, t: t, closeCh: make(chan struct{})}
+				defer fs.close()
+				go fs.serve()
+				port = ln.Addr().(*net.TCPAddr).Port
+			} else {
+				srv := newFakeServer(t, true, &cert)
+				defer srv.close()
+				port = srv.port()
+			}
+			s := &SMTP{
+				Host:        "127.0.0.1",
+				Port:        port,
+				From:        "test@example.com",
+				Timeout:     2 * time.Second,
+				ImplicitTLS: implicit,
+				TLSConfig:   &tls.Config{RootCAs: pool, ServerName: "127.0.0.1"},
+			}
+			err := s.Probe(context.Background())
+			if err == nil {
+				t.Fatal("Probe succeeded, want expiry plus hostname")
+			}
+			first, _, _ := strings.Cut(err.Error(), "\n")
+			if !strings.HasPrefix(first, wantPrefix) {
+				t.Fatalf("first line = %q, want prefix %q", first, wantPrefix)
+			}
+			var invalid x509.CertificateInvalidError
+			if !errors.As(err, &invalid) || invalid.Reason != x509.Expired {
+				t.Fatalf("errors.As expiry = %v (%v), want Expired", invalid.Reason, err)
+			}
+			var hostErr x509.HostnameError
+			if !errors.As(err, &hostErr) {
+				t.Fatalf("errors.As HostnameError missing: %v", err)
+			}
+		})
 	}
 }
