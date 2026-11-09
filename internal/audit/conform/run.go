@@ -14,18 +14,18 @@ func LogStore(t *testing.T, open func() audit.LogStore) {
 	ctx := context.Background()
 	s := open()
 
-	seq1, err := s.Append(ctx, nil, audit.Record{PairingID: "pair-a", Kind: "message", Payload: []byte("one"), CreatedAt: 10})
+	seq1, err := s.Append(ctx, nil, audit.LogRecord{PairingID: "pair-a", Kind: "message", Payload: []byte("one"), CreatedAt: 10})
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
-	seq2, err := s.Append(ctx, nil, audit.Record{PairingID: "pair-a", Kind: "grant", Payload: []byte("two"), CreatedAt: 20})
+	seq2, err := s.Append(ctx, nil, audit.LogRecord{PairingID: "pair-a", Kind: "grant", Payload: []byte("two"), CreatedAt: 20})
 	if err != nil {
 		t.Fatalf("append 2: %v", err)
 	}
 	if seq1 != 1 || seq2 != 2 {
 		t.Fatalf("seqs = %d, %d, want 1, 2", seq1, seq2)
 	}
-	if _, err := s.Append(ctx, nil, audit.Record{PairingID: "pair-b", Kind: "message", Payload: []byte("other"), CreatedAt: 15}); err != nil {
+	if _, err := s.Append(ctx, nil, audit.LogRecord{PairingID: "pair-b", Kind: "message", Payload: []byte("other"), CreatedAt: 15}); err != nil {
 		t.Fatalf("append other pairing: %v", err)
 	}
 
