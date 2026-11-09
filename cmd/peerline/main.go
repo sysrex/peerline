@@ -122,7 +122,7 @@ func buildTrustedProxySettings(getenv func(string) string, log *slog.Logger) (pr
 
 	if tp != "" {
 		proxies = strings.Split(tp, ",")
-		// Validate CIDRs before mailer and SMTP probe to fail fast on typos or broad ranges
+		// Validate CIDRs after the store is open and before mailer setup and the SMTP probe.
 		_, _, err = api.ParseTrustedProxiesWithOpts(proxies, allowBroad)
 		if err != nil {
 			return nil, false, fmt.Errorf("invalid PEERLINE_TRUSTED_PROXIES: %w", err)
@@ -405,7 +405,8 @@ func main() {
 		log.Warn("key index size exceeds PEERLINE_KEY_INDEX_WARN", "keys", n, "warn_threshold", keyIndexWarn)
 	}
 
-	// Parse trusted proxy config before SMTP probe (fail-fast on typos)
+	// Parse trusted proxy config after the store open and key index load,
+	// and before mailer setup and the SMTP probe.
 	trustedProxies, allowBroadIPv6, err := buildTrustedProxySettings(os.Getenv, log)
 	if err != nil {
 		log.Error("trusted proxy config", "err", err)

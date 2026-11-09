@@ -67,8 +67,9 @@ type Config struct {
 	// TrustedProxies is a list of CIDR ranges (e.g. "10.0.0.0/8") from which
 	// X-Forwarded-For headers are honored. If empty, X-Forwarded-For is ignored.
 	TrustedProxies []string
-	// AllowBroadIPv6 lowers the IPv6 floor from /32 to /29 and permits ULA ranges.
-	// Only use when trusting a known public /29 (e.g. Cloudflare 2a06:98c0::/29).
+	// AllowBroadIPv6 lowers the IPv6 floor from /32 to /29, permits ULA ranges,
+	// and permits CGNAT prefixes shorter than /24. Only use when you trust
+	// every address in those ranges (e.g. Cloudflare 2a06:98c0::/29).
 	AllowBroadIPv6 bool
 	// Clock is the time source for invite expiry and rate limiters; defaults to clock.Real{}.
 	Clock clock.Clock
@@ -200,12 +201,15 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 		if cfg.AllowBroadIPv6 {
 			if len(relaxed) > 0 {
 				cfg.Logger.Info("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD accepted entries that would have been rejected", "relaxed", strings.Join(relaxed, ", "))
-				hasPublic, hasULA := categorizeRelaxed(relaxed)
-				warnMsg := relaxedWarning(hasPublic, hasULA)
+				hasPublic, hasULA, hasCGNAT := categorizeRelaxed(relaxed)
+				warnMsg := relaxedWarning(hasPublic, hasULA, hasCGNAT)
 				cfg.Logger.Warn(warnMsg)
 			} else {
 				cfg.Logger.Warn("PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled but no entries needed it; consider disabling")
 			}
+		}
+		if shared := cgnatTrustedPrefixes(trustedNets); len(shared) > 0 {
+			cfg.Logger.Warn("trusted proxy entry is inside CGNAT shared address space 100.64.0.0/10 (RFC 6598); trust only the proxy's own prefix", "prefixes", strings.Join(shared, ", "))
 		}
 	} else {
 		cfg.Logger.Warn("no trusted proxies configured: X-Forwarded-For will be ignored", "entries", len(cfg.TrustedProxies))

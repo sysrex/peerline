@@ -22,6 +22,14 @@ var rejectedIPv4Prefixes = [...]struct {
 	{netip.MustParsePrefix("192.88.99.0/24"), "overlaps 6to4 relay anycast prefix 192.88.99.0/24"},
 }
 
+// cgnatPrefix is RFC 6598 shared address space (carrier-grade NAT). The same
+// block is used by Tailscale and some cluster networks, so a single host or a
+// /24 is a plausible reverse proxy. Anything shorter trusts too many clients
+// to spoof X-Forwarded-For and is rejected unless the broad opt-in is set.
+var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
+
+const cgnatMinBits = 24
+
 // rejectedIPv6Prefixes lists IPv6 transition/translation ranges that are rejected
 // from trusted proxy lists because they cover arbitrary clients.
 var rejectedIPv6Prefixes = [...]struct {
@@ -195,6 +203,9 @@ func rateLimitKey(ip string) string {
 // Rejects zone identifiers (e.g., fe80::1%eth0).
 // Rejects 0.0.0.0/8 ("this network") and its IPv4-mapped form.
 // Rejects IPv4 6to4 relay anycast prefix 192.88.99.0/24.
+// Rejects CGNAT prefixes inside 100.64.0.0/10 that are shorter than /24.
+// A /24 or longer is accepted. The broad opt-in is only available via
+// ParseTrustedProxiesWithOpts.
 // Rejects IPv6 transition/translation prefixes: Teredo 2001::/32,
 // NAT64 64:ff9b::/96 and 64:ff9b:1::/48, and 6to4 2002::/16.
 func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
@@ -204,8 +215,9 @@ func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 
 // ParseTrustedProxiesWithOpts parses trusted proxies with optional broader IPv6 floor.
 // When allowBroadIPv6 is true, the IPv6 floor is /29 (allowing Cloudflare 2a06:98c0::/29,
-// and rejecting 2000::/3 as too broad), and ULA ranges contained in fc00::/7
-// (bits >= 7) are permitted. ::/0 is always rejected.
+// and rejecting 2000::/3 as too broad), ULA ranges contained in fc00::/7
+// (bits >= 7) are permitted, and CGNAT prefixes shorter than /24 are permitted.
+// ::/0 is always rejected.
 // IPv4 6to4 relay anycast prefix 192.88.99.0/24 is always rejected.
 // IPv6 transition/translation prefixes are always rejected: Teredo 2001::/32,
 // NAT64 64:ff9b::/96 and 64:ff9b:1::/48, and 6to4 2002::/16.
@@ -295,6 +307,14 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 					return nil, nil, fmt.Errorf("parsing %q: %s", cidr, rejected.errMsg)
 				}
 			}
+			// CGNAT shared space. A /24 or a single host can be a Tailscale
+			// or in-cluster proxy; a shorter prefix trusts the carrier's clients.
+			if cgnatPrefix.Overlaps(prefix) && bits < cgnatMinBits {
+				if !allowBroadIPv6 {
+					return nil, nil, fmt.Errorf("parsing %q: overlaps CGNAT shared address space 100.64.0.0/10 and is shorter than /%d; list the proxy's own prefix, or set PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD=1", cidr, cgnatMinBits)
+				}
+				relaxed = append(relaxed, prefix.String())
+			}
 		} else {
 			// IPv6: apply floor and additional checks
 			addr := prefix.Addr()
@@ -353,14 +373,20 @@ func ParseTrustedProxiesWithOpts(cidrs []string, allowBroadIPv6 bool) ([]*net.IP
 }
 
 // categorizeRelaxed examines the relaxed entries and returns whether they contain
-// public /29 prefixes or ULA prefixes. Used to word warnings precisely.
-func categorizeRelaxed(relaxed []string) (hasPublic bool, hasULA bool) {
+// public /29 prefixes, ULA prefixes, or a broad CGNAT prefix. Used to word warnings precisely.
+func categorizeRelaxed(relaxed []string) (hasPublic bool, hasULA bool, hasCGNAT bool) {
 	for _, s := range relaxed {
 		prefix, err := netip.ParsePrefix(s)
 		if err != nil {
 			continue
 		}
 		addr := prefix.Addr()
+		if addr.Is4() {
+			if cgnatPrefix.Overlaps(prefix) {
+				hasCGNAT = true
+			}
+			continue
+		}
 		if addr.Is6() {
 			// Check if this is a ULA prefix (starts with fc or fd)
 			if addr.As16()[0] == 0xfc || addr.As16()[0] == 0xfd {
@@ -373,20 +399,42 @@ func categorizeRelaxed(relaxed []string) (hasPublic bool, hasULA bool) {
 	return
 }
 
+// cgnatTrustedPrefixes returns parsed proxy networks that overlap RFC 6598 space.
+func cgnatTrustedPrefixes(nets []*net.IPNet) []string {
+	var out []string
+	for _, n := range nets {
+		prefix, err := netip.ParsePrefix(n.String())
+		if err != nil {
+			continue
+		}
+		if cgnatPrefix.Overlaps(prefix) {
+			out = append(out, prefix.String())
+		}
+	}
+	return out
+}
+
 // relaxedWarning returns the appropriate warning message based on which types
 // of relaxed entries were detected. Extracted for testing.
-func relaxedWarning(hasPublic, hasULA bool) string {
-	if hasPublic && hasULA {
-		return "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /29 lets anyone inside it spoof X-Forwarded-For; ULA (fc00::/7) ranges are also permitted and exempt from the /32 floor"
+func relaxedWarning(hasPublic, hasULA, hasCGNAT bool) string {
+	var msg string
+	switch {
+	case hasPublic && hasULA:
+		msg = "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /29 lets anyone inside it spoof X-Forwarded-For; ULA (fc00::/7) ranges are also permitted and exempt from the /32 floor"
+	case hasPublic:
+		msg = "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /29 lets anyone inside it spoof X-Forwarded-For"
+	case hasULA:
+		msg = "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: ULA (fc00::/7) ranges are permitted and exempt from the /32 floor"
+	case hasCGNAT:
+		return "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: a CGNAT prefix shorter than /24 inside 100.64.0.0/10 is trusted; anyone who can connect from it can spoof X-Forwarded-For"
+	default:
+		// Fallback when categorization cannot classify the relaxed entries (e.g., unparsable)
+		return "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: broader ranges are permitted"
 	}
-	if hasPublic {
-		return "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /29 lets anyone inside it spoof X-Forwarded-For"
+	if hasCGNAT {
+		msg += "; a CGNAT prefix shorter than /24 inside 100.64.0.0/10 is also trusted"
 	}
-	if hasULA {
-		return "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: ULA (fc00::/7) ranges are permitted and exempt from the /32 floor"
-	}
-	// Fallback when categorization cannot classify the relaxed entries (e.g., unparsable)
-	return "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: broader ranges are permitted"
+	return msg
 }
 
 // LimiterManager manages multiple rate limiters with proper lifecycle and pruning.
