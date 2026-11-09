@@ -1352,6 +1352,17 @@ func TestIPv6FloorWithOptIn(t *testing.T) {
 		{name: "6to4 relay IPv4-mapped neighbor ::ffff:192.88.98.0/120 allowed (default)", input: []string{"::ffff:192.88.98.0/120"}, allowBroad: false, wantNet: "192.88.98.0/24"},
 		{name: "6to4 relay IPv4-mapped neighbor ::ffff:192.88.98.0/120 allowed (opt-in)", input: []string{"::ffff:192.88.98.0/120"}, allowBroad: true, wantNet: "192.88.98.0/24"},
 
+		{name: "CGNAT /10 rejected (default)", input: []string{"100.64.0.0/10"}, allowBroad: false, wantError: "overlaps CGNAT shared address space 100.64.0.0/10"},
+		{name: "CGNAT /10 allowed (opt-in)", input: []string{"100.64.0.0/10"}, allowBroad: true, wantNet: "100.64.0.0/10"},
+		{name: "CGNAT /16 rejected (default)", input: []string{"100.96.0.0/16"}, allowBroad: false, wantError: "shorter than /24"},
+		{name: "CGNAT /23 rejected (default)", input: []string{"100.64.0.0/23"}, allowBroad: false, wantError: "shorter than /24"},
+		{name: "CGNAT /24 allowed (default)", input: []string{"100.64.1.0/24"}, allowBroad: false, wantNet: "100.64.1.0/24"},
+		{name: "CGNAT host allowed (default)", input: []string{"100.64.1.5"}, allowBroad: false, wantNet: "100.64.1.5/32"},
+		{name: "CGNAT outside /16 allowed (default)", input: []string{"100.128.0.0/16"}, allowBroad: false, wantNet: "100.128.0.0/16"},
+		{name: "CGNAT supernet 100.0.0.0/8 rejected (default)", input: []string{"100.0.0.0/8"}, allowBroad: false, wantError: "overlaps CGNAT shared address space 100.64.0.0/10"},
+		{name: "CGNAT mapped host allowed (default)", input: []string{"::ffff:100.64.1.5"}, allowBroad: false, wantNet: "100.64.1.5/32"},
+		{name: "CGNAT mapped /10 rejected (default)", input: []string{"::ffff:100.64.0.0/106"}, allowBroad: false, wantError: "overlaps CGNAT shared address space 100.64.0.0/10"},
+
 		// Still rejected even with opt-in
 		{name: "::/0 rejected (opt-in)", input: []string{"::/0"}, allowBroad: true, wantError: "too broad"},
 	}
@@ -1385,6 +1396,7 @@ func TestRelaxedWarning(t *testing.T) {
 		name      string
 		hasPublic bool
 		hasULA    bool
+		hasCGNAT  bool
 		want      string
 	}{
 		{
@@ -1411,13 +1423,24 @@ func TestRelaxedWarning(t *testing.T) {
 			hasULA:    false,
 			want:      "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: broader ranges are permitted",
 		},
+		{
+			name:     "CGNAT only",
+			hasCGNAT: true,
+			want:     "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: a CGNAT prefix shorter than /24 inside 100.64.0.0/10 is trusted; anyone who can connect from it can spoof X-Forwarded-For",
+		},
+		{
+			name:      "public and CGNAT",
+			hasPublic: true,
+			hasCGNAT:  true,
+			want:      "PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD is enabled: trusting a public /29 lets anyone inside it spoof X-Forwarded-For; a CGNAT prefix shorter than /24 inside 100.64.0.0/10 is also trusted",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := relaxedWarning(tt.hasPublic, tt.hasULA)
+			got := relaxedWarning(tt.hasPublic, tt.hasULA, tt.hasCGNAT)
 			if got != tt.want {
-				t.Errorf("relaxedWarning(%v, %v) = %q, want %q", tt.hasPublic, tt.hasULA, got, tt.want)
+				t.Errorf("relaxedWarning(%v, %v, %v) = %q, want %q", tt.hasPublic, tt.hasULA, tt.hasCGNAT, got, tt.want)
 			}
 		})
 	}
@@ -1604,15 +1627,10 @@ func safeIndex(s []string, i int) string {
 func TestRejectedPrefixTables(t *testing.T) {
 	// Test IPv4 table
 	for i, entry := range rejectedIPv4Prefixes {
-		// Check prefix is valid and non-zero
-		if !entry.prefix.IsValid() {
-			t.Errorf("rejectedIPv4Prefixes[%d]: invalid prefix", i)
-			continue
-		}
-		// An empty entry from zero-filled array slot has IsValid() == false and Bits() == 0
-		// But also check error message is non-empty to catch incomplete entries
-		if entry.errMsg == "" {
-			t.Errorf("rejectedIPv4Prefixes[%d]: empty error message", i)
+		// A zero slot is invalid and has an empty message. Check both together
+		// so an incomplete entry cannot pass by failing only the first test.
+		if !entry.prefix.IsValid() || entry.errMsg == "" {
+			t.Errorf("rejectedIPv4Prefixes[%d]: prefix valid=%v errMsg=%q", i, entry.prefix.IsValid(), entry.errMsg)
 			continue
 		}
 
@@ -1632,55 +1650,85 @@ func TestRejectedPrefixTables(t *testing.T) {
 			t.Errorf("rejectedIPv4Prefixes[%d]: error %q does not contain %q", i, err.Error(), entry.errMsg)
 		}
 
-		// Check a host inside is rejected
+		// Check a host inside is rejected with this entry's message, not any error.
 		if entry.prefix.Bits() < 32 {
 			hostAddr := entry.prefix.Masked().Addr()
 			_, _, err := ParseTrustedProxiesWithOpts([]string{hostAddr.String()}, false)
-			if err == nil {
-				t.Errorf("rejectedIPv4Prefixes[%d]: host %s inside %s not rejected", i, hostAddr, entry.prefix)
+			if err == nil || !strings.Contains(err.Error(), entry.errMsg) {
+				t.Errorf("rejectedIPv4Prefixes[%d]: host %s error = %v, want %q", i, hostAddr, err, entry.errMsg)
 			}
 		}
 	}
 
 	// Test IPv6 table
 	for i, entry := range rejectedIPv6Prefixes {
-		// Check prefix is valid and non-zero
-		if !entry.prefix.IsValid() {
-			t.Errorf("rejectedIPv6Prefixes[%d]: invalid prefix", i)
-			continue
-		}
-		// An empty entry from zero-filled array slot has IsValid() == false and Bits() == 0
-		// But also check error message is non-empty to catch incomplete entries
-		if entry.errMsg == "" {
-			t.Errorf("rejectedIPv6Prefixes[%d]: empty error message", i)
+		if !entry.prefix.IsValid() || entry.errMsg == "" {
+			t.Errorf("rejectedIPv6Prefixes[%d]: prefix valid=%v errMsg=%q", i, entry.prefix.IsValid(), entry.errMsg)
 			continue
 		}
 
-		// Check exact prefix is rejected with ALLOW_BROAD off
-		// Note: 2002::/16 hits the /32 floor first, so it may not get the overlap error
-		_, _, err := ParseTrustedProxiesWithOpts([]string{entry.prefix.String()}, false)
-		if err == nil {
-			t.Errorf("rejectedIPv6Prefixes[%d]: %s not rejected (ALLOW_BROAD off)", i, entry.prefix)
-		} else if !strings.Contains(err.Error(), entry.errMsg) && !strings.Contains(err.Error(), "must be at least") {
-			t.Errorf("rejectedIPv6Prefixes[%d]: error %q does not contain %q or floor error", i, err.Error(), entry.errMsg)
+		// The prefix itself may hit the length floor before the overlap check
+		// (2002::/16 is shorter than /32 and /29). A host inside the prefix
+		// is what must carry this entry's message.
+		for _, allowBroad := range []bool{false, true} {
+			_, _, err := ParseTrustedProxiesWithOpts([]string{entry.prefix.String()}, allowBroad)
+			if err == nil {
+				t.Errorf("rejectedIPv6Prefixes[%d]: %s not rejected (allowBroad=%v)", i, entry.prefix, allowBroad)
+				continue
+			}
+			floor := 32
+			if allowBroad {
+				floor = 29
+			}
+			specific := strings.Contains(err.Error(), entry.errMsg)
+			floorErr := entry.prefix.Bits() < floor && strings.Contains(err.Error(), "must be at least")
+			if !specific && !floorErr {
+				t.Errorf("rejectedIPv6Prefixes[%d]: allowBroad=%v error %q, want %q", i, allowBroad, err.Error(), entry.errMsg)
+			}
 		}
 
-		// Check exact prefix is rejected with ALLOW_BROAD on
-		// Note: 2002::/16 hits the /29 floor first with opt-in
-		_, _, err = ParseTrustedProxiesWithOpts([]string{entry.prefix.String()}, true)
-		if err == nil {
-			t.Errorf("rejectedIPv6Prefixes[%d]: %s not rejected (ALLOW_BROAD on)", i, entry.prefix)
-		} else if !strings.Contains(err.Error(), entry.errMsg) && !strings.Contains(err.Error(), "must be at least") {
-			t.Errorf("rejectedIPv6Prefixes[%d]: error %q does not contain %q or floor error", i, err.Error(), entry.errMsg)
-		}
-
-		// Check a host inside is rejected
 		if entry.prefix.Bits() < 128 {
 			hostAddr := entry.prefix.Masked().Addr()
 			_, _, err := ParseTrustedProxiesWithOpts([]string{hostAddr.String()}, false)
-			if err == nil {
-				t.Errorf("rejectedIPv6Prefixes[%d]: host %s inside %s not rejected", i, hostAddr, entry.prefix)
+			if err == nil || !strings.Contains(err.Error(), entry.errMsg) {
+				t.Errorf("rejectedIPv6Prefixes[%d]: host %s error = %v, want %q", i, hostAddr, err, entry.errMsg)
 			}
 		}
+	}
+}
+
+func TestCGNATRelaxedListAndStartupWarning(t *testing.T) {
+	_, relaxed, err := ParseTrustedProxiesWithOpts([]string{"100.64.0.0/10", "100.64.1.5"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(relaxed) != 1 || relaxed[0] != "100.64.0.0/10" {
+		t.Fatalf("relaxed = %v, want [100.64.0.0/10]", relaxed)
+	}
+	hasPublic, hasULA, hasCGNAT := categorizeRelaxed(relaxed)
+	if hasPublic || hasULA || !hasCGNAT {
+		t.Fatalf("categorizeRelaxed = public %v ula %v cgnat %v", hasPublic, hasULA, hasCGNAT)
+	}
+
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	h := &captureHandler{}
+	srv := mustNew(t, st, Config{
+		TrustedProxies: []string{"100.64.1.5"},
+		Logger:         slog.New(h),
+	})
+	t.Cleanup(srv.lim.Stop)
+
+	var saw bool
+	for _, r := range h.records {
+		if r.Level == slog.LevelWarn && strings.Contains(r.Message, "CGNAT shared address space 100.64.0.0/10") {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Fatal("api.New did not warn that a CGNAT host is trusted")
 	}
 }

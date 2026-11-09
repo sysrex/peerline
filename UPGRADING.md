@@ -79,7 +79,25 @@ file:/data/x%23y.db  # Opens x#y.db
 - There is no override; any entry that overlaps this range will prevent the server from starting.
 
 **How to fix:**
-Remove the overlapping entry from `PEERLINE_TRUSTED_PROXIES`. If a wider entry contains the range (e.g., `192.0.0.0/8` or `192.88.0.0/16`), split it into ranges that exclude `192.88.99.0/24`. This range covers arbitrary 6to4 relay clients and is not a legitimate reverse-proxy network.
+Remove the overlapping entry from `PEERLINE_TRUSTED_PROXIES`. If a wider entry contains the range (e.g., `192.0.0.0/8` or `192.88.0.0/16`), split it into ranges that exclude `192.88.99.0/24`. Splitting a public `/8` is only an illustration of the exclusion; trust only your proxies' actual ranges. This range covers arbitrary 6to4 relay clients and is not a legitimate reverse-proxy network.
+
+### CGNAT shared address space in PEERLINE_TRUSTED_PROXIES (#359)
+
+**Affected versions:** All versions upgrading to include the #359 change
+
+**Impact:** An entry that overlaps `100.64.0.0/10` (RFC 6598) and is shorter than `/24` now fails startup, unless `PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD=1`. A `/24` or a single address still starts, and logs a warning.
+
+**What changed:**
+- Default: `100.64.0.0/10`, a `/16` inside it, or any shorter overlapping prefix is rejected. `100.64.1.5` and `100.64.1.0/24` are accepted.
+- Opt-in: `PEERLINE_TRUSTED_PROXIES_ALLOW_BROAD=1` also allows the shorter CGNAT prefixes. Startup still warns.
+- The same block is used by Tailscale and some cluster networks. List the proxy's own address, not the whole shared range. Trusting the `/10` means every client who can connect from that space can spoof `X-Forwarded-For`.
+
+**How to fix:**
+Replace a broad CGNAT entry with the reverse proxy's address or a `/24` or longer that you actually control. Set the broad opt-in only when every address in the prefix is a proxy you trust.
+
+### API config startup log text (#344)
+
+`main` logs a `buildAPIConfig` failure as `api config`. Older builds logged `invalid rate limiter config`. Update any alert that matched the old text.
 
 ### IPv6 transition/translation prefixes rejected in PEERLINE_TRUSTED_PROXIES (#320)
 
