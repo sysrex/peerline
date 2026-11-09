@@ -343,17 +343,20 @@ func (fs *fakeServer) serve() {
 		if err != nil {
 			return
 		}
-		go fs.handleConn(c)
+		// Count before the handler runs so a test can observe the accept
+		// even when the handler has not reached its own bookkeeping yet.
+		fs.mu.Lock()
+		fs.connCount++
+		connNum := fs.connCount
+		fs.mu.Unlock()
+		go fs.handleConn(c, connNum)
 	}
 }
 
-func (fs *fakeServer) handleConn(c net.Conn) {
+func (fs *fakeServer) handleConn(c net.Conn, connNum int) {
 	defer c.Close()
 
-	// Track connection count and check if should stall
 	fs.mu.Lock()
-	fs.connCount++
-	connNum := fs.connCount
 	shouldStall := fs.stallSecondConn && connNum == 2
 	fs.mu.Unlock()
 
@@ -848,7 +851,7 @@ func TestSMTPSendRefusedBeforeAUTH(t *testing.T) {
 	}
 }
 
-func TestSMTPSendWrongHostnameTrustedChain(t *testing.T) {
+func TestSMTPSendWrongHostnamePinnedRoot(t *testing.T) {
 	cert := genTestCert(t, "wronghost.example.com")
 	srv := newFakeServer(t, true, &cert)
 	defer srv.close()
@@ -901,7 +904,7 @@ func TestSMTPSendWrongHostnameTrustedChain(t *testing.T) {
 	}
 }
 
-func TestSMTPSendWrongHostnamePort465TrustedChain(t *testing.T) {
+func TestSMTPSendWrongHostnamePort465PinnedRoot(t *testing.T) {
 	tests := []struct {
 		name       string
 		serverName string // empty means use default from Host
@@ -970,15 +973,15 @@ func TestSMTPSendWrongHostnamePort465TrustedChain(t *testing.T) {
 	}
 }
 
-func TestSMTPSendPort465IPSANTrustedChain(t *testing.T) {
+func TestSMTPSendPort465IPSANPinnedRoot(t *testing.T) {
 	cert := genTestCertIPOnly(t, "127.0.0.1")
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
 
 	fs := &fakeServer{ln: ln, cert: &cert, t: t, closeCh: make(chan struct{})}
+	t.Cleanup(fs.close)
 	go fs.serve()
 
 	certPool := x509.NewCertPool()
@@ -1001,24 +1004,22 @@ func TestSMTPSendPort465IPSANTrustedChain(t *testing.T) {
 	}
 	err = s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"})
 	if err != nil {
-		var hostnameErr x509.HostnameError
-		if errors.As(err, &hostnameErr) {
-			t.Fatalf("Send should succeed with matching IP SAN, got HostnameError: %v", err)
-		}
 		t.Fatalf("Send should succeed with matching IP SAN, got: %v", err)
 	}
 
-	// Verify handshake succeeded and SMTP commands were sent
+	// Verify handshake succeeded and the message was submitted.
 	cmds := fs.receivedCommands()
-	hasEHLO := false
-	for _, cmd := range cmds {
-		if strings.HasPrefix(cmd, "EHLO") || strings.HasPrefix(cmd, "HELO") {
-			hasEHLO = true
-			break
+	for _, prefix := range []string{"EHLO", "MAIL", "RCPT", "DATA"} {
+		found := false
+		for _, cmd := range cmds {
+			if strings.HasPrefix(cmd, prefix) {
+				found = true
+				break
+			}
 		}
-	}
-	if !hasEHLO {
-		t.Fatalf("expected EHLO/HELO after successful handshake, got: %v", cmds)
+		if !found {
+			t.Fatalf("expected %s after successful handshake, got: %v", prefix, cmds)
+		}
 	}
 }
 
