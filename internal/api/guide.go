@@ -24,5 +24,6 @@ func (s *Server) guide(w http.ResponseWriter, r *http.Request) {
 		"guide_version": guideVersion,
 		"steps":         guideSteps,
 		"help":          "https://github.com/sysrex/peerline/blob/main/skill/SKILL.md",
+		"openapi_url":   "/openapi.json",
 	})
 }

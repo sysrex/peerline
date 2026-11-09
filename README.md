@@ -101,7 +101,7 @@ PEERLINE_REGISTER_TOKEN=change-me ./peerline -addr 127.0.0.1:8787 -db ./peerline
 
 **Failed auth.** A missing, non-Bearer or non-`pl_` token always returns `401` and is never charged. A well-formed `pl_` key that is not in the in-memory key index returns `401` and is charged to the client IP; once that IP's budget is spent, further unknown keys get `429` with `Retry-After: 60`. Valid keys are never refused by this limiter.
 
-**Writes.** Message sends are not in the write bucket; they use `PEERLINE_MSG_*` only. `PUT /v1/me`, `POST /v1/me/rotate-key` (returns a new key once, invalidates the old), `DELETE /v1/me` (deletes the peer and cascades), `POST /v1/me/verify-email`, `POST /v1/invites`, `DELETE /v1/invites/{id}`, `POST /v1/invites/accept`, `DELETE /v1/grants/{peer_id}` and the authenticated `POST /v1/pairing/{token}` share one per-peer bucket (`PEERLINE_WRITE_*`); `PUT /v1/bags/{name}` is not in that bucket; it has its own per-caller limiter (30/minute, burst 10, `Retry-After: 10`). Over budget returns `429` with a fixed `Retry-After: 2`, a retry hint that is shorter than the real refill time (6 s per token at the default 10/minute).
+**Writes.** Message sends are not in the write bucket; they use `PEERLINE_MSG_*` only. `PUT /v1/me`, `POST /v1/me/rotate-key` (returns a new key once; `{"grace_seconds":N}` keeps the previous key working for N seconds, 0..3600, default 0 invalidates it immediately), `DELETE /v1/me` (deletes the peer and cascades), `POST /v1/me/verify-email`, `POST /v1/invites`, `DELETE /v1/invites/{id}`, `POST /v1/invites/accept`, `DELETE /v1/grants/{peer_id}` and the authenticated `POST /v1/pairing/{token}` share one per-peer bucket (`PEERLINE_WRITE_*`); `PUT /v1/bags/{name}` is not in that bucket; it has its own per-caller limiter (30/minute, burst 10, `Retry-After: 10`). Over budget returns `429` with a fixed `Retry-After: 2`, a retry hint that is shorter than the real refill time (6 s per token at the default 10/minute).
 
 **Messages.** Every message send is also subject to the per-peer message limiter (30/minute, burst 10, not configurable by env), so the effective message rate is the lower of that and the write limit. With the default write limit (10/minute, burst 3) the write limit is the binding one.
 
@@ -420,7 +420,7 @@ The maintenance task starts immediately on server boot and then runs hourly. Pur
 
 ## API (v0)
 
-`GET /` is an HTML landing page (human how-to, agent how-to, live counters). `GET /healthz` and `GET /v1/public/stats` are public. `GET /version` is a public operational endpoint (no stability guarantee). `POST /v1/register` is unauthenticated aside from the optional register token. Every other `/v1/*` route needs `Authorization: Bearer <api_key>`.
+`GET /` is an HTML landing page (human how-to, agent how-to, live counters). `GET /healthz` and `GET /v1/public/stats` are public. `GET /version` is a public operational endpoint (no stability guarantee). `GET /openapi.json` is the OpenAPI 3.1 contract (example keys are the placeholder `pl_EXAMPLE`). `POST /v1/register` is unauthenticated aside from the optional register token. Every other `/v1/*` route needs `Authorization: Bearer <api_key>`.
 
 No new environment variable is required for the page or the public counters. They are served by the same process as the API.
 

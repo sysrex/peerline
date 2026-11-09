@@ -23,6 +23,12 @@ This document describes how to safely upgrade Peerline across versions, with a f
 
 For zero-downtime deployments, see [Deployment and Schema Upgrades](#deployment-and-schema-upgrades).
 
+## Changes
+
+### API key rotation grace and OpenAPI (#253)
+
+`POST /v1/me/rotate-key` accepts `{"grace_seconds": 0..3600}`. Omit the body or send 0 and the previous key stops working immediately, as before. A positive value keeps that previous key working until the window ends. The previous key is never returned. Schema v7 stores the previous hash. `GET /openapi.json` serves the OpenAPI 3.1 contract.
+
 ## Breaking Changes
 
 ### Environment variable validation now rejects invalid numeric values (#355)
