@@ -16,6 +16,12 @@ type StorePurger interface {
 	ReconcileKeyIndex(ctx context.Context, forceRebuild bool) (rebuilt bool, err error)
 }
 
+// AuditRetainer deletes aged audit records. StorePurger stays as it is;
+// a store that also implements this is retained on the same loop.
+type AuditRetainer interface {
+	PurgeAuditRecords(ctx context.Context, retentionDays int) (deleted int, more bool, err error)
+}
+
 // MaintenanceManager runs periodic cleanup tasks.
 type MaintenanceManager struct {
 	store                StorePurger
@@ -31,6 +37,7 @@ type MaintenanceManager struct {
 	rebuildInterval      time.Duration
 	lastRebuild          time.Time
 	rebuildIntervalHours int
+	auditRetentionDays   int
 }
 
 // MaintenanceManagerOption configures a MaintenanceManager.
@@ -41,6 +48,15 @@ func WithTickInterval(d time.Duration) MaintenanceManagerOption {
 	return func(m *MaintenanceManager) {
 		if d > 0 {
 			m.tickInterval = d
+		}
+	}
+}
+
+// WithAuditRetention sets the audit retention floor in days (default 183).
+func WithAuditRetention(days int) MaintenanceManagerOption {
+	return func(m *MaintenanceManager) {
+		if days > 0 {
+			m.auditRetentionDays = days
 		}
 	}
 }
@@ -73,6 +89,7 @@ func NewMaintenanceManager(ctx context.Context, store StorePurger, log *slog.Log
 		rebuildInterval:      time.Duration(rebuildIntervalHours) * time.Hour,
 		rebuildIntervalHours: rebuildIntervalHours,
 		lastRebuild:          clk.Now(), // start timer from now
+		auditRetentionDays:   183,
 	}
 
 	for _, opt := range opts {
@@ -90,7 +107,7 @@ func (m *MaintenanceManager) maintenanceLoop() {
 	defer m.wg.Done()
 
 	// Run once immediately at startup
-	m.more = m.purgeExpired()
+	m.more = m.purgeExpired() || m.purgeAudit()
 	m.reconcileKeyIndex()
 
 	// Then run every tick interval, or after followUpInterval when a capped run left a backlog
@@ -102,7 +119,7 @@ func (m *MaintenanceManager) maintenanceLoop() {
 		case <-m.ctx.Done():
 			return
 		case <-timer.C:
-			m.more = m.purgeExpired()
+			m.more = m.purgeExpired() || m.purgeAudit()
 			m.reconcileKeyIndex()
 			timer.Reset(m.nextDelay())
 		}
@@ -124,6 +141,25 @@ func (m *MaintenanceManager) purgeExpired() bool {
 	}
 	if err != nil && !errors.Is(err, context.Canceled) {
 		m.log.Error("maintenance: purge failed", "err", err)
+	}
+	return more
+}
+
+func (m *MaintenanceManager) purgeAudit() bool {
+	retainer, ok := m.store.(AuditRetainer)
+	if !ok {
+		return false
+	}
+	days := m.auditRetentionDays
+	if days <= 0 {
+		days = 183
+	}
+	count, more, err := retainer.PurgeAuditRecords(m.ctx, days)
+	if count > 0 {
+		m.log.Info("maintenance: purged audit records", "count", count, "more", more)
+	}
+	if err != nil && !errors.Is(err, context.Canceled) {
+		m.log.Error("maintenance: audit retention failed", "err", err)
 	}
 	return more
 }

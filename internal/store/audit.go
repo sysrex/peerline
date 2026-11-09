@@ -24,6 +24,8 @@ type AuditRecord struct {
 	ContentHashKind string
 	ContentSize     int
 	ExtraJSON       string
+	// PairingID, when set, appends to that pairing instead of deriving one.
+	PairingID string
 	// Leaf is hashed into ContentHash when an instance signing key is configured.
 	// It is not stored. Keep peer ids, bag names, and scope lists out of it.
 	Leaf []byte
@@ -85,9 +87,13 @@ func (s *Store) appendAuditOwned(ctx context.Context, rec AuditRecord) (int64, e
 }
 
 func (s *Store) appendAudit(ctx context.Context, tx DBTX, rec AuditRecord) (int64, error) {
-	pairingID, err := ensurePairing(ctx, tx, rec.FromPeer, rec.ToPeer, rec.TsMs)
-	if err != nil {
-		return 0, err
+	var err error
+	pairingID := rec.PairingID
+	if pairingID == "" {
+		pairingID, err = ensurePairing(ctx, tx, rec.FromPeer, rec.ToPeer, rec.TsMs)
+		if err != nil {
+			return 0, err
+		}
 	}
 	var pairSeq int64
 	var prev []byte
