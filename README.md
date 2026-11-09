@@ -464,7 +464,7 @@ Scopes: `messages`, `bags:read`, `bags:write`. Bag names: `^[a-z0-9][a-z0-9._-]{
 
 ## Audit log
 
-Schema v9 adds `pairings`, `pairing_keys`, `audit_records`, and `audit_chain_heads`. None of them reference `peers`, so deleting a peer does not delete the log. `PEERLINE_AUDIT_ENABLED` defaults off: the tables are created, and appends do nothing until the flag is `1`. The hash and signature columns are a provisional chain until the canonical record format lands. Peerline does not log message bodies in this table.
+Schema v9 adds `pairings`, `pairing_keys`, `audit_records`, and `audit_chain_heads`. None of them reference `peers`, so deleting a peer does not delete the log. `PEERLINE_AUDIT_ENABLED` defaults off: the tables are created, and appends do nothing until the flag is `1`. When it is on, `PEERLINE_AUDIT_SIGNING_KEY_PATH` must point at a mode-0600 Ed25519 seed. A failed audit append rolls the request back. The anchored leaf is a content hash: message type and body, bag version and content hash, or an event name. Peer ids, bag names, and scope lists stay off that leaf. Events recorded: `message.sent`, `bag.put`, `invite.created`, `invite.revoked`, `grant.created`, `grant.revoked`, `key.rotated`, `peer.deleted`.
 
 ## Security model
 

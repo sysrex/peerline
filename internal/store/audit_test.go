@@ -1,6 +1,8 @@
 package store
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +13,11 @@ import (
 func TestAuditSchemaSurvivesPeerDelete(t *testing.T) {
 	clk := clocktest.New(time.Unix(1_700_000_000, 0))
 	s := openAuditStore(t, true, clk)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.auditSigner = priv
 	if err := s.CreatePeer(t.Context(), "p1", "ada", "hash-1", "", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +41,8 @@ func TestAuditSchemaSurvivesPeerDelete(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pairing_keys`).Scan(&keys); err != nil {
 		t.Fatal(err)
 	}
-	if peers != 0 || records != 1 || pairings != 1 || keys != 1 {
+	// The explicit append plus the peer.deleted hook.
+	if peers != 0 || records != 2 || pairings != 1 || keys != 1 {
 		t.Fatalf("peers=%d records=%d pairings=%d keys=%d", peers, records, pairings, keys)
 	}
 }

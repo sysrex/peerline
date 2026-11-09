@@ -7,6 +7,8 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+
+	"github.com/sysrex/peerline/internal/audit"
 )
 
 // AuditRecord is one durable event. Hashes and sig are a provisional chain:
@@ -22,6 +24,9 @@ type AuditRecord struct {
 	ContentHashKind string
 	ContentSize     int
 	ExtraJSON       string
+	// Leaf is hashed into ContentHash when an instance signing key is configured.
+	// It is not stored. Keep peer ids, bag names, and scope lists out of it.
+	Leaf []byte
 }
 
 // AppendAudit writes rec in tx when audit is enabled. A nil tx starts one.
@@ -42,7 +47,7 @@ func (s *Store) AppendAudit(ctx context.Context, tx DBTX, rec AuditRecord) (int6
 		rec.TsMs = s.clk.Now().UnixMilli()
 	}
 	if tx != nil {
-		return appendAudit(ctx, tx, rec)
+		return s.appendAudit(ctx, tx, rec)
 	}
 	var last error
 	for range 5 {
@@ -69,7 +74,7 @@ func (s *Store) appendAuditOwned(ctx context.Context, rec AuditRecord) (int64, e
 		return 0, err
 	}
 	defer tx.Rollback()
-	seq, err := appendAudit(ctx, tx, rec)
+	seq, err := s.appendAudit(ctx, tx, rec)
 	if err != nil {
 		return 0, err
 	}
@@ -79,7 +84,7 @@ func (s *Store) appendAuditOwned(ctx context.Context, rec AuditRecord) (int64, e
 	return seq, nil
 }
 
-func appendAudit(ctx context.Context, tx DBTX, rec AuditRecord) (int64, error) {
+func (s *Store) appendAudit(ctx context.Context, tx DBTX, rec AuditRecord) (int64, error) {
 	pairingID, err := ensurePairing(ctx, tx, rec.FromPeer, rec.ToPeer, rec.TsMs)
 	if err != nil {
 		return 0, err
@@ -98,13 +103,40 @@ func appendAudit(ctx context.Context, tx DBTX, rec AuditRecord) (int64, error) {
 	pairSeq++
 	sum := auditRecordHash(prev, rec)
 	sig := make([]byte, 64)
+	kid := "unsigned"
+	if s.auditSigner != nil {
+		var key []byte
+		if err := tx.QueryRowContext(ctx, `SELECT wrapped_key FROM pairing_keys WHERE pairing_id=?`, pairingID).Scan(&key); err != nil {
+			return 0, err
+		}
+		if len(rec.Leaf) > 0 {
+			rec.ContentHash = audit.ContentHash(key, rec.Leaf)
+			rec.ContentHashKind = audit.ContentPlaintext
+			rec.ContentSize = len(rec.Leaf)
+		}
+		instance := s.auditInstance
+		if instance == "" {
+			instance = "peerline"
+		}
+		signed := audit.Record{
+			RecordID: rec.RecordID, TS: rec.TsMs, Instance: instance,
+			PairingID: pairingID, FromPeer: rec.FromPeer, ToPeer: rec.ToPeer,
+			EventType: rec.EventType, ContentHash: rec.ContentHash,
+			ContentHashKind: rec.ContentHashKind, ContentSize: rec.ContentSize,
+			PrevHash: prev,
+		}
+		if err := audit.Sign(&signed, s.auditSigner); err != nil {
+			return 0, err
+		}
+		sum, sig, kid = signed.RecordHash, signed.Sig, signed.SigKID
+	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO audit_records (
   record_id, pairing_id, pair_seq, ts_ms, event_type, from_peer, to_peer,
   content_hash, content_hash_kind, content_size, extra_json, prev_hash, record_hash, sig, sig_kid)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unsigned')`,
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		rec.RecordID, pairingID, pairSeq, rec.TsMs, rec.EventType, rec.FromPeer, rec.ToPeer,
-		rec.ContentHash, rec.ContentHashKind, rec.ContentSize, rec.ExtraJSON, prev, sum, sig); err != nil {
+		rec.ContentHash, rec.ContentHashKind, rec.ContentSize, rec.ExtraJSON, prev, sum, sig, kid); err != nil {
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `
