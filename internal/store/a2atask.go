@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/ed25519"
 	"database/sql"
 	"errors"
 	"time"
@@ -162,6 +163,47 @@ WHERE id=?`, to, s.clk.Now().Unix(), message, message, artifacts, artifacts, id)
 		}
 	}
 	return tx.Commit()
+}
+
+// EnableAuditForTest turns the audit writer on so an API test can see records.
+func EnableAuditForTest(s *Store, key ed25519.PrivateKey) {
+	s.auditEnabled = true
+	s.auditSigner = key
+}
+
+// AuditEventCount is the number of audit rows of one event type.
+func AuditEventCount(s *Store, event string) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM audit_records WHERE event_type=?`, event).Scan(&n)
+	return n, err
+}
+
+// NoteA2ACall records one JSON-RPC call. The leaf is hashes, not peer ids.
+func (s *Store) NoteA2ACall(ctx context.Context, peer string, leaf []byte) error {
+	return s.noteAudit(ctx, nil, "a2a.rpc", peer, "", leaf, "")
+}
+
+// ListA2ATasks returns tasks where peer is the client or the executor.
+func (s *Store) ListA2ATasks(ctx context.Context, peer string, limit int) ([]A2ATask, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, context_id, client_peer, exec_peer, state, history_json, artifacts_json, expires_at
+FROM a2a_tasks WHERE client_peer=? OR exec_peer=? ORDER BY updated_at DESC LIMIT ?`, peer, peer, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []A2ATask
+	for rows.Next() {
+		var t A2ATask
+		if err := rows.Scan(&t.ID, &t.ContextID, &t.ClientPeer, &t.ExecPeer, &t.State, &t.History, &t.Artifacts, &t.ExpiresAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }
 
 // PurgeA2ATasks deletes expired tasks in batches.

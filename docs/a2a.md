@@ -10,6 +10,8 @@
 | `taskId` and `referenceTaskIds` | `a2a_msg_map` links an A2A message id to a Peerline message id and a task |
 | Artifact | Inline JSON, at most 64 KiB |
 
+`POST /a2a` is JSON-RPC. `SendMessage` checks the grant, stores the task, writes an inbox message, and returns `submitted` immediately. It does not wait for the executor. `GetTask`, `ListTasks`, and `CancelTask` are the other methods. An unknown method returns JSON-RPC code `-32601`. An unknown or ungranted tenant returns `-32001` with message `not found`, and that miss is not written to the audit log. Successful calls record `a2a.rpc` with hashes of the request and the response.
+
 The executor reads the inbox and answers with `PUT /v1/a2a/tasks/{id}`. Only that peer can change state. The client and the executor can read the task. Anyone else gets the same not-found error as a missing id.
 
 Terminal states are `completed`, `failed`, `canceled`, and `rejected`. A message to a terminal task is refused. Canceling a terminal task is refused separately.
