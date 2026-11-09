@@ -462,6 +462,10 @@ Scopes: `messages`, `bags:read`, `bags:write`. Bag names: `^[a-z0-9][a-z0-9._-]{
 
 ---
 
+## Audit log
+
+Schema v9 adds `pairings`, `pairing_keys`, `audit_records`, and `audit_chain_heads`. None of them reference `peers`, so deleting a peer does not delete the log. `PEERLINE_AUDIT_ENABLED` defaults off: the tables are created, and appends do nothing until the flag is `1`. The hash and signature columns are a provisional chain until the canonical record format lands. Peerline does not log message bodies in this table.
+
 ## Security model
 
 - **Cross-account by design** — peer IDs are not tied to a single human; pairing is the trust boundary.

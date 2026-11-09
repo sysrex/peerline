@@ -300,6 +300,7 @@ func main() {
 
 	// Parse backup environment variables
 	skipBackup := os.Getenv("PEERLINE_SKIP_MIGRATION_BACKUP") == "1"
+	auditEnabled := auditFlagEnabled(os.Getenv("PEERLINE_AUDIT_ENABLED"))
 	backupDir := os.Getenv("PEERLINE_BACKUP_DIR")
 	backupKeep := 3
 	backupTimeout := 5 * time.Minute // Default: 5 minutes
@@ -331,6 +332,9 @@ func main() {
 	if skipBackup {
 		log.Warn("PEERLINE_SKIP_MIGRATION_BACKUP is enabled, pre-migration backups are disabled")
 	}
+	if auditEnabled {
+		log.Info("audit log enabled")
+	}
 
 	// Open database with explicit options
 	clk := clock.Real{}
@@ -341,6 +345,7 @@ func main() {
 		BackupTimeout:        backupTimeout,
 		Logger:               log,
 		Clock:                clk,
+		AuditEnabled:         auditEnabled,
 	}
 
 	st, err := store.OpenWithOptions(*dbPath, opts)
@@ -529,6 +534,15 @@ func parseBagLimits(bagsStr, bytesStr string) (int, int64, error) {
 		return 0, 0, fmt.Errorf("PEERLINE_MAX_BAG_BYTES_PER_PEER: %w", err)
 	}
 	return maxBags, maxBytes, nil
+}
+
+func auditFlagEnabled(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func parseNonNegativeInt64(s string) (int64, error) {

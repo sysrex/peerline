@@ -52,7 +52,7 @@ func TestVerifyBackupWithSpecialCharsInPath(t *testing.T) {
 			db.Close()
 
 			// Create backup in the directory with special characters
-			backupPath := filepath.Join(dir, "test.db.pre-v8-from-v2.20260101-120000.000000")
+			backupPath := filepath.Join(dir, "test.db.pre-v9-from-v2.20260101-120000.000000")
 			_, err = os.Create(backupPath)
 			if err != nil {
 				t.Fatal(err)
@@ -116,9 +116,9 @@ func TestRetentionWithHexSuffixes(t *testing.T) {
 
 	// Create several old backups with hex suffixes
 	oldBackups := []string{
-		"x.db.pre-v8-from-v2.20260101-120000.000000.deadbeef",
-		"x.db.pre-v8-from-v2.20260101-120001.000000.cafebabe",
-		"x.db.pre-v8-from-v2.20260101-120002.000000.12345678", // all-digits hex
+		"x.db.pre-v9-from-v2.20260101-120000.000000.deadbeef",
+		"x.db.pre-v9-from-v2.20260101-120001.000000.cafebabe",
+		"x.db.pre-v9-from-v2.20260101-120002.000000.12345678", // all-digits hex
 	}
 
 	for _, name := range oldBackups {
@@ -143,12 +143,12 @@ func TestRetentionWithHexSuffixes(t *testing.T) {
 
 	// Create files that should NOT be deleted
 	keepFiles := []string{
-		"x.db.pre-v8-from-v2.20260101-120000.000000.DEADBEEF",  // uppercase hex
-		"x.db.pre-v8-from-v2.20260101-120000.000000.KEEP",      // not matching pattern
-		"x.db.pre-v8-from-v2.20260101-120000.000000.deadbee",   // 7 chars, not 8
-		"x.db.pre-v8-from-v2.20260101-120000.000000.deadbeeff", // 9 chars, not 8
-		"x.db.pre-v8-from-v2.notes",                            // different pattern
-		"other.db.pre-v8-from-v2.20260101-120000.000000",       // different DB base
+		"x.db.pre-v9-from-v2.20260101-120000.000000.DEADBEEF",  // uppercase hex
+		"x.db.pre-v9-from-v2.20260101-120000.000000.KEEP",      // not matching pattern
+		"x.db.pre-v9-from-v2.20260101-120000.000000.deadbee",   // 7 chars, not 8
+		"x.db.pre-v9-from-v2.20260101-120000.000000.deadbeeff", // 9 chars, not 8
+		"x.db.pre-v9-from-v2.notes",                            // different pattern
+		"other.db.pre-v9-from-v2.20260101-120000.000000",       // different DB base
 	}
 
 	for _, name := range keepFiles {
@@ -256,7 +256,7 @@ func TestTwoFilesWithHashFragment(t *testing.T) {
 		db.Close()
 
 		// Create backup
-		backupPath := filepath.Join(dir, "test.db.pre-v8-from-v2.20260101-120000.000000")
+		backupPath := filepath.Join(dir, "test.db.pre-v9-from-v2.20260101-120000.000000")
 		if _, err := os.Create(backupPath); err != nil {
 			t.Fatal(err)
 		}
@@ -273,7 +273,7 @@ func TestTwoFilesWithHashFragment(t *testing.T) {
 	}
 
 	// Verify that the backup in dir2 (with # in path) verifies correctly
-	backup2 := filepath.Join(dir2, "test.db.pre-v8-from-v2.20260101-120000.000000")
+	backup2 := filepath.Join(dir2, "test.db.pre-v9-from-v2.20260101-120000.000000")
 	if err := verifyBackup(backup2, 2); err != nil {
 		t.Errorf("verifyBackup failed for path with #: %v", err)
 	}

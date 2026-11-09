@@ -60,6 +60,7 @@ type Store struct {
 	backupReused       bool
 	keyIndex           *keyIndex
 	keyIndexLoaded     bool
+	auditEnabled       bool
 }
 
 // nowUnix returns the current Unix timestamp from the store's clock.
@@ -78,6 +79,7 @@ var migrations = []func(*sql.Tx) error{
 	migrateV6ClaimOffer,
 	migrateV7PeerWebhook,
 	migrateV8SigningKeys,
+	migrateV9Audit,
 }
 
 // SchemaVersion returns the maximum schema version this binary supports.
@@ -127,6 +129,10 @@ type OpenOptions struct {
 	// Clock is an injectable time source for testing. If nil, uses clock.Real{}.
 	// Used for invite expiry checks, backup timestamps, and other time-based operations.
 	Clock clock.Clock
+
+	// AuditEnabled turns AppendAudit into a real write. The schema is always
+	// migrated. When false, appends are no-ops. Set from PEERLINE_AUDIT_ENABLED.
+	AuditEnabled bool
 
 	// vacuumInto is an injectable hook for testing. If nil, uses db.Exec("VACUUM INTO ?", path).
 	vacuumInto func(db *sql.DB, backupPath string) error
@@ -585,6 +591,7 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 		lastBackupPath:     backupPath,
 		backupReused:       reused,
 		keyIndex:           newKeyIndex(),
+		auditEnabled:       opts.AuditEnabled,
 	}, nil
 }
 
@@ -621,7 +628,11 @@ var expectedColumns = map[string][]string{
 	"peers": {"id", "name", "key_hash", "created_at", "notify_email", "notify_email_verified", "notify_email_token", "created_via_invite"},
 	"invites": {"code_hash", "from_peer", "scopes", "bags", "expires_at", "used_by", "pairing_token_hash", "public_id",
 		"require_confirm", "claimed_by", "confirm_by", "declined_at", "nonce", "back_scopes", "back_bags", "code_fails"},
-	"grants": {"owner", "grantee", "scopes", "bags", "created_at"},
+	"grants":            {"owner", "grantee", "scopes", "bags", "created_at"},
+	"pairings":          {"id", "peer_lo", "peer_hi", "created_at", "sig_policy"},
+	"pairing_keys":      {"pairing_id", "wrapped_key", "key_version", "created_at"},
+	"audit_records":     {"seq", "record_id", "pairing_id", "pair_seq", "prev_hash", "record_hash", "sig", "sig_kid"},
+	"audit_chain_heads": {"pairing_id", "pair_seq", "head_hash"},
 }
 
 var expectedIndexes = []string{"invites_pairing_token_hash", "invites_public_id"}
@@ -1520,6 +1531,57 @@ CREATE TABLE IF NOT EXISTS signing_key_audit (
   prev_hash BLOB NOT NULL,
   record_hash BLOB NOT NULL,
   created_at INTEGER NOT NULL
+);`)
+	return err
+}
+
+func migrateV9Audit(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+CREATE TABLE IF NOT EXISTS pairings (
+  id TEXT PRIMARY KEY,
+  peer_lo TEXT NOT NULL,
+  peer_hi TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  hold_until INTEGER,
+  sig_policy TEXT NOT NULL DEFAULT 'optional',
+  UNIQUE(peer_lo, peer_hi)
+);
+CREATE TABLE IF NOT EXISTS pairing_keys (
+  pairing_id TEXT PRIMARY KEY,
+  wrapped_key BLOB NOT NULL,
+  key_version INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  erased_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS audit_records (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  record_id TEXT NOT NULL UNIQUE,
+  pairing_id TEXT NOT NULL,
+  pair_seq INTEGER NOT NULL,
+  ts_ms INTEGER NOT NULL,
+  event_type TEXT NOT NULL,
+  from_peer TEXT,
+  to_peer TEXT,
+  org_ref TEXT,
+  content_hash BLOB,
+  content_hash_kind TEXT,
+  content_size INTEGER,
+  media_types TEXT,
+  a2a_json TEXT,
+  extra_json TEXT,
+  prev_hash BLOB NOT NULL,
+  record_hash BLOB NOT NULL,
+  sig BLOB NOT NULL,
+  sig_kid TEXT NOT NULL,
+  batch_seq INTEGER,
+  UNIQUE(pairing_id, pair_seq)
+);
+CREATE INDEX IF NOT EXISTS audit_unbatched ON audit_records(seq) WHERE batch_seq IS NULL;
+CREATE INDEX IF NOT EXISTS audit_retention ON audit_records(ts_ms);
+CREATE TABLE IF NOT EXISTS audit_chain_heads (
+  pairing_id TEXT PRIMARY KEY,
+  pair_seq INTEGER NOT NULL,
+  head_hash BLOB NOT NULL
 );`)
 	return err
 }

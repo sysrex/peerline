@@ -219,6 +219,8 @@ Schema v7 adds `peer_webhook` and `webhook_delivery`. Existing messages are unch
 
 Schema v8 adds `peer_signing_keys` and `signing_key_audit`. Those tables have no foreign key to `peers`, so deleting a peer leaves the key history in place. Peerline stores public keys only.
 
+Schema v9 adds the audit tables `pairings`, `pairing_keys`, `audit_records`, and `audit_chain_heads`, also with no foreign key to `peers`. `PEERLINE_AUDIT_ENABLED` defaults off. Turning it on starts appending events; leaving it off keeps current request behavior.
+
 ### Automatic Backup Behavior
 
 - **When**: A backup is created before migrating from an older schema version to a newer one.
