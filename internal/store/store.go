@@ -85,6 +85,7 @@ var migrations = []func(*sql.Tx) error{
 	migrateV8SigningKeys,
 	migrateV9Audit,
 	migrateV10AuditRetention,
+	migrateV11A2ATasks,
 }
 
 // SchemaVersion returns the maximum schema version this binary supports.
@@ -1607,6 +1608,31 @@ func migrateV10AuditRetention(tx *sql.Tx) error {
 		return nil
 	}
 	_, err := tx.Exec(`ALTER TABLE audit_records ADD COLUMN anchored_at INTEGER`)
+	return err
+}
+
+func migrateV11A2ATasks(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+CREATE TABLE IF NOT EXISTS a2a_tasks (
+  id TEXT PRIMARY KEY,
+  context_id TEXT NOT NULL,
+  client_peer TEXT NOT NULL,
+  exec_peer TEXT NOT NULL,
+  state TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  history_json TEXT NOT NULL DEFAULT '[]',
+  artifacts_json TEXT NOT NULL DEFAULT '[]',
+  metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS a2a_tasks_client ON a2a_tasks(client_peer, updated_at);
+CREATE INDEX IF NOT EXISTS a2a_tasks_exec ON a2a_tasks(exec_peer, updated_at);
+CREATE TABLE IF NOT EXISTS a2a_msg_map (
+  a2a_message_id TEXT PRIMARY KEY,
+  peerline_message_id INTEGER NOT NULL,
+  task_id TEXT NOT NULL
+);`)
 	return err
 }
 
