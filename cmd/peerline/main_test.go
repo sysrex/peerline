@@ -47,6 +47,8 @@ func TestParseNonNegativeInt(t *testing.T) {
 		{"at max", "200", "TEST_VAR", 200, 200, false, nil},
 		{"exceeds max", "201", "TEST_VAR", 200, 0, true, []string{"TEST_VAR", "201", "200"}},
 		{"huge overflow", "999999999999999999999", "TEST_VAR", 0, 0, true, []string{"TEST_VAR", "999999999999999999999", "out of range"}},
+		{"leading space rejected", " 5", "TEST_VAR", 0, 0, true, []string{"TEST_VAR", " 5", "numeric"}},
+		{"explicit plus accepted", "+5", "TEST_VAR", 0, 5, false, nil},
 	}
 
 	for _, tt := range tests {
@@ -213,6 +215,60 @@ func TestParseStartupLimits(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestValidateStartupEnv(t *testing.T) {
+	t.Run("empty is valid", func(t *testing.T) {
+		if err := validateStartupEnv(func(string) string { return "" }); err != nil {
+			t.Fatalf("validateStartupEnv(empty) = %v", err)
+		}
+	})
+	t.Run("bad retention names the variable", func(t *testing.T) {
+		err := validateStartupEnv(func(key string) string {
+			if key == "PEERLINE_RETENTION_DAYS" {
+				return "3O"
+			}
+			return ""
+		})
+		if err == nil || !strings.Contains(err.Error(), "PEERLINE_RETENTION_DAYS") || !strings.Contains(err.Error(), "3O") {
+			t.Fatalf("validateStartupEnv() = %v, want error naming PEERLINE_RETENTION_DAYS and 3O", err)
+		}
+	})
+	t.Run("bad email limit names the variable", func(t *testing.T) {
+		err := validateStartupEnv(func(key string) string {
+			if key == "PEERLINE_EMAIL_PER_HOUR" {
+				return "-1"
+			}
+			return ""
+		})
+		if err == nil || !strings.Contains(err.Error(), "PEERLINE_EMAIL_PER_HOUR") || !strings.Contains(err.Error(), "-1") {
+			t.Fatalf("validateStartupEnv() = %v, want error naming PEERLINE_EMAIL_PER_HOUR and -1", err)
+		}
+	})
+	t.Run("rebuild hours above cap", func(t *testing.T) {
+		err := validateStartupEnv(func(key string) string {
+			if key == "PEERLINE_KEY_INDEX_REBUILD_HOURS" {
+				return "8761"
+			}
+			return ""
+		})
+		if err == nil || !strings.Contains(err.Error(), "PEERLINE_KEY_INDEX_REBUILD_HOURS") || !strings.Contains(err.Error(), "8761") {
+			t.Fatalf("validateStartupEnv() = %v, want error for 8761", err)
+		}
+	})
+}
+
+func TestRetentionSecondsFromDays(t *testing.T) {
+	// 36500 is the documented cap and is above MaxInt32/86400 (24855).
+	// The result must be the full int64 product, never a wrapped int.
+	const days = 36500
+	const want = int64(days) * 24 * 60 * 60
+	if got := retentionSecondsFromDays(days); got != want || got <= 0 {
+		t.Fatalf("retentionSecondsFromDays(%d) = %d, want %d", days, got, want)
+	}
+	if got := retentionSecondsFromDays(0); got != 0 {
+		t.Fatalf("retentionSecondsFromDays(0) = %d, want 0", got)
 	}
 }
 

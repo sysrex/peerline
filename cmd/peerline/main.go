@@ -53,9 +53,9 @@ func parseNonNegativeInt(val, name string, max int) (int, error) {
 	n, err := strconv.Atoi(val)
 	if err != nil {
 		if errors.Is(err, strconv.ErrRange) {
-			return 0, fmt.Errorf("%s is out of range: %s", name, val)
+			return 0, fmt.Errorf("%s is out of range: %q", name, val)
 		}
-		return 0, fmt.Errorf("%s must be numeric, got: %s", name, val)
+		return 0, fmt.Errorf("%s must be numeric, got: %q", name, val)
 	}
 	if n < 0 {
 		return 0, fmt.Errorf("%s must be non-negative, got: %d", name, n)
@@ -145,25 +145,54 @@ func parseStartupLimits(getenv func(string) string) (keyIndexWarn, retentionDays
 	return keyIndexWarn, retentionDays, nil
 }
 
+// retentionSecondsFromDays converts a day count to seconds in int64.
+// The multiply happens after the widening cast: 36500 days (the documented
+// cap) exceeds MaxInt32/86400, so multiplying in int would wrap on 32-bit.
+func retentionSecondsFromDays(days int) int64 {
+	return int64(days) * 24 * 60 * 60
+}
+
+// parseAPILimitEnv validates the four numeric limits that buildAPIConfig
+// applies. Zero and unset are valid; the caller applies defaults.
+func parseAPILimitEnv(getenv func(string) string) (maxOutstandingInvites, emailPerHour, notifyPerHour, keyIndexRebuildHours int, err error) {
+	maxOutstandingInvites, err = parseNonNegativeInt(getenv("PEERLINE_MAX_OUTSTANDING_INVITES"), "PEERLINE_MAX_OUTSTANDING_INVITES", 0)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	emailPerHour, err = parseNonNegativeInt(getenv("PEERLINE_EMAIL_PER_HOUR"), "PEERLINE_EMAIL_PER_HOUR", 0)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	notifyPerHour, err = parseNonNegativeInt(getenv("PEERLINE_NOTIFY_PER_HOUR"), "PEERLINE_NOTIFY_PER_HOUR", 0)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	keyIndexRebuildHours, err = parseNonNegativeInt(getenv("PEERLINE_KEY_INDEX_REBUILD_HOURS"), "PEERLINE_KEY_INDEX_REBUILD_HOURS", 8760)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	return maxOutstandingInvites, emailPerHour, notifyPerHour, keyIndexRebuildHours, nil
+}
+
+// validateStartupEnv checks numeric limit env vars before the database is
+// opened, so a typo exits before migrations and the pre-migration backup.
+func validateStartupEnv(getenv func(string) string) error {
+	if _, _, err := parseStartupLimits(getenv); err != nil {
+		return err
+	}
+	if _, _, _, _, err := parseAPILimitEnv(getenv); err != nil {
+		return err
+	}
+	return nil
+}
+
 // buildAPIConfig constructs the api.Config that main() passes to api.New.
 // It parses all environment variables, validates them, and returns the exact config.
 // Called once from main(); the returned config is passed verbatim to api.New with no field assignments in between.
 func buildAPIConfig(getenv func(string) string, clk clock.Clock, ml mailer.Sender, versionDetail, publicURL string, maxBagsPerPeer int, maxBagBytesPerPeer, retentionSeconds int64, trustedProxies []string, allowBroadIPv6 bool, logger *slog.Logger) (api.Config, error) {
 
 	regTok := getenv("PEERLINE_REGISTER_TOKEN")
-	maxOutstandingInvites, err := parseNonNegativeInt(getenv("PEERLINE_MAX_OUTSTANDING_INVITES"), "PEERLINE_MAX_OUTSTANDING_INVITES", 0)
-	if err != nil {
-		return api.Config{}, err
-	}
-	emailPerHour, err := parseNonNegativeInt(getenv("PEERLINE_EMAIL_PER_HOUR"), "PEERLINE_EMAIL_PER_HOUR", 0)
-	if err != nil {
-		return api.Config{}, err
-	}
-	notifyPerHour, err := parseNonNegativeInt(getenv("PEERLINE_NOTIFY_PER_HOUR"), "PEERLINE_NOTIFY_PER_HOUR", 0)
-	if err != nil {
-		return api.Config{}, err
-	}
-	keyIndexRebuildHours, err := parseNonNegativeInt(getenv("PEERLINE_KEY_INDEX_REBUILD_HOURS"), "PEERLINE_KEY_INDEX_REBUILD_HOURS", 8760)
+	maxOutstandingInvites, emailPerHour, notifyPerHour, keyIndexRebuildHours, err := parseAPILimitEnv(getenv)
 	if err != nil {
 		return api.Config{}, err
 	}
@@ -262,6 +291,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Reject bad numeric limits before opening the store. A typo must not
+	// run migrations and then exit.
+	if err := validateStartupEnv(os.Getenv); err != nil {
+		log.Error("config", "err", err)
+		os.Exit(1)
+	}
+
 	// Parse backup environment variables
 	skipBackup := os.Getenv("PEERLINE_SKIP_MIGRATION_BACKUP") == "1"
 	backupDir := os.Getenv("PEERLINE_BACKUP_DIR")
@@ -356,7 +392,7 @@ func main() {
 	if retentionDays <= 0 {
 		retentionDays = 30 // default
 	}
-	retentionSeconds := int64(retentionDays * 24 * 60 * 60)
+	retentionSeconds := retentionSecondsFromDays(retentionDays)
 
 	// Load key index at startup (#112)
 	n, dur, err := st.LoadKeyIndex(context.Background())
