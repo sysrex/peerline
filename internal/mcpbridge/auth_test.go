@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -15,7 +16,20 @@ func TestOAuthIntrospectionAccountIsolation(t *testing.T) {
 	t.Setenv("TEST_OAUTH_SECRET", "secret")
 	upstreamStatus := 0
 	malformed := false
-	claims := map[string]any{"active": true, "sub": "subject-a", "iss": "https://issuer.example", "aud": "https://mcp.example/mcp", "scope": "peerline:messages", "exp": time.Now().Add(time.Hour).Unix()}
+	// One explicit expiry. Resampling time.Now() later made this test fail
+	// whenever a second elapsed between authentication and the assertion.
+	validExp := time.Now().Add(time.Hour).Unix()
+	var claimsMu sync.Mutex
+	claims := map[string]any{"active": true, "sub": "subject-a", "iss": "https://issuer.example", "aud": "https://mcp.example/mcp", "scope": "peerline:messages", "exp": validExp}
+	fixture := func() (status int, bad bool, body map[string]any) {
+		claimsMu.Lock()
+		defer claimsMu.Unlock()
+		body = make(map[string]any, len(claims))
+		for k, v := range claims {
+			body[k] = v
+		}
+		return upstreamStatus, malformed, body
+	}
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id, secret, ok := r.BasicAuth()
 		if !ok || id != "id" || secret != "secret" {
@@ -25,15 +39,16 @@ func TestOAuthIntrospectionAccountIsolation(t *testing.T) {
 		if r.Form.Get("token") != "access-token" {
 			t.Error("missing token")
 		}
-		if upstreamStatus != 0 {
-			w.WriteHeader(upstreamStatus)
+		status, bad, body := fixture()
+		if status != 0 {
+			w.WriteHeader(status)
 			return
 		}
-		if malformed {
+		if bad {
 			w.Write([]byte(`not-json`))
 			return
 		}
-		json.NewEncoder(w).Encode(claims)
+		json.NewEncoder(w).Encode(body)
 	}))
 	defer srv.Close()
 	account := Account{ID: "a", Subject: "subject-a", PeerID: "peer-a", RelayURL: "https://relay.example", APIKeyEnv: "KEY_A", Peers: map[string]string{"bob": "peer-b"}}
@@ -72,31 +87,43 @@ func TestOAuthIntrospectionAccountIsolation(t *testing.T) {
 			t.Fatal("cross-account access accepted", field)
 		}
 	}
+	claimsMu.Lock()
 	claims["active"] = false
+	claimsMu.Unlock()
 	if ok, err := a.CheckAccess(context.Background(), account, "access-token"); ok || err != nil {
 		t.Fatal("revoked subscription accepted")
 	}
+	claimsMu.Lock()
 	claims["active"] = true
 	claims["exp"] = time.Now().Add(-time.Hour).Unix()
+	claimsMu.Unlock()
 	if ok, err := a.CheckAccess(context.Background(), account, "access-token"); ok || err != nil {
 		t.Fatal("expired subscription accepted")
 	}
-	claims["exp"] = time.Now().Add(time.Hour).Unix()
-	if got.AccessTokenExpiresAt.Unix() != claims["exp"].(int64) {
-		t.Fatal("missing access token expiry")
+	claimsMu.Lock()
+	claims["exp"] = validExp
+	claimsMu.Unlock()
+	if got.AccessTokenExpiresAt.Unix() != validExp {
+		t.Fatalf("access token expiry = %d, want %d", got.AccessTokenExpiresAt.Unix(), validExp)
 	}
 	for _, status := range []int{400, 401, 403, 404, 429, 500, 503} {
+		claimsMu.Lock()
 		upstreamStatus = status
+		claimsMu.Unlock()
 		if ok, err := a.CheckAccess(context.Background(), account, "access-token"); ok || err == nil {
 			t.Fatal("transient status treated as revocation", status)
 		}
 	}
+	claimsMu.Lock()
 	upstreamStatus = 0
 	malformed = true
+	claimsMu.Unlock()
 	if ok, err := a.CheckAccess(context.Background(), account, "access-token"); ok || err == nil {
 		t.Fatal("malformed response treated as revocation")
 	}
+	claimsMu.Lock()
 	malformed = false
+	claimsMu.Unlock()
 	encoded, _ := json.Marshal(got)
 	if strings.Contains(string(encoded), "access-token") {
 		t.Fatal("token serialized")
@@ -114,16 +141,20 @@ func TestOAuthIntrospectionAccountIsolation(t *testing.T) {
 		bad   any
 	}{{"active", false}, {"sub", "other"}, {"iss", "https://evil.example"}, {"aud", "https://other.example"}, {"scope", "other"}, {"exp", time.Now().Add(-time.Hour).Unix()}, {"nbf", time.Now().Add(time.Hour).Unix()}} {
 		t.Run(tc.field, func(t *testing.T) {
-			old := claims[tc.field]
+			claimsMu.Lock()
+			old, had := claims[tc.field]
 			claims[tc.field] = tc.bad
+			claimsMu.Unlock()
 			if _, err := a.Authenticate(req); err == nil {
 				t.Fatal("accepted invalid claims")
 			}
-			if old == nil {
+			claimsMu.Lock()
+			if !had {
 				delete(claims, tc.field)
 			} else {
 				claims[tc.field] = old
 			}
+			claimsMu.Unlock()
 		})
 	}
 	req.Header.Del("Authorization")
