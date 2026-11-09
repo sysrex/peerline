@@ -19,7 +19,19 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/sysrex/peerline/internal/clock"
+	"github.com/sysrex/peerline/internal/clock/clocktest"
 )
+
+// testClock is the single fake used by this package. Certificate lifetimes
+// are built from it, and TestMain installs it as the mailer's fallback clock.
+var testClock = clocktest.New(time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC))
+
+func TestMain(m *testing.M) {
+	systemClock = testClock
+	os.Exit(m.Run())
+}
 
 func TestValidAddress(t *testing.T) {
 	for _, ok := range []string{"bob@example.com", " bob+bots@mail.example.co.uk "} {
@@ -454,11 +466,11 @@ func (fs *fakeServer) receivedCommands() []string {
 }
 
 func genTestCert(t *testing.T, hostname string) tls.Certificate {
-	return genTestCertWithValidity(t, hostname, time.Now(), time.Now().Add(time.Hour))
+	return genTestCertWithValidity(t, hostname, testClock.Now(), testClock.Now().Add(time.Hour))
 }
 
 func genExpiredTestCert(t *testing.T, hostname string) tls.Certificate {
-	return genTestCertWithValidity(t, hostname, time.Now().Add(-2*time.Hour), time.Now().Add(-1*time.Hour))
+	return genTestCertWithValidity(t, hostname, testClock.Now().Add(-2*time.Hour), testClock.Now().Add(-1*time.Hour))
 }
 
 func genTestCertWithValidity(t *testing.T, hostname string, notBefore, notAfter time.Time) tls.Certificate {
@@ -494,8 +506,8 @@ func genTestCertDNSOnly(t *testing.T, hostname string) tls.Certificate {
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: hostname},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(time.Hour),
+		NotBefore:    testClock.Now(),
+		NotAfter:     testClock.Now().Add(time.Hour),
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:     []string{hostname},
@@ -518,8 +530,8 @@ func genTestCertIPOnly(t *testing.T, ip string) tls.Certificate {
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: ip},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(time.Hour),
+		NotBefore:    testClock.Now(),
+		NotAfter:     testClock.Now().Add(time.Hour),
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		IPAddresses:  []net.IP{net.ParseIP(ip)},
@@ -545,8 +557,8 @@ func genTestCertChain(t *testing.T, hostname string, leafNotBefore, leafNotAfter
 	rootTemplate := x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: "Test Root CA"},
-		NotBefore:             time.Now().Add(-10 * time.Hour),
-		NotAfter:              time.Now().Add(24 * time.Hour),
+		NotBefore:             testClock.Now().Add(-10 * time.Hour),
+		NotAfter:              testClock.Now().Add(24 * time.Hour),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		IsCA:                  true,
 		BasicConstraintsValid: true,
@@ -1460,7 +1472,7 @@ func TestSMTPProbe(t *testing.T) {
 	})
 
 	t.Run("STARTTLS with not-yet-valid cert = fatal (clock skew)", func(t *testing.T) {
-		cert := genTestCertWithValidity(t, "localhost", time.Now().Add(time.Hour), time.Now().Add(2*time.Hour))
+		cert := genTestCertWithValidity(t, "localhost", testClock.Now().Add(time.Hour), testClock.Now().Add(2*time.Hour))
 		srv := newFakeServer(t, true, &cert)
 		defer srv.close()
 
@@ -1573,7 +1585,7 @@ func TestSMTPProbe(t *testing.T) {
 			Timeout:   5 * time.Second,
 			TLSConfig: &tls.Config{RootCAs: certPool, ServerName: "localhost"},
 		}
-		start := time.Now()
+		start := clock.Real{}.Now()
 		err = s.Probe(ctx)
 		elapsed := time.Since(start)
 
@@ -1589,7 +1601,7 @@ func TestSMTPProbe(t *testing.T) {
 	t.Run("STARTTLS expired intermediate under trusted root = expiry-only warn", func(t *testing.T) {
 		// #246 and Architect P1-2: expired intermediate under a trusted root.
 		// The leaf must be issued while the intermediate was valid, so the re-check succeeds.
-		now := time.Now()
+		now := testClock.Now()
 		leafCert, rootCert := genTestCertChain(t, "localhost",
 			now.Add(-3*time.Hour), now.Add(24*time.Hour), // leaf: issued 3h ago, valid for 24h more
 			now.Add(-4*time.Hour), now.Add(-time.Hour)) // intermediate: issued 4h ago, expired 1h ago
@@ -1623,7 +1635,7 @@ func TestSMTPProbe(t *testing.T) {
 
 	t.Run("STARTTLS expired intermediate under untrusted root = fatal", func(t *testing.T) {
 		// #246: expired intermediate under an untrusted (or no) root.
-		now := time.Now()
+		now := testClock.Now()
 		leafCert, _ := genTestCertChain(t, "localhost",
 			now.Add(-3*time.Hour), now.Add(24*time.Hour), // leaf: issued 3h ago, valid for 24h more
 			now.Add(-4*time.Hour), now.Add(-time.Hour)) // intermediate: issued 4h ago, expired 1h ago
@@ -2103,7 +2115,7 @@ func TestSMTPImplicitTLS(t *testing.T) {
 	})
 
 	t.Run("port 465 not-yet-valid cert = fatal (check the host clock)", func(t *testing.T) {
-		cert := genTestCertWithValidity(t, "localhost", time.Now().Add(time.Hour), time.Now().Add(2*time.Hour))
+		cert := genTestCertWithValidity(t, "localhost", testClock.Now().Add(time.Hour), testClock.Now().Add(2*time.Hour))
 		ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
 		if err != nil {
 			t.Fatal(err)
