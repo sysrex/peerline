@@ -449,12 +449,10 @@ func (s *SMTP) Probe(ctx context.Context) error {
 				return wrappedErr
 			}
 			// Check for expiry-only error (transient: relay state, not Peerline config)
-			if s.isExpiryOnlyError(ctx, err, conn, tlsCfg) {
+			if expiryOnly, recheckErr := s.isExpiryOnlyError(ctx, err, conn, tlsCfg); expiryOnly {
 				return fmt.Errorf("%w: relay certificate expired (sends will fail until renewed): %v", ErrRelayUnreachable, err)
-			}
-			// Check if it's a certificate/TLS error (fatal) or a timeout/reset (transient)
-			if isTLSError(err) {
-				return fmt.Errorf("smtp probe: TLS handshake failed on port 465: %w", err)
+			} else if isTLSError(err) {
+				return fmt.Errorf("smtp probe: TLS handshake failed on port 465: %w", joinRecheck(err, recheckErr))
 			}
 			return fmt.Errorf("%w: TLS handshake timeout/reset on port 465: %v", ErrRelayUnreachable, err)
 		}
@@ -493,11 +491,10 @@ func (s *SMTP) Probe(ctx context.Context) error {
 					return wrappedErr
 				}
 				// Check for expiry-only error (transient: relay state, not Peerline config)
-				if s.isExpiryOnlyError(ctx, err, conn, tlsCfg) {
+				if expiryOnly, recheckErr := s.isExpiryOnlyError(ctx, err, conn, tlsCfg); expiryOnly {
 					return fmt.Errorf("%w: relay certificate expired (sends will fail until renewed): %v", ErrRelayUnreachable, err)
-				}
-				if isTLSError(err) {
-					return fmt.Errorf("smtp probe: STARTTLS handshake failed: %w", err)
+				} else if isTLSError(err) {
+					return fmt.Errorf("smtp probe: STARTTLS handshake failed: %w", joinRecheck(err, recheckErr))
 				}
 				return fmt.Errorf("%w: STARTTLS timeout/reset: %v", ErrRelayUnreachable, err)
 			}
@@ -550,26 +547,30 @@ func isTLSError(err error) bool {
 	return false
 }
 
-// isExpiryOnlyError returns true if err is a certificate expiry error (past NotAfter) and that is
-// the ONLY problem (hostname and trust are valid). Go's x509 checks validity dates before
-// hostname and trust, so Reason == Expired can mask config errors (wrong host, untrusted CA).
-// We re-verify at a time when the cert would be valid to distinguish expiry-only (transient)
-// from multi-problem certs (fatal config error).
-// Not-yet-valid certificates (NotBefore in the future) are treated as fatal: they indicate
-// clock skew or misconfiguration, not relay state.
+// joinRecheck attaches a TLS failure from the expiry re-check. The first
+// line of Error() stays the handshake error; errors.As still finds both.
+func joinRecheck(handshakeErr, recheckErr error) error {
+	if recheckErr == nil || !isTLSError(recheckErr) {
+		return handshakeErr
+	}
+	return errors.Join(handshakeErr, recheckErr)
+}
+
+// isExpiryOnlyError reports whether err is a certificate expiry (past NotAfter)
+// and that is the only problem. The second return is a TLS error from the
+// re-check when expiry was masking another certificate problem. Network
+// failures return (false, nil): the caller still treats the cert as fatal.
 //
-// The re-verification makes a second connection to the same host:port with a modified TLS config
-// (Time set to NotAfter - 1s). If that connection fails for any reason (network error, rate limit,
-// timeout), the expired certificate is treated as fatal (safe side). A load-balanced relay could
-// answer from a different backend with a different certificate; that is acceptable since Send
-// verifies independently.
-func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, tlsCfg *tls.Config) bool {
+// Go's x509 checks validity dates before hostname and trust, so Reason == Expired
+// can mask a wrong host or an untrusted CA. The re-check uses Time = NotAfter-1s.
+// Not-yet-valid certificates are not expiry-only.
+func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, tlsCfg *tls.Config) (bool, error) {
 	var x509Invalid x509.CertificateInvalidError
 	if !errors.As(err, &x509Invalid) || x509Invalid.Reason != x509.Expired {
-		return false
+		return false, nil
 	}
 	if x509Invalid.Cert == nil {
-		return false
+		return false, nil
 	}
 	// Not-yet-valid (NotBefore in the future) is fatal: indicates clock skew or misconfiguration
 	// Use tlsCfg.Time if set (for tests), otherwise use the mailer clock.
@@ -578,7 +579,7 @@ func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, 
 		now = tlsCfg.Time()
 	}
 	if now.Before(x509Invalid.Cert.NotBefore) {
-		return false
+		return false, nil
 	}
 	// Cert is expired (past NotAfter). Check if it would be valid at NotAfter - 1s.
 	// If that succeeds, expiry was the only problem (transient).
@@ -601,27 +602,31 @@ func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, 
 
 	if s.ImplicitTLS {
 		// For implicit TLS, dial then upgrade
-		recheckConn, err := dial(recheckCtx, "tcp", addr)
-		if err != nil {
-			return false
+		recheckConn, dialErr := dial(recheckCtx, "tcp", addr)
+		if dialErr != nil {
+			return false, nil
 		}
 		implicitCfg := s.tlsConfigForImplicitTLS(recheckCfg)
 		tlsConn := tls.Client(recheckConn, implicitCfg)
 		if deadline, ok := recheckCtx.Deadline(); ok {
 			tlsConn.SetDeadline(deadline)
 		}
-		if err := tlsConn.HandshakeContext(recheckCtx); err == nil {
+		if hsErr := tlsConn.HandshakeContext(recheckCtx); hsErr == nil {
 			tlsConn.Close()
-			return true // Handshake succeeded at alternate time, so expiry was the only problem
+			return true, nil
+		} else {
+			recheckConn.Close()
+			if isTLSError(hsErr) {
+				return false, hsErr
+			}
+			return false, nil
 		}
-		recheckConn.Close()
-		return false
 	}
 
 	// For STARTTLS, dial plaintext then upgrade
-	recheckConn, err := dial(recheckCtx, "tcp", addr)
-	if err != nil {
-		return false
+	recheckConn, dialErr := dial(recheckCtx, "tcp", addr)
+	if dialErr != nil {
+		return false, nil
 	}
 	defer recheckConn.Close()
 
@@ -629,25 +634,27 @@ func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, 
 		recheckConn.SetDeadline(deadline)
 	}
 
-	c, err := smtp.NewClient(recheckConn, s.Host)
-	if err != nil {
-		return false
+	c, clientErr := smtp.NewClient(recheckConn, s.Host)
+	if clientErr != nil {
+		return false, nil
 	}
 	defer c.Quit()
 
-	if err := c.Hello("localhost"); err != nil {
-		return false
+	if helloErr := c.Hello("localhost"); helloErr != nil {
+		return false, nil
 	}
 
 	hasSTARTTLS, err := startTLSOffered(c)
 	if err != nil || !hasSTARTTLS {
-		return false
+		return false, nil
 	}
 
-	if err := c.StartTLS(recheckCfg); err == nil {
-		return true // STARTTLS succeeded at alternate time
+	if hsErr := c.StartTLS(recheckCfg); hsErr == nil {
+		return true, nil
+	} else if isTLSError(hsErr) {
+		return false, hsErr
 	}
-	return false
+	return false, nil
 }
 
 // Compose renders an RFC 5322 plain-text message with CRLF line endings.
