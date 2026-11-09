@@ -267,60 +267,80 @@ func (s *Server) pruneVerifyLoop() {
 }
 
 func (s *Server) Handler() http.Handler {
+	h, _ := s.buildHandler()
+	return h
+}
+
+// routePatterns is the method+path list Handler registers. The OpenAPI drift test uses it.
+func (s *Server) routePatterns() []string {
+	_, patterns := s.buildHandler()
+	return patterns
+}
+
+func (s *Server) buildHandler() (http.Handler, []string) {
 	mux := http.NewServeMux()
+	var patterns []string
+	reg := func(mux *http.ServeMux, pattern string, h http.Handler) {
+		patterns = append(patterns, pattern)
+		mux.Handle(pattern, h)
+	}
 	// {$} is an exact match for "/". A bare "GET /" would swallow every other path.
-	mux.HandleFunc("GET /{$}", s.rateLimitGet(s.home))
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
-	mux.HandleFunc("POST /v1/register", s.register)
+	reg(mux, "GET /{$}", s.rateLimitGet(s.home))
+	reg(mux, "GET /healthz", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) }))
+	reg(mux, "POST /v1/register", http.HandlerFunc(s.register))
 	// Registered on the outer mux so it is not behind Bearer auth. The more
 	// specific pattern wins over the /v1/ subtree below.
 	// Only register /version if not disabled
 	if s.cfg.VersionDetail != "off" {
-		mux.HandleFunc("GET /version", s.rateLimitVersion(s.versionHandler))
+		reg(mux, "GET /version", s.rateLimitVersion(s.versionHandler))
 	}
-	mux.HandleFunc("GET /v1/public/stats", s.rateLimitGet(s.publicStats))
-	mux.HandleFunc("GET /v1/guide", s.rateLimitGet(s.guide))
+	reg(mux, "GET /v1/public/stats", s.rateLimitGet(s.publicStats))
+	reg(mux, "GET /v1/guide", s.rateLimitGet(s.guide))
+	reg(mux, "GET /openapi.json", s.rateLimitGet(s.openAPI))
 
 	authed := http.NewServeMux()
-	authed.HandleFunc("GET /v1/me", s.rateLimitAuth(s.me))
-	authed.HandleFunc("PUT /v1/me", s.rateLimitWrite(s.updateMe))
-	authed.HandleFunc("POST /v1/me/rotate-key", s.rateLimitWrite(s.rotateKey))
-	authed.HandleFunc("DELETE /v1/me", s.rateLimitWrite(s.deleteMe))
-	authed.HandleFunc("POST /v1/me/verify-email", s.rateLimitWrite(s.verifyEmail))
-	authed.HandleFunc("POST /v1/invites", s.rateLimitWrite(s.createInvite))
-	authed.HandleFunc("GET /v1/invites", s.rateLimitAuth(s.listInvites))
-	authed.HandleFunc("DELETE /v1/invites/{id}", s.rateLimitWrite(s.deleteInvite))
-	authed.HandleFunc("POST /v1/invites/accept", s.rateLimitWrite(s.acceptInvite))
-	authed.HandleFunc("GET /v1/grants", s.rateLimitAuth(s.listGrants))
-	authed.HandleFunc("DELETE /v1/grants/{peer_id}", s.rateLimitWrite(s.revokeGrant))
-	authed.HandleFunc("POST /v1/peers/{peer_id}/messages", s.rateLimitAuth(s.sendMessage))
-	authed.HandleFunc("GET /v1/inbox", s.rateLimitAuth(s.inbox)) // polling-friendly rate limit
-	authed.HandleFunc("GET /v1/bags/{name}", s.rateLimitAuth(s.getBag))
-	authed.HandleFunc("PUT /v1/bags/{name}", s.rateLimitBagWrite(s.putBag))
-	authed.HandleFunc("POST /v1/pairing/{token}", s.rateLimitWrite(s.acceptPairing)) // authenticated pairing acceptance
+	reg(authed, "GET /v1/me", s.rateLimitAuth(s.me))
+	reg(authed, "PUT /v1/me", s.rateLimitWrite(s.updateMe))
+	reg(authed, "POST /v1/me/rotate-key", s.rateLimitWrite(s.rotateKey))
+	reg(authed, "DELETE /v1/me", s.rateLimitWrite(s.deleteMe))
+	reg(authed, "POST /v1/me/verify-email", s.rateLimitWrite(s.verifyEmail))
+	reg(authed, "POST /v1/invites", s.rateLimitWrite(s.createInvite))
+	reg(authed, "GET /v1/invites", s.rateLimitAuth(s.listInvites))
+	reg(authed, "DELETE /v1/invites/{id}", s.rateLimitWrite(s.deleteInvite))
+	reg(authed, "POST /v1/invites/accept", s.rateLimitWrite(s.acceptInvite))
+	reg(authed, "GET /v1/grants", s.rateLimitAuth(s.listGrants))
+	reg(authed, "DELETE /v1/grants/{peer_id}", s.rateLimitWrite(s.revokeGrant))
+	reg(authed, "POST /v1/peers/{peer_id}/messages", s.rateLimitAuth(s.sendMessage))
+	reg(authed, "GET /v1/inbox", s.rateLimitAuth(s.inbox)) // polling-friendly rate limit
+	reg(authed, "GET /v1/bags/{name}", s.rateLimitAuth(s.getBag))
+	reg(authed, "PUT /v1/bags/{name}", s.rateLimitBagWrite(s.putBag))
+	reg(authed, "POST /v1/pairing/{token}", s.rateLimitWrite(s.acceptPairing)) // authenticated pairing acceptance
 	authMW := s.authMiddleware(authed)
 	mux.Handle("/v1/", authMW)
+	for _, p := range s.claimRoutePatterns() {
+		patterns = append(patterns, p)
+	}
 	s.claimRoutes(mux, func(h http.Handler) http.Handler { return s.authMiddleware(h) })
 	// The landing page for accept_url: only unauthenticated GET shows instructions.
 	// Authenticated GET returns 405; only POST accepts the invite.
-	mux.HandleFunc("GET /v1/invites/accept", func(w http.ResponseWriter, r *http.Request) {
+	reg(mux, "GET /v1/invites/accept", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "" {
 			w.Header().Set("Allow", "POST")
 			writeErr(w, http.StatusMethodNotAllowed, "use POST to accept the invite")
 			return
 		}
 		s.acceptLanding(w, r)
-	})
+	}))
 	// Pairing endpoints: GET shows details, POST accepts (optionally creating a new peer)
-	mux.HandleFunc("GET /v1/pairing/{token}", s.rateLimitGet(s.getPairing))
-	mux.HandleFunc("POST /v1/pairing/{token}", func(w http.ResponseWriter, r *http.Request) {
+	reg(mux, "GET /v1/pairing/{token}", s.rateLimitGet(s.getPairing))
+	reg(mux, "POST /v1/pairing/{token}", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "" {
 			authMW.ServeHTTP(w, r)
 			return
 		}
 		s.acceptPairingUnauthenticated(w, r)
-	})
-	return deprecateQueryCodeOnAccept(deprecationDate, deprecationLink)(securityHeaders(mux))
+	}))
+	return deprecateQueryCodeOnAccept(deprecationDate, deprecationLink)(securityHeaders(mux)), patterns
 }
 
 // ---- auth middleware ----
@@ -573,8 +593,22 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) rotateKey(w http.ResponseWriter, r *http.Request) {
 	me := auth.PeerID(r.Context())
+	grace := 0
+	if r.Header.Get("Content-Type") != "" || r.ContentLength > 0 {
+		var in struct {
+			GraceSeconds int `json:"grace_seconds"`
+		}
+		if !decode(w, r, &in) {
+			return
+		}
+		if in.GraceSeconds < 0 || in.GraceSeconds > 3600 {
+			writeErr(w, http.StatusBadRequest, "grace_seconds must be 0..3600")
+			return
+		}
+		grace = in.GraceSeconds
+	}
 	key := auth.NewKey()
-	if err := s.st.RotateKey(r.Context(), me, auth.Hash(key)); err != nil {
+	if err := s.st.RotateKeyWithGrace(r.Context(), me, auth.Hash(key), grace); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "peer not found")
 			return
@@ -582,11 +616,16 @@ func (s *Server) rotateKey(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
-	s.log.Info("api key rotated", "peer_id", me)
+	note := "api_key is shown once; the previous key no longer works"
+	if grace > 0 {
+		note = "api_key is shown once; the previous key keeps working until the grace window ends"
+	}
+	s.log.Info("key.rotated", "event", "key.rotated", "peer_id", me, "grace_seconds", grace)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"peer_id": me,
-		"api_key": key,
-		"note":    "api_key is shown once; the previous key no longer works",
+		"peer_id":       me,
+		"api_key":       key,
+		"grace_seconds": grace,
+		"note":          note,
 	})
 }
 

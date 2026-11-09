@@ -76,6 +76,7 @@ var migrations = []func(*sql.Tx) error{
 	migrateV4EmailVerification,
 	migrateV5InviteClaimState,
 	migrateV6ClaimOffer,
+	migrateV7KeyGrace,
 }
 
 // SchemaVersion returns the maximum schema version this binary supports.
@@ -616,7 +617,7 @@ func backfillNullPublicIDs(db *sql.DB) error {
 // expectedColumns and expectedIndexes are what the code reads and relies on; a database at the
 // current user_version that lacks any of them (partial restore, hand edit) is refused.
 var expectedColumns = map[string][]string{
-	"peers": {"id", "name", "key_hash", "created_at", "notify_email", "notify_email_verified", "notify_email_token", "created_via_invite"},
+	"peers": {"id", "name", "key_hash", "created_at", "notify_email", "notify_email_verified", "notify_email_token", "created_via_invite", "prev_key_hash", "prev_key_expires_at"},
 	"invites": {"code_hash", "from_peer", "scopes", "bags", "expires_at", "used_by", "pairing_token_hash", "public_id",
 		"require_confirm", "claimed_by", "confirm_by", "declined_at", "nonce", "back_scopes", "back_bags", "code_fails"},
 	"grants": {"owner", "grantee", "scopes", "bags", "created_at"},
@@ -1473,6 +1474,28 @@ ALTER TABLE invites ADD COLUMN code_fails INTEGER NOT NULL DEFAULT 0;`)
 	return err
 }
 
+// migrateV7KeyGrace keeps the previous API key hash for a short overlap window.
+func migrateV7KeyGrace(tx *sql.Tx) error {
+	var n int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name = 'prev_key_hash'`).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		if _, err := tx.Exec(`ALTER TABLE peers ADD COLUMN prev_key_hash TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name = 'prev_key_expires_at'`).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		if _, err := tx.Exec(`ALTER TABLE peers ADD COLUMN prev_key_expires_at INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // outstandingInvite is the one definition of an unused invite that can still be acted on
 // (?1 = now): offered rows live until expires_at, claimed rows until confirm_by.
 const outstandingInvite = `(used_by IS NULL AND declined_at IS NULL AND
@@ -1621,8 +1644,34 @@ func (s *Store) GetVerifiedNotifyEmail(ctx context.Context, id string) (string, 
 // RotateKey replaces the peer's API key hash. The old key stops authenticating
 // immediately; grants, bags and identity are untouched.
 func (s *Store) RotateKey(ctx context.Context, id, newKeyHash string) error {
+	return s.RotateKeyWithGrace(ctx, id, newKeyHash, 0)
+}
+
+// RotateKeyWithGrace replaces the API key. When graceSeconds is 0 the old key
+// stops working immediately. Otherwise the old hash keeps authenticating until
+// now+graceSeconds (1..3600). Only the current key and one previous key are kept.
+func (s *Store) RotateKeyWithGrace(ctx context.Context, id, newKeyHash string, graceSeconds int) error {
+	if graceSeconds < 0 || graceSeconds > 3600 {
+		return fmt.Errorf("grace_seconds must be 0..3600")
+	}
+	var oldHash string
+	err := s.db.QueryRowContext(ctx, `SELECT key_hash FROM peers WHERE id=?`, id).Scan(&oldHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	now := s.nowUnix()
 	s.keyIndexRemove(id)
-	res, err := s.db.ExecContext(ctx, `UPDATE peers SET key_hash=? WHERE id=?`, newKeyHash, id)
+	var res sql.Result
+	var expires int64
+	if graceSeconds == 0 {
+		res, err = s.db.ExecContext(ctx, `UPDATE peers SET key_hash=?, prev_key_hash='', prev_key_expires_at=0 WHERE id=?`, newKeyHash, id)
+	} else {
+		expires = now + int64(graceSeconds)
+		res, err = s.db.ExecContext(ctx, `UPDATE peers SET prev_key_hash=key_hash, prev_key_expires_at=?, key_hash=? WHERE id=?`, expires, newKeyHash, id)
+	}
 	if err != nil {
 		return err
 	}
@@ -1630,6 +1679,9 @@ func (s *Store) RotateKey(ctx context.Context, id, newKeyHash string) error {
 		return ErrNotFound
 	}
 	s.keyIndex.add(newKeyHash, id)
+	if graceSeconds > 0 {
+		s.keyIndex.addUntil(oldHash, id, expires)
+	}
 	return nil
 }
 

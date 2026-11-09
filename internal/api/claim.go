@@ -47,13 +47,25 @@ func (s *Server) SetClaimStore(c ClaimStore) { s.claims = c }
 
 // claimRoutes registers on the outer mux because the unauthenticated
 // POST /v1/pairing/{token} would otherwise match before the /v1/ subtree.
+func (s *Server) claimRoutePatterns() []string {
+	if s.claims == nil {
+		return nil
+	}
+	return []string{
+		"POST /v1/pairing/claim",
+		"POST /v1/pairing/status",
+		"GET /v1/invites/{public_id}",
+		"POST /v1/invites/{public_id}/confirm",
+		"POST /v1/invites/{public_id}/decline",
+	}
+}
+
 func (s *Server) claimRoutes(mux *http.ServeMux, wrap func(http.Handler) http.Handler) {
 	if s.claims == nil {
 		return
 	}
 	h := wrap(s.claimHandlers())
-	for _, p := range []string{"POST /v1/pairing/claim", "POST /v1/pairing/status", "GET /v1/invites/{public_id}",
-		"POST /v1/invites/{public_id}/confirm", "POST /v1/invites/{public_id}/decline"} {
+	for _, p := range s.claimRoutePatterns() {
 		mux.Handle(p, h)
 	}
 }
