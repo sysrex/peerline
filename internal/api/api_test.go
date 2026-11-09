@@ -348,8 +348,8 @@ func TestRedactSecrets(t *testing.T) {
 		},
 		{
 			name:       "truncated code (10+ char fragment)",
-			input:      "smtp 550 rejected: " + strings.Repeat("a", 32)[:15],
-			exactCodes: []string{"inv_" + strings.Repeat("a", 32)},
+			input:      "smtp 550 rejected: " + "aB3dE6gH9jK2mN5",
+			exactCodes: []string{"inv_xxaB3dE6gH9jK2mN5pQ8sT1vW4xY7z0"},
 			want:       "smtp 550 rejected: [REDACTED:inv_...]",
 		},
 		{
@@ -361,6 +361,13 @@ func TestRedactSecrets(t *testing.T) {
 			name:  "case-insensitive with K (U+212A Kelvin, 3 bytes)",
 			input: "K inv_" + strings.Repeat("R", 32),
 			want:  "K [REDACTED:inv_...]",
+		},
+		{
+			// (?i)[A-Za-z] matches U+212A, so a Kelvin sign glued to the end of a
+			// token is consumed. That over-redaction is accepted.
+			name:  "Kelvin sign immediately after a token is over-redacted",
+			input: "inv_" + strings.Repeat("R", 32) + "\u212a trailing",
+			want:  "[REDACTED:inv_...] trailing",
 		},
 		{
 			name:  "multiple İ and K before token",
@@ -392,6 +399,12 @@ func TestRedactSecrets(t *testing.T) {
 			name:  "negative: unrelated long identifier",
 			input: "error in long_identifier_" + strings.Repeat("x", 20),
 			want:  "error in long_identifier_" + strings.Repeat("x", 20),
+		},
+		{
+			name:       "input longer than the redact cap is truncated",
+			input:      "prefix inv_" + strings.Repeat("Z", 32) + " " + strings.Repeat("y", maxRedactInput),
+			exactCodes: []string{"inv_" + strings.Repeat("Z", 32)},
+			want:       "prefix [REDACTED:inv_...] " + strings.Repeat("y", maxRedactInput-len("prefix inv_")-32-1) + " [truncated]",
 		},
 	}
 

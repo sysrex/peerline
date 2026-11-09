@@ -335,6 +335,31 @@ func (e echoMailerWithSecret) Send(_ context.Context, m mailer.Message) error {
 	return errors.New("mailer error: failed to send. quoted: " + e.secret)
 }
 
+// assertNoFragments fails if secret, or any 10+ character slice of it, appears in logs.
+// The comparison is case-sensitive, matching redactSecrets' fragment pass. A fragment
+// that is both shorter than 16 characters and case-changed is not detected here.
+func assertNoFragments(t *testing.T, logStr, secret string) {
+	t.Helper()
+	if secret == "" {
+		return
+	}
+	if strings.Contains(logStr, secret) {
+		t.Errorf("secret leaked in logs (exact match, len=%d)", len(secret))
+	}
+	if len(secret) < 10 {
+		return
+	}
+	for length := 10; length <= len(secret); length++ {
+		for start := 0; start+length <= len(secret); start++ {
+			fragment := secret[start : start+length]
+			if strings.Contains(logStr, fragment) {
+				t.Errorf("secret fragment leaked (start=%d len=%d)", start, length)
+				return
+			}
+		}
+	}
+}
+
 // TestMailerErrorRedaction verifies that when a Mailer.Send error embeds the message body
 // (including an invite code), the logged error is redacted and no invite code leaks into logs.
 // This is a defense-in-depth measure for issue #353.
@@ -379,31 +404,7 @@ func TestMailerErrorRedaction(t *testing.T) {
 				t.Error("logs should contain redaction marker '[REDACTED:inv_'")
 			}
 
-			// Assert no invite code reaches logs (exact substring check)
-			if strings.Contains(logStr, inv.Code) {
-				t.Errorf("invite code leaked in logs (exact match, len=%d)", len(inv.Code))
-			}
-
-			// Assert no invite code reaches logs (prefix check)
-			if len(inv.Code) >= 10 && strings.Contains(logStr, inv.Code[:10]) {
-				t.Errorf("invite code prefix leaked in logs (len=%d)", len(inv.Code))
-			}
-
-			// Assert no invite code reaches logs (suffix check)
-			if len(inv.Code) >= 10 && strings.Contains(logStr, inv.Code[len(inv.Code)-10:]) {
-				t.Errorf("invite code suffix leaked in logs (len=%d)", len(inv.Code))
-			}
-
-			// Assert no invite code reaches logs (middle check: 10-char windows)
-			if len(inv.Code) >= 10 {
-				for k := 1; k+10 <= len(inv.Code); k++ {
-					fragment := inv.Code[k : k+10]
-					if strings.Contains(logStr, fragment) {
-						t.Errorf("invite code middle fragment leaked in logs (pos=%d, len=10)", k)
-						break
-					}
-				}
-			}
+			assertNoFragments(t, logStr, inv.Code)
 
 			// Assert no unredacted inv_ pattern with proper length appears in logs
 			invCodeRegex := regexp.MustCompile(`inv_[A-Za-z0-9_-]{32,}`)
@@ -476,21 +477,7 @@ func TestVerificationEmailErrorRedaction(t *testing.T) {
 				t.Error("logs should contain redaction marker '[REDACTED:eml_'")
 			}
 
-			// Assert no eml_ token reaches logs (exact substring check)
-			if strings.Contains(logStr, token) {
-				t.Errorf("eml_ token leaked in logs (exact match, len=%d)", len(token))
-			}
-
-			// Assert no eml_ token reaches logs (fragment check: 10+ chars)
-			if len(token) >= 10 {
-				for i := 10; i <= len(token); i++ {
-					fragment := token[:i]
-					if strings.Contains(logStr, fragment) {
-						t.Errorf("eml_ token fragment leaked in logs (prefix len=%d)", i)
-						break
-					}
-				}
-			}
+			assertNoFragments(t, logStr, token)
 
 			// Assert no unredacted eml_ token with proper length appears in logs
 			emlTokenRegex := regexp.MustCompile(`(?i)eml_[A-Za-z0-9_-]{16,}`)
@@ -553,38 +540,7 @@ func TestVerificationEmailUpdateErrorRedaction(t *testing.T) {
 				t.Error("logs should contain redaction marker '[REDACTED:eml_'")
 			}
 
-			// Assert no eml_ token reaches logs (exact substring check)
-			if strings.Contains(logStr, token) {
-				t.Errorf("eml_ token leaked in logs (exact match, len=%d)", len(token))
-			}
-
-			// Assert no eml_ token reaches logs (fragment check: 10+ chars, prefix/suffix/middle)
-			if len(token) >= 10 {
-				// Check prefix fragments
-				for i := 10; i <= len(token); i++ {
-					fragment := token[:i]
-					if strings.Contains(logStr, fragment) {
-						t.Errorf("eml_ token prefix fragment leaked (len=%d)", i)
-						break
-					}
-				}
-				// Check suffix fragments
-				for i := 10; i <= len(token); i++ {
-					fragment := token[len(token)-i:]
-					if strings.Contains(logStr, fragment) {
-						t.Errorf("eml_ token suffix fragment leaked (len=%d)", i)
-						break
-					}
-				}
-				// Check middle fragments (10-char windows at every position)
-				for k := 1; k+10 <= len(token); k++ {
-					fragment := token[k : k+10]
-					if strings.Contains(logStr, fragment) {
-						t.Errorf("eml_ token middle fragment leaked (pos=%d, len=10)", k)
-						break
-					}
-				}
-			}
+			assertNoFragments(t, logStr, token)
 
 			// Assert no unredacted eml_ token with proper length appears in logs
 			emlTokenRegex := regexp.MustCompile(`(?i)eml_[A-Za-z0-9_-]{16,}`)
@@ -646,19 +602,19 @@ func TestNotifyEmailErrorRedaction(t *testing.T) {
 			}, nil)
 			want(t, resp, body, 201)
 
-			// Give notify goroutine time to run
-			time.Sleep(200 * time.Millisecond)
-
-			logStr := logs.String()
-
-			// Assert logs were captured
-			if logStr == "" {
-				t.Fatal("no logs captured (logging not wired)")
-			}
-
-			// Assert "notify email failed" log line is present
-			if !strings.Contains(logStr, "notify email failed") {
-				t.Error("logs should contain 'notify email failed' line")
+			// notifyNewMessage runs before the response today. Poll so a later
+			// move onto a goroutine cannot flake the way a fixed sleep would.
+			deadline := time.Now().Add(2 * time.Second)
+			var logStr string
+			for {
+				logStr = logs.String()
+				if strings.Contains(logStr, "notify email failed") {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("timed out waiting for notify email failed; logs: %s", logStr)
+				}
+				time.Sleep(5 * time.Millisecond)
 			}
 
 			// Assert the redaction markers are present
@@ -669,15 +625,8 @@ func TestNotifyEmailErrorRedaction(t *testing.T) {
 				t.Error("logs should contain redaction marker '[REDACTED:pl_'")
 			}
 
-			// Assert no inv_ secret reaches logs (exact match)
-			if strings.Contains(logStr, invSecret) {
-				t.Errorf("inv_ secret leaked in logs (exact match, len=%d)", len(invSecret))
-			}
-
-			// Assert no pl_ secret reaches logs (exact match)
-			if strings.Contains(logStr, plSecret) {
-				t.Errorf("pl_ secret leaked in logs (exact match, len=%d)", len(plSecret))
-			}
+			assertNoFragments(t, logStr, invSecret)
+			assertNoFragments(t, logStr, plSecret)
 
 			// Assert no unredacted patterns appear in logs
 			invTokenRegex := regexp.MustCompile(`(?i)inv_[A-Za-z0-9_-]{16,}`)

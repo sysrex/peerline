@@ -410,10 +410,26 @@ func redactMarker(token string) string {
 	return "[REDACTED:" + prefix + "...]"
 }
 
+// maxRedactInput bounds how much of an error string is scanned. A relay that
+// echoes a huge body must not make logging quadratic in that body.
+const maxRedactInput = 64 << 10
+
 // redactSecrets replaces secret tokens in s with "[REDACTED:<prefix>...]" to prevent them from
 // leaking into logs. It redacts via fragments (10+ chars from exactCodes) and case-insensitive
 // regex patterns (secretTokenInBodyCI and apiKeyInBodyCI).
+//
+// The fragment pass is case-sensitive. A value that is both shorter than 16
+// characters and case-changed can still get through; full tokens of 16 or more
+// characters are covered by the case-insensitive regex. That combination is rare.
 func redactSecrets(s string, exactCodes ...string) string {
+	truncated := false
+	if len(s) > maxRedactInput {
+		s = s[:maxRedactInput]
+		for len(s) > 0 && !utf8.ValidString(s) {
+			s = s[:len(s)-1]
+		}
+		truncated = true
+	}
 	// First redact fragments for any specific codes passed (e.g., the code being sent).
 	// Fragment match: redact any substring of 10+ characters to catch truncated echoes.
 	// Work from longest to shortest to handle overlaps correctly.
@@ -443,6 +459,9 @@ func redactSecrets(s string, exactCodes ...string) string {
 	// Redact API keys (pl_)
 	s = apiKeyInBodyCI.ReplaceAllStringFunc(s, redactMarker)
 
+	if truncated {
+		s += " [truncated]"
+	}
 	return s
 }
 
