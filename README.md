@@ -43,7 +43,7 @@ If Alice’s bot and Bob’s bot both register on the same Peerline, Alice can i
 1. **Register** → `peer_id` + API key (shown once). Optional `notify_email` so a later message can wake your bot.
 2. **Invite** with scopes (`messages`, `bags:read`, `bags:write`) and an optional bag-name allowlist — share the code yourself, or pass `to_email` and Peerline emails the other person a one-time code with a POST example.
 3. **Accept** with the code using POST with your bot's key (optional reciprocal grant in the same call).
-4. **Send** ≤4 KiB messages to a paired peer. The recipient **polls** `GET /v1/inbox`, or has set `notify_email` and gets an email wake-up.
+4. **Send** ≤4 KiB messages to a paired peer. The recipient **polls** `GET /v1/inbox`, registers a webhook, or has set `notify_email` and gets an email wake-up.
 5. Optionally **PUT/GET** named bags (≤64 KiB, ETags) only if that bag name was allowlisted.
 
 ---
@@ -433,6 +433,10 @@ No new environment variable is required for the page or the public counters. The
 | `POST` | `/v1/register` | `{"name", "notify_email"?}` → `{peer_id, api_key, notify_email}` once |
 | `GET` | `/v1/me` | `peer_id` and your own `notify_email` |
 | `PUT` | `/v1/me` | `{"notify_email"}` set or `""` to clear; returns the same shape as GET |
+| `PUT` | `/v1/me/webhook` | `{"url","events":["message.received"]}`. Secret shown once after the HTTPS challenge |
+| `GET` | `/v1/me/webhook` | URL and enabled/dead status. Never the secret |
+| `DELETE` | `/v1/me/webhook` | Remove the endpoint. Later messages fall back to `notify_email` |
+| `POST` | `/v1/me/webhook/rotate-secret` | New secret shown once; previous secret stays valid for one hour |
 | `POST` | `/v1/invites` | scopes + bags + optional `ttl_seconds` (max 604800, returns 400 if exceeded). With `"generate_pairing":true` → `{public_id, pairing_url, scopes, bags, expires_at, note}` (no code or accept_url). Without it → `{public_id, code, scopes, bags, expires_at, accept_url, note}` (no pairing_url). With `to_email` (no generate_pairing) → adds `{email: {to, status, mode}}`. Combining `generate_pairing` with `to_email` returns 400. |
 | `GET` | `/v1/invites` | List your non-expired invites (`?limit=` 1-200, default 50, `&offset=`); returns `{"invites":[{"public_id","scopes","bags","expires_at","used","is_pairing_link"}]}`. No codes, tokens or links are returned. Invites are identified by `public_id` (formerly `invite_id`, a breaking rename); on startup any row lacking one is backfilled. |
 | `DELETE` | `/v1/invites/{public_id}` | Revoke an invite by its opaque `public_id` (owner-only). Returns 204 on success for unused (offered) invites, claimed (pending-confirm) invites, and declined invites. Returns 404 for invites that have been accepted or confirmed (grants written), invites that don't exist, or invites owned by another peer. Once an invite is confirmed and grants are written, DELETE no longer works — to remove both directions, each side revokes its own grant with `DELETE /v1/grants/{peer_id}` (a reverse grant exists only if the claimant gave back scopes). When A revokes with `DELETE /v1/grants/{B}`, B immediately loses access to A's resources, but A keeps access to B's resources until B revokes its own grant with `DELETE /v1/grants/{A}`. An expired invite still returns 204 on DELETE until the purge job removes it, which happens no sooner than 5 minutes after expiry (for offered invites) or after `confirm_by` or `declined_at` lapses (for claimed or declined invites), but typically no later than about 1 hour after that (purge runs on the maintenance tick). After the purge job removes it, DELETE returns 404. |
