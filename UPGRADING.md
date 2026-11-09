@@ -25,6 +25,25 @@ For zero-downtime deployments, see [Deployment and Schema Upgrades](#deployment-
 
 ## Breaking Changes
 
+### Environment variable validation now rejects invalid numeric values (#355)
+
+**Affected versions:** All versions upgrading to include the #355 fix
+
+**Impact:** If `PEERLINE_EMAIL_PER_HOUR`, `PEERLINE_NOTIFY_PER_HOUR`, `PEERLINE_MAX_OUTSTANDING_INVITES`, `PEERLINE_KEY_INDEX_REBUILD_HOURS`, `PEERLINE_KEY_INDEX_WARN`, or `PEERLINE_RETENTION_DAYS` is set to a non-numeric value (e.g., `1O` with capital O) or a negative value, startup now fails with a clear error message naming the variable and the invalid value.
+
+**What changed:**
+- Before: a non-numeric value (for example `1O`) was silently ignored and the default used. A negative value was also treated as the default: `EMAIL_PER_HOUR` and `NOTIFY_PER_HOUR` via `api.New`'s `<= 0` check, and `MAX_OUTSTANDING_INVITES`, `KEY_INDEX_REBUILD_HOURS`, `KEY_INDEX_WARN`, and `RETENTION_DAYS` the same way in `main` or `api.New`.
+- After: startup fails before the database is opened, with an error like `PEERLINE_EMAIL_PER_HOUR must be numeric, got: "1O"` or `PEERLINE_MAX_OUTSTANDING_INVITES must be non-negative, got: -1`. Replace a negative with `0` to keep the default.
+- **Zero is still valid** and means "use the default" as documented (e.g., `PEERLINE_RETENTION_DAYS=0` → 30 days).
+
+**New upper bounds:**
+- `PEERLINE_KEY_INDEX_REBUILD_HOURS` must be ≤ 8760 (hours in a year) to prevent overflow in `time.Duration` conversion
+- `PEERLINE_RETENTION_DAYS` must be ≤ 36500 (100 years). The day-to-seconds conversion widens to `int64` before multiplying, so the cap is safe on 32-bit builds as well.
+
+**Action required:** If you have set any of these variables to invalid values (typos or negative numbers), correct them before upgrading. Note that `PEERLINE_MAX_OUTSTANDING_INVITES` no longer accepts negative values; use `0` for the default instead. Unset, empty, or `0` variables continue to use their defaults as before.
+
+The startup error for `PEERLINE_MAX_BAGS_PER_PEER` changed from `PEERLINE_MAX_BAGS_PER_PEER: must be non-negative` to `PEERLINE_MAX_BAGS_PER_PEER must be non-negative, got: N`. Update any log alerts that match the old text.
+
 ### Fragment (#) in file: URI DSNs is now refused (#327, #349)
 
 **Affected versions:** All versions upgrading to include the #327/#349 fix

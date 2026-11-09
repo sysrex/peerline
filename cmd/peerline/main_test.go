@@ -28,31 +28,247 @@ func (testMailerStub) Mode() string                                     { return
 
 func TestParseNonNegativeInt(t *testing.T) {
 	tests := []struct {
-		input   string
-		want    int
-		wantErr bool
+		name        string
+		input       string
+		varName     string
+		max         int
+		want        int
+		wantErr     bool
+		errContains []string // must all be present in error message
 	}{
-		{"", 0, false},
-		{"0", 0, false},
-		{"5", 5, false},
-		{"-1", 0, true},
-		{"1OO", 0, true}, // capital O instead of zero
-		{"abc", 0, true},
+		{"empty string", "", "TEST_VAR", 0, 0, false, nil},
+		{"zero", "0", "TEST_VAR", 0, 0, false, nil},
+		{"valid positive", "10", "TEST_VAR", 0, 10, false, nil},
+		{"valid large", "1000000", "TEST_VAR", 0, 1000000, false, nil},
+		{"negative", "-5", "TEST_VAR", 0, 0, true, []string{"TEST_VAR", "-5", "non-negative"}},
+		{"non-numeric", "abc", "TEST_VAR", 0, 0, true, []string{"TEST_VAR", "abc", "numeric"}},
+		{"typo O for 0", "1O", "TEST_VAR", 0, 0, true, []string{"TEST_VAR", "1O", "numeric"}},
+		{"within max", "100", "TEST_VAR", 200, 100, false, nil},
+		{"at max", "200", "TEST_VAR", 200, 200, false, nil},
+		{"exceeds max", "201", "TEST_VAR", 200, 0, true, []string{"TEST_VAR", "201", "200"}},
+		{"huge overflow", "999999999999999999999", "TEST_VAR", 0, 0, true, []string{"TEST_VAR", "999999999999999999999", "out of range"}},
+		{"leading space rejected", " 5", "TEST_VAR", 0, 0, true, []string{"TEST_VAR", " 5", "numeric"}},
+		{"explicit plus accepted", "+5", "TEST_VAR", 0, 5, false, nil},
 	}
 
 	for _, tt := range tests {
-		got, err := parseNonNegativeInt(tt.input)
-		if tt.wantErr {
-			if err == nil {
-				t.Errorf("parseNonNegativeInt(%q) = %d, nil; want error", tt.input, got)
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseNonNegativeInt(tt.input, tt.varName, tt.max)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("parseNonNegativeInt(%q, %q, %d) = %d, nil; want error", tt.input, tt.varName, tt.max, got)
+				} else {
+					errStr := err.Error()
+					for _, substr := range tt.errContains {
+						if !strings.Contains(errStr, substr) {
+							t.Errorf("parseNonNegativeInt(%q, %q, %d) error = %q; want it to contain %q", tt.input, tt.varName, tt.max, errStr, substr)
+						}
+					}
+				}
+			} else {
+				if err != nil {
+					t.Errorf("parseNonNegativeInt(%q, %q, %d) = %d, %v; want %d, nil", tt.input, tt.varName, tt.max, got, err, tt.want)
+				} else if got != tt.want {
+					t.Errorf("parseNonNegativeInt(%q, %q, %d) = %d; want %d", tt.input, tt.varName, tt.max, got, tt.want)
+				}
 			}
-		} else {
-			if err != nil {
-				t.Errorf("parseNonNegativeInt(%q) = %d, %v; want %d, nil", tt.input, got, err, tt.want)
-			} else if got != tt.want {
-				t.Errorf("parseNonNegativeInt(%q) = %d; want %d", tt.input, got, tt.want)
+		})
+	}
+}
+
+// TestParseStartupLimits verifies that parseStartupLimits correctly parses and validates
+// PEERLINE_KEY_INDEX_WARN and PEERLINE_RETENTION_DAYS.
+func TestParseStartupLimits(t *testing.T) {
+	tests := []struct {
+		name              string
+		keyIndexWarn      string
+		retentionDays     string
+		wantKeyIndexWarn  int
+		wantRetentionDays int
+		wantErr           bool
+		errContains       []string // must all be present in error message
+	}{
+		{
+			name:              "both valid",
+			keyIndexWarn:      "500000",
+			retentionDays:     "90",
+			wantKeyIndexWarn:  500000,
+			wantRetentionDays: 90,
+			wantErr:           false,
+		},
+		{
+			name:              "both unset",
+			keyIndexWarn:      "",
+			retentionDays:     "",
+			wantKeyIndexWarn:  0,
+			wantRetentionDays: 0,
+			wantErr:           false,
+		},
+		{
+			name:              "both zero (defaults)",
+			keyIndexWarn:      "0",
+			retentionDays:     "0",
+			wantKeyIndexWarn:  0,
+			wantRetentionDays: 0,
+			wantErr:           false,
+		},
+		{
+			name:          "KEY_INDEX_WARN non-numeric",
+			keyIndexWarn:  "abc",
+			retentionDays: "30",
+			wantErr:       true,
+			errContains:   []string{"PEERLINE_KEY_INDEX_WARN", "abc", "numeric"},
+		},
+		{
+			name:          "KEY_INDEX_WARN typo",
+			keyIndexWarn:  "1OOO",
+			retentionDays: "30",
+			wantErr:       true,
+			errContains:   []string{"PEERLINE_KEY_INDEX_WARN", "1OOO", "numeric"},
+		},
+		{
+			name:          "KEY_INDEX_WARN negative",
+			keyIndexWarn:  "-100",
+			retentionDays: "30",
+			wantErr:       true,
+			errContains:   []string{"PEERLINE_KEY_INDEX_WARN", "-100", "non-negative"},
+		},
+		{
+			name:          "RETENTION_DAYS non-numeric",
+			keyIndexWarn:  "1000000",
+			retentionDays: "xyz",
+			wantErr:       true,
+			errContains:   []string{"PEERLINE_RETENTION_DAYS", "xyz", "numeric"},
+		},
+		{
+			name:          "RETENTION_DAYS typo",
+			keyIndexWarn:  "1000000",
+			retentionDays: "3O",
+			wantErr:       true,
+			errContains:   []string{"PEERLINE_RETENTION_DAYS", "3O", "numeric"},
+		},
+		{
+			name:          "RETENTION_DAYS negative",
+			keyIndexWarn:  "1000000",
+			retentionDays: "-7",
+			wantErr:       true,
+			errContains:   []string{"PEERLINE_RETENTION_DAYS", "-7", "non-negative"},
+		},
+		{
+			name:          "RETENTION_DAYS exceeds max",
+			keyIndexWarn:  "1000000",
+			retentionDays: "50000",
+			wantErr:       true,
+			errContains:   []string{"PEERLINE_RETENTION_DAYS", "50000", "36500"},
+		},
+		{
+			name:              "RETENTION_DAYS at max",
+			keyIndexWarn:      "1000000",
+			retentionDays:     "36500",
+			wantKeyIndexWarn:  1000000,
+			wantRetentionDays: 36500,
+			wantErr:           false,
+		},
+		{
+			name:          "RETENTION_DAYS at max+1",
+			keyIndexWarn:  "1000000",
+			retentionDays: "36501",
+			wantErr:       true,
+			errContains:   []string{"PEERLINE_RETENTION_DAYS", "36501", "36500"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			getenv := func(key string) string {
+				switch key {
+				case "PEERLINE_KEY_INDEX_WARN":
+					return tt.keyIndexWarn
+				case "PEERLINE_RETENTION_DAYS":
+					return tt.retentionDays
+				}
+				return ""
 			}
+
+			gotKeyIndexWarn, gotRetentionDays, err := parseStartupLimits(getenv)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("parseStartupLimits() succeeded with (%d, %d), want error", gotKeyIndexWarn, gotRetentionDays)
+				} else {
+					errStr := err.Error()
+					for _, substr := range tt.errContains {
+						if !strings.Contains(errStr, substr) {
+							t.Errorf("parseStartupLimits() error = %q; want it to contain %q", errStr, substr)
+						}
+					}
+				}
+			} else {
+				if err != nil {
+					t.Errorf("parseStartupLimits() error = %v, want nil", err)
+				} else {
+					if gotKeyIndexWarn != tt.wantKeyIndexWarn {
+						t.Errorf("parseStartupLimits() keyIndexWarn = %d; want %d", gotKeyIndexWarn, tt.wantKeyIndexWarn)
+					}
+					if gotRetentionDays != tt.wantRetentionDays {
+						t.Errorf("parseStartupLimits() retentionDays = %d; want %d", gotRetentionDays, tt.wantRetentionDays)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestValidateStartupEnv(t *testing.T) {
+	t.Run("empty is valid", func(t *testing.T) {
+		if err := validateStartupEnv(func(string) string { return "" }); err != nil {
+			t.Fatalf("validateStartupEnv(empty) = %v", err)
 		}
+	})
+	t.Run("bad retention names the variable", func(t *testing.T) {
+		err := validateStartupEnv(func(key string) string {
+			if key == "PEERLINE_RETENTION_DAYS" {
+				return "3O"
+			}
+			return ""
+		})
+		if err == nil || !strings.Contains(err.Error(), "PEERLINE_RETENTION_DAYS") || !strings.Contains(err.Error(), "3O") {
+			t.Fatalf("validateStartupEnv() = %v, want error naming PEERLINE_RETENTION_DAYS and 3O", err)
+		}
+	})
+	t.Run("bad email limit names the variable", func(t *testing.T) {
+		err := validateStartupEnv(func(key string) string {
+			if key == "PEERLINE_EMAIL_PER_HOUR" {
+				return "-1"
+			}
+			return ""
+		})
+		if err == nil || !strings.Contains(err.Error(), "PEERLINE_EMAIL_PER_HOUR") || !strings.Contains(err.Error(), "-1") {
+			t.Fatalf("validateStartupEnv() = %v, want error naming PEERLINE_EMAIL_PER_HOUR and -1", err)
+		}
+	})
+	t.Run("rebuild hours above cap", func(t *testing.T) {
+		err := validateStartupEnv(func(key string) string {
+			if key == "PEERLINE_KEY_INDEX_REBUILD_HOURS" {
+				return "8761"
+			}
+			return ""
+		})
+		if err == nil || !strings.Contains(err.Error(), "PEERLINE_KEY_INDEX_REBUILD_HOURS") || !strings.Contains(err.Error(), "8761") {
+			t.Fatalf("validateStartupEnv() = %v, want error for 8761", err)
+		}
+	})
+}
+
+func TestRetentionSecondsFromDays(t *testing.T) {
+	// 36500 is the documented cap and is above MaxInt32/86400 (24855).
+	// The result must be the full int64 product, never a wrapped int.
+	const days = 36500
+	const want = int64(days) * 24 * 60 * 60
+	if got := retentionSecondsFromDays(days); got != want || got <= 0 {
+		t.Fatalf("retentionSecondsFromDays(%d) = %d, want %d", days, got, want)
+	}
+	if got := retentionSecondsFromDays(0); got != 0 {
+		t.Fatalf("retentionSecondsFromDays(0) = %d, want 0", got)
 	}
 }
 
@@ -515,6 +731,7 @@ func TestBuildAPIConfig(t *testing.T) {
 		retentionSeconds   int64
 		want               api.Config
 		wantBuildErr       bool
+		wantBuildErrSubstr []string // must all be present in buildAPIConfig error
 		wantNewErr         bool
 		wantNewErrContains string
 	}{
@@ -625,6 +842,296 @@ func TestBuildAPIConfig(t *testing.T) {
 			wantBuildErr:   true,
 		},
 		{
+			name: "EMAIL_PER_HOUR non-numeric",
+			envVars: map[string]string{
+				"PEERLINE_EMAIL_PER_HOUR": "1O",
+			},
+			trustedProxies:     nil,
+			allowBroadIPv6:     false,
+			logger:             testLogger,
+			wantBuildErr:       true,
+			wantBuildErrSubstr: []string{"PEERLINE_EMAIL_PER_HOUR", "1O", "numeric"},
+		},
+		{
+			name: "EMAIL_PER_HOUR zero (default)",
+			envVars: map[string]string{
+				"PEERLINE_EMAIL_PER_HOUR": "0",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			want: api.Config{
+				RegisterToken:         "",
+				MsgPerMinute:          0,
+				MsgBurst:              0,
+				Logger:                testLogger,
+				Mailer:                nil,
+				PublicURL:             "",
+				EmailPerHour:          0,
+				EmailBurst:            0,
+				EmailRcptPerHour:      0,
+				NotifyPerHour:         0,
+				NotifyBurst:           0,
+				TrustedProxies:        nil,
+				AllowBroadIPv6:        false,
+				Clock:                 nil,
+				MaxOutstandingInvites: 0,
+				RetentionSeconds:      0,
+				AuthFailPerMinute:     0,
+				AuthFailBurst:         0,
+				WritePerMinute:        0,
+				WriteBurst:            0,
+				KeyIndexRebuildHours:  6,
+				VersionDetail:         "",
+				CodePepper:            []byte{},
+				MaxBagsPerPeer:        0,
+				MaxBagBytesPerPeer:    0,
+			},
+		},
+		{
+			name: "EMAIL_PER_HOUR negative",
+			envVars: map[string]string{
+				"PEERLINE_EMAIL_PER_HOUR": "-5",
+			},
+			trustedProxies:     nil,
+			allowBroadIPv6:     false,
+			logger:             testLogger,
+			wantBuildErr:       true,
+			wantBuildErrSubstr: []string{"PEERLINE_EMAIL_PER_HOUR", "-5", "non-negative"},
+		},
+		{
+			name: "NOTIFY_PER_HOUR non-numeric",
+			envVars: map[string]string{
+				"PEERLINE_NOTIFY_PER_HOUR": "abc",
+			},
+			trustedProxies:     nil,
+			allowBroadIPv6:     false,
+			logger:             testLogger,
+			wantBuildErr:       true,
+			wantBuildErrSubstr: []string{"PEERLINE_NOTIFY_PER_HOUR", "abc", "numeric"},
+		},
+		{
+			name: "NOTIFY_PER_HOUR zero (default)",
+			envVars: map[string]string{
+				"PEERLINE_NOTIFY_PER_HOUR": "0",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			want: api.Config{
+				RegisterToken:         "",
+				MsgPerMinute:          0,
+				MsgBurst:              0,
+				Logger:                testLogger,
+				Mailer:                nil,
+				PublicURL:             "",
+				EmailPerHour:          0,
+				EmailBurst:            0,
+				EmailRcptPerHour:      0,
+				NotifyPerHour:         0,
+				NotifyBurst:           0,
+				TrustedProxies:        nil,
+				AllowBroadIPv6:        false,
+				Clock:                 nil,
+				MaxOutstandingInvites: 0,
+				RetentionSeconds:      0,
+				AuthFailPerMinute:     0,
+				AuthFailBurst:         0,
+				WritePerMinute:        0,
+				WriteBurst:            0,
+				KeyIndexRebuildHours:  6,
+				VersionDetail:         "",
+				CodePepper:            []byte{},
+				MaxBagsPerPeer:        0,
+				MaxBagBytesPerPeer:    0,
+			},
+		},
+		{
+			name: "NOTIFY_PER_HOUR negative",
+			envVars: map[string]string{
+				"PEERLINE_NOTIFY_PER_HOUR": "-10",
+			},
+			trustedProxies:     nil,
+			allowBroadIPv6:     false,
+			logger:             testLogger,
+			wantBuildErr:       true,
+			wantBuildErrSubstr: []string{"PEERLINE_NOTIFY_PER_HOUR", "-10", "non-negative"},
+		},
+		{
+			name: "MAX_OUTSTANDING_INVITES non-numeric",
+			envVars: map[string]string{
+				"PEERLINE_MAX_OUTSTANDING_INVITES": "xyz",
+			},
+			trustedProxies:     nil,
+			allowBroadIPv6:     false,
+			logger:             testLogger,
+			wantBuildErr:       true,
+			wantBuildErrSubstr: []string{"PEERLINE_MAX_OUTSTANDING_INVITES", "xyz", "numeric"},
+		},
+		{
+			name: "MAX_OUTSTANDING_INVITES zero (default)",
+			envVars: map[string]string{
+				"PEERLINE_MAX_OUTSTANDING_INVITES": "0",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			want: api.Config{
+				RegisterToken:         "",
+				MsgPerMinute:          0,
+				MsgBurst:              0,
+				Logger:                testLogger,
+				Mailer:                nil,
+				PublicURL:             "",
+				EmailPerHour:          0,
+				EmailBurst:            0,
+				EmailRcptPerHour:      0,
+				NotifyPerHour:         0,
+				NotifyBurst:           0,
+				TrustedProxies:        nil,
+				AllowBroadIPv6:        false,
+				Clock:                 nil,
+				MaxOutstandingInvites: 0,
+				RetentionSeconds:      0,
+				AuthFailPerMinute:     0,
+				AuthFailBurst:         0,
+				WritePerMinute:        0,
+				WriteBurst:            0,
+				KeyIndexRebuildHours:  6,
+				VersionDetail:         "",
+				CodePepper:            []byte{},
+				MaxBagsPerPeer:        0,
+				MaxBagBytesPerPeer:    0,
+			},
+		},
+		{
+			name: "MAX_OUTSTANDING_INVITES negative",
+			envVars: map[string]string{
+				"PEERLINE_MAX_OUTSTANDING_INVITES": "-1",
+			},
+			trustedProxies:     nil,
+			allowBroadIPv6:     false,
+			logger:             testLogger,
+			wantBuildErr:       true,
+			wantBuildErrSubstr: []string{"PEERLINE_MAX_OUTSTANDING_INVITES", "-1", "non-negative"},
+		},
+		{
+			name: "KEY_INDEX_REBUILD_HOURS non-numeric",
+			envVars: map[string]string{
+				"PEERLINE_KEY_INDEX_REBUILD_HOURS": "notanumber",
+			},
+			trustedProxies:     nil,
+			allowBroadIPv6:     false,
+			logger:             testLogger,
+			wantBuildErr:       true,
+			wantBuildErrSubstr: []string{"PEERLINE_KEY_INDEX_REBUILD_HOURS", "notanumber", "numeric"},
+		},
+		{
+			name: "KEY_INDEX_REBUILD_HOURS zero (default)",
+			envVars: map[string]string{
+				"PEERLINE_KEY_INDEX_REBUILD_HOURS": "0",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			want: api.Config{
+				RegisterToken:         "",
+				MsgPerMinute:          0,
+				MsgBurst:              0,
+				Logger:                testLogger,
+				Mailer:                nil,
+				PublicURL:             "",
+				EmailPerHour:          0,
+				EmailBurst:            0,
+				EmailRcptPerHour:      0,
+				NotifyPerHour:         0,
+				NotifyBurst:           0,
+				TrustedProxies:        nil,
+				AllowBroadIPv6:        false,
+				Clock:                 nil,
+				MaxOutstandingInvites: 0,
+				RetentionSeconds:      0,
+				AuthFailPerMinute:     0,
+				AuthFailBurst:         0,
+				WritePerMinute:        0,
+				WriteBurst:            0,
+				KeyIndexRebuildHours:  6,
+				VersionDetail:         "",
+				CodePepper:            []byte{},
+				MaxBagsPerPeer:        0,
+				MaxBagBytesPerPeer:    0,
+			},
+		},
+		{
+			name: "KEY_INDEX_REBUILD_HOURS negative",
+			envVars: map[string]string{
+				"PEERLINE_KEY_INDEX_REBUILD_HOURS": "-3",
+			},
+			trustedProxies:     nil,
+			allowBroadIPv6:     false,
+			logger:             testLogger,
+			wantBuildErr:       true,
+			wantBuildErrSubstr: []string{"PEERLINE_KEY_INDEX_REBUILD_HOURS", "-3", "non-negative"},
+		},
+		{
+			name: "KEY_INDEX_REBUILD_HOURS exceeds max",
+			envVars: map[string]string{
+				"PEERLINE_KEY_INDEX_REBUILD_HOURS": "10000",
+			},
+			trustedProxies:     nil,
+			allowBroadIPv6:     false,
+			logger:             testLogger,
+			wantBuildErr:       true,
+			wantBuildErrSubstr: []string{"PEERLINE_KEY_INDEX_REBUILD_HOURS", "10000", "8760"},
+		},
+		{
+			name: "KEY_INDEX_REBUILD_HOURS at max",
+			envVars: map[string]string{
+				"PEERLINE_KEY_INDEX_REBUILD_HOURS": "8760",
+			},
+			trustedProxies: nil,
+			allowBroadIPv6: false,
+			logger:         testLogger,
+			want: api.Config{
+				RegisterToken:         "",
+				MsgPerMinute:          0,
+				MsgBurst:              0,
+				Logger:                testLogger,
+				Mailer:                nil,
+				PublicURL:             "",
+				EmailPerHour:          0,
+				EmailBurst:            0,
+				EmailRcptPerHour:      0,
+				NotifyPerHour:         0,
+				NotifyBurst:           0,
+				TrustedProxies:        nil,
+				AllowBroadIPv6:        false,
+				Clock:                 nil,
+				MaxOutstandingInvites: 0,
+				RetentionSeconds:      0,
+				AuthFailPerMinute:     0,
+				AuthFailBurst:         0,
+				WritePerMinute:        0,
+				WriteBurst:            0,
+				KeyIndexRebuildHours:  8760,
+				VersionDetail:         "",
+				CodePepper:            []byte{},
+				MaxBagsPerPeer:        0,
+				MaxBagBytesPerPeer:    0,
+			},
+		},
+		{
+			name: "KEY_INDEX_REBUILD_HOURS at max+1",
+			envVars: map[string]string{
+				"PEERLINE_KEY_INDEX_REBUILD_HOURS": "8761",
+			},
+			trustedProxies:     nil,
+			allowBroadIPv6:     false,
+			logger:             testLogger,
+			wantBuildErr:       true,
+			wantBuildErrSubstr: []string{"PEERLINE_KEY_INDEX_REBUILD_HOURS", "8761", "8760"},
+		},
+		{
 			name:               "/29 without opt-in rejected by api.New",
 			envVars:            map[string]string{},
 			trustedProxies:     []string{"2a06:98c0::/29"},
@@ -710,6 +1217,13 @@ func TestBuildAPIConfig(t *testing.T) {
 			if tt.wantBuildErr {
 				if err == nil {
 					t.Errorf("buildAPIConfig() succeeded, want error")
+				} else if len(tt.wantBuildErrSubstr) > 0 {
+					errStr := err.Error()
+					for _, substr := range tt.wantBuildErrSubstr {
+						if !strings.Contains(errStr, substr) {
+							t.Errorf("buildAPIConfig() error = %q; want it to contain %q", errStr, substr)
+						}
+					}
 				}
 				return
 			}
