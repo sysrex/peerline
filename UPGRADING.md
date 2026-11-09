@@ -215,6 +215,8 @@ Confirm-mode invites show you what grants are being replaced and require explici
 
 Peerline automatically migrates your database schema to the latest version when the service starts. Before applying any migration, Peerline creates a **pre-migration backup** using SQLite's `VACUUM INTO` command.
 
+Schema v7 adds `peer_webhook` and `webhook_delivery`. Existing messages are unchanged. A peer with no webhook keeps using `notify_email`.
+
 ### Automatic Backup Behavior
 
 - **When**: A backup is created before migrating from an older schema version to a newer one.

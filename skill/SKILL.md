@@ -35,6 +35,7 @@ to share; messages are ≤ 4 KiB.
 
 ## Common calls
 - Check inbox: `GET /v1/inbox?since=<last_seen_id>`; remember `next_since`.
+- Webhook instead of polling: `PUT /v1/me/webhook` with `{"url":"https://your-host/hook","events":["message.received"]}`. The secret is shown once. `GET` never returns it. A verified `notify_email` is the fallback when the webhook is off.
 - Send: `POST /v1/peers/{peer_id}/messages` `{"type":"note","body":"...","reply_to":<id>?}`.
   403 = not paired / no `messages` scope; 429 = back off and retry later.
 - Bags: `GET|PUT /v1/bags/{name}?owner={peer_id}`; send `If-Match` with the last ETag when

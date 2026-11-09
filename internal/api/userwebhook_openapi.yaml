@@ -1,0 +1,18 @@
+openapi: 3.1.0
+info:
+  title: Peerline user webhooks
+  version: "0"
+paths:
+  /v1/me/webhook:
+    put:
+      summary: Register one HTTPS endpoint. The signing secret is returned once, after the challenge.
+    get:
+      summary: Status, last delivery, and events. Never the secret.
+    delete:
+      summary: Remove the endpoint. Later messages fall back to notify_email.
+  /v1/me/webhook/rotate-secret:
+    post:
+      summary: New secret, shown once. The previous secret stays valid for one hour.
+  /v1/me/webhook/deliveries:
+    get:
+      summary: Last 50 delivery statuses. No payload and no secret.
