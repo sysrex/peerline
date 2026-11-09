@@ -3,37 +3,27 @@ package mcpbridge
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
+
+	"github.com/sysrex/peerline/internal/webhook"
 )
 
-func signingKey(secret string) ([]byte, error) {
-	if !strings.HasPrefix(secret, "whsec_") {
-		return nil, errors.New("invalid secret")
-	}
-	key, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(secret, "whsec_"))
-	if err != nil || len(key) < 24 || len(key) > 64 {
-		return nil, errors.New("invalid secret")
-	}
-	return key, nil
-}
+func signingKey(secret string) ([]byte, error) { return webhook.SigningKey(secret) }
+
 func webhookSignature(secret, id, stamp string, body []byte) string {
-	key, _ := signingKey(secret)
-	h := hmac.New(sha256.New, key)
-	h.Write([]byte(id + "." + stamp + "."))
-	h.Write(body)
-	return "v1," + base64.StdEncoding.EncodeToString(h.Sum(nil))
+	sig, err := webhook.Sign(secret, id, stamp, body)
+	if err != nil {
+		return ""
+	}
+	return sig
 }
 func (e *EventEngine) post(ctx context.Context, id, sub, url, secret, old string, body []byte) (int, []byte, error) {
 	if len(body) > 262144 {
