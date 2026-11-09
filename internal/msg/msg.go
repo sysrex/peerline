@@ -46,6 +46,16 @@ const (
 	evictionSamples = 5    // sample this many buckets for eviction candidate
 )
 
+// Allowance is the limiter port. *Limiter is the in-memory implementation.
+// A later shared backend can implement the same three methods.
+type Allowance interface {
+	Allow(key string) bool
+	Ready(key string) bool
+	Refund(key string)
+}
+
+var _ Allowance = (*Limiter)(nil)
+
 // Limiter is a sharded token-bucket rate limiter with bounded memory.
 // Each shard has its own lock to reduce contention.
 type Limiter struct {
