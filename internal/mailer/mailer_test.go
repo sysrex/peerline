@@ -306,6 +306,7 @@ func TestFromEnvRejectsZonedHosts(t *testing.T) {
 type fakeServer struct {
 	ln                net.Listener
 	advertiseSTARTTLS bool
+	starttlsKeyword   string // empty means STARTTLS
 	cert              *tls.Certificate
 	commands          []string
 	mu                sync.Mutex
@@ -318,6 +319,24 @@ type fakeServer struct {
 
 func newFakeServer(t *testing.T, advertiseSTARTTLS bool, cert *tls.Certificate) *fakeServer {
 	return newFakeServerWithOptions(t, advertiseSTARTTLS, cert, false)
+}
+
+func newFakeServerAdvertising(t *testing.T, keyword string, cert *tls.Certificate) *fakeServer {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := &fakeServer{
+		ln:                ln,
+		advertiseSTARTTLS: true,
+		starttlsKeyword:   keyword,
+		cert:              cert,
+		t:                 t,
+		closeCh:           make(chan struct{}),
+	}
+	go fs.serve()
+	return fs
 }
 
 func newFakeServerWithOptions(t *testing.T, advertiseSTARTTLS bool, cert *tls.Certificate, stallSecondConn bool) *fakeServer {
@@ -384,7 +403,11 @@ func (fs *fakeServer) handleConn(c net.Conn, connNum int) {
 		case strings.HasPrefix(cmd, "EHLO"):
 			say("250-test")
 			if fs.advertiseSTARTTLS {
-				say("250 STARTTLS")
+				kw := fs.starttlsKeyword
+				if kw == "" {
+					kw = "STARTTLS"
+				}
+				say("250 " + kw)
 			} else {
 				say("250 ok")
 			}
@@ -848,6 +871,55 @@ func TestSMTPSendRefusedBeforeAUTH(t *testing.T) {
 			strings.HasPrefix(cmd, "RCPT") || cmd == "DATA" {
 			t.Fatalf("command %q should not have been sent when STARTTLS is missing: %v", cmd, cmds)
 		}
+	}
+}
+
+func TestSMTPSendLowercaseSTARTTLSUpgrades(t *testing.T) {
+	cert := genTestCert(t, "127.0.0.1")
+	certPool := x509.NewCertPool()
+	parsed, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPool.AddCert(parsed)
+
+	for _, allowPlain := range []bool{false, true} {
+		name := "required"
+		if allowPlain {
+			name = "plaintext-allowed"
+		}
+		t.Run(name, func(t *testing.T) {
+			srv := newFakeServerAdvertising(t, "starttls", &cert)
+			defer srv.close()
+			s := &SMTP{
+				Host:           "127.0.0.1",
+				Port:           srv.port(),
+				From:           "test@example.com",
+				User:           "testuser",
+				Pass:           "testpass",
+				Timeout:        2 * time.Second,
+				AllowPlaintext: allowPlain,
+				TLSConfig:      &tls.Config{RootCAs: certPool, ServerName: "127.0.0.1"},
+			}
+			if !allowPlain {
+				if err := s.Probe(context.Background()); err != nil {
+					t.Fatalf("Probe should upgrade on a lowercase starttls keyword, got: %v", err)
+				}
+			}
+			if err := s.Send(context.Background(), Message{To: "bob@example.com", Subject: "test", Body: "test"}); err != nil {
+				t.Fatalf("Send should upgrade on a lowercase starttls keyword, got: %v", err)
+			}
+			cmds := srv.receivedCommands()
+			sawTLS := false
+			for _, cmd := range cmds {
+				if cmd == "STARTTLS" {
+					sawTLS = true
+				}
+			}
+			if !sawTLS {
+				t.Fatalf("lowercase starttls was not upgraded, commands: %v", cmds)
+			}
+		})
 	}
 }
 

@@ -123,6 +123,39 @@ func (s *SMTP) checkSTARTTLS(offered bool) error {
 	return nil
 }
 
+// startTLSOffered reports whether the server advertised STARTTLS.
+// RFC 5321 keywords are case-insensitive. net/smtp stores the EHLO keyword
+// as sent and uppercases only the lookup, so "starttls" would otherwise
+// look absent. When the uppercase lookup misses, read the reply again.
+func startTLSOffered(c *smtp.Client) (bool, error) {
+	if c == nil {
+		return false, nil
+	}
+	if ok, _ := c.Extension("STARTTLS"); ok {
+		return true, nil
+	}
+	if c.Text == nil {
+		return false, nil
+	}
+	id, err := c.Text.Cmd("EHLO localhost")
+	if err != nil {
+		return false, err
+	}
+	c.Text.StartResponse(id)
+	defer c.Text.EndResponse(id)
+	_, msg, err := c.Text.ReadResponse(250)
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(msg, "\n") {
+		keyword, _, _ := strings.Cut(strings.TrimSpace(line), " ")
+		if strings.EqualFold(keyword, "STARTTLS") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // IsLoopback returns true if host is a loopback address.
 // Recognizes "localhost" by name, and any IPv4 or IPv6 loopback address
 // (including expanded forms like "0:0:0:0:0:0:0:1" or "127.0.0.2").
@@ -303,7 +336,10 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 	}
 	defer c.Close()
 	if !s.ImplicitTLS {
-		hasSTARTTLS, _ := c.Extension("STARTTLS")
+		hasSTARTTLS, err := startTLSOffered(c)
+		if err != nil {
+			return fmt.Errorf("smtp: EHLO: %w", err)
+		}
 		if err := s.checkSTARTTLS(hasSTARTTLS); err != nil {
 			return fmt.Errorf("smtp: %w", err)
 		}
@@ -414,7 +450,10 @@ func (s *SMTP) Probe(ctx context.Context) error {
 	}
 
 	if !s.ImplicitTLS {
-		hasSTARTTLS, _ := c.Extension("STARTTLS")
+		hasSTARTTLS, err := startTLSOffered(c)
+		if err != nil {
+			return fmt.Errorf("smtp probe: %s:%d: EHLO: %w", s.Host, s.Port, err)
+		}
 		if err := s.checkSTARTTLS(hasSTARTTLS); err != nil {
 			return fmt.Errorf("smtp probe: %s:%d: %w", s.Host, s.Port, err)
 		}
@@ -576,8 +615,8 @@ func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, 
 		return false
 	}
 
-	hasSTARTTLS, _ := c.Extension("STARTTLS")
-	if !hasSTARTTLS {
+	hasSTARTTLS, err := startTLSOffered(c)
+	if err != nil || !hasSTARTTLS {
 		return false
 	}
 
