@@ -282,6 +282,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/guide", s.rateLimitGet(s.guide))
 
 	authed := http.NewServeMux()
+	s.a2aRoutes(mux)
 	authed.HandleFunc("GET /v1/me", s.rateLimitAuth(s.me))
 	authed.HandleFunc("PUT /v1/me", s.rateLimitWrite(s.updateMe))
 	authed.HandleFunc("POST /v1/me/rotate-key", s.rateLimitWrite(s.rotateKey))
