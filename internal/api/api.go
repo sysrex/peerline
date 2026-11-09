@@ -297,6 +297,7 @@ func (s *Server) Handler() http.Handler {
 	authed.HandleFunc("PUT /v1/me", s.rateLimitWrite(s.updateMe))
 	authed.HandleFunc("POST /v1/me/rotate-key", s.rateLimitWrite(s.rotateKey))
 	s.webhookRoutes(authed)
+	s.a2aTaskRoutes(authed)
 	s.signingKeyRoutes(authed)
 	authed.HandleFunc("DELETE /v1/me", s.rateLimitWrite(s.deleteMe))
 	authed.HandleFunc("POST /v1/me/verify-email", s.rateLimitWrite(s.verifyEmail))

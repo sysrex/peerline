@@ -2004,7 +2004,7 @@ func TestBackupBeforeMigration(t *testing.T) {
 	}
 	defer s.Close()
 
-	// Verify a backup was created with pattern .pre-v10-from-v2.<timestamp>
+	// Verify a backup was created with pattern .pre-v11-from-v2.<timestamp>
 	files, err := os.ReadDir(tempDir)
 	if err != nil {
 		t.Fatal(err)
@@ -2012,7 +2012,7 @@ func TestBackupBeforeMigration(t *testing.T) {
 
 	var backupPath string
 	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "test.db.pre-v10-from-v") {
+		if strings.HasPrefix(f.Name(), "test.db.pre-v11-from-v") {
 			backupPath = tempDir + "/" + f.Name()
 			break
 		}
@@ -2114,7 +2114,7 @@ func TestBackupWithQuoteInPath(t *testing.T) {
 
 	foundBackup := false
 	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "test.db.pre-v10-from-v") {
+		if strings.HasPrefix(f.Name(), "test.db.pre-v11-from-v") {
 			foundBackup = true
 			// Verify we can open it
 			backupPath := quotedDir + "/" + f.Name()
@@ -2173,7 +2173,7 @@ func TestBackupRetry(t *testing.T) {
 	}
 	backupCount := 0
 	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "retry.db.pre-v10-from-v") {
+		if strings.HasPrefix(f.Name(), "retry.db.pre-v11-from-v") {
 			backupCount++
 		}
 	}
@@ -2205,7 +2205,7 @@ func TestBackupRetry(t *testing.T) {
 	}
 	backupCount = 0
 	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "retry.db.pre-v10-from-v") {
+		if strings.HasPrefix(f.Name(), "retry.db.pre-v11-from-v") {
 			backupCount++
 		}
 	}
@@ -2348,7 +2348,7 @@ func TestPreExistingBackupNotOverwritten(t *testing.T) {
 	fixedTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	// Pre-create files at the base backup name to force collision
-	baseName := "test.db.pre-v10-from-v2.20260101-120000.000000"
+	baseName := "test.db.pre-v11-from-v2.20260101-120000.000000"
 	basePath := tempDir + "/" + baseName
 	if err := os.WriteFile(basePath, []byte("pre-existing base"), 0600); err != nil {
 		t.Fatal(err)
@@ -2903,7 +2903,7 @@ func TestBackupReuseOnRestartLoop(t *testing.T) {
 	db.Close()
 
 	// Manually create a valid backup to simulate a previous crash-loop attempt
-	backupName := "restart.db.pre-v10-from-v2.20260101-120000.000000"
+	backupName := "restart.db.pre-v11-from-v2.20260101-120000.000000"
 	backupPath := tempDir + "/" + backupName
 
 	// Copy the DB to create the backup
@@ -2945,7 +2945,7 @@ func TestBackupReuseOnRestartLoop(t *testing.T) {
 	}
 	backupCount := 0
 	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "restart.db.pre-v10-from-v") {
+		if strings.HasPrefix(f.Name(), "restart.db.pre-v11-from-v") {
 			backupCount++
 		}
 	}
@@ -2978,9 +2978,9 @@ func TestRetentionCoversAllVersions(t *testing.T) {
 			}{
 				{dbBase + ".pre-v2-from-v1.20260101-120000.000000", baseTime},
 				{dbBase + ".pre-v2-from-v1.20260101-130000.000000", baseTime.Add(10 * time.Minute)},
-				{dbBase + ".pre-v10-from-v2.20260101-140000.000000", baseTime.Add(20 * time.Minute)},
-				{dbBase + ".pre-v10-from-v2.20260101-150000.000000", baseTime.Add(30 * time.Minute)},
-				{dbBase + ".pre-v10-from-v2.20260101-160000.000000", baseTime.Add(40 * time.Minute)}, // newest
+				{dbBase + ".pre-v11-from-v2.20260101-140000.000000", baseTime.Add(20 * time.Minute)},
+				{dbBase + ".pre-v11-from-v2.20260101-150000.000000", baseTime.Add(30 * time.Minute)},
+				{dbBase + ".pre-v11-from-v2.20260101-160000.000000", baseTime.Add(40 * time.Minute)}, // newest
 			}
 
 			for _, backup := range backupNames {
@@ -3314,10 +3314,10 @@ func TestInvalidBackupKeepValue(t *testing.T) {
 		name  string
 		mtime time.Time
 	}{
-		{dbBase + ".pre-v10-from-v2.20260101-100000.000000", time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)}, // oldest
-		{dbBase + ".pre-v10-from-v2.20260101-110000.000000", time.Date(2026, 1, 1, 11, 0, 0, 0, time.UTC)},
-		{dbBase + ".pre-v10-from-v2.20260101-120000.000000", time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)},
-		{dbBase + ".pre-v10-from-v2.20260101-130000.000000", time.Date(2026, 1, 1, 13, 0, 0, 0, time.UTC)}, // newest seeded
+		{dbBase + ".pre-v11-from-v2.20260101-100000.000000", time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)}, // oldest
+		{dbBase + ".pre-v11-from-v2.20260101-110000.000000", time.Date(2026, 1, 1, 11, 0, 0, 0, time.UTC)},
+		{dbBase + ".pre-v11-from-v2.20260101-120000.000000", time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)},
+		{dbBase + ".pre-v11-from-v2.20260101-130000.000000", time.Date(2026, 1, 1, 13, 0, 0, 0, time.UTC)}, // newest seeded
 	}
 	for _, backup := range seededBackups {
 		path := dir + "/" + backup.name
@@ -3419,7 +3419,7 @@ func TestBackupCollisionRetry(t *testing.T) {
 	fixedTime := time.Date(2026, 1, 30, 12, 0, 0, 0, time.UTC)
 
 	// Create a pre-existing backup file with that timestamp
-	existingBackup := fmt.Sprintf("%s/collision.db.pre-v10-from-v2.%s", tempDir, fixedTime.Format("20060102-150405.000000"))
+	existingBackup := fmt.Sprintf("%s/collision.db.pre-v11-from-v2.%s", tempDir, fixedTime.Format("20060102-150405.000000"))
 	if err := os.WriteFile(existingBackup, []byte("fake"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -3449,7 +3449,7 @@ func TestBackupCollisionRetry(t *testing.T) {
 	}
 
 	// Should start with the base name
-	expectedPrefix := "collision.db.pre-v10-from-v2.20260130-120000.000000."
+	expectedPrefix := "collision.db.pre-v11-from-v2.20260130-120000.000000."
 	if !strings.HasPrefix(backupBase, expectedPrefix) {
 		t.Errorf("backup name %q should start with %s", backupBase, expectedPrefix)
 	}
@@ -3461,7 +3461,7 @@ func TestBackupCollisionRetry(t *testing.T) {
 	}
 	backupCount := 0
 	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "collision.db.pre-v10-from-v2") {
+		if strings.HasPrefix(f.Name(), "collision.db.pre-v11-from-v2") {
 			backupCount++
 		}
 	}
@@ -3484,8 +3484,8 @@ func TestRetentionIgnoresLookalikeFiles(t *testing.T) {
 	// Create real backups
 	realBackups := []string{
 		dbBase + ".pre-v2-from-v1.20260101-120000.000000",
-		dbBase + ".pre-v10-from-v2.20260101-130000.000000",
-		dbBase + ".pre-v10-from-v2.20260101-140000.000000",
+		dbBase + ".pre-v11-from-v2.20260101-130000.000000",
+		dbBase + ".pre-v11-from-v2.20260101-140000.000000",
 	}
 	for _, name := range realBackups {
 		path := tempDir + "/" + name
@@ -3496,7 +3496,7 @@ func TestRetentionIgnoresLookalikeFiles(t *testing.T) {
 
 	// Create operator-kept lookalike files that should NOT match the strict regex
 	lookalikeFiles := []string{
-		dbBase + ".pre-v10-from-v2.manual-backup",
+		dbBase + ".pre-v11-from-v2.manual-backup",
 		dbBase + ".pre-v99-emergency",
 		dbBase + ".backup",
 	}

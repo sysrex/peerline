@@ -107,7 +107,7 @@ func TestBackupPermissionsOnReuse(t *testing.T) {
 	tempDB.Close()
 
 	// Manually create a valid backup to simulate a previous crash-loop attempt
-	backupName := "restart.db.pre-v10-from-v2.20260101-120000.000000"
+	backupName := "restart.db.pre-v11-from-v2.20260101-120000.000000"
 	backupPath := tempDir + "/" + backupName
 
 	// Copy the v2 DB as the backup
