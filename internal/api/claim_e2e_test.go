@@ -850,25 +850,17 @@ func TestDeleteClaimedInvite(t *testing.T) {
 			t.Fatalf("GET after DELETE: got %d, want 404; body: %s", resp.StatusCode, b)
 		}
 
-		// Recreate an expired invite for the purge test
-		pub2, _ := confirmInvite(t, inviter)
-		clk.Advance(2 * time.Hour)
-
-		// Before purge, DELETE still returns 204
-		resp, b = inviter.do("DELETE", "/v1/invites/"+pub2, nil, nil)
-		if resp.StatusCode != 204 {
-			t.Fatalf("DELETE expired invite before purge: got %d, want 204; body: %s", resp.StatusCode, b)
-		}
-
-		// Recreate another expired invite
+		// Recreate an expired invite for the purge test.
 		pub3, _ := confirmInvite(t, inviter)
 		clk.Advance(2 * time.Hour)
 
 		// Advance past the 5-minute grace period
 		clk.Advance(6 * time.Minute)
 
-		// Run the purge
-		count, _, err := st.PurgeExpiredInvites(context.Background(), 0)
+		// usedInviteRetention is how long a used invite is kept. It is not
+		// the 5-minute grace that delays deletion of an unused expired invite.
+		const usedInviteRetention = 30 * 24 * 60 * 60
+		count, _, err := st.PurgeExpiredInvites(context.Background(), usedInviteRetention)
 		if err != nil {
 			t.Fatalf("PurgeExpiredInvites failed: %v", err)
 		}
@@ -880,6 +872,30 @@ func TestDeleteClaimedInvite(t *testing.T) {
 		resp, b = inviter.do("DELETE", "/v1/invites/"+pub3, nil, nil)
 		if resp.StatusCode != 404 {
 			t.Fatalf("DELETE expired invite after purge: got %d, want 404; body: %s", resp.StatusCode, b)
+		}
+	})
+
+	t.Run("purge grace keeps the invite at +4m and removes it at +6m", func(t *testing.T) {
+		srv, st, clk := claimServer(t)
+		inviter := register(t, srv, "inviter_purge_boundary")
+		pub, _ := confirmInvite(t, inviter)
+
+		// Default TTL is 1h. Four minutes past expiry is still inside the
+		// 5-minute grace, so the row must survive. Six minutes is past it.
+		clk.Advance(time.Hour + 4*time.Minute)
+		const usedInviteRetention = 30 * 24 * 60 * 60
+		n, _, err := st.PurgeExpiredInvites(context.Background(), usedInviteRetention)
+		if err != nil || n != 0 {
+			t.Fatalf("purge at +4m deleted %d invites: %v", n, err)
+		}
+		clk.Advance(2 * time.Minute)
+		n, _, err = st.PurgeExpiredInvites(context.Background(), usedInviteRetention)
+		if err != nil || n != 1 {
+			t.Fatalf("purge at +6m deleted %d invites, want 1: %v", n, err)
+		}
+		resp, b := inviter.do("DELETE", "/v1/invites/"+pub, nil, nil)
+		if resp.StatusCode != 404 {
+			t.Fatalf("DELETE after +6m purge: got %d, want 404; body: %s", resp.StatusCode, b)
 		}
 	})
 
