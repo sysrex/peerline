@@ -77,6 +77,7 @@ var migrations = []func(*sql.Tx) error{
 	migrateV5InviteClaimState,
 	migrateV6ClaimOffer,
 	migrateV7PeerWebhook,
+	migrateV8SigningKeys,
 }
 
 // SchemaVersion returns the maximum schema version this binary supports.
@@ -1495,6 +1496,30 @@ CREATE TABLE IF NOT EXISTS webhook_delivery (
   created_at INTEGER NOT NULL,
   payload TEXT NOT NULL DEFAULT '',
   UNIQUE(peer_id, message_id)
+);`)
+	return err
+}
+
+func migrateV8SigningKeys(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+CREATE TABLE IF NOT EXISTS peer_signing_keys (
+  peer_id TEXT NOT NULL,
+  kid TEXT NOT NULL,
+  pubkey BLOB NOT NULL,
+  valid_from INTEGER NOT NULL,
+  valid_to INTEGER NOT NULL DEFAULT 0,
+  revoked_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (peer_id, kid)
+);
+CREATE TABLE IF NOT EXISTS signing_key_audit (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_type TEXT NOT NULL,
+  peer_id TEXT NOT NULL,
+  kid TEXT NOT NULL,
+  pubkey_hash BLOB NOT NULL,
+  prev_hash BLOB NOT NULL,
+  record_hash BLOB NOT NULL,
+  created_at INTEGER NOT NULL
 );`)
 	return err
 }

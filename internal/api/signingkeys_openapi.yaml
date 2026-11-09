@@ -1,0 +1,14 @@
+openapi: 3.1.0
+info:
+  title: Peerline signing keys
+  version: "0"
+paths:
+  /v1/me/signing-keys:
+    put:
+      summary: Register an Ed25519 public key. The request carries a proof of possession, never a private key.
+  /v1/me/signing-keys/{kid}:
+    delete:
+      summary: Revoke one of your signing keys.
+  /v1/peers/{peer_id}/signing-keys:
+    get:
+      summary: Public keys of a paired peer. Unpaired callers get 404.
