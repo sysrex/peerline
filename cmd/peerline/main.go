@@ -303,6 +303,10 @@ func main() {
 	// Parse backup environment variables
 	skipBackup := os.Getenv("PEERLINE_SKIP_MIGRATION_BACKUP") == "1"
 	auditEnabled := auditFlagEnabled(os.Getenv("PEERLINE_AUDIT_ENABLED"))
+	if _, err := store.AuditRetentionDays(os.Getenv("PEERLINE_AUDIT_RETENTION_DAYS")); err != nil {
+		log.Error("audit retention", "err", err)
+		os.Exit(1)
+	}
 	backupDir := os.Getenv("PEERLINE_BACKUP_DIR")
 	backupKeep := 3
 	backupTimeout := 5 * time.Minute // Default: 5 minutes

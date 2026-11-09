@@ -221,6 +221,8 @@ Schema v8 adds `peer_signing_keys` and `signing_key_audit`. Those tables have no
 
 Schema v9 adds the audit tables `pairings`, `pairing_keys`, `audit_records`, and `audit_chain_heads`, also with no foreign key to `peers`. `PEERLINE_AUDIT_ENABLED` defaults off. Turning it on starts appending events; leaving it off keeps current request behavior.
 
+Schema v10 adds `audit_records.anchored_at`. Retention will not delete a row until that timestamp and `batch_seq` are set. `PEERLINE_AUDIT_RETENTION_DAYS` defaults to 183 and refuses a smaller value.
+
 ### Automatic Backup Behavior
 
 - **When**: A backup is created before migrating from an older schema version to a newer one.

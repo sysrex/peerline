@@ -84,6 +84,7 @@ var migrations = []func(*sql.Tx) error{
 	migrateV7PeerWebhook,
 	migrateV8SigningKeys,
 	migrateV9Audit,
+	migrateV10AuditRetention,
 }
 
 // SchemaVersion returns the maximum schema version this binary supports.
@@ -642,7 +643,7 @@ var expectedColumns = map[string][]string{
 	"grants":            {"owner", "grantee", "scopes", "bags", "created_at"},
 	"pairings":          {"id", "peer_lo", "peer_hi", "created_at", "sig_policy"},
 	"pairing_keys":      {"pairing_id", "wrapped_key", "key_version", "created_at"},
-	"audit_records":     {"seq", "record_id", "pairing_id", "pair_seq", "prev_hash", "record_hash", "sig", "sig_kid"},
+	"audit_records":     {"seq", "record_id", "pairing_id", "pair_seq", "prev_hash", "record_hash", "sig", "sig_kid", "anchored_at"},
 	"audit_chain_heads": {"pairing_id", "pair_seq", "head_hash"},
 }
 
@@ -1594,6 +1595,18 @@ CREATE TABLE IF NOT EXISTS audit_chain_heads (
   pair_seq INTEGER NOT NULL,
   head_hash BLOB NOT NULL
 );`)
+	return err
+}
+
+func migrateV10AuditRetention(tx *sql.Tx) error {
+	var n int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('audit_records') WHERE name='anchored_at'`).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	_, err := tx.Exec(`ALTER TABLE audit_records ADD COLUMN anchored_at INTEGER`)
 	return err
 }
 

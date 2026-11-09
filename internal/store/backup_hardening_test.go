@@ -36,9 +36,9 @@ func openOpts(dir string) OpenOptions {
 func TestRetentionOnlyDeletesRegularBackupFiles(t *testing.T) {
 	dir := secureTempDir(t)
 	keep := []string{
-		"x.db.pre-v9-from-v2.20260101-120000.000000.KEEP",
-		"other.db.pre-v9-from-v2.20260101-120000.000000",
-		"x.db.pre-v9-from-v2.notes",
+		"x.db.pre-v10-from-v2.20260101-120000.000000.KEEP",
+		"other.db.pre-v10-from-v2.20260101-120000.000000",
+		"x.db.pre-v10-from-v2.notes",
 	}
 	for _, n := range keep {
 		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0600); err != nil {
@@ -47,11 +47,11 @@ func TestRetentionOnlyDeletesRegularBackupFiles(t *testing.T) {
 	}
 	target := filepath.Join(dir, "elsewhere")
 	os.WriteFile(target, []byte("x"), 0600)
-	link := "x.db.pre-v9-from-v2.20260101-120001.000000"
+	link := "x.db.pre-v10-from-v2.20260101-120001.000000"
 	os.Symlink(target, filepath.Join(dir, link))
 	keep = append(keep, link)
-	os.Mkdir(filepath.Join(dir, "x.db.pre-v9-from-v2.20260101-120002.000000"), 0700)
-	keep = append(keep, "x.db.pre-v9-from-v2.20260101-120002.000000")
+	os.Mkdir(filepath.Join(dir, "x.db.pre-v10-from-v2.20260101-120002.000000"), 0700)
+	keep = append(keep, "x.db.pre-v10-from-v2.20260101-120002.000000")
 
 	p := makeV2DB(t, dir)
 	s, err := OpenWithOptions(p, openOpts(dir))
@@ -123,7 +123,7 @@ func TestVacuumIntoFailureRemovesOnlyCreatedFile(t *testing.T) {
 	p := makeV2DB(t, dir)
 
 	// Pre-create a valid backup that must not be deleted
-	preExisting := filepath.Join(dir, "x.db.pre-v9-from-v2.20260101-120000.000000")
+	preExisting := filepath.Join(dir, "x.db.pre-v10-from-v2.20260101-120000.000000")
 	if err := os.WriteFile(preExisting, []byte("do not delete"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +188,7 @@ func TestCollisionRetryWithRandomSuffix(t *testing.T) {
 	clockTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	// Pre-plant invalid file at the FINAL name (not .partial) to force collision
-	baseName := "x.db.pre-v9-from-v2.20260101-120000.000000"
+	baseName := "x.db.pre-v10-from-v2.20260101-120000.000000"
 	basePath := filepath.Join(dir, baseName)
 	if err := os.WriteFile(basePath, []byte("invalid"), 0600); err != nil {
 		t.Fatal(err)
@@ -273,7 +273,7 @@ func TestCollisionMultipleRetries(t *testing.T) {
 	clockTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	// Pre-plant files at the base name and with a specific first random suffix
-	baseName := "x.db.pre-v9-from-v2.20260101-120000.000000"
+	baseName := "x.db.pre-v10-from-v2.20260101-120000.000000"
 	basePath := filepath.Join(dir, baseName)
 	if err := os.WriteFile(basePath, []byte("invalid-base"), 0600); err != nil {
 		t.Fatal(err)
@@ -361,7 +361,7 @@ func TestSweepPartialBackups(t *testing.T) {
 	now := time.Now()
 
 	// Old .partial (10 minutes old, >2 minutes, should be swept)
-	oldPartial := filepath.Join(dir, "x.db.pre-v9-from-v2.20260101-115700.000000.partial")
+	oldPartial := filepath.Join(dir, "x.db.pre-v10-from-v2.20260101-115700.000000.partial")
 	if err := os.WriteFile(oldPartial, []byte("old"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -371,7 +371,7 @@ func TestSweepPartialBackups(t *testing.T) {
 	}
 
 	// Fresh .partial (30 seconds old, <2 minutes, should be kept)
-	freshPartial := filepath.Join(dir, "x.db.pre-v9-from-v2.20260101-115830.000000.partial")
+	freshPartial := filepath.Join(dir, "x.db.pre-v10-from-v2.20260101-115830.000000.partial")
 	if err := os.WriteFile(freshPartial, []byte("fresh"), 0600); err != nil {
 		t.Fatal(err)
 	}
