@@ -15,6 +15,8 @@ import (
 	"log/slog"
 	"mime"
 	"net"
+
+	"github.com/sysrex/peerline/internal/clock"
 	"net/mail"
 	"net/smtp"
 	"os"
@@ -100,6 +102,34 @@ type SMTP struct {
 	// dialContext is the dialer for SMTP connections (tests).
 	// nil means the default net.Dialer{}.DialContext.
 	dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	// Clock is the time source for certificate validity checks and the Date header.
+	// Nil uses the process clock (tests may replace that).
+	Clock clock.Clock
+}
+
+// systemClock is the fallback when SMTP.Clock is nil. Tests replace it with one fake.
+var systemClock clock.Clock = clock.Real{}
+
+func (s *SMTP) now() time.Time {
+	if s != nil && s.Clock != nil {
+		return s.Clock.Now()
+	}
+	return clock.Or(systemClock).Now()
+}
+
+// clientTLSConfig returns the TLS config for a handshake. A nil Time func
+// uses the mailer clock, so tests can freeze certificate validity.
+func (s *SMTP) clientTLSConfig() *tls.Config {
+	var cfg *tls.Config
+	if s.TLSConfig == nil {
+		cfg = &tls.Config{ServerName: s.Host, MinVersion: tls.VersionTLS12}
+	} else {
+		cfg = s.TLSConfig.Clone()
+	}
+	if cfg.Time == nil {
+		cfg.Time = s.now
+	}
+	return cfg
 }
 
 func (s *SMTP) Mode() string { return "smtp" }
@@ -270,6 +300,7 @@ func FromEnv(lg *slog.Logger) (Sender, error) {
 		Timeout:        10 * time.Second,
 		AllowPlaintext: allowPlaintext,
 		ImplicitTLS:    implicitTLS,
+		Clock:          clock.Real{},
 	}, nil
 }
 
@@ -289,10 +320,7 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	addr := net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
-	tlsCfg := s.TLSConfig
-	if tlsCfg == nil {
-		tlsCfg = &tls.Config{ServerName: s.Host, MinVersion: tls.VersionTLS12}
-	}
+	tlsCfg := s.clientTLSConfig()
 
 	dial := s.dialContext
 	if dial == nil {
@@ -364,7 +392,7 @@ func (s *SMTP) Send(ctx context.Context, m Message) error {
 	if err != nil {
 		return fmt.Errorf("smtp DATA: %w", err)
 	}
-	if _, err := w.Write(Compose(s.From, to, m.Subject, m.Body, time.Now())); err != nil {
+	if _, err := w.Write(Compose(s.From, to, m.Subject, m.Body, s.now())); err != nil {
 		return fmt.Errorf("smtp write: %w", err)
 	}
 	if err := w.Close(); err != nil {
@@ -392,10 +420,7 @@ func (s *SMTP) Probe(ctx context.Context) error {
 	defer cancel()
 
 	addr := net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
-	tlsCfg := s.TLSConfig
-	if tlsCfg == nil {
-		tlsCfg = &tls.Config{ServerName: s.Host, MinVersion: tls.VersionTLS12}
-	}
+	tlsCfg := s.clientTLSConfig()
 
 	dial := s.dialContext
 	if dial == nil {
@@ -420,7 +445,7 @@ func (s *SMTP) Probe(ctx context.Context) error {
 		tlsConn := tls.Client(conn, implicitCfg)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			// Check for not-yet-valid certificate (fatal: clock skew or misconfiguration)
-			if isNotYetValid, wrappedErr := isNotYetValidError(err, tlsCfg, "TLS handshake failed on port 465"); isNotYetValid {
+			if isNotYetValid, wrappedErr := isNotYetValidError(err, tlsCfg, "TLS handshake failed on port 465", s.now()); isNotYetValid {
 				return wrappedErr
 			}
 			// Check for expiry-only error (transient: relay state, not Peerline config)
@@ -464,7 +489,7 @@ func (s *SMTP) Probe(ctx context.Context) error {
 			// Actually perform the handshake to verify certs
 			if err := c.StartTLS(tlsCfg); err != nil {
 				// Check for not-yet-valid certificate (fatal: clock skew or misconfiguration)
-				if isNotYetValid, wrappedErr := isNotYetValidError(err, tlsCfg, "STARTTLS handshake failed"); isNotYetValid {
+				if isNotYetValid, wrappedErr := isNotYetValidError(err, tlsCfg, "STARTTLS handshake failed", s.now()); isNotYetValid {
 					return wrappedErr
 				}
 				// Check for expiry-only error (transient: relay state, not Peerline config)
@@ -484,13 +509,12 @@ func (s *SMTP) Probe(ctx context.Context) error {
 // isNotYetValidError returns true if err is a certificate not-yet-valid error (NotBefore in the future).
 // If true, it returns a wrapped error (mentions "check the host clock" and includes the stage).
 // The stage parameter describes where the error occurred (e.g., "port 465" or "STARTTLS handshake").
-func isNotYetValidError(err error, tlsCfg *tls.Config, stage string) (bool, error) {
+func isNotYetValidError(err error, tlsCfg *tls.Config, stage string, now time.Time) (bool, error) {
 	var x509Invalid x509.CertificateInvalidError
 	if !errors.As(err, &x509Invalid) || x509Invalid.Reason != x509.Expired || x509Invalid.Cert == nil {
 		return false, nil
 	}
-	// Use tlsCfg.Time if set (for tests), otherwise use time.Now()
-	now := time.Now()
+	// Use tlsCfg.Time if set (for tests), otherwise the caller clock.
 	if tlsCfg != nil && tlsCfg.Time != nil {
 		now = tlsCfg.Time()
 	}
@@ -548,8 +572,8 @@ func (s *SMTP) isExpiryOnlyError(ctx context.Context, err error, conn net.Conn, 
 		return false
 	}
 	// Not-yet-valid (NotBefore in the future) is fatal: indicates clock skew or misconfiguration
-	// Use tlsCfg.Time if set (for tests), otherwise use time.Now()
-	now := time.Now()
+	// Use tlsCfg.Time if set (for tests), otherwise use the mailer clock.
+	now := s.now()
 	if tlsCfg != nil && tlsCfg.Time != nil {
 		now = tlsCfg.Time()
 	}
