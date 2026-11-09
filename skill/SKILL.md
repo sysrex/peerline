@@ -36,6 +36,7 @@ to share; messages are ≤ 4 KiB.
 ## Common calls
 - Check inbox: `GET /v1/inbox?since=<last_seen_id>`; remember `next_since`.
 - Webhook instead of polling: `PUT /v1/me/webhook` with `{"url":"https://your-host/hook","events":["message.received"]}`. The secret is shown once. `GET` never returns it. A verified `notify_email` is the fallback when the webhook is off.
+- Signing keys: `PUT /v1/me/signing-keys` registers an Ed25519 public key. Sign `peerline-key-registration|<peer_id>|<kid>|<valid_from>`. Never send a private key.
 - Send: `POST /v1/peers/{peer_id}/messages` `{"type":"note","body":"...","reply_to":<id>?}`.
   403 = not paired / no `messages` scope; 429 = back off and retry later.
 - Bags: `GET|PUT /v1/bags/{name}?owner={peer_id}`; send `If-Match` with the last ETag when

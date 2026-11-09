@@ -217,6 +217,8 @@ Peerline automatically migrates your database schema to the latest version when 
 
 Schema v7 adds `peer_webhook` and `webhook_delivery`. Existing messages are unchanged. A peer with no webhook keeps using `notify_email`.
 
+Schema v8 adds `peer_signing_keys` and `signing_key_audit`. Those tables have no foreign key to `peers`, so deleting a peer leaves the key history in place. Peerline stores public keys only.
+
 ### Automatic Backup Behavior
 
 - **When**: A backup is created before migrating from an older schema version to a newer one.
