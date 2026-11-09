@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/sysrex/peerline/internal/api"
+	"github.com/sysrex/peerline/internal/audit"
 	"github.com/sysrex/peerline/internal/clock"
 	"github.com/sysrex/peerline/internal/mailer"
 	"github.com/sysrex/peerline/internal/store"
@@ -332,7 +334,19 @@ func main() {
 	if skipBackup {
 		log.Warn("PEERLINE_SKIP_MIGRATION_BACKUP is enabled, pre-migration backups are disabled")
 	}
+	var auditKey ed25519.PrivateKey
 	if auditEnabled {
+		keyPath := os.Getenv("PEERLINE_AUDIT_SIGNING_KEY_PATH")
+		if keyPath == "" {
+			log.Error("PEERLINE_AUDIT_SIGNING_KEY_PATH is required when PEERLINE_AUDIT_ENABLED is set")
+			os.Exit(1)
+		}
+		key, err := audit.LoadSigningKey(keyPath)
+		if err != nil {
+			log.Error("audit signing key", "err", err)
+			os.Exit(1)
+		}
+		auditKey = key
 		log.Info("audit log enabled")
 	}
 
@@ -346,6 +360,7 @@ func main() {
 		Logger:               log,
 		Clock:                clk,
 		AuditEnabled:         auditEnabled,
+		AuditSigner:          auditKey,
 	}
 
 	st, err := store.OpenWithOptions(*dbPath, opts)
