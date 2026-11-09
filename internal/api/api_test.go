@@ -2462,6 +2462,43 @@ func TestDeletedInviteCannotBeAccepted(t *testing.T) {
 	}
 }
 
+// TestEmailRateLimitMissingInviteStill429 verifies that a compensating delete
+// which finds the invite already gone still returns the rate-limit response (#306).
+func TestEmailRateLimitMissingInviteStill429(t *testing.T) {
+	cfg := Config{EmailPerHour: 1, EmailBurst: 1, EmailRcptPerHour: 10}
+	srv, raw, st := newServerWithAccess(t, cfg)
+	var drop bool
+	raw.testBeforeEmailLimitHook = func(publicID, owner string) {
+		if !drop {
+			return
+		}
+		if err := st.DeleteInvite(context.Background(), publicID, owner); err != nil {
+			t.Errorf("delete invite before rate-limit cleanup: %v", err)
+		}
+	}
+	alice := register(t, srv, "Alice")
+
+	resp, b := alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "first@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first email invite: %d %s", resp.StatusCode, b)
+	}
+
+	drop = true
+	resp, b = alice.do("POST", "/v1/invites", map[string]any{
+		"to_email": "second@example.com",
+		"scopes":   []string{"messages"},
+	}, nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second email invite: status %d, want 429; body %s", resp.StatusCode, b)
+	}
+	if got := resp.Header.Get("Retry-After"); got != "600" {
+		t.Fatalf("Retry-After = %q, want 600", got)
+	}
+}
+
 // TestConcurrentInviteCapRace verifies the concurrent cap check race is fixed (#53).
 //
 // The barrier (via testInviteCreatedHook) holds all requests before CreateInviteAtomic.

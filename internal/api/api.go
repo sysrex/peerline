@@ -119,6 +119,9 @@ type Server struct {
 	testInviteCreatedHook func(peerID string)
 	// Test-only hook: called after email Ready checks pass and before mailLim.Allow (for deterministic Ready→Allow race testing)
 	testAfterEmailReadyHook func(peerID string)
+	// Test-only hook: called after the invite row exists and before the email
+	// rate-limit check. Production: nil.
+	testBeforeEmailLimitHook func(publicID, ownerID string)
 }
 
 func New(st *store.Store, cfg Config) (*Server, error) {
@@ -810,6 +813,10 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if s.testBeforeEmailLimitHook != nil {
+		s.testBeforeEmailLimitHook(publicID, me)
+	}
+
 	// Check email rate limit AFTER creating invite (#53)
 	// If limit fails, delete the invite and return error
 	if to != "" {
@@ -903,7 +910,7 @@ func (s *Server) publicBase(r *http.Request) string {
 func (s *Server) rejectEmailRateLimited(w http.ResponseWriter, r *http.Request, publicID, me string) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
 	defer cancel()
-	if err := s.st.DeleteInvite(ctx, publicID, me); err != nil {
+	if err := s.st.DeleteInvite(ctx, publicID, me); err != nil && !errors.Is(err, store.ErrNotFound) {
 		s.internal(w, fmt.Errorf("rate limited and invite cleanup failed: %w", err))
 		return
 	}
