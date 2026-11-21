@@ -241,6 +241,12 @@ Peerline automatically migrates your database schema to the latest version when 
 
 Schema v8 adds `peer_webhook` and `webhook_delivery`. Existing messages are unchanged. A peer with no webhook keeps using `notify_email`.
 
+Schema v9 adds `peer_signing_keys` and `signing_key_audit`. Those tables have no foreign key to `peers`, so deleting a peer leaves the key history in place. Peerline stores public keys only.
+
+Schema v10 adds the audit tables `pairings`, `pairing_keys`, `audit_records`, and `audit_chain_heads`, also with no foreign key to `peers`. `PEERLINE_AUDIT_ENABLED` defaults off. Turning it on starts appending events; leaving it off keeps current request behavior.
+
+Schema v11 adds `a2a_tasks` and `a2a_msg_map`, with no foreign key to `peers`. Audit retention and pairing erasure (#392 / #264) are held pending #288 and are not in this schema.
+
 ### Automatic Backup Behavior
 
 - **When**: A backup is created before migrating from an older schema version to a newer one.
