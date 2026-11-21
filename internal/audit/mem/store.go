@@ -7,7 +7,6 @@ import (
 	"sync"
 
 	"github.com/sysrex/peerline/internal/audit"
-	"github.com/sysrex/peerline/internal/store"
 )
 
 // Store is a process-local audit log. It ignores the DBTX argument; the
@@ -15,7 +14,7 @@ import (
 type Store struct {
 	mu   sync.Mutex
 	now  func() int64
-	rows []audit.Record
+	rows []audit.LogRecord
 	seq  map[string]int64
 }
 
@@ -27,7 +26,7 @@ func New(now func() int64) *Store {
 	return &Store{now: now, seq: map[string]int64{}}
 }
 
-func (s *Store) Append(_ context.Context, _ store.DBTX, rec audit.Record) (int64, error) {
+func (s *Store) Append(_ context.Context, _ audit.Tx, rec audit.LogRecord) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.seq[rec.PairingID]++
@@ -40,10 +39,10 @@ func (s *Store) Append(_ context.Context, _ store.DBTX, rec audit.Record) (int64
 	return rec.Seq, nil
 }
 
-func (s *Store) ReadRange(_ context.Context, pairingID string, fromSeq, toSeq int64) ([]audit.Record, error) {
+func (s *Store) ReadRange(_ context.Context, pairingID string, fromSeq, toSeq int64) ([]audit.LogRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out []audit.Record
+	var out []audit.LogRecord
 	for _, rec := range s.rows {
 		if rec.PairingID != pairingID || rec.Seq < fromSeq {
 			continue
@@ -53,7 +52,7 @@ func (s *Store) ReadRange(_ context.Context, pairingID string, fromSeq, toSeq in
 		}
 		out = append(out, rec)
 	}
-	slices.SortFunc(out, func(a, b audit.Record) int {
+	slices.SortFunc(out, func(a, b audit.LogRecord) int {
 		if a.Seq < b.Seq {
 			return -1
 		}
@@ -65,7 +64,7 @@ func (s *Store) ReadRange(_ context.Context, pairingID string, fromSeq, toSeq in
 	return out, nil
 }
 
-func (s *Store) MarkBatched(_ context.Context, _ store.DBTX, pairingID string, throughSeq int64, batchID string) error {
+func (s *Store) MarkBatched(_ context.Context, _ audit.Tx, pairingID string, throughSeq int64, batchID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := range s.rows {
@@ -77,7 +76,7 @@ func (s *Store) MarkBatched(_ context.Context, _ store.DBTX, pairingID string, t
 	return nil
 }
 
-func (s *Store) MarkAnchored(_ context.Context, _ store.DBTX, batchID, anchorRef string) error {
+func (s *Store) MarkAnchored(_ context.Context, _ audit.Tx, batchID, anchorRef string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := range s.rows {
@@ -88,7 +87,7 @@ func (s *Store) MarkAnchored(_ context.Context, _ store.DBTX, batchID, anchorRef
 	return nil
 }
 
-func (s *Store) DeleteBefore(_ context.Context, _ store.DBTX, beforeUnix int64) (int, error) {
+func (s *Store) DeleteBefore(_ context.Context, _ audit.Tx, beforeUnix int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	kept := s.rows[:0]
