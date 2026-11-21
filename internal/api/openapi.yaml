@@ -209,6 +209,52 @@ paths:
         "200":
           description: Recent delivery statuses.
 
+  /v1/me/signing-keys:
+    put:
+      operationId: putSigningKey
+      summary: Register an Ed25519 public key. The request carries a proof of possession, never a private key.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Key registered.
+        "400":
+          description: Invalid kid, key, or proof.
+  /v1/me/signing-keys/{kid}:
+    delete:
+      operationId: deleteSigningKey
+      summary: Revoke one of your signing keys.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: kid
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Key revoked.
+        "404":
+          description: Unknown kid.
+  /v1/peers/{peer_id}/signing-keys:
+    get:
+      operationId: listSigningKeys
+      summary: Public keys of a paired peer. Unpaired callers get 404.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: peer_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Public keys.
+        "404":
+          description: Unknown or unpaired peer.
+
   /v1/me/verify-email:
     post:
       operationId: verifyEmail
