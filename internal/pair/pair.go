@@ -15,9 +15,10 @@ const (
 	ScopeMessages  = "messages"
 	ScopeBagsRead  = "bags:read"
 	ScopeBagsWrite = "bags:write"
+	ScopeA2A       = "a2a"
 )
 
-var validScopes = []string{ScopeMessages, ScopeBagsRead, ScopeBagsWrite}
+var validScopes = []string{ScopeMessages, ScopeBagsRead, ScopeBagsWrite, ScopeA2A}
 
 var bagNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
