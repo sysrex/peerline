@@ -125,6 +125,7 @@ type Server struct {
 	testWebhookPost func(id string, body []byte, signature string) (int, error)
 	webhookDeliv    *msg.Limiter
 	webhookMetrics  webhook.Metrics
+	signingKeyLim   *msg.Limiter
 
 	// For pruning verifyLim
 	pruneDone chan struct{}
@@ -238,15 +239,16 @@ func New(st *store.Store, cfg Config) (*Server, error) {
 	}
 
 	s := &Server{
-		st:           st,
-		cfg:          cfg,
-		log:          cfg.Logger,
-		lim:          NewLimiterManager(cfg),
-		verifyLim:    msg.NewLimiterPerHour(3, 3, msg.WithClock(clk.Now)), // 3 verification emails per peer/address per hour
-		webhookDeliv: msg.NewLimiter(600, 10, msg.WithClock(clk.Now)),     // 10 deliveries/s, burst 10
-		trustedNets:  trustedNets,
-		clk:          clk,
-		pruneDone:    make(chan struct{}),
+		st:            st,
+		cfg:           cfg,
+		log:           cfg.Logger,
+		lim:           NewLimiterManager(cfg),
+		verifyLim:     msg.NewLimiterPerHour(3, 3, msg.WithClock(clk.Now)), // 3 verification emails per peer/address per hour
+		webhookDeliv:  msg.NewLimiter(600, 10, msg.WithClock(clk.Now)),     // 10 deliveries/s, burst 10
+		signingKeyLim: msg.NewLimiter(1, 1, msg.WithClock(clk.Now)),        // one signing-key registration per minute
+		trustedNets:   trustedNets,
+		clk:           clk,
+		pruneDone:     make(chan struct{}),
 	}
 
 	s.statsCacheTTL = cfg.StatsCacheTTL
@@ -336,6 +338,7 @@ func (s *Server) buildHandler() (http.Handler, []string) {
 	reg(authed, "PUT /v1/me", s.rateLimitWrite(s.updateMe))
 	reg(authed, "POST /v1/me/rotate-key", s.rateLimitWrite(s.rotateKey))
 	s.webhookRoutes(reg, authed)
+	s.signingKeyRoutes(reg, authed)
 	reg(authed, "DELETE /v1/me", s.rateLimitWrite(s.deleteMe))
 	reg(authed, "POST /v1/me/verify-email", s.rateLimitWrite(s.verifyEmail))
 	reg(authed, "POST /v1/invites", s.rateLimitWrite(s.createInvite))
