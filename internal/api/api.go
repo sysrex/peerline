@@ -332,6 +332,7 @@ func (s *Server) buildHandler() (http.Handler, []string) {
 	reg(mux, "GET /openapi.json", s.rateLimitGet(s.openAPI))
 
 	authed := http.NewServeMux()
+	s.a2aRoutes(reg, mux)
 	reg(authed, "GET /v1/me", s.rateLimitAuth(s.me))
 	reg(authed, "PUT /v1/me", s.rateLimitWrite(s.updateMe))
 	reg(authed, "POST /v1/me/rotate-key", s.rateLimitWrite(s.rotateKey))

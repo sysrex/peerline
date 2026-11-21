@@ -73,6 +73,47 @@ paths:
                 properties:
                   version:
                     type: string
+  /.well-known/agent-card.json:
+    get:
+      operationId: publicAgentCard
+      summary: Public A2A gateway card
+      parameters:
+        - name: A2A-Version
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Agent card
+        "400":
+          $ref: "#/components/responses/Error"
+  /a2a/{peer_id}/agent-card.json:
+    get:
+      operationId: peerAgentCard
+      summary: Per-peer A2A card
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: peer_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: A2A-Version
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Agent card
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
   /v1/public/stats:
     get:
       operationId: publicStats
